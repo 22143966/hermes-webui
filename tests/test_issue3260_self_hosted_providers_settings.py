@@ -704,3 +704,10 @@ def test_provider_card_status_keys_are_translated_alongside_the_new_label():
         for key, en in english.items():
             value = re.search(rf"{key}: '([^']+)'", body).group(1)
             assert value != en, (locale, key, value)
+
+
+def test_provider_card_badge_wraps_on_narrow_phones():
+    """Fable UX gate r4 (2026-10-06): at 320px the German keyed pill could not shrink and
+    collapsed the meta column to one-word lines; narrow phones cap and wrap the pill."""
+    css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+    assert "@media (max-width: 420px){.provider-card-badge{max-width:50%;white-space:normal;" in css
