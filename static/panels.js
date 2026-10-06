@@ -11885,8 +11885,17 @@ function _buildProviderCard(p){
   const isConfigured=p.is_self_hosted===true
     ? typeof p.base_url==='string' && p.base_url.trim().length>0
     : p.has_key;
+  // The meta line names the credential source and the pill carries the status: a keyed
+  // card reads "API key" + "API key configured". A configured keyless self-hosted card
+  // names its endpoint (host[:port] only: no path, no userinfo) instead of repeating
+  // "Configured" in both slots.
+  const selfHostedEndpoint=(raw)=>{
+    const value=String(raw||'').trim();
+    try{ const u=new URL(value); if(u.host) return u.host; }catch(_){}
+    return value.replace(/^[a-z][a-z0-9+.-]*:\/\//i,'').replace(/^[^@/]*@/,'').split(/[/?#]/)[0];
+  };
   const sourceLabel=p.is_self_hosted
-    ? (isConfigured ? t('providers_status_configured_label')||'Configured' : t('providers_status_not_configured_label'))
+    ? (isConfigured ? (selfHostedEndpoint(p.base_url)||t('providers_status_configured_label')||'Configured') : t('providers_status_not_configured_label'))
     : p.key_source==='oauth'
       ? t('providers_status_oauth')
       : p.key_source==='config_yaml'

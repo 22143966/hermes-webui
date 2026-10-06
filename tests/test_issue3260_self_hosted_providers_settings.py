@@ -472,6 +472,14 @@ def test_provider_card_uses_backend_projection_authority_matrix(isolated_self_ho
     assert keyless_row["has_key"] is False
     assert "Configured" in keyless_payload["headerText"]
     assert "provider-card-badge" in keyless_payload["headerHtml"]
+    # Fable UX gate (2026-10-06): the meta line names the endpoint (host only) and the
+    # pill carries the status, so "Configured" is not repeated in both slots.
+    assert "provider-b" in keyless_payload["headerText"]
+    assert keyless_payload["headerText"].count("Configured") == 1
+    userinfo_payload = render_provider({**keyless_row, "base_url": "http://user:s3cret@10.0.0.5:11434/v1?x=1"})
+    assert "10.0.0.5:11434" in userinfo_payload["headerText"]
+    assert "s3cret" not in userinfo_payload["headerHtml"]
+    assert "/v1" not in userinfo_payload["headerText"]
 
     missing_cfg = {
         "model": {
