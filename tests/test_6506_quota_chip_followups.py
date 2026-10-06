@@ -109,6 +109,22 @@ return {seeded, during: chip(), newRequests: requests.length - before};
     assert out["during"] == {"hidden": True, "label": ""}
 
 
+def test_unspecified_provider_refetch_always_clears():
+    # No session and no composer override: the request carries no provider and the server answers for its current
+    # default, which may have changed (Codex delta review, 2026-10-06).
+    out = _run("""
+S.session = null;
+_syncProviderQuotaForActiveContext();
+pending.shift().resolve(available(42)); await tick();
+const seeded = chip();
+void refreshProviderQuotaIndicator(null);
+return {seeded, during: chip(), last: requests[requests.length - 1]};
+""")
+    assert out["seeded"] == {"hidden": False, "label": "42%"}
+    assert out["during"] == {"hidden": True, "label": ""}
+    assert out["last"] == "/api/provider/quota"
+
+
 def test_successful_profile_switch_drops_the_empty_composer_override():
     panels = PANELS_JS.read_text(encoding="utf-8")
     start = panels.index("const data = await api('/api/profile/switch'")

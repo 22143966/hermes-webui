@@ -3311,7 +3311,8 @@ async function refreshProviderQuotaIndicator(providerId){
   const requestKey=_providerQuotaProfileKey()+'|'+provider;
   // Clear before the request when the profile or provider changes, so the old account's numbers are not
   // visible or keyboard-reachable meanwhile. A same-account refetch (session switch, tab return) keeps them.
-  if(requestKey!==_providerQuotaRenderedKey) clearProviderQuotaIndicator();
+  // An unspecified provider means "the server's current default", which can change underneath, so it always clears.
+  if(!provider||requestKey!==_providerQuotaRenderedKey) clearProviderQuotaIndicator();
   // Short-circuit before the fetch when the chip is disabled — no point asking
   // the server for quota data the UI will throw away.
   if(window._showQuotaChip!==true){clearProviderQuotaIndicator();return;}
