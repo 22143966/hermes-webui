@@ -323,7 +323,9 @@ def test_provider_quota_refresh_follows_each_authoritative_provider_transition()
     first_topbar = load.index("syncTopbar()")
     assert pending_model < first_topbar
 
-    new_session = _between(sessions, "async function newSession", "function _clearStuckSessionOnBoot")
+    # End anchor: the next top-level function after newSession on current master (`_clearStuckSessionOnBoot` was
+    # removed by 7c436dfd9).
+    new_session = _between(sessions, "async function newSession", "function _rearmActiveSessionStream")
     server_session = new_session.index("S.session=data.session;")
     server_messages = new_session.index("S.messages=data.session.messages||[];", server_session)
     new_topbar = new_session.index("syncTopbar();renderMessages();")
