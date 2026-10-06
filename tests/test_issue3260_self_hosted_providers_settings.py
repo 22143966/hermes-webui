@@ -682,3 +682,25 @@ def test_provider_card_meta_wraps_long_endpoint_hosts():
     css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
     rule = re.search(r"\.provider-card-meta\{([^}]*)\}", css)
     assert rule and "overflow-wrap:anywhere" in rule.group(1)
+
+
+def test_provider_card_status_keys_are_translated_alongside_the_new_label():
+    """Fable UX gate r3 (2026-10-06): es/de/ko translated only the new configured label, so
+    a card mixed one native word with English siblings. The four sibling status keys the
+    card header uses are translated in those blocks too."""
+    i18n = (ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
+    blocks = dict(re.findall(
+        r"(?ms)^  (?P<locale>'[^']+'|[A-Za-z-]+): \{(?P<body>.*?)(?=^  (?:'[^']+'|[A-Za-z-]+): \{|\Z)",
+        i18n,
+    ))
+    english = {
+        "providers_status_configured": "API key configured",
+        "providers_status_not_configured": "No API key",
+        "providers_status_not_configured_label": "Not configured",
+        "providers_status_api_key": "API key",
+    }
+    for locale in ("es", "de", "ko"):
+        body = blocks[locale]
+        for key, en in english.items():
+            value = re.search(rf"{key}: '([^']+)'", body).group(1)
+            assert value != en, (locale, key, value)
