@@ -5578,7 +5578,7 @@ main.main > #mainPlugin{display:none;}
 .provider-card-header:hover{background:var(--surface);}
 .provider-card-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;}
 .provider-card-name{font-size:13px;font-weight:500;color:var(--text);line-height:1.2;}
-.provider-card-meta{font-size:11px;color:var(--muted);line-height:1.2;opacity:.82;}
+.provider-card-meta{font-size:11px;color:var(--muted);line-height:1.2;opacity:.82;overflow-wrap:anywhere;}
 .provider-card-badge{
   flex-shrink:0;
   font-size:10.5px;font-weight:500;

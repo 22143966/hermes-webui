@@ -673,3 +673,12 @@ def test_probe_self_hosted_provider_accepts_string_models(tmp_path):
     payload = json.loads(result.stdout)
     assert payload["modelValue"] == "qwen3:8b"
     assert payload["saveDisabled"] is False
+
+
+def test_provider_card_meta_wraps_long_endpoint_hosts():
+    """Fable UX gate r2 (2026-10-06): the meta line now carries a user-supplied endpoint host
+    (e.g. a Tailscale or LAN name), an unbreakable token that overflowed the card at phone
+    widths; it must wrap instead."""
+    css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+    rule = re.search(r"\.provider-card-meta\{([^}]*)\}", css)
+    assert rule and "overflow-wrap:anywhere" in rule.group(1)
