@@ -7286,6 +7286,9 @@ async function switchToProfile(name) {
     // error surfaces ONLY when the CURRENT switch genuinely fails (@rodboev review, #4662).
     const data = await api('/api/profile/switch', { method: 'POST', body: JSON.stringify({ name }), timeoutToast: false });
     if (_switchGen !== _profileSwitchGeneration) return false;
+    // A retained empty-composer pick belongs to the old profile's providers; keeping it
+    // would make New Chat / Send post the old profile's model (#6506 gate).
+    if (typeof _clearEmptyComposerModelOverride === 'function') _clearEmptyComposerModelOverride();
     S.activeProfile = data.active || name;
     S.activeProfileIsDefault = !!data.is_default;
     // The switch's optimistic chip already claims the new profile, but the

@@ -3225,6 +3225,12 @@ setTimeout(_initMediaPlaybackObserver,0);
 // can reappear while the active conversation uses another provider.
 let _providerQuotaRefreshSeq=0;
 let _providerQuotaContextIdentity;
+// profile|provider whose numbers the chip currently shows (null when cleared). A refetch for the same
+// profile and provider keeps them visible instead of blanking the chip until the response arrives.
+let _providerQuotaRenderedKey=null;
+function _providerQuotaProfileKey(){
+  return (typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'';
+}
 
 function _formatQuotaMoneyShort(value){
   const n=Number(value);
@@ -3262,6 +3268,7 @@ function _providerQuotaIndicatorText(status){
   return null;
 }
 function clearProviderQuotaIndicator(){
+  _providerQuotaRenderedKey=null;
   const chip=$('providerQuotaChip');
   const label=$('providerQuotaChipLabel');
   const mobileAction=$('composerMobileQuotaAction');
@@ -3300,18 +3307,21 @@ function renderProviderQuotaIndicator(status){
 }
 async function refreshProviderQuotaIndicator(providerId){
   const requestSeq=++_providerQuotaRefreshSeq;
-  // Clear before the request so the old provider's account state is not visible
-  // or keyboard-reachable while the active session changes provider.
-  clearProviderQuotaIndicator();
+  const provider=String(providerId||'').trim();
+  const requestKey=_providerQuotaProfileKey()+'|'+provider;
+  // Clear before the request when the profile or provider changes, so the old account's numbers are not
+  // visible or keyboard-reachable meanwhile. A same-account refetch (session switch, tab return) keeps them.
+  if(requestKey!==_providerQuotaRenderedKey) clearProviderQuotaIndicator();
   // Short-circuit before the fetch when the chip is disabled — no point asking
   // the server for quota data the UI will throw away.
-  if(window._showQuotaChip!==true) return;
-  const provider=String(providerId||'').trim();
+  if(window._showQuotaChip!==true){clearProviderQuotaIndicator();return;}
   const query=provider?'?provider='+encodeURIComponent(provider):'';
   try{
     const status=await api('/api/provider/quota'+query);
     if(requestSeq!==_providerQuotaRefreshSeq) return;
     renderProviderQuotaIndicator(status);
+    const chip=$('providerQuotaChip');
+    _providerQuotaRenderedKey=(chip&&!chip.hidden)?requestKey:null;
   }catch(_e){
     if(requestSeq!==_providerQuotaRefreshSeq) return;
     clearProviderQuotaIndicator();
@@ -3340,9 +3350,11 @@ function _syncProviderQuotaForActiveContext(){
   if(typeof S==='undefined'||!S||S._bootReady!==true) return;
   const provider=_currentQuotaProvider();
   const providerIdentity=String(provider||'').trim();
-  const contextIdentity=S.session
+  // Quota is per profile (the route binds the profile env), so the active profile is part of the identity.
+  const profileIdentity='profile:'+_providerQuotaProfileKey()+'|';
+  const contextIdentity=profileIdentity+(S.session
     ? 'session:'+String(S.session.session_id||'')+'|provider:'+providerIdentity
-    : 'composer|provider:'+providerIdentity;
+    : 'composer|provider:'+providerIdentity);
   if(contextIdentity===_providerQuotaContextIdentity) return;
   _providerQuotaContextIdentity=contextIdentity;
   if(typeof refreshProviderQuotaIndicator==='function'){
