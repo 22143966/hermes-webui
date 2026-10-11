@@ -2489,6 +2489,52 @@ def _materialize_active_turn_user(identity, msg_text, source):
     return message
 
 
+def _settle_existing_current_turn_user_row(result_messages, previous_context, identity, msg_text):
+    """Return the index of the current turn's user row when already present.
+
+    The settle's exact-prefix suffix proof appends the Agent's returned rows
+    verbatim, and the eager checkpoint is dropped from the owner projection
+    before the Agent runs, so the returned list normally ALREADY contains the
+    current turn's user row. ``_find_active_turn_checkpoint_index`` recognizes
+    it only through a surviving ``_active_turn_token`` or the Agent-resolved
+    ``current_turn_user_idx``; when neither survives (older/stub Agents return
+    no ``turn_id``, or the projection carried no token), the caller must not
+    fall through to materializing a second copy of the same prompt.
+
+    Mirror ``_active_turn_boundary``'s text fallback: the LAST prompt-matching
+    user row at/after a content-matching previous-context prefix is the
+    current turn's row. Returns None when the row is genuinely absent — the
+    caller then materializes it as before.
+    """
+    previous_context = list(previous_context or [])
+    # #7237 round 4 follow-up: only a genuine SUPER-LIST of the previous
+    # context may be probed for an already-present current-turn row. Without
+    # that prefix a compacted / collision-shaped result can carry a same-text
+    # HISTORICAL user row; claiming it as this turn's row inverts the
+    # self-heal ownership proof
+    # (test_compression_snapshot_revision::test_self_heal_repeated_prompt_never_accepts_shifted_historical_row).
+    if not (
+        previous_context
+        and len(result_messages) > len(previous_context)
+        and _messages_have_prefix(result_messages, previous_context)
+    ):
+        return None
+    candidate_start = len(previous_context)
+    expected_text = identity.get('text') if isinstance(identity, dict) else None
+    expected = _normalize_user_text(expected_text if expected_text is not None else msg_text)
+    if not expected:
+        return None
+    for idx in range(len(result_messages) - 1, candidate_start - 1, -1):
+        message = result_messages[idx]
+        if (
+            isinstance(message, dict)
+            and message.get('role') == 'user'
+            and _normalize_user_text(_message_text(message.get('content'))) == expected
+        ):
+            return idx
+    return None
+
+
 def _settle_current_turn_boundary(previous_context, result_messages, identity, msg_text, source):
     """Insert the pending turn before assistant/tool output when it is absent."""
     result_messages = list(result_messages or [])
@@ -2500,6 +2546,30 @@ def _settle_current_turn_boundary(previous_context, result_messages, identity, m
         identity,
         msg_text,
     )
+    if _checkpoint_idx is None:
+        # The current turn's user row can already sit inside
+        # ``result_messages`` even when no token/index authority survives the
+        # projection: the eager checkpoint row is dropped from the owner
+        # projection before the Agent runs (``_drop_checkpointed_current_user_
+        # from_context``), so the user row the Agent returned IS this turn's
+        # own row, not an echo. Materializing a second copy beside it would
+        # persist the same prompt twice — the exact-prefix suffix proof marks
+        # that row protected, so the final context dedupe cannot collapse the
+        # duplicate either (#7237 round 4: cancelled-history real producers,
+        # PRIOR_Q2 duplicated and the state.db Gateway pair dropped). Mirror
+        # ``_active_turn_boundary``'s text fallback: the LAST prompt-matching
+        # user row at/after the previous-context prefix owns the turn.
+        _checkpoint_idx = _settle_existing_current_turn_user_row(
+            result_messages, previous_context, identity, msg_text,
+        )
+        if _checkpoint_idx is not None and identity.get('timestamp') is not None:
+            # The returned row is this turn's own row, but its timestamp may
+            # have been re-stamped with a wall clock by the display merge.
+            # Keep the eager checkpoint's pending-start clock (what the
+            # materialize path stamps) so pre-stop mirror alignment against
+            # the state.db rows stays exact and cancelled-history gap
+            # restoration keeps its anchors (#7237 round 4, real producers).
+            result_messages[_checkpoint_idx]['timestamp'] = identity['timestamp']
     if _checkpoint_idx is not None:
         existing_checkpoint = result_messages[_checkpoint_idx]
         _mark_active_turn_checkpoint(existing_checkpoint, identity)
@@ -7641,6 +7711,20 @@ def _sanitize_messages_for_agent(
     against the Agent's returned list, so it must model the Agent's merge or
     every second successive follow-up drops its prompt and reply.
     """
+    if normalize_bare_assistant_adjacency:
+        # Normalize on the RAW rows BEFORE the API-safe projection: the
+        # cancelled-history block criterion below reads provenance that the
+        # projection strips (``_state_db_row_id``, ``_partial``,
+        # ``_recovered*``, timestamps), so the merge decision must happen
+        # while that provenance is still visible (#7237 round 4, cancelled
+        # readers/boundary regressions). The normalizer only ever collapses
+        # bare pairs the sanitizer's own pass-0 merge deliberately leaves
+        # alone, so running it first cannot conflict with that merge.
+        # The user-pair merge mirrors the installed Agent's pass-3
+        # consecutive-user repair; it runs before the assistant merge so
+        # both Agent passes are modelled on the same input.
+        messages = _merge_agent_replay_bare_user_rows(messages)
+        messages = _merge_agent_replay_bare_assistant_rows(messages)
     sanitized = _sanitize_messages_for_api(
         messages,
         cfg=cfg,
@@ -7650,9 +7734,139 @@ def _sanitize_messages_for_agent(
         preserve_api_content=True,
         requested_provider=requested_provider,
     )
-    if normalize_bare_assistant_adjacency:
-        sanitized = _merge_agent_replay_bare_assistant_rows(sanitized)
     return sanitized
+
+
+def _replay_merge_blocked_by_cancelled_history(prev, msg, next_row):
+    """Return True when an adjacent assistant pair must stay separate.
+
+    The Agent-replay projection is the snapshot the settle diffs against the
+    Agent's return, so it normally mirrors the installed Agent's unconditional
+    merge of adjacent bare assistant rows. Rows the cancelled-history contract
+    spliced in (state.db reconciliation / cancel-journal recovery) are
+    pre-stop mirrors that must stay individually addressable: absorbing them
+    into the preceding turn's row breaks the row-level prefix the readers and
+    boundary tests pin. The installed Agent would merge them, but the WebUI
+    persist path cannot re-split a merged row, so the projection keeps them
+    separate and the settle's exact-prefix proof stays exact.
+
+    The block list mirrors the provenance of such rows on the RAW (pre
+    projection) list, which is why the normalizer runs before
+    ``_sanitize_messages_for_api`` strips those fields:
+
+    ① a durable row id on the later row (``_state_db_row_id`` / ``_row_id``)
+       — the row exists only in the state.db view;
+    ② a cancel-stop / recovery marker on either row (``_partial``,
+       ``_error``, ``_recovered*``, ``_active_turn_token``);
+    ③ a state.db-origin clock: a float timestamp on either row (the sqlite
+       REAL round-trip), or a later-row timestamp NEWER than the row that
+       follows the pair (a late-output splice the reconciliation inserted
+       out of order).
+    """
+    for row in (prev, msg):
+        if not isinstance(row, dict):
+            continue
+        if row.get("_state_db_row_id") is not None or row.get("_row_id") is not None:
+            return True
+        if row.get("_partial") is True or row.get("_error") is True:
+            return True
+        if any(str(key).startswith("_recovered") for key in row):
+            return True
+        if row.get("_active_turn_token"):
+            return True
+        if isinstance(row.get("timestamp"), float):
+            return True
+    later_ts = msg.get("timestamp") if isinstance(msg, dict) else None
+    if isinstance(next_row, dict):
+        next_ts = next_row.get("timestamp")
+        if (
+            isinstance(later_ts, (int, float))
+            and not isinstance(later_ts, bool)
+            and isinstance(next_ts, (int, float))
+            and not isinstance(next_ts, bool)
+            and later_ts > next_ts
+        ):
+            return True
+    return False
+
+
+def _replay_user_row_is_plain_mergeable(row):
+    """Return True when a user row may take part in the Agent's user-pair merge.
+
+    Mirrors the installed ``_merge_consecutive_users`` guard: only plain-text
+    user rows merge. Compression/summary carriers (``split_user_originated``
+    material), /steer control rows (``display_kind == 'steer'``), structured
+    (JSON-prefixed / list) content, and non-replayable rows are left alone.
+    """
+    if not isinstance(row, dict) or row.get('role') != 'user':
+        return False
+    kind = row.get('display_kind')
+    if kind is not None and kind != 'steer':
+        return False
+    content = row.get('content')
+    if not isinstance(content, str):
+        return False
+    if content.startswith('\x00json:'):
+        return False
+    if (
+        _is_context_compression_marker(row)
+        or _is_compressed_context_tool_result_summary_message(row)
+        or row.get('_recovered_display_only') is True
+        or _is_reasoning_only_assistant_message(row)
+        or _is_non_replayable_history_row(row)
+    ):
+        return False
+    return True
+
+
+def _merge_agent_replay_bare_user_rows(messages):
+    """Mirror the installed Agent's pass-3 merge of consecutive user rows.
+
+    The Agent's ``repair_message_sequence`` folds consecutive plain-text user
+    rows into one row joined with a literal ``\\n\\n`` boundary, so an
+    unanswered user tail followed by a new prompt is returned as a single
+    merged row. The Agent-replay projection is both the input the Agent
+    re-merges and the snapshot the settle diffs against the Agent's output:
+    if the projection leaves the pair unmerged, the Agent merges it, the
+    returned prefix no longer matches the snapshot, and settlement fails
+    closed — the next successive send loses its prompt and reply (#7237
+    review blocker 2, nesquena-hermes 2026-10-09).
+
+    This helper applies the Agent's pass-3 rule only, on a copy, for the
+    Agent-replay caller. It never rewrites the durable raw history — the
+    settle persists the raw rows and appends the proven current-turn suffix
+    on top. A merge that changes the visible content drops the survivor's
+    ``api_content`` sidecar (``drop_stale_api_content`` mirror).
+    """
+    if not isinstance(messages, list):
+        return messages
+    merged: list = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            merged.append(msg)
+            continue
+        prev = merged[-1] if merged and isinstance(merged[-1], dict) else None
+        if (
+            prev is not None
+            and _replay_user_row_is_plain_mergeable(prev)
+            and _replay_user_row_is_plain_mergeable(msg)
+        ):
+            survivor = copy.deepcopy(prev)
+            prev_content = survivor.get('content')
+            new_content = msg.get('content')
+            if prev_content and new_content:
+                survivor['content'] = prev_content + '\n\n' + new_content
+            elif new_content:
+                survivor['content'] = new_content
+            elif not prev_content:
+                survivor['content'] = ''
+            content_rewritten = survivor.get('content') != prev_content
+            if content_rewritten:
+                survivor.pop('api_content', None)
+            merged[-1] = survivor
+            continue
+        merged.append(msg)
+    return merged
 
 
 def _merge_agent_replay_bare_assistant_rows(messages):
@@ -7672,32 +7886,60 @@ def _merge_agent_replay_bare_assistant_rows(messages):
     (#7237 review round 3 finding 5).
 
     This helper applies the Agent's rule only, on a copy, for that one caller.
-    It never widens the provider projection.
+    It never widens the provider projection. Three exclusions mirror the
+    installed contract and the cancelled-history invariants:
+
+    - Codex interim rows are exempt, exactly like the Agent's own
+      ``_is_codex_interim`` gate (#7237 review round 4 finding).
+    - Pairs with a tool call on either side are left to the sanitizer's own
+      pass-0 merge (tool-call union semantics); this helper only collapses
+      the BARE pair that merge deliberately keeps.
+    - Pairs flagged by ``_replay_merge_blocked_by_cancelled_history`` stay
+      separate so pre-stop mirror rows keep their individual identity.
+    - A merge that changes the visible content drops the survivor's
+      ``api_content`` sidecar (mirror of the Agent's
+      ``drop_stale_api_content``), so the replay never resends pre-merge
+      bytes the rewrite discarded.
     """
     if not isinstance(messages, list):
         return messages
     merged: list = []
-    for msg in messages:
+    for idx, msg in enumerate(messages):
         if not isinstance(msg, dict):
             merged.append(msg)
             continue
         prev = merged[-1] if merged and isinstance(merged[-1], dict) else None
+        next_row = messages[idx + 1] if idx + 1 < len(messages) else None
         if (
             prev is not None
             and prev.get("role") == "assistant"
             and msg.get("role") == "assistant"
+            and not _is_codex_interim_row(prev)
+            and not _is_codex_interim_row(msg)
+            and not prev.get("tool_calls")
+            and not msg.get("tool_calls")
+            and not _is_reasoning_only_assistant_message(prev)
+            and not _is_reasoning_only_assistant_message(msg)
+            and not _is_non_replayable_history_row(prev)
+            and not _is_non_replayable_history_row(msg)
+            and not _replay_merge_blocked_by_cancelled_history(prev, msg, next_row)
         ):
             survivor = copy.deepcopy(prev)
             prev_content = survivor.get("content")
             new_content = msg.get("content")
+            content_rewritten = False
             if isinstance(prev_content, str) and isinstance(new_content, str):
                 joined = "\n".join(
                     part for part in (prev_content.strip(), new_content.strip()) if part
                 )
                 if joined:
                     survivor["content"] = joined
+                    content_rewritten = joined != prev_content
             elif not prev_content and new_content is not None:
                 survivor["content"] = new_content
+                content_rewritten = new_content != prev_content
+            if content_rewritten:
+                survivor.pop("api_content", None)
             if not survivor.get("reasoning_content") and msg.get("reasoning_content"):
                 survivor["reasoning_content"] = msg.get("reasoning_content")
             merged[-1] = survivor
@@ -15562,9 +15804,18 @@ def _run_agent_streaming(
                                     _turn_pending_source,
                                     _active_turn_identity,
                                     _heal_projected_history,
-                                    compression_authorized=bool(
-                                        getattr(agent, "session_id", None)
-                                        and getattr(agent, "session_id", None) != session_id
+                                    # #7237 review blocker 4 (nesquena-hermes
+                                    # 2026-10-09): the first heal retry's
+                                    # result was produced by THIS ``agent``
+                                    # (fresh credentials, same instance), so
+                                    # the compression authority must read the
+                                    # shared producer commitment from it —
+                                    # rotation-only proxies cannot see the
+                                    # default in-place compaction and the
+                                    # settle would refuse a genuine
+                                    # compression, dropping the healed answer.
+                                    compression_authorized=_producer_committed_compression(
+                                        agent, session_id
                                     ),
                                 )
                                 # normal post-result persistence path by
@@ -16942,9 +17193,20 @@ def _run_agent_streaming(
                                         _turn_pending_source,
                                         _active_turn_identity,
                                         _heal_projected_history2,
-                                        compression_authorized=bool(
-                                            getattr(agent, "session_id", None)
-                                            and getattr(agent, "session_id", None) != session_id
+                                        # #7237 review blocker 4 (nesquena-hermes
+                                        # 2026-10-09): the terminal heal's result
+                                        # was produced by ``_heal_agent`` (a fresh
+                                        # instance minted for the retry), not the
+                                        # original ``agent`` the old rotation-only
+                                        # proxy checked. Deriving the compression
+                                        # authority from the ACTUAL producer keeps
+                                        # the settle consistent with the streaming
+                                        # and sync paths: an in-place compaction by
+                                        # the heal agent must be honoured, or the
+                                        # healed answer is dropped with the old
+                                        # context.
+                                        compression_authorized=_producer_committed_compression(
+                                            _heal_agent, session_id
                                         ),
                                     )
                                     # Terminal self-heal success must finalize the

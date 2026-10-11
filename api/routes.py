@@ -27123,7 +27123,16 @@ def _handle_chat_sync(handler, body):
                 # current turn owns are appended when the replayed prefix
                 # diverges from the raw context (#7237 review
                 # data-regression finding).
-                conversation_history=_run_conversation_projected_history,
+                # #7237 review blocker 1 (nesquena-hermes 2026-10-09): the
+                # proof snapshot above must stay an IMMUTABLE copy. The
+                # installed Agent shallow-copies the list it receives and
+                # performs its consecutive-user repair on the tail dict, so
+                # handing it the same object the settle compares against
+                # makes the prefix proof a moving target — the repair
+                # mutates the dict in place and the settle then rejects the
+                # changed prefix, dropping the follow-up's prompt and reply.
+                # A second deep copy here isolates the Agent's mutation.
+                conversation_history=copy.deepcopy(_run_conversation_projected_history),
                 task_id=s.session_id,
                 persist_user_message=msg,
             )
