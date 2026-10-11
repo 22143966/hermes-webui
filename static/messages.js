@@ -1421,6 +1421,11 @@ async function send(){
     _sendInProgress=false;_sendInProgressSid=null;
     return;
   }
+  // Capture overlay authority at the originating Send action. Bundle/catalog
+  // resolution below can await before it discovers that a session must be
+  // created; recapturing inside newSession() would let that older Send retire a
+  // project picker the user opened during the resolver wait.
+  const _sendProjectPickerClaim=(typeof _projectPickerOpenEpoch==='number')?_projectPickerOpenEpoch:0;
 
   // #5472: snapshot the ORIGINAL user-typed composer state now — before slash
   // rewrites (/moa, bundles) mutate `text` and before uploadPendingFiles()
@@ -1646,7 +1651,7 @@ async function send(){
       }
     }
   }
-  if(!S.session){await newSession();}
+  if(!S.session){await newSession(false,{pickerClaimEpoch:_sendProjectPickerClaim});}
 
   const activeSid=S.session.session_id;
   _sendInProgressSid=activeSid;

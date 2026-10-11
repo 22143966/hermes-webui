@@ -2002,7 +2002,7 @@ async function newSession(flash, options={}){
   _setNewSessionPending(true);
   _newSessionInFlight=(async()=>{
     // Intent-time picker epoch; see the refresh below.
-    const newSessionClaim=(typeof _projectPickerOpenEpoch==='number')?_projectPickerOpenEpoch:0;
+    let newSessionClaim=(typeof _projectPickerOpenEpoch==='number')?_projectPickerOpenEpoch:0;
     // Starting a brand-new chat must not carry named context blocks selected in
     // the previous conversation (#2543). loadSession() clears these on a sidebar
     // switch, but the New Chat path replaces S.session here without going through
@@ -2112,6 +2112,7 @@ async function newSession(flash, options={}){
     // window). The marker must never authorize a provider override for a
     // different (new) session.
     if(S.session&&S.session.session_id&&typeof _clearExplicitPickerPick==='function') _clearExplicitPickerPick(S.session.session_id);
+    if(options&&typeof options.pickerClaimEpoch==='number') newSessionClaim=options.pickerClaimEpoch;
     const data=await api('/api/session/new',{method:'POST',body:JSON.stringify(reqBody)});
     if(consumedExplicitModelOverride&&typeof _clearEmptyComposerModelOverride==='function'){
       _clearEmptyComposerModelOverride();
@@ -6666,7 +6667,7 @@ function _renderSessionListLoadErrorNote(){
       setPending();
       _sessionListLoadError={..._sessionListLoadError,retrying:true};
       renderSessionListFromCache();
-      void renderSessionList({deferWhileInteracting:false}).finally(()=>{
+      void renderSessionList({deferWhileInteracting:false,keepProjectPicker:true}).finally(()=>{
         if(!retry.parentNode||(_sessionListLoadError&&_sessionListLoadError.retrying)) return;
         retry.textContent='Retry';
         retry.removeAttribute('aria-disabled');
@@ -6765,13 +6766,15 @@ async function _runRenderSessionListRefresh(opts, _gen){
     // up-front profile-switch skeleton instead of stranding it.
     _sessionListSkeletonActive = false;
     if (_scopeMatches) {
-      _repaintSidebarForBackgroundChurn();
+      if(opts&&opts.keepProjectPicker===true) _repaintSidebarKeepingProjectPicker();
+      else _repaintSidebarForBackgroundChurn();
     } else {
       _allSessions = [];
       _sidebarReferenceSessions = [];
       _allSessionsScope = _curScope;
       _clearSessionSourceTabCounts();
-      _repaintSidebarForBackgroundChurn();
+      if(opts&&opts.keepProjectPicker===true) _repaintSidebarKeepingProjectPicker();
+      else _repaintSidebarForBackgroundChurn();
     }
   }
 }
@@ -10607,12 +10610,49 @@ function _repaintSidebarForBackgroundChurn(){
 // a picker anchored to the session this response mutated — its row is going
 // away — then repaint as background churn so a picker owned by another session
 // survives. Callers run after the awaited response, never across it.
-function _repaintSidebarAfterSessionCompletion(sessionId){
+function _repaintSidebarAfterSessionCompletion(sessionId,claimEpoch){
   const open=typeof _openProjectPicker!=='undefined'?_openProjectPicker:null;
   if(open&&sessionId&&open.sessionId===sessionId&&typeof _retireProjectPickerForExplicitRepaint==='function'){
-    _retireProjectPickerForExplicitRepaint();
+    const retired=_retireProjectPickerForExplicitRepaint(claimEpoch);
+    // A newer picker for the same still-existing row outranks this held
+    // completion. Publish the durable move now, but preserve and re-anchor the
+    // newer overlay instead of deferring it or granting the old response
+    // dismissal authority.
+    if(!retired&&typeof claimEpoch==='number'){
+      _repaintSidebarKeepingProjectPicker();
+      return;
+    }
   }
   _repaintSidebarForBackgroundChurn();
+}
+
+// Resolve picker ownership through the same cache/filter/lineage pipeline the
+// next sidebar render will use. A connected DOM row is not authoritative: a
+// successful delete/archive/filter change can leave that old node connected
+// until the repaint. In that case background churn must proceed immediately so
+// the render removes the stale row and its overlay.
+function _projectPickerOwnerEligibleForSidebar(sessionId){
+  if(!sessionId) return false;
+  const rows=Array.isArray(_allSessions)?_allSessions:[];
+  const searchEl=(typeof $==='function')?$('sessionSearch'):null;
+  const query=searchEl?String(searchEl.value||'').trim():'';
+  const matched=(typeof _sessionSearchMergeMatches==='function')
+    ? _sessionSearchMergeMatches(rows,query,typeof _contentSearchResults!=='undefined'?_contentSearchResults:[])
+    : rows;
+  if(typeof _partitionSidebarSessionRows!=='function'||typeof _renderSidebarRowsFromRawSessions!=='function'){
+    return matched.some(row=>row&&row.session_id===sessionId);
+  }
+  const activeSid=(typeof S!=='undefined'&&S.session)?S.session.session_id:null;
+  const partition=_partitionSidebarSessionRows(matched,activeSid);
+  const cliOnly=typeof _sessionSourceFilter!=='undefined'&&_sessionSourceFilter==='cli';
+  const references=(typeof _scopedSidebarReferenceRows==='function')
+    ? _scopedSidebarReferenceRows(cliOnly,partition.projectIdFor)
+    : [];
+  const rendered=_renderSidebarRowsFromRawSessions(partition.sessionsRaw,references);
+  return rendered.some(row=>{
+    if(typeof _sessionLineageContainsSession==='function') return _sessionLineageContainsSession(row,sessionId);
+    return Boolean(row&&row.session_id===sessionId);
+  });
 }
 
 // Decide what a sidebar repaint does while the project picker is open. Returns
@@ -10626,7 +10666,12 @@ function _repaintSidebarAfterSessionCompletion(sessionId){
 // picker it never claimed authority over.
 function _projectPickerBlocksRepaint(){
   if(typeof _projectPickerTeardown==='undefined'||_projectPickerTeardown===null) return false;
-  return Boolean(typeof _sidebarRepaintBackgroundChurn!=='undefined'&&_sidebarRepaintBackgroundChurn);
+  const background=Boolean(typeof _sidebarRepaintBackgroundChurn!=='undefined'&&_sidebarRepaintBackgroundChurn);
+  if(!background) return false;
+  const open=typeof _openProjectPicker!=='undefined'?_openProjectPicker:null;
+  if(open&&typeof _projectPickerOwnerEligibleForSidebar==='function'
+     &&!_projectPickerOwnerEligibleForSidebar(open.sessionId)) return false;
+  return true;
 }
 
 // True when the open picker is anchored to a row inside the session list — the
@@ -10744,7 +10789,7 @@ function _showProjectPicker(session, anchorEl){
       // renderSessionListFromCache() reflects the move. (#2551)
       const idx=_allSessions.findIndex(s=>s&&s.session_id===session.session_id);
       if(idx>=0) _allSessions[idx].project_id=null;
-      _repaintSidebarAfterSessionCompletion(session.session_id);
+      _repaintSidebarAfterSessionCompletion(session.session_id,pickerEpoch);
       showToast('Removed from project');
     } catch(e) {
       showToast('Unassign failed: '+(e.message||e));
@@ -10785,7 +10830,7 @@ function _showProjectPicker(session, anchorEl){
         // See #2551 — write to _allSessions, not the shallow sidebar copy.
         const idx=_allSessions.findIndex(s=>s&&s.session_id===session.session_id);
         if(idx>=0) _allSessions[idx].project_id=p.project_id;
-        _repaintSidebarAfterSessionCompletion(session.session_id);
+        _repaintSidebarAfterSessionCompletion(session.session_id,pickerEpoch);
         showToast('Moved to '+p.name);
       }catch(e){showToast('Move failed: '+(e.message||e));}
     };

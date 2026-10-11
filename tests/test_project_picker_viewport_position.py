@@ -1397,6 +1397,14 @@ def _project_picker_blocks_repaint_source() -> str:
     return SESSIONS_JS[start:end] + "\n"
 
 
+def _project_picker_owner_eligible_for_sidebar_source() -> str:
+    start = SESSIONS_JS.find("function _projectPickerOwnerEligibleForSidebar(")
+    assert start >= 0, "_projectPickerOwnerEligibleForSidebar not found in static/sessions.js"
+    end = SESSIONS_JS.find("\nfunction ", start + 1)
+    assert end > start
+    return SESSIONS_JS[start:end] + "\n"
+
+
 def test_created_items_force_an_immediate_picker_preserving_payload_paint():
     """A completed create paints now even when a newer picker is open.
 
@@ -1598,7 +1606,7 @@ def test_completion_policy_is_wired_through_the_generation_claim_and_reanchor():
     assert "claimEpoch" in retire_body and "openEpoch>claimEpoch" in retire_body, (
         "the retire action must refuse claims older than the picker's opening"
     )
-    assert "const newSessionClaim=" in js
+    assert "let newSessionClaim=" in js
     assert "_retireProjectPickerForExplicitRepaint(newSessionClaim)" in js
     assert "const createClaim=" in js
     assert "_retireProjectPickerForExplicitRepaint(createClaim)" in js
@@ -1689,8 +1697,8 @@ LATE_COMPLETION_REPAINTS = [
     ("L1 title regenerate", "cached.title=nextTitle;", "_repaintSidebarForBackgroundChurn();"),
     ("L2 pin toggle", "if(cached) cached.pinned=newPinned;", "_repaintSidebarForBackgroundChurn();"),
     ("L3 share create/refresh", "cached.share_token=session.share_token;", "_repaintSidebarForBackgroundChurn();"),
-    ("L4 move to project", "_allSessions[idx].project_id=p.project_id;", "_repaintSidebarAfterSessionCompletion(session.session_id);"),
-    ("L5 unassign project", "_allSessions[idx].project_id=null;", "_repaintSidebarAfterSessionCompletion(session.session_id);"),
+    ("L4 move to project", "_allSessions[idx].project_id=p.project_id;", "_repaintSidebarAfterSessionCompletion(session.session_id,pickerEpoch);"),
+    ("L5 unassign project", "_allSessions[idx].project_id=null;", "_repaintSidebarAfterSessionCompletion(session.session_id,pickerEpoch);"),
     ("L6 archive", "if(cached) cached.archived=archived;", "_repaintSidebarAfterSessionCompletion(session.session_id);"),
     ("delete failure rollback", "_allSessions=previousSessions;", "_repaintSidebarAfterSessionCompletion(sid);"),
     ("hide external session", "return {...s,archived:!!archived};", "_repaintSidebarAfterSessionCompletion(sid);"),
@@ -1743,10 +1751,112 @@ def test_picker_move_completions_use_the_session_owned_repaint():
     start = SESSIONS_JS.index("function _showProjectPicker(")
     end = SESSIONS_JS.index("\nfunction _resizeProjectInput(", start)
     body = SESSIONS_JS[start:end]
-    assert body.count("_repaintSidebarAfterSessionCompletion(session.session_id);") == 2, (
-        "both move completions (assign and unassign) must repaint as background "
-        "churn and retire only a picker anchored to the moved session"
+    assert body.count("_repaintSidebarAfterSessionCompletion(session.session_id,pickerEpoch);") == 2, (
+        "both move completions must carry the interaction generation so a newer "
+        "same-owner picker is preserved while the durable move paints"
     )
+
+
+def test_same_owner_move_completion_keeps_a_newer_picker_and_paints_immediately():
+    """C1: a held move cannot dismiss a picker reopened after the POST began."""
+    assert NODE is not None
+    script = r"""
+let _sessionListRepaintDeferredByPicker = false;
+let _sidebarRepaintBackgroundChurn = false;
+let _sidebarRepaintKeepProjectPicker = false;
+let _projectPickerTeardown = null;
+let _openProjectPicker = null;
+let retired = 0;
+const paints = [];
+function renderSessionListFromCache(){ paints.push({background:_sidebarRepaintBackgroundChurn,keep:_sidebarRepaintKeepProjectPicker}); }
+""" + _retire_project_picker_for_explicit_repaint_source() + _repaint_sidebar_for_background_churn_source() + _repaint_sidebar_keeping_project_picker_source() + _repaint_sidebar_after_session_completion_source() + r"""
+const openPicker = (epoch) => {
+  _projectPickerTeardown = () => { retired += 1; _projectPickerTeardown = null; _openProjectPicker = null; };
+  _openProjectPicker = {sessionId:'a',openEpoch:epoch};
+};
+openPicker(8);
+_repaintSidebarAfterSessionCompletion('a',7);
+const staleCompletion = {retired,stillOpen:_openProjectPicker!==null,paints:[...paints]};
+_repaintSidebarAfterSessionCompletion('a',8);
+const currentCompletion = {retired,closed:_openProjectPicker===null,paints:[...paints]};
+console.log(JSON.stringify({staleCompletion,currentCompletion}));
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "staleCompletion": {
+            "retired": 0,
+            "stillOpen": True,
+            "paints": [{"background": False, "keep": True}],
+        },
+        "currentCompletion": {
+            "retired": 1,
+            "closed": True,
+            "paints": [
+                {"background": False, "keep": True},
+                {"background": True, "keep": False},
+            ],
+        },
+    }
+
+
+def test_background_repaint_does_not_defer_for_an_authoritatively_removed_owner():
+    """C2: connected stale DOM is not authority after the cache removed B."""
+    assert NODE is not None
+    script = r"""
+let _sessionListRepaintDeferredByPicker = false;
+let _sidebarRepaintBackgroundChurn = true;
+let _projectPickerTeardown = () => {};
+let _openProjectPicker = {sessionId:'deleted-b'};
+let _allSessions = [{session_id:'still-a'}];
+let _contentSearchResults = [];
+let _sidebarReferenceSessions = [];
+let _sessionSourceFilter = 'webui';
+let _showArchived = false;
+let _activeProject = null;
+let S = {session:{session_id:'still-a'}};
+function $(id){ return id==='sessionSearch'?{value:''}:null; }
+function _sessionSearchMergeMatches(rows){ return rows; }
+function _partitionSidebarSessionRows(rows){ return {sessionsRaw:rows,projectIdFor:()=>null}; }
+function _scopedSidebarReferenceRows(){ return []; }
+function _renderSidebarRowsFromRawSessions(rows){ return rows; }
+function _sessionLineageContainsSession(row,sid){ return row&&row.session_id===sid; }
+""" + _project_picker_owner_eligible_for_sidebar_source() + _project_picker_blocks_repaint_source() + r"""
+console.log(JSON.stringify({eligible:_projectPickerOwnerEligibleForSidebar('deleted-b'),blocks:_projectPickerBlocksRepaint()}));
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"eligible": False, "blocks": False}
+
+
+def test_retry_completion_publishes_success_and_failure_while_keeping_newer_picker():
+    """C3: native Retry requests immediate keep-picker paints on both exits."""
+    js = SESSIONS_JS
+    note_start = js.index("function _renderSessionListLoadErrorNote(")
+    note_end = js.index("\nasync function _runRenderSessionListRefresh(", note_start)
+    note_body = js[note_start:note_end]
+    assert "renderSessionList({deferWhileInteracting:false,keepProjectPicker:true})" in note_body
+
+    refresh_start = note_end
+    refresh_end = js.index("\nasync function _loadSidebarSessionListPayload(", refresh_start)
+    refresh_body = js[refresh_start:refresh_end]
+    assert refresh_body.count("opts&&opts.keepProjectPicker===true") >= 2
+    assert "_repaintSidebarKeepingProjectPicker();" in refresh_body
+
+
+def test_send_carries_the_originating_picker_generation_into_delayed_new_session():
+    """B1: bundle/catalog awaits cannot recapture a picker opened meanwhile."""
+    messages = (REPO / "static" / "messages.js").read_text()
+    send_start = messages.index("async function send(){")
+    send_end = messages.index("\nfunction ", send_start + 1)
+    send_body = messages[send_start:send_end]
+    assert "const _sendProjectPickerClaim=" in send_body
+    assert "newSession(false,{pickerClaimEpoch:_sendProjectPickerClaim})" in send_body
+
+    new_start = SESSIONS_JS.index("async function newSession(")
+    new_end = SESSIONS_JS.index("\n// #2971", new_start)
+    new_body = SESSIONS_JS[new_start:new_end]
+    assert "options.pickerClaimEpoch" in new_body
 
 
 def test_completion_repaint_retires_only_the_mutated_sessions_picker():
