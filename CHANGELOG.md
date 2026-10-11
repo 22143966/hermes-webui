@@ -135,6 +135,85 @@
 
 ### Fixed
 
+- **New chats answer faster: the session ID no longer breaks the model's prompt cache.** Every new chat put its own
+  session ID near the end of the system prompt, so no two chats ever shared a cacheable prompt and the model had to
+  re-read it from that line on each time (on a local backend the reporter saw 15-18 s first responses drop to 2-3 s).
+  The ID is now left out by default, matching hermes-agent's own `pass_session_id`. Set `webui.pass_session_id: true`
+  in config.yaml to include it again; it is then added last, so everything before it stays shareable. Thanks @ybai08,
+  and @apakuts for the report. (#8150, fixes #8148)
+
+- **Asking another profile's conversation to change no longer rewrites it before the refusal.** When a request
+  targeted a conversation owned by another profile (such as archive or pin), the ownership check loaded the
+  conversation through the full repair path first, so a refused request could still collapse duplicate partial files
+  and write a shrink backup of the other profile's transcript. The check now reads only who owns the conversation,
+  without repairing, saving or touching the session cache, and refusals answer exactly as before. Thanks @Tivonsico.
+  (#8142, fixes #8094)
+
+- **Long conversations no longer show tool results twice after compression.** When the agent compressed old tool
+  output into a one-line summary, the WebUI kept the full result and also spliced the summary in next to it, so repeated
+  tool cards built up over many compressions. A tool row already on screen is now recognised by its durable row identity
+  and not added again. Thanks @psanger. (#7990)
+
+- **Code blocks no longer flash unhighlighted while you scroll a long conversation.** In virtualized transcripts a
+  newly mounted code block was painted plain for a frame before syntax highlighting and tree views applied; they now
+  render highlighted on first paint, including after switching back to a cached conversation. Thanks @webtecnica.
+  (#7912, #7752)
+- **Starting the WebUI on a port that is already taken explains what to do.** `bootstrap.py` / `start.sh` now check the
+  port before launching: if your own WebUI is already running there it says so (and opens it), otherwise it names the
+  port as busy and suggests a free one instead of failing later with a bind error. Works for IPv4, IPv6 and HTTPS.
+  Thanks @mercael91. (#8112, #8111)
+
+- **A Git "terminal prompts disabled" answer from Git Credential Manager is reported as an authentication failure.**
+  Workspace Git status and fetch now show the sign-in message instead of a generic Git error when GCM refuses to prompt
+  because interactivity is disabled. Thanks @PeterPunk1320. (#8127)
+- **The "Move to project" picker is keyboard-reachable, translated and finger-sized.** Arrow keys, Home, End and Escape work (focus
+  returns to the ⋮ trigger), labels are translated in all 15 locales, and rows are 44px on touch. The picker uses the same placement
+  as the ⋮ menu (below the row, flipping above when that fits, pinned 8px inside the window and scrolling when taller), follows window
+  resizes, and closes when a resize or phone rotation hides the sidebar instead of floating over the composer. Thanks @ybai08. (#8052,
+  fixes #8044)
+
+- **Passkey enrollment works with security keys that send extensions.** Registering a YubiKey or another
+  authenticator that includes CBOR extension data no longer fails with "Trailing CBOR data"; malformed extension bytes
+  are rejected cleanly instead of causing a server error. Existing passkeys keep working. Thanks @Dandandad. (#8093, #8092)
+
+- **Codex sign-in sends an explicit User-Agent on its device-code requests**, so the OAuth endpoint no longer
+  sees a bare library default. Thanks @angelusbr. (#8118)
+
+- **A reply line that legitimately repeats earlier text is no longer hidden while it streams.** Echo suppression used to
+  match on text alone, so two different events with the same words (for example "Processing…" on both sides of a tool
+  call) collapsed into one. Rows are now de-duplicated by their identity, and only a genuinely re-delivered row is
+  dropped. Thanks @webtecnica. (#6293)
+- **A conversation no longer gets stuck on "session already has an active stream".** A tab that went away without a
+  clean disconnect (a half-open connection) kept its session channel alive for the life of the server, and a stream left
+  behind by a worker that exited without cleaning up blocked every new message in that conversation, sometimes for hours.
+  Abandoned channels are now collected once their subscribers stop draining, a new message clears a stream whose worker
+  is gone, and a restored Gateway run claims its ownership before it starts. Thanks @PeterPunk1320. (#7302)
+- **A closed mobile sidebar or workspace drawer is out of the keyboard's way.** Once a drawer has slid closed it is
+  inert and hidden from the tab order and screen readers, so Tab no longer walks into an invisible off-screen list;
+  closing it by tapping outside or with its own close button returns focus to the control that opened it, and the
+  hidden file-upload input is no longer a stray tab stop. Thanks @happy5318. (#7924)
+
+- **Sending uses the model's own provider.** Picking a model now sends with that model's provider instead of a stale
+  provider left on the conversation, including qualified ids such as `provider:model`, new chats and conversations whose
+  provider was removed. Saving Settings and reopening them no longer brings back a phantom "unsaved changes" bar.
+  Thanks @happy5318. (#7865, #7860)
+
+- **OpenAI text-to-speech starts sooner and plays to the end.** Long replies are split into chunks that play as they
+  arrive instead of waiting for the whole clip; a rate-limited (429) chunk is retried without stopping playback, and
+  every chunk request (OpenAI and Edge) stays pinned to the profile the reply started on, even if you switch profiles
+  mid-reply. Thanks @happy5318. (#7529)
+
+- **Conversation titles recover after a bad model reply.** When the title model returns a list of options, a menu or
+  other unusable text, the WebUI now rejects it and keeps or regenerates a proper title instead of saving the junk.
+  Genuine titles with commas or two parts are kept. A title generated while you reconnected to a continued
+  conversation now reaches that conversation, a title you renamed by hand is never overwritten, and repeated bad
+  replies from a model are capped. Thanks @CharlesMcquade. (#7318)
+- **A workspace panel you closed stays closed.** On phones, the on-screen keyboard (a viewport resize) no longer
+  reopens the workspace panel after you dismissed it. File and artifact previews are now owned by the open that started
+  them: a slow preview that finishes after you switched conversations, opened another file or closed the panel no longer
+  pops the panel back open or overwrites the newer selection, and a slow HTML preview still opens. HTML previews are also
+  downloaded once instead of twice. Thanks @sand01chi. (#6710)
+
 - **The auto-scroll setting is easier to find and understand.** Settings → Appearance's "Auto-follow new content" is
   now "Auto-scroll to new content" with clearer helper text in 15 languages, and searching Settings for "autoscroll",
   "auto-follow", "sticky" or "bottom" finds it. The setting itself and its default are unchanged. Thanks @webtecnica. (#6248)
@@ -929,6 +1008,9 @@
 
 ### Documentation
 
+- **Troubleshooting no longer sends package-managed installs to the stale in-tree venv.** It resolves the store
+  Python with `hermes --print-runtime-command` at each start (no `jq` needed) and stops the launcher instead of exporting
+  an empty path when that lookup fails. Thanks @smhc. (#8110)
 - **The README's remote-access paragraph now leads with Tailscale Serve.** It sent users straight to a
   `HERMES_WEBUI_HOST=0.0.0.0` bind, which contradicted the guide it links to. It now recommends Serve, which
   keeps WebUI on loopback behind tailnet-only HTTPS, and keeps the authenticated direct-IP bind as the
