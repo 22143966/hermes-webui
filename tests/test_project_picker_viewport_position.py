@@ -1483,6 +1483,155 @@ def test_automatic_repaints_route_through_the_background_wrapper():
     assert "renderSessionListFromCache();" not in scroll_body
 
 
+def _repaint_sidebar_after_session_completion_source() -> str:
+    start = SESSIONS_JS.find("function _repaintSidebarAfterSessionCompletion(")
+    assert start >= 0, "_repaintSidebarAfterSessionCompletion not found in static/sessions.js"
+    end = SESSIONS_JS.find("\nfunction ", start + 1)
+    assert end > start
+    return SESSIONS_JS[start:end] + "\n"
+
+
+# A response that lands after an await is a completion, not fresh user intent.
+# Each entry pairs the durable cache write that makes the response observable
+# with the repaint that must run as background churn. The gate charged these
+# sites as L1-L6 plus the delete-failure rollback lead.
+LATE_COMPLETION_REPAINTS = [
+    ("L1 title regenerate", "cached.title=nextTitle;", "_repaintSidebarForBackgroundChurn();"),
+    ("L2 pin toggle", "if(cached) cached.pinned=newPinned;", "_repaintSidebarForBackgroundChurn();"),
+    ("L3 share create/refresh", "cached.share_token=session.share_token;", "_repaintSidebarForBackgroundChurn();"),
+    ("L4 move to project", "_allSessions[idx].project_id=p.project_id;", "_repaintSidebarAfterSessionCompletion(session.session_id);"),
+    ("L5 unassign project", "_allSessions[idx].project_id=null;", "_repaintSidebarAfterSessionCompletion(session.session_id);"),
+    ("L6 archive", "if(cached) cached.archived=archived;", "_repaintSidebarAfterSessionCompletion(session.session_id);"),
+    ("delete failure rollback", "_allSessions=previousSessions;", "_repaintSidebarAfterSessionCompletion(sid);"),
+]
+
+
+@pytest.mark.parametrize("label,durable_write,repaint_call", LATE_COMPLETION_REPAINTS)
+def test_delayed_response_repaints_defer_while_a_newer_picker_is_open(label, durable_write, repaint_call):
+    """Gate L1-L6: an awaited response must defer, not dismiss a newer picker.
+
+    Start an action for A, hold its POST, open B's project picker, then release
+    A's response. An unmarked ``renderSessionListFromCache()`` retires B's
+    picker as if the user had asked for that repaint. Each completion writes its
+    durable result into the cache first, then repaints through the
+    background-churn wrapper so the picker owned by another session survives.
+    """
+    assert SESSIONS_JS.count(durable_write) == 1, f"{label}: durable write is not unique"
+    durable_at = SESSIONS_JS.index(durable_write)
+    repaint_at = SESSIONS_JS.index(repaint_call, durable_at)
+    assert repaint_at - durable_at < 700, (
+        f"{label}: no routed repaint follows the durable cache write; the "
+        "completion may still be painting as user intent"
+    )
+    window = SESSIONS_JS[durable_at:repaint_at]
+    assert "renderSessionListFromCache();" not in window, (
+        f"{label}: the completion calls renderSessionListFromCache() directly, "
+        "which retires a picker the user opened while the response was in flight"
+    )
+    assert "_retireProjectPickerForExplicitRepaint();" not in window, (
+        f"{label}: the completion retires whatever picker is open instead of "
+        "only one owned by the session it mutated"
+    )
+
+
+def test_share_completion_and_archive_have_no_bare_cache_repaint():
+    """The two completion bodies must not leave a second unmarked repaint."""
+    for name, sentinel in (
+        ("_syncSessionShareState", "\nasync function _createOrRefreshSessionShare("),
+        ("_archiveSession", "\nfunction _projectPickerSessionActionHandoff("),
+    ):
+        start = SESSIONS_JS.index(f"function {name}(")
+        end = SESSIONS_JS.index(sentinel, start)
+        assert "renderSessionListFromCache();" not in SESSIONS_JS[start:end], (
+            f"{name}: a bare renderSessionListFromCache() would retire a newer picker"
+        )
+
+
+def test_picker_move_completions_use_the_session_owned_repaint():
+    """Both picker move completions retire only their own session's picker."""
+    start = SESSIONS_JS.index("function _showProjectPicker(")
+    end = SESSIONS_JS.index("\nfunction _resizeProjectInput(", start)
+    body = SESSIONS_JS[start:end]
+    assert body.count("_repaintSidebarAfterSessionCompletion(session.session_id);") == 2, (
+        "both move completions (assign and unassign) must repaint as background "
+        "churn and retire only a picker anchored to the moved session"
+    )
+
+
+def test_completion_repaint_retires_only_the_mutated_sessions_picker():
+    """Owner half of the routing fix, driven through the shipped guards.
+
+    A completion for session A must keep a picker the user opened for session B:
+    the repaint defers through the background wrapper, so B's picker survives
+    and the durable result for A paints on the replay. A completion for the
+    session that owns the open picker retires that picker instead.
+    """
+    assert NODE is not None
+    script = r"""
+let _sessionListRepaintDeferredByPicker = false;
+let _sidebarRepaintBackgroundChurn = false;
+let _sidebarRepaintKeepProjectPicker = false;
+let _projectPickerTeardown = null;
+let _openProjectPicker = null;
+let retired = 0;
+const _allSessions = [{session_id: 'a', pinned: false}, {session_id: 'b', pinned: false}];
+const painted = [];
+function renderSessionListFromCache(){
+  // Mirror the shipped guard: background churn defers while a picker is open.
+  if(_projectPickerTeardown !== null && _sidebarRepaintBackgroundChurn){
+    _sessionListRepaintDeferredByPicker = true;
+    return;
+  }
+  painted.push(_allSessions.map(s => s.pinned));
+}
+""" + _retire_project_picker_for_explicit_repaint_source() + _repaint_sidebar_for_background_churn_source() + _repaint_sidebar_after_session_completion_source() + r"""
+const openPicker = (sessionId) => {
+  const picker = {};
+  _projectPickerTeardown = () => {
+    retired += 1;
+    if(_openProjectPicker && _openProjectPicker.picker === picker) _openProjectPicker = null;
+  };
+  _openProjectPicker = {picker, sessionId};
+};
+// B is choosing a project for 'b' while A's pin response lands.
+openPicker('b');
+_allSessions[0].pinned = true;
+_repaintSidebarAfterSessionCompletion('a');
+const newerPickerKept = {
+  retired,
+  stillOpen: _openProjectPicker !== null && _openProjectPicker.sessionId === 'b',
+  deferralPending: _sessionListRepaintDeferredByPicker === true,
+  painted: painted.length,
+};
+// Closing B's picker replays the deferred repaint with A's durable result.
+_projectPickerTeardown = null;
+_openProjectPicker = null;
+if(_sessionListRepaintDeferredByPicker){
+  _sessionListRepaintDeferredByPicker = false;
+  renderSessionListFromCache();
+}
+const replayed = {painted: painted.length, durableA: painted[painted.length - 1][0]};
+// A completion for the session that owns the open picker retires it, then paints.
+openPicker('a');
+_repaintSidebarAfterSessionCompletion('a');
+const ownPickerRetired = {
+  retired,
+  cleared: _projectPickerTeardown === null && _openProjectPicker === null,
+  deferralCleared: _sessionListRepaintDeferredByPicker === false,
+  painted: painted.length,
+  flagRestored: _sidebarRepaintBackgroundChurn === false,
+};
+console.log(JSON.stringify({newerPickerKept, replayed, ownPickerRetired}));
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "newerPickerKept": {"retired": 0, "stillOpen": True, "deferralPending": True, "painted": 0},
+        "replayed": {"painted": 1, "durableA": True},
+        "ownPickerRetired": {"retired": 1, "cleared": True, "deferralCleared": True, "painted": 2, "flagRestored": True},
+    }
+
+
 def test_picker_handoff_resolves_current_state_for_a_menu_opened_during_a_kept_deferral():
     """A second menu opened while a held-gesture menu keeps the repaint deferred.
 

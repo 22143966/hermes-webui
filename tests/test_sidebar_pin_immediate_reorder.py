@@ -14,7 +14,9 @@ def test_pin_action_updates_local_cache_and_renders_before_refetch():
     cached_idx = snippet.find("const cached=(_allSessions||[]).find(s=>s&&s.session_id===session.session_id);")
     update_idx = snippet.find("if(cached) cached.pinned=newPinned;")
     active_idx = snippet.find("if(S.session&&S.session.session_id===session.session_id) S.session.pinned=newPinned;")
-    cache_render_idx = snippet.find("renderSessionListFromCache();")
+    # Pin's response lands after an await, so the cached repaint runs as
+    # background churn (gate L2) instead of retiring a newer project picker.
+    cache_render_idx = snippet.find("_repaintSidebarForBackgroundChurn();")
     refetch_idx = snippet.find("void renderSessionList();")
 
     assert cached_idx != -1, "pin action must find the cached sidebar row"

@@ -5652,7 +5652,7 @@ function _syncSessionShareState(session, nextSession){
     S.session.share_created_at=session.share_created_at;
     if(typeof _syncHermesPanelSessionActions==='function') _syncHermesPanelSessionActions();
   }
-  renderSessionListFromCache();
+  _repaintSidebarForBackgroundChurn();
   void renderSessionList();
 }
 
@@ -5827,7 +5827,7 @@ async function _archiveSession(session, archived=true, beforeListRender=null){
     if(renderHold) await renderHold;
     if(_showArchived&&!_sessionPrefersReducedMotion()) _sessionSwipeReturnOffsets.set(session.session_id,'0px');
     _pendingSessionReflowPositions=reflowPositions;
-    renderSessionListFromCache();
+    _repaintSidebarAfterSessionCompletion(session.session_id);
     void renderSessionList();
     return true;
   }catch(err){if(renderHold) await renderHold.catch(()=>{});_pendingSessionReflowPositions=null;showToast(t('session_archive_failed')+err.message);return false;}
@@ -5989,7 +5989,7 @@ function _openSessionActionMenu(session, anchorEl){
         const cached=(_allSessions||[]).find(s=>s&&s.session_id===session.session_id);
         if(cached) cached.pinned=newPinned;
         if(S.session&&S.session.session_id===session.session_id) S.session.pinned=newPinned;
-        renderSessionListFromCache();
+        _repaintSidebarForBackgroundChurn();
         void renderSessionList();
       }catch(err){
         showToast(t('session_pin_failed')+err.message);
@@ -6070,7 +6070,7 @@ function _openSessionActionMenu(session, anchorEl){
           const cached=(_allSessions||[]).find(item=>item&&item.session_id===session.session_id);
           if(cached) cached.title=nextTitle;
           if(S.session&&S.session.session_id===session.session_id){S.session.title=nextTitle;syncTopbar();}
-          renderSessionListFromCache();
+          _repaintSidebarForBackgroundChurn();
         }
         if(typeof showToast==='function') showToast(t('session_title_regenerated', nextTitle||t('untitled')), 2400);
       }catch(err){
@@ -10496,7 +10496,7 @@ async function deleteSession(sid, beforeDelete=null){
     if(optimisticRendered){
       _optimisticallyRemovedSessionIds.delete(sid);
       _allSessions=previousSessions;
-      renderSessionListFromCache();
+      _repaintSidebarAfterSessionCompletion(sid);
     }
     const err=deleteResult.error;
     setStatus(`Delete failed: ${err&&err.message?err.message:String(err)}`);
@@ -10561,6 +10561,20 @@ function _repaintSidebarForBackgroundChurn(){
   _sidebarRepaintBackgroundChurn=true;
   try{ renderSessionListFromCache(); }
   finally{ _sidebarRepaintBackgroundChurn=previous; }
+}
+
+// A completion whose durable result retires or relocates a row (archive, move,
+// delete rollback) must not paint as fresh user intent just because the user
+// started the action earlier: the open picker is the newer choice. Retire only
+// a picker anchored to the session this response mutated — its row is going
+// away — then repaint as background churn so a picker owned by another session
+// survives. Callers run after the awaited response, never across it.
+function _repaintSidebarAfterSessionCompletion(sessionId){
+  const open=typeof _openProjectPicker!=='undefined'?_openProjectPicker:null;
+  if(open&&sessionId&&open.sessionId===sessionId&&typeof _retireProjectPickerForExplicitRepaint==='function'){
+    _retireProjectPickerForExplicitRepaint();
+  }
+  _repaintSidebarForBackgroundChurn();
 }
 
 // Decide what a sidebar repaint does while the project picker is open. Returns
@@ -10634,7 +10648,7 @@ function _showProjectPicker(session, anchorEl){
       // renderSessionListFromCache() reflects the move. (#2551)
       const idx=_allSessions.findIndex(s=>s&&s.session_id===session.session_id);
       if(idx>=0) _allSessions[idx].project_id=null;
-      renderSessionListFromCache();
+      _repaintSidebarAfterSessionCompletion(session.session_id);
       showToast('Removed from project');
     } catch(e) {
       showToast('Unassign failed: '+(e.message||e));
@@ -10675,7 +10689,7 @@ function _showProjectPicker(session, anchorEl){
         // See #2551 — write to _allSessions, not the shallow sidebar copy.
         const idx=_allSessions.findIndex(s=>s&&s.session_id===session.session_id);
         if(idx>=0) _allSessions[idx].project_id=p.project_id;
-        renderSessionListFromCache();
+        _repaintSidebarAfterSessionCompletion(session.session_id);
         showToast('Moved to '+p.name);
       }catch(e){showToast('Move failed: '+(e.message||e));}
     };

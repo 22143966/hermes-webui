@@ -1,0 +1,68 @@
+{
+ "url": "https://github.com/nesquena/hermes-webui/pull/6713",
+ "type": "PR",
+ "repo": "nesquena/hermes-webui",
+ "number": 6713,
+ "title": "fix(sessions): keep project picker within viewport",
+ "state": "OPEN",
+ "headRefOid": "c4c8d3cbe9738ba19affb175e905f08a94c852bf",
+ "headRefName": "fix/project-picker-viewport",
+ "headRepo": "pxxD1998/hermes-webui",
+ "own_repo": false,
+ "note": "",
+ "reasons": [
+  "head moved -> c4c8d3cbe",
+  "checks: SUCCESS -> PENDING",
+  "5 new comment/review"
+ ],
+ "new_activity": [
+  {
+   "kind": "comment",
+   "author": "nesquena-hermes",
+   "role": "maintainer",
+   "at": "2026-10-10T23:43:06Z",
+   "body": "Gate certification: RED, three more repaint/gesture gaps (the five previous findings are fixed) Contributor head: a33425ae7d9733da579a8949c43ef67fe2c953a9. Fresh three-dot integration: 99de5fbb315ad330cced92f68813cc0c317939f3 on frozen mas…"
+  },
+  {
+   "kind": "review",
+   "author": "greptile-apps",
+   "role": "bot",
+   "at": "2026-10-11T01:21:40Z",
+   "state": "COMMENTED",
+   "body": ""
+  },
+  {
+   "kind": "review",
+   "author": "greptile-apps",
+   "role": "bot",
+   "at": "2026-10-11T01:41:35Z",
+   "state": "COMMENTED",
+   "body": ""
+  },
+  {
+   "kind": "review_comment",
+   "author": "greptile-apps",
+   "role": "bot",
+   "at": "2026-10-11T01:21:40Z",
+   "path": "static/sessions.js",
+   "body": "Replies close the project picker The new default removes the picker when an automatic update calls renderSessionListFromCache() directly. Expand prior turns in the detailed sidebar, then open “Move to project” before the report request finishes. Both report callbacks still call the renderer directly, so the reply closes the picker while the user is choosing a project. Content-search replies and scroll-driven row rebuilds have the same problem. Route these automatic repaints through _repaintSide…"
+  },
+  {
+   "kind": "review_comment",
+   "author": "greptile-apps",
+   "role": "bot",
+   "at": "2026-10-11T01:41:34Z",
+   "path": "static/sessions.js",
+   "body": "Sidebar scrolling shows blank space Open “Move to project” from a topbar-title long-press, then scroll a sidebar with more than 80 sessions. The picker is anchored outside .session-list, so scrolling the list does not close it. The new _repaintSidebarForBackgroundChurn() call skips the row rebuild while that picker remains open. Scrolling beyond the rendered rows then shows blank space instead of conversations until the picker closes. Let scroll-driven rebuilds proceed when the picker’s anchor …"
+  }
+ ],
+ "actionable": true,
+ "standingSignature": "review:PRR_kwDOR1LuPM8AAAABRoYKLQ",
+ "standingOpen": false,
+ "standingReview": {
+  "id": "PRR_kwDOR1LuPM8AAAABRoYKLQ",
+  "submittedAt": "2026-10-10T07:37:36Z",
+  "author": "nesquena-hermes",
+  "body": "Re-reviewed exact head 5f141ce4b5672cc5a3a6dcd764764d52f095a854 against previous converged head 92269cb5e3f591128c4102240499af45056ed418 and pinned master 1da79492f95e9b70dc67b039d7eef1f97682876a. Thanks @pxxD1998. The upstream merge needs…"
+ }
+}
