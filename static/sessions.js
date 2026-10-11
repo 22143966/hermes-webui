@@ -2001,9 +2001,7 @@ async function newSession(flash, options={}){
   }
   _setNewSessionPending(true);
   _newSessionInFlight=(async()=>{
-    // Overlay-generation claim: the picker set open when this intent fired. A
-    // picker the user opens while this create is in flight is newer than this
-    // completion and must survive it (see the refresh at the end).
+    // Intent-time picker epoch; see the refresh below.
     const newSessionClaim=(typeof _projectPickerOpenEpoch==='number')?_projectPickerOpenEpoch:0;
     // Starting a brand-new chat must not carry named context blocks selected in
     // the previous conversation (#2543). loadSession() clears these on a sidebar
