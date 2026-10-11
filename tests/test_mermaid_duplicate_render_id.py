@@ -32,6 +32,7 @@ def _extract_render_mermaid_blocks() -> str:
 
 
 def test_render_mermaid_blocks_assigns_unique_ids_to_duplicate_blocks():
+    """Same render pass, a later reply after the first rendered, and an untouched unique id."""
     node = shutil.which("node")
     if not node:
         pytest.skip("node is required for this runtime test")
@@ -72,17 +73,29 @@ def test_render_mermaid_blocks_assigns_unique_ids_to_duplicate_blocks():
           },
         };
         const code = 'flowchart TD\\n  A --> B';
-        const a = makeBlock('mermaid-same', code);
-        const b = makeBlock('mermaid-same', code);
-        const root = {querySelectorAll: () => [a, b]};
         %FN%
-        renderMermaidBlocks(root);
-        setTimeout(() => {
+        (async () => {
+          // 1) both identical blocks in the same render pass
+          const a = makeBlock('mermaid-same', code);
+          const b = makeBlock('mermaid-same', code);
+          renderMermaidBlocks({querySelectorAll: () => [a, b]});
+          await new Promise(r => setTimeout(r, 30));
           assert.ok(a.classList.contains('mermaid-rendered'), 'first block renders');
           assert.ok(b.classList.contains('mermaid-rendered'), 'second identical block renders too');
           assert.notStrictEqual(a.dataset.mermaidId, b.dataset.mermaidId, 'ids are unique after rendering');
+          // 2) a later reply with the same cached id arrives after the first diagram already rendered
+          const c = makeBlock(a.dataset.mermaidId, code);
+          renderMermaidBlocks({querySelectorAll: () => [c]});
+          await new Promise(r => setTimeout(r, 30));
+          assert.ok(c.classList.contains('mermaid-rendered'), 'a later duplicate reply renders');
+          assert.notStrictEqual(c.dataset.mermaidId, a.dataset.mermaidId, 'later duplicate gets its own id');
+          // 3) a unique id is left untouched
+          const d = makeBlock('mermaid-unique', code);
+          renderMermaidBlocks({querySelectorAll: () => [d]});
+          await new Promise(r => setTimeout(r, 30));
+          assert.strictEqual(d.dataset.mermaidId, 'mermaid-unique', 'unique ids are not rewritten');
           console.log('ok');
-        }, 50);
+        })().catch(e => { console.error(e); process.exit(1); });
         """
     ).replace("%FN%", fn)
     result = subprocess.run([node, "-e", script], cwd=ROOT, text=True,
