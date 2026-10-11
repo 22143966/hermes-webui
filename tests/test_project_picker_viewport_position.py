@@ -1405,6 +1405,14 @@ def _project_picker_owner_eligible_for_sidebar_source() -> str:
     return SESSIONS_JS[start:end] + "\n"
 
 
+def _render_sidebar_rows_from_partition_source() -> str:
+    start = SESSIONS_JS.find("function _renderSidebarRowsFromPartition(")
+    assert start >= 0, "_renderSidebarRowsFromPartition not found in static/sessions.js"
+    end = SESSIONS_JS.find("\nfunction ", start + 1)
+    assert end > start
+    return SESSIONS_JS[start:end] + "\n"
+
+
 def test_created_items_force_an_immediate_picker_preserving_payload_paint():
     """A completed create paints now even when a newer picker is open.
 
@@ -1816,12 +1824,15 @@ let _showArchived = false;
 let _activeProject = null;
 let S = {session:{session_id:'still-a'}};
 function $(id){ return id==='sessionSearch'?{value:''}:null; }
+function _sessionRowsWithActiveEphemeralSession(rows){ return rows; }
 function _sessionSearchMergeMatches(rows){ return rows; }
-function _partitionSidebarSessionRows(rows){ return {sessionsRaw:rows,projectIdFor:()=>null}; }
+function _ensureActiveSessionRowPresent(rows){ return rows; }
+function _activeSessionIdForSidebar(){ return 'still-a'; }
+function _partitionSidebarSessionRows(rows){ return {sessionsRaw:rows,webuiReferenceRaw:[],cliReferenceRaw:[],projectIdFor:()=>null}; }
 function _scopedSidebarReferenceRows(){ return []; }
 function _renderSidebarRowsFromRawSessions(rows){ return rows; }
 function _sessionLineageContainsSession(row,sid){ return row&&row.session_id===sid; }
-""" + _project_picker_owner_eligible_for_sidebar_source() + _project_picker_blocks_repaint_source() + r"""
+""" + _render_sidebar_rows_from_partition_source() + _project_picker_owner_eligible_for_sidebar_source() + _project_picker_blocks_repaint_source() + r"""
 console.log(JSON.stringify({eligible:_projectPickerOwnerEligibleForSidebar('deleted-b'),blocks:_projectPickerBlocksRepaint()}));
 """
     result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
@@ -1852,11 +1863,117 @@ def test_send_carries_the_originating_picker_generation_into_delayed_new_session
     send_body = messages[send_start:send_end]
     assert "const _sendProjectPickerClaim=" in send_body
     assert "newSession(false,{pickerClaimEpoch:_sendProjectPickerClaim})" in send_body
+    metadata_paths = send_body[send_body.index("const _agentCmd="):]
+    assert "await newSession();" not in metadata_paths
+    assert metadata_paths.count("newSession(false,{pickerClaimEpoch:_sendProjectPickerClaim})") >= 6
 
     new_start = SESSIONS_JS.index("async function newSession(")
     new_end = SESSIONS_JS.index("\n// #2971", new_start)
     new_body = SESSIONS_JS[new_start:new_end]
     assert "options.pickerClaimEpoch" in new_body
+
+
+def test_bundle_resolution_error_keeps_the_send_originating_picker_claim():
+    """B1 follow-up: the resolver error lane must not recapture a newer picker."""
+    assert NODE is not None
+    messages = (REPO / "static" / "messages.js").read_text()
+    send_start = messages.index("async function send(){")
+    send_end = messages.index("\nfunction ", send_start + 1)
+    send_source = messages[send_start:send_end]
+    script = r"""
+let _sendInProgress=false;
+let _sendInProgressSid=null;
+let _projectPickerOpenEpoch=7;
+let _pendingSelections=[];
+const msg={value:'/bundle'};
+const S={session:null,pendingFiles:[],busy:false,messages:[],activeProfile:'default'};
+const document={querySelector(){return null;}};
+const COMMANDS=[];
+const _AGENT_COMMANDS_RUN_ON_WEBUI=new Set();
+const claims=[];
+let releaseResolver;
+let resolverStartedResolve;
+const resolverStarted=new Promise(resolve=>{resolverStartedResolve=resolve;});
+const resolverGate=new Promise(resolve=>{releaseResolver=resolve;});
+function $(id){return id==='msg'?msg:{value:'',focus(){}};}
+function _composerTextWithPendingSelections(){return msg.value;}
+function _flushSelectionBlocksToComposer(){}
+function _clearStaleBusyStateBeforeSend(){}
+function parseCommand(){return {name:'bundle',args:''};}
+async function getAgentCommandMetadata(){return null;}
+async function getBundleCommandMetadata(){return {name:'bundle'};}
+async function resolveBundleCommand(){resolverStartedResolve();await resolverGate;throw new Error('held resolver failed');}
+async function newSession(_flash,options){claims.push(options&&options.pickerClaimEpoch);S.session={session_id:'new-session'};}
+function renderMessages(){}
+function autoResize(){}
+function hideCmdDropdown(){}
+function renderTray(){}
+function showToast(){}
+""" + send_source + r"""
+(async()=>{
+  const pending=send();
+  await resolverStarted;
+  _projectPickerOpenEpoch=8;
+  releaseResolver();
+  await pending;
+  console.log(JSON.stringify({claims,currentEpoch:_projectPickerOpenEpoch,messages:S.messages}));
+})().catch(error=>{console.error(error&&error.stack||error);process.exit(1);});
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["claims"] == [7]
+    assert output["currentEpoch"] == 8
+    assert output["messages"][-1]["content"] == "Bundle command error: held resolver failed"
+
+
+def test_picker_owner_qualification_uses_the_complete_renderer_projection():
+    """C2 follow-up: active-row preparation and partition references stay canonical."""
+    owner = _project_picker_owner_eligible_for_sidebar_source()
+    projection = _render_sidebar_rows_from_partition_source()
+    assert "_sessionRowsWithActiveEphemeralSession(rows)" in owner
+    assert "_ensureActiveSessionRowPresent(searchMatches,sidebarRows)" in owner
+    assert "_activeSessionIdForSidebar()" in owner
+    assert "_renderSidebarRowsFromPartition(partition)" in owner
+    assert "partition.cliReferenceRaw:partition.webuiReferenceRaw" in projection
+    assert "_scopedSidebarReferenceRows(isCliView, partition.projectIdFor)" in projection
+
+
+def test_picker_owner_qualification_composes_partition_reference_rows():
+    """An archived-parent reference can suppress a fork in the painted projection."""
+    assert NODE is not None
+    script = r"""
+let _allSessions=[{session_id:'a'},{session_id:'fork',parent_session_id:'archived-parent'}];
+let _contentSearchResults=[];
+let _sidebarReferenceSessions=[];
+let _sessionSourceFilter='webui';
+let S={session:{session_id:'a'}};
+function $(id){return id==='sessionSearch'?{value:''}:null;}
+function _sessionRowsWithActiveEphemeralSession(rows){return rows;}
+function _sessionSearchMergeMatches(rows){return rows;}
+function _ensureActiveSessionRowPresent(rows){return rows;}
+function _activeSessionIdForSidebar(){return 'a';}
+function _partitionSidebarSessionRows(rows){return {
+  sessionsRaw:rows,
+  webuiReferenceRaw:[{session_id:'archived-parent',archived:true}],
+  cliReferenceRaw:[],
+  projectIdFor:()=>null,
+};}
+function _scopedSidebarReferenceRows(){return [];}
+function _renderSidebarRowsFromRawSessions(rows,references){
+  const hasArchivedParent=references.some(row=>row&&row.session_id==='archived-parent');
+  return hasArchivedParent?rows.filter(row=>row.session_id!=='fork'):rows;
+}
+function _sessionLineageContainsSession(row,sid){return row&&row.session_id===sid;}
+""" + _render_sidebar_rows_from_partition_source() + _project_picker_owner_eligible_for_sidebar_source() + r"""
+console.log(JSON.stringify({
+  root:_projectPickerOwnerEligibleForSidebar('a'),
+  suppressedFork:_projectPickerOwnerEligibleForSidebar('fork'),
+}));
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"root": True, "suppressedFork": False}
 
 
 def test_completion_repaint_retires_only_the_mutated_sessions_picker():

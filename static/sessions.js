@@ -8841,6 +8841,18 @@ function _renderSidebarRowsFromRawSessions(sessionsRaw, referenceSessionsRaw){
   return _attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(sessionsRaw), sessionsRaw, referenceRows);
 }
 
+// Apply the renderer's complete source/reference/lineage projection to an
+// already partitioned view. Keeping this final projection shared prevents
+// overlay-owner qualification from drifting from the rows the sidebar paints.
+function _renderSidebarRowsFromPartition(partition){
+  const isCliView=_sessionSourceFilter==='cli';
+  const referenceRaw=isCliView?partition.cliReferenceRaw:partition.webuiReferenceRaw;
+  return _renderSidebarRowsFromRawSessions(
+    partition.sessionsRaw,
+    [...referenceRaw, ..._scopedSidebarReferenceRows(isCliView, partition.projectIdFor)],
+  );
+}
+
 function _attachProjectQuickCreateButton(chip, project){
   const btn=document.createElement('button');
   btn.type='button';
@@ -8934,6 +8946,7 @@ function renderSessionListFromCache(){
   // session id into another conversation, that content hit should still appear.
   const searchMatches=_sessionSearchMergeMatches(sidebarRows,searchQueryRaw,_contentSearchResults);
   const allMatched=_ensureActiveSessionRowPresent(searchMatches,sidebarRows);
+  const sidebarPartition=_partitionSidebarSessionRows(allMatched, activeSidForSidebar);
   const {
     cliSessionCount,
     profileFiltered,
@@ -8944,10 +8957,8 @@ function renderSessionListFromCache(){
     webuiSessionsRaw,
     cliSessionsRaw,
     projectIdFor,
-  }=_partitionSidebarSessionRows(allMatched, activeSidForSidebar);
-  const referenceRaw=_sessionSourceFilter==='cli'?cliReferenceRaw:webuiReferenceRaw;
-  const isCliView=_sessionSourceFilter==='cli';
-  const sessions=_renderSidebarRowsFromRawSessions(sessionsRaw, [...referenceRaw, ..._scopedSidebarReferenceRows(isCliView, projectIdFor)]);
+  }=sidebarPartition;
+  const sessions=_renderSidebarRowsFromPartition(sidebarPartition);
   // Server-provided source bucket counts are authoritative for the current
   // payload. When present, skip the expensive cross-bucket render/count pass;
   // null is a deliberate "not computed" sentinel consumed only by
@@ -10636,19 +10647,23 @@ function _projectPickerOwnerEligibleForSidebar(sessionId){
   const rows=Array.isArray(_allSessions)?_allSessions:[];
   const searchEl=(typeof $==='function')?$('sessionSearch'):null;
   const query=searchEl?String(searchEl.value||'').trim():'';
-  const matched=(typeof _sessionSearchMergeMatches==='function')
-    ? _sessionSearchMergeMatches(rows,query,typeof _contentSearchResults!=='undefined'?_contentSearchResults:[])
+  const sidebarRows=typeof _sessionRowsWithActiveEphemeralSession==='function'
+    ? _sessionRowsWithActiveEphemeralSession(rows)
     : rows;
-  if(typeof _partitionSidebarSessionRows!=='function'||typeof _renderSidebarRowsFromRawSessions!=='function'){
+  const searchMatches=(typeof _sessionSearchMergeMatches==='function')
+    ? _sessionSearchMergeMatches(sidebarRows,query,typeof _contentSearchResults!=='undefined'?_contentSearchResults:[])
+    : sidebarRows;
+  const matched=typeof _ensureActiveSessionRowPresent==='function'
+    ? _ensureActiveSessionRowPresent(searchMatches,sidebarRows)
+    : searchMatches;
+  if(typeof _partitionSidebarSessionRows!=='function'||typeof _renderSidebarRowsFromPartition!=='function'){
     return matched.some(row=>row&&row.session_id===sessionId);
   }
-  const activeSid=(typeof S!=='undefined'&&S.session)?S.session.session_id:null;
+  const activeSid=typeof _activeSessionIdForSidebar==='function'
+    ? _activeSessionIdForSidebar()
+    : ((typeof S!=='undefined'&&S.session)?S.session.session_id:null);
   const partition=_partitionSidebarSessionRows(matched,activeSid);
-  const cliOnly=typeof _sessionSourceFilter!=='undefined'&&_sessionSourceFilter==='cli';
-  const references=(typeof _scopedSidebarReferenceRows==='function')
-    ? _scopedSidebarReferenceRows(cliOnly,partition.projectIdFor)
-    : [];
-  const rendered=_renderSidebarRowsFromRawSessions(partition.sessionsRaw,references);
+  const rendered=_renderSidebarRowsFromPartition(partition);
   return rendered.some(row=>{
     if(typeof _sessionLineageContainsSession==='function') return _sessionLineageContainsSession(row,sessionId);
     return Boolean(row&&row.session_id===sessionId);
