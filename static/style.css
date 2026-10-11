@@ -2294,11 +2294,18 @@
      shared app dialog (z-index 1100) so a prompt/confirm opened from inside
      still stacks on top of it. */
   .app-dialog-overlay.project-bindings-overlay{display:flex;z-index:1050;}
-  .project-bindings-dialog{max-height:80vh;overflow:auto;}
-  .project-bindings-body{font-size:13px;}
+  /* UX gate r8 (2026-10-11T05:45:57Z): the whole dialog used to be the scroll
+     container, so a long workspace list pushed Save/Cancel below the dialog's
+     edge (invisible at 9 workspaces on 1440x900, 7 on 390x844, 2 in 844x390) and
+     the Add row clipped flush against the border. The r7 split removed the
+     auto-assign checkbox that used to cue the scroll, and the overlay scrollbar
+     is hidden on many platforms. Pin the header and the actions instead: the
+     dialog is a flex column that never scrolls itself, and the body below the
+     header is the ONLY scroller, so the title and both buttons stay put. */
+  .project-bindings-dialog{display:flex;flex-direction:column;overflow:hidden;max-height:80vh;}
+  .project-bindings-body{font-size:13px;overflow:auto;min-height:0;flex:1 1 auto;}
   .project-bindings-field{margin-bottom:12px;}
   .project-bindings-label{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:5px;}
-  .project-bindings-body .app-dialog-actions{margin-top:16px;}
 
   .sidebar-actions{display:flex;gap:6px;}
   .sm-btn{flex:1;padding:8px 0;border-radius:8px;font-size:11px;font-weight:500;background:var(--input-bg);border:1px solid var(--border);color:var(--muted);cursor:pointer;transition:all .15s;text-align:center;letter-spacing:.02em;}
