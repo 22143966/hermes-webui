@@ -1397,14 +1397,18 @@ def _project_picker_blocks_repaint_source() -> str:
     return SESSIONS_JS[start:end] + "\n"
 
 
-def test_sidebar_repaint_guard_defers_background_churn_and_retires_for_user_intent():
-    """The inverted picker guard: background churn defers, user intent paints.
+def test_sidebar_repaint_guard_defers_background_churn_and_keeps_the_overlay_for_unclaimed_repaints():
+    """The completion-safe picker guard: churn defers, unclaimed repaints keep.
 
     Background producers (list refresh, stream/unread sync, poll timers,
     panel-resync repairs) run their repaints through the background-churn
     wrapper, so the guard defers them while the picker is open and the picker's
-    close replays them. Every other repaint is user intent: the guard retires
-    the picker first, folding any pending deferral into that repaint.
+    close replays them. Every other repaint proceeds without inheriting a
+    dismissal: it retires the picker only when it claims an interaction newer
+    than the picker's opening generation (claims arrive via
+    _retireProjectPickerForExplicitRepaint(claimEpoch)), so legacy async
+    completions keep the overlay and rely on the render re-anchoring it
+    (_reanchorProjectPickerAfterRepaint).
     """
     assert NODE is not None
     script = r"""
@@ -1412,6 +1416,7 @@ let _sessionListRepaintDeferredByPicker = false;
 let _sidebarRepaintBackgroundChurn = false;
 let _sidebarRepaintKeepProjectPicker = false;
 let _projectPickerTeardown = null;
+let _openProjectPicker = null;
 let retired = 0;
 const renderCalls = [];
 const keepCalls = [];
@@ -1421,19 +1426,25 @@ _repaintSidebarForBackgroundChurn();
 const wrapper = {callSawFlag: renderCalls[0] === true, flagRestored: _sidebarRepaintBackgroundChurn === false};
 _repaintSidebarKeepingProjectPicker();
 const keepWrapper = {callSawFlag: keepCalls[1] === true, flagRestored: _sidebarRepaintKeepProjectPicker === false};
-const retireSpy = () => { retired += 1; };
+const retireSpy = () => { retired += 1; _projectPickerTeardown = null; };
 const noPicker = {blocks: _projectPickerBlocksRepaint(), retired};
 _projectPickerTeardown = retireSpy;
 _sidebarRepaintBackgroundChurn = true;
 const background = {blocks: _projectPickerBlocksRepaint(), retired, teardownKept: _projectPickerTeardown === retireSpy};
 _sidebarRepaintBackgroundChurn = false;
 _sessionListRepaintDeferredByPicker = true;
-const userIntent = {blocks: _projectPickerBlocksRepaint(), retired, teardownCleared: _projectPickerTeardown === null, flagFolded: _sessionListRepaintDeferredByPicker === false};
+const unclaimed = {blocks: _projectPickerBlocksRepaint(), retired, teardownKept: _projectPickerTeardown === retireSpy};
 _projectPickerTeardown = retireSpy;
 _sidebarRepaintKeepProjectPicker = true;
 const kept = {blocks: _projectPickerBlocksRepaint(), retired, teardownKept: _projectPickerTeardown === retireSpy};
 _sidebarRepaintKeepProjectPicker = false;
-console.log(JSON.stringify({wrapper, keepWrapper, noPicker, background, userIntent, kept}));
+// Overlay generation: a claim at least as new as the picker's opening may
+// retire it; an older claim is refused and the picker stays.
+_openProjectPicker = {picker: {}, anchorEl: {isConnected: true}, sessionId: 's', openEpoch: 5};
+_sidebarRepaintBackgroundChurn = false;
+const staleClaim = {retired: _retireProjectPickerForExplicitRepaint(4), refused: _projectPickerTeardown === retireSpy};
+const freshClaim = {retired: _retireProjectPickerForExplicitRepaint(5), cleared: _projectPickerTeardown === null, flagFolded: _sessionListRepaintDeferredByPicker === false};
+console.log(JSON.stringify({wrapper, keepWrapper, noPicker, background, unclaimed, kept, staleClaim, freshClaim}));
 """
     result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
@@ -1443,9 +1454,129 @@ console.log(JSON.stringify({wrapper, keepWrapper, noPicker, background, userInte
         "keepWrapper": {"callSawFlag": True, "flagRestored": True},
         "noPicker": {"blocks": False, "retired": 0},
         "background": {"blocks": True, "retired": 0, "teardownKept": True},
-        "userIntent": {"blocks": False, "retired": 1, "teardownCleared": True, "flagFolded": True},
-        "kept": {"blocks": False, "retired": 1, "teardownKept": True},
+        "unclaimed": {"blocks": False, "retired": 0, "teardownKept": True},
+        "kept": {"blocks": False, "retired": 0, "teardownKept": True},
+        "staleClaim": {"retired": False, "refused": True},
+        "freshClaim": {"retired": True, "cleared": True, "flagFolded": True},
     }
+
+
+def _reanchor_project_picker_after_repaint_source() -> str:
+    start = SESSIONS_JS.find("function _reanchorProjectPickerAfterRepaint(")
+    assert start >= 0, "_reanchorProjectPickerAfterRepaint not found in static/sessions.js"
+    end = SESSIONS_JS.find("\nfunction ", start + 1)
+    assert end > start
+    return SESSIONS_JS[start:end] + "\n"
+
+
+def test_completion_repaints_keep_and_reanchor_the_newer_picker():
+    """The completion default retains the overlay instead of dismissing it.
+
+    A repaint that cannot claim a newer interaction rebuilds the rows, keeps an
+    open picker owned by another session, and re-anchors it to that owner's
+    rebuilt row — retiring it only when the owner itself is actually gone
+    (archived, deleted, filtered out). A claim older than the picker can never
+    retire it (overlay generation).
+    """
+    assert NODE is not None
+    script = r"""
+let _sessionListRepaintDeferredByPicker = false;
+let _sidebarRepaintBackgroundChurn = false;
+let _projectPickerTeardown = null;
+let _openProjectPicker = null;
+let retired = 0;
+let dismissed = 0;
+let positioned = 0;
+const painted = [];
+const newRows = {b: {isConnected: true}};
+function renderSessionListFromCache(){
+  if(_projectPickerBlocksRepaint()){
+    _sessionListRepaintDeferredByPicker = true;
+    return;
+  }
+  painted.push('rows');
+  _reanchorProjectPickerAfterRepaint();
+}
+function _findSessionRenameRow(sessionId){ return newRows[sessionId] || null; }
+function _positionProjectPicker(){ positioned += 1; }
+""" + _retire_project_picker_for_explicit_repaint_source() + _repaint_sidebar_for_background_churn_source() + _project_picker_blocks_repaint_source() + _reanchor_project_picker_after_repaint_source() + r"""
+const openPicker = (sessionId, epoch) => {
+  const opening = {
+    picker: {isConnected: true},
+    sessionId,
+    openEpoch: epoch,
+    anchorEl: {isConnected: true},
+    dismiss: () => { dismissed += 1; _projectPickerTeardown = null; _openProjectPicker = null; },
+    retarget: function(next){ this.anchorEl = next; },
+  };
+  _projectPickerTeardown = () => { retired += 1; _openProjectPicker = null; };
+  _openProjectPicker = opening;
+  return opening;
+};
+// A completion repaint with B's picker open: B survives, the rows rebuild, and
+// the picker re-anchors to B's rebuilt row.
+const b = openPicker('b', 2);
+b.anchorEl.isConnected = false;   // the rebuild replaced B's row element
+renderSessionListFromCache();
+const kept = {retired, dismissed, painted: painted.length,
+  stillOpen: _openProjectPicker === b,
+  reanchored: _openProjectPicker.anchorEl === newRows.b,
+  positioned};
+// A rebuild where B's owner row is actually gone: retire the invalid owner.
+const c = openPicker('c', 2);
+c.anchorEl.isConnected = false;
+renderSessionListFromCache();
+const invalidOwner = {retired, dismissed, painted: painted.length,
+  closed: _openProjectPicker === null};
+// A claim older than the picker's opening can never retire it.
+const d = openPicker('d', 9);
+const staleClaim = _retireProjectPickerForExplicitRepaint(8);
+const keptByGeneration = {teardownKept: _projectPickerTeardown !== null, staleClaim,
+  stillOpen: _openProjectPicker === d};
+console.log(JSON.stringify({kept, invalidOwner, keptByGeneration}));
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data == {
+        "kept": {"retired": 0, "dismissed": 0, "painted": 1, "stillOpen": True, "reanchored": True, "positioned": 1},
+        "invalidOwner": {"retired": 0, "dismissed": 1, "painted": 2, "closed": True},
+        "keptByGeneration": {"teardownKept": True, "staleClaim": False, "stillOpen": True},
+    }
+
+
+def test_completion_policy_is_wired_through_the_generation_claim_and_reanchor():
+    """Source wiring: the default keeps, claims gate dismissal, render re-anchors.
+
+    The unmarked default must not inherit dismissal authority; delayed
+    completions (new chat, inline project create) retire only a picker older
+    than their captured claim; the render re-anchors a kept overlay; explicit
+    synchronous intents keep their dismissal; opening records the generation
+    and exposes a retarget.
+    """
+    js = SESSIONS_JS
+    guard_start = js.index("function _projectPickerBlocksRepaint(")
+    guard_end = js.index("\nfunction ", guard_start + 1)
+    guard_body = js[guard_start:guard_end]
+    assert "_retireProjectPickerForExplicitRepaint(" not in guard_body, (
+        "the unmarked default must not inherit dismissal authority"
+    )
+    retire_start = js.index("function _retireProjectPickerForExplicitRepaint(")
+    retire_end = js.index("\nfunction ", retire_start + 1)
+    retire_body = js[retire_start:retire_end]
+    assert "claimEpoch" in retire_body and "openEpoch>claimEpoch" in retire_body, (
+        "the retire action must refuse claims older than the picker's opening"
+    )
+    assert "const newSessionClaim=" in js
+    assert "_retireProjectPickerForExplicitRepaint(newSessionClaim)" in js
+    assert "const createClaim=" in js
+    assert "_retireProjectPickerForExplicitRepaint(createClaim)" in js
+    assert "if(typeof _reanchorProjectPickerAfterRepaint==='function') _reanchorProjectPickerAfterRepaint();" in js
+    assert "openEpoch:pickerEpoch" in js
+    assert "retarget:" in js
+    toggle_start = js.index("function toggleSessionSelectMode(){")
+    toggle_end = js.index("\nfunction ", toggle_start + 1)
+    assert "_retireProjectPickerForExplicitRepaint();" in js[toggle_start:toggle_end]
 
 
 def test_automatic_repaints_route_through_the_background_wrapper():

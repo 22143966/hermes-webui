@@ -1517,10 +1517,15 @@ def _explicit_new_session_script() -> str:
     return "\n".join(
         [
             "let _projectPickerTeardown = null;",
+            "let _openProjectPicker = null;",
             "let _sessionListRepaintDeferredByPicker = false;",
             "let _sidebarRepaintBackgroundChurn = false;",
             "let repaints = 0;",
             "let activeSid = 'old-chat';",
+            "// Production captures the overlay-generation claim when the new-chat",
+            "// intent fires; this engine opens the picker before the intent, so the",
+            "// claim never refuses the retire below.",
+            "const newSessionClaim = 0;",
             "const S = {session: {session_id: 'old-chat'}};",
             "function renderSessionListFromCache(){",
             "  // Mirror the shipped guard: background churn defers while the picker",

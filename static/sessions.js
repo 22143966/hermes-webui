@@ -2001,6 +2001,10 @@ async function newSession(flash, options={}){
   }
   _setNewSessionPending(true);
   _newSessionInFlight=(async()=>{
+    // Overlay-generation claim: the picker set open when this intent fired. A
+    // picker the user opens while this create is in flight is newer than this
+    // completion and must survive it (see the refresh at the end).
+    const newSessionClaim=(typeof _projectPickerOpenEpoch==='number')?_projectPickerOpenEpoch:0;
     // Starting a brand-new chat must not carry named context blocks selected in
     // the previous conversation (#2543). loadSession() clears these on a sidebar
     // switch, but the New Chat path replaces S.session here without going through
@@ -2194,9 +2198,11 @@ async function newSession(flash, options={}){
     // now that newSession() owns the sole refresh it must force the paint,
     // matching the project "+" path (#5002: "newSession doesn't render; callers must").
     // User intent (Ctrl/Cmd+K, New-chat controls): retire an open project
-    // picker first, or this refresh is swallowed by the picker's
-    // background-repaint deferral and the new chat stays unpainted.
-    if(typeof _retireProjectPickerForExplicitRepaint==='function') _retireProjectPickerForExplicitRepaint();
+    // picker that is older than this intent first, or this refresh is swallowed
+    // by the picker's background-repaint deferral and the new chat stays
+    // unpainted. A picker opened while this create was in flight is the newer
+    // choice — the delayed completion keeps it and the render re-anchors it.
+    if(typeof _retireProjectPickerForExplicitRepaint==='function') _retireProjectPickerForExplicitRepaint(newSessionClaim);
     if(typeof refreshSessionList==='function'){Promise.resolve(refreshSessionList('new-session',{force:true})).catch(()=>{})}
   })();
   try{
@@ -5159,6 +5165,9 @@ function _wireSessionNewTabListeners(node, getSid, getSession, opts){
 function toggleSessionSelectMode(){
   _sessionSelectMode=!_sessionSelectMode;
   _selectedSessions.clear();
+  // Explicit user intent: the select-mode repaint must paint now, not be
+  // swallowed by the picker's background-repaint deferral.
+  _retireProjectPickerForExplicitRepaint();
   renderSessionListFromCache();
 }
 function exitSessionSelectMode(){
@@ -9356,6 +9365,12 @@ function renderSessionListFromCache(){
   const reflowTimeout=animateRefresh?SESSION_LIST_FLIP_TIMEOUT_MS:SESSION_REFLOW_TIMEOUT_MS;
   _pendingSessionReflowPositions=null;
   _playSessionRowsReflowFromPositions(reflowBefore,reflowTimeout,_sessionPrefersReducedMotion);
+  // The rebuild above may have replaced the row an open project picker is
+  // anchored to. Qualify the overlay independently of this repaint: keep it by
+  // re-anchoring to its owner's rebuilt row, or retire it only when that owner
+  // is actually gone. (Repaints that were deferred for the picker returned at
+  // the top of this function and never reach here.)
+  if(typeof _reanchorProjectPickerAfterRepaint==='function') _reanchorProjectPickerAfterRepaint();
 
   function _renderOneSession(s, isPinnedGroup=false){
     const el=document.createElement('div');
@@ -9491,6 +9506,9 @@ function renderSessionListFromCache(){
         const toggleLineageSegments=(e)=>{
           e.preventDefault();
           e.stopPropagation();
+          // Explicit user intent: the toggle must paint now, not be swallowed by
+          // the picker's background-repaint deferral.
+          _retireProjectPickerForExplicitRepaint();
           if(_expandedLineageKeys.has(lineageKey)) _expandedLineageKeys.delete(lineageKey);
           else {
             _expandedLineageKeys.add(lineageKey);
@@ -10551,14 +10569,22 @@ let _projectPickerTeardown=null;
 // Set when a sidebar repaint was skipped because the project picker was open, so the
 // picker's teardown can replay it (same contract as the ⋮ menu guard, minus the lost repaint).
 let _sessionListRepaintDeferredByPicker=false;
+// Overlay generation for dismissal authority. Bumped every time a picker opens;
+// flows that may need to dismiss a picker capture the current value when their
+// interaction fires, so work that began before a picker opened can never retire
+// that newer overlay (its claim is older than the picker's opening).
+let _projectPickerOpenEpoch=0;
 
 // Sidebar repaints that are background churn — list refreshes, stream/unread
 // syncs, poll timers, panel-resync repairs — defer while the project picker is
 // open instead of tearing the rows out from under it, and the picker's close
-// replays them. Producers run through the wrapper below; every unmarked repaint
-// is user intent and retires the picker first, so a transition the user just
-// asked for is never swallowed by the deferral (the earlier default deferred
-// every caller and had to be taught user-intent call sites one at a time).
+// replays them. Producers run through the wrapper below. Every other repaint
+// proceeds — a durable/view update is never deferred — and the render then
+// qualifies the overlay independently: keep it by re-anchoring to its owner's
+// rebuilt row, or retire it when its owner is actually gone. A dismissal is
+// never inherited: only an explicit claim at least as new as the picker's
+// opening may retire it (see the claim parameter of the explicit repaint
+// action), so legacy async callers can no longer dismiss a newer picker.
 let _sidebarRepaintBackgroundChurn=false;
 function _repaintSidebarForBackgroundChurn(){
   const previous=_sidebarRepaintBackgroundChurn;
@@ -10583,15 +10609,16 @@ function _repaintSidebarAfterSessionCompletion(sessionId){
 
 // Decide what a sidebar repaint does while the project picker is open. Returns
 // true when the caller must skip this repaint (background churn: defer, and the
-// picker's close replays it). Otherwise the picker is retired first and the
-// caller paints now; the retire folds any pending deferral into that repaint,
-// exactly like _retireProjectPickerForExplicitRepaint().
+// picker's close replays it). Every other repaint proceeds now — completion,
+// navigation and explicit intent alike — and the render qualifies the overlay
+// afterwards: an explicit caller may have claimed a dismissal first (see the
+// claim parameter of the explicit repaint action), otherwise the picker is
+// kept and re-anchored to its owner's rebuilt row. No caller inherits a blanket
+// dismissal, so a legacy async completion can no longer tear down a newer
+// picker it never claimed authority over.
 function _projectPickerBlocksRepaint(){
   if(typeof _projectPickerTeardown==='undefined'||_projectPickerTeardown===null) return false;
-  if(typeof _sidebarRepaintBackgroundChurn!=='undefined'&&_sidebarRepaintBackgroundChurn) return true;
-  if(typeof _sidebarRepaintKeepProjectPicker!=='undefined'&&_sidebarRepaintKeepProjectPicker) return false;
-  if(typeof _retireProjectPickerForExplicitRepaint==='function') _retireProjectPickerForExplicitRepaint();
-  return false;
+  return Boolean(typeof _sidebarRepaintBackgroundChurn!=='undefined'&&_sidebarRepaintBackgroundChurn);
 }
 
 // True when the open picker is anchored to a row inside the session list — the
@@ -10618,13 +10645,23 @@ function _repaintSidebarKeepingProjectPicker(){
   finally{ _sidebarRepaintKeepProjectPicker=previous; }
 }
 
-// Retire the picker ahead of an explicit repaint the user just asked for
-// (child-count toggle, tag filter, inline project create). The deferral guard
-// in renderSessionListFromCache exists for background churn; an explicit
+// Retire the picker ahead of a repaint the user just asked for (child-count
+// toggle, tag filter, inline project create, Select, a new chat). The deferral
+// guard in renderSessionListFromCache exists for background churn; an explicit
 // transition must complete instead. Callers repaint immediately after, so a
 // pending deferral folds into that repaint instead of replaying later.
-function _retireProjectPickerForExplicitRepaint(){
+//
+// Overlay generation: a caller whose interaction may land after newer work
+// started (a held response, a delayed completion) passes the claim it captured
+// when the interaction fired. A picker that opened after that claim is the
+// user's newer choice; this repaint has no dismissal authority over it and the
+// call is refused — the overlay is kept and re-anchored by the render instead.
+function _retireProjectPickerForExplicitRepaint(claimEpoch){
   if(typeof _projectPickerTeardown==='undefined'||!_projectPickerTeardown) return false;
+  const open=(typeof _openProjectPicker!=='undefined')?_openProjectPicker:null;
+  if(open&&typeof claimEpoch==='number'
+     &&typeof open.openEpoch==='number'
+     &&open.openEpoch>claimEpoch) return false;
   const retire=_projectPickerTeardown;
   _projectPickerTeardown=null;
   if(typeof _sessionListRepaintDeferredByPicker!=='undefined') _sessionListRepaintDeferredByPicker=false;
@@ -10632,7 +10669,48 @@ function _retireProjectPickerForExplicitRepaint(){
   return true;
 }
 
+// Qualify the open picker after a repaint rebuilt the sidebar rows. The repaint
+// itself always proceeds (view adoption and durable updates stay immediate);
+// this decides the overlay's fate independently. When the picker's anchor row
+// was replaced, move the picker to the row its owner has now — a still-eligible
+// owner keeps its overlay — and retire it only when that owner is actually gone
+// (archived, deleted, filtered out). Never leave the picker mounted on a
+// detached anchor.
+
+function _reanchorProjectPickerAfterRepaint(){
+  const open=(typeof _openProjectPicker!=='undefined')?_openProjectPicker:null;
+  if(!open||!open.picker||open.picker.isConnected===false) return false;
+  const current=open.anchorEl;
+  if(current&&current.isConnected!==false) return false;
+  let next=(typeof _findSessionRenameRow==='function')?_findSessionRenameRow(open.sessionId):null;
+  if(next&&current&&current.classList&&typeof current.classList.contains==='function'
+     &&current.classList.contains('session-actions-trigger')
+     &&typeof _projectPickerFocusReturnTarget==='function'){
+    next=_projectPickerFocusReturnTarget({session_id:open.sessionId},null)||next;
+  }
+  if(!next||next.isConnected===false){
+    if(typeof open.dismiss==='function') open.dismiss({restoreFocus:false});
+    return false;
+  }
+  if(typeof open.retarget==='function') open.retarget(next);
+  else open.anchorEl=next;
+  if(typeof _positionProjectPicker==='function') _positionProjectPicker(open.picker,next);
+  if(typeof requestAnimationFrame==='function'){
+    requestAnimationFrame(()=>{
+      if(open.picker&&open.picker.isConnected!==false&&open.anchorEl&&open.anchorEl.isConnected!==false
+         &&typeof _positionProjectPicker==='function'){
+        try{ _positionProjectPicker(open.picker,open.anchorEl); }catch(_){}
+      }
+    });
+  }
+  return true;
+}
+
 function _showProjectPicker(session, anchorEl){
+  // Overlay generation: opening a picker is the event a later dismissal claim
+  // is measured against (see _retireProjectPickerForExplicitRepaint).
+  if(typeof _projectPickerOpenEpoch==='number') _projectPickerOpenEpoch+=1;
+  const pickerEpoch=(typeof _projectPickerOpenEpoch==='number')?_projectPickerOpenEpoch:0;
   // Close any existing picker. Its teardown, not just element removal, has to
   // run so no resize/click listener outlives the element it was bound for.
   if(_projectPickerTeardown){const stale=_projectPickerTeardown;_projectPickerTeardown=null;stale();}
@@ -10867,7 +10945,15 @@ function _showProjectPicker(session, anchorEl){
     _focusSessionActionMenuRestoreTarget(_projectPickerFocusReturnTarget(session,anchorEl));
   };
   _wireProjectPickerKeys(picker,dismiss);
-  _openProjectPicker={picker,anchorEl,sessionId:session.session_id,dismiss};
+  _openProjectPicker={picker,anchorEl,sessionId:session.session_id,dismiss,openEpoch:pickerEpoch,retarget:(nextAnchor)=>{
+    // Follow a sidebar rebuild to the row that conversation has now (see
+    // _reanchorProjectPickerAfterRepaint). Rebind the closure's anchor and the
+    // module-level copy so every listener, observer and placement reads the
+    // live element.
+    if(!nextAnchor) return;
+    anchorEl=nextAnchor;
+    if(_openProjectPicker&&_openProjectPicker.picker===picker) _openProjectPicker.anchorEl=nextAnchor;
+  }};
   _focusProjectPickerItem(picker);
 }
 
@@ -11199,6 +11285,8 @@ function _startProjectCreate(bar, addBtn){
     _finishDone=true;
     if(save&&inp.value.trim()){
       const color=PROJECT_COLORS[_allProjects.length%PROJECT_COLORS.length];
+      // Overlay-generation claim: the picker set open when this create fired.
+      const createClaim=(typeof _projectPickerOpenEpoch==='number')?_projectPickerOpenEpoch:0;
       try{
         await api('/api/projects/create',{method:'POST',body:JSON.stringify({name:inp.value.trim(),color})});
       }catch(e){
@@ -11206,9 +11294,11 @@ function _startProjectCreate(bar, addBtn){
         showToast('Project create failed: '+(e.message||e));
         return;
       }
-      // The API-success transition (editor -> chip) must paint now: retire the
-      // picker first so this repaint is not swallowed by its deferral.
-      _retireProjectPickerForExplicitRepaint();
+      // The API-success transition (editor -> chip) must paint now. A picker
+      // that predates this create is retired first (folding its deferral); one
+      // the user opened while the create was in flight is newer than this
+      // completion, so it is kept and the repaint re-anchors it.
+      _retireProjectPickerForExplicitRepaint(createClaim);
       await renderSessionList();
       showToast('Project created');
     }else{
