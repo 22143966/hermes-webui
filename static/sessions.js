@@ -3884,13 +3884,19 @@ async function _ensureMessagesLoaded(sid, opts) {
     if(typeof data.session.visible_message_count==='number'&&data.session.visible_message_count>=0){
       S.session.visible_message_count=data.session.visible_message_count;
     }
-    // #7882 (greptile round-4 P2): the server transcript just landed in
+    // #7882 (greptile round-5 P2): the server transcript just landed in
     // S.messages wholesale — re-baseline the send's optimistic-count
     // snapshot so the next send bumps exactly its own rows. When a send is
     // in flight the send-time snapshot stays authoritative (the server
-    // count here predates the optimistic turn).
+    // count here predates the optimistic turn). Both halves move together:
+    // a local-only baseline poisons the next send's bump with NaN
+    // (undefined server half), and the NaN comparison makes the sidebar
+    // fall back to the raw count — hidden wakeups included.
     if(!S.busy){
       S.session._visibleBaselineLocal=(Array.isArray(S.messages)?S.messages:[]).filter(m=>m&&m.role&&m._source!=='delegation_wakeup').length;
+      S.session._visibleBaselineServer=(typeof data.session.visible_message_count==='number'&&data.session.visible_message_count>=0)
+        ?data.session.visible_message_count
+        :S.session._visibleBaselineLocal;
     }
     S.lastUsage={...(data.session.last_usage||S.lastUsage||{})};
     // Phase 2: the messages=1 response carries the canonical cold-load
@@ -4599,10 +4605,19 @@ async function _ensureAllMessagesLoaded() {
     _syncToolCallsForLoadedMessages(msgs, data.session.tool_calls);
     if (S.session && S.session.session_id === sid) {
       S.session.message_count = Number(data.session.message_count || msgs.length);
-      // #7882 (greptile round-4 P2): full transcript landed — re-baseline the
+      // #7882 (greptile round-5 P2): full transcript landed — re-baseline the
       // optimistic-count snapshot so the next send bumps exactly its own rows.
+      // BOTH baselines move together: setting only the local half leaves the
+      // server half stale, and the send-time bump then reports NaN
+      // (visible_message_count = staleServerBaseline + optimistic), which the
+      // sidebar falls back from to the RAW count — counting hidden wakeups
+      // again. The stale server value is also simply wrong for the fresh
+      // transcript: data.session.visible_message_count is its authority.
       if(!S.busy){
         S.session._visibleBaselineLocal=(Array.isArray(S.messages)?S.messages:[]).filter(m=>m&&m.role&&m._source!=='delegation_wakeup').length;
+        S.session._visibleBaselineServer=(typeof data.session.visible_message_count==='number'&&data.session.visible_message_count>=0)
+          ?data.session.visible_message_count
+          :S.session._visibleBaselineLocal;
       }
       if (Object.prototype.hasOwnProperty.call(data.session, 'regeneration_revision')) {
         S.session.regeneration_revision = data.session.regeneration_revision;
@@ -7311,11 +7326,14 @@ function startGatewaySSE(){
                     S.messages = _nextToAssign;
                     if(S.session && S.session.session_id === activeSid){
                       S.session.message_count = next.length;
-                      // #7882 (greptile round-4 P2): gateway refresh replaced
+                      // #7882 (greptile round-5 P2): gateway refresh replaced
                       // the transcript while idle — re-baseline the
-                      // optimistic-count snapshot.
+                      // optimistic-count snapshot. Both halves move together
+                      // (see _ensureMessagesLoaded): a local-only baseline
+                      // NaN-poisons the next send's visible-count bump.
                       if(!S.busy){
                         S.session._visibleBaselineLocal=(Array.isArray(S.messages)?S.messages:[]).filter(m=>m&&m.role&&m._source!=='delegation_wakeup').length;
+                        S.session._visibleBaselineServer=S.session._visibleBaselineLocal;
                       }
                       const newest = next.length ? next[next.length - 1] : null;
                       const newestTs = Number((newest && (newest.timestamp || newest._ts)) || 0);
@@ -8355,6 +8373,15 @@ function upsertActiveSessionForLocalTurn({title='', messageCount=0, timestampMs=
       S.session._visibleBaselineServer=S.session.visible_message_count;
     }
     const optimisticVisible=Math.max(0,localVisible-S.session._visibleBaselineLocal);
+    // #7882 (greptile round-5 P2): a baseline pair must never be half-set —
+    // an undefined server half makes this expression NaN and the NaN
+    // comparison demotes the sidebar to the raw count (hidden wakeups
+    // included). The reload paths now reset both together; this local
+    // fallback additionally makes the expression well-defined if a future
+    // path forgets.
+    if(typeof S.session._visibleBaselineServer!=='number'){
+      S.session._visibleBaselineServer=S.session._visibleBaselineLocal;
+    }
     S.session.visible_message_count=Math.max(
       S.session.visible_message_count,
       S.session._visibleBaselineServer+optimisticVisible
