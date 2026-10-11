@@ -4786,7 +4786,11 @@ function _optimisticallyArchiveSessionInList(sid, archived){
     changed=true;
     return {...s,archived:!!archived};
   });
-  if(changed) renderSessionListFromCache();
+  // Only the external-hide completion calls this helper, and it lands after an
+  // awaited response: route the repaint through the shared completion helper so
+  // a picker owned by another session survives and only this session's own
+  // picker is retired.
+  if(changed) _repaintSidebarAfterSessionCompletion(sid);
 }
 function _optimisticallyRemoveSessionFromList(sid){
   if(!sid||!Array.isArray(_allSessions)) return;

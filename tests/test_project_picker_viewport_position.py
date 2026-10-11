@@ -1491,10 +1491,38 @@ def _repaint_sidebar_after_session_completion_source() -> str:
     return SESSIONS_JS[start:end] + "\n"
 
 
+def _optimistically_archive_session_in_list_source() -> str:
+    start = SESSIONS_JS.find("function _optimisticallyArchiveSessionInList(")
+    assert start >= 0, "_optimisticallyArchiveSessionInList not found in static/sessions.js"
+    end = SESSIONS_JS.find("\nfunction ", start + 1)
+    assert end > start
+    return SESSIONS_JS[start:end] + "\n"
+
+
+def _external_hide_handler_source() -> str:
+    marker = SESSIONS_JS.index("t('session_hide_external')")
+    start = SESSIONS_JS.index("async()=>{", marker)
+    brace = SESSIONS_JS.index("{", start)
+    depth = 0
+    i = brace
+    while i < len(SESSIONS_JS):
+        char = SESSIONS_JS[i]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    assert depth == 0, "the external hide handler body did not close"
+    return SESSIONS_JS[brace:i + 1]
+
+
 # A response that lands after an await is a completion, not fresh user intent.
 # Each entry pairs the durable cache write that makes the response observable
 # with the repaint that must run as background churn. The gate charged these
-# sites as L1-L6 plus the delete-failure rollback lead.
+# sites as L1-L6 plus the delete-failure rollback lead; the external-hide
+# completion was added when a warm-up found it was the remaining sibling path.
 LATE_COMPLETION_REPAINTS = [
     ("L1 title regenerate", "cached.title=nextTitle;", "_repaintSidebarForBackgroundChurn();"),
     ("L2 pin toggle", "if(cached) cached.pinned=newPinned;", "_repaintSidebarForBackgroundChurn();"),
@@ -1503,6 +1531,7 @@ LATE_COMPLETION_REPAINTS = [
     ("L5 unassign project", "_allSessions[idx].project_id=null;", "_repaintSidebarAfterSessionCompletion(session.session_id);"),
     ("L6 archive", "if(cached) cached.archived=archived;", "_repaintSidebarAfterSessionCompletion(session.session_id);"),
     ("delete failure rollback", "_allSessions=previousSessions;", "_repaintSidebarAfterSessionCompletion(sid);"),
+    ("hide external session", "return {...s,archived:!!archived};", "_repaintSidebarAfterSessionCompletion(sid);"),
 ]
 
 
@@ -1671,4 +1700,212 @@ console.log(JSON.stringify({
         "staleClosureNotBound": True,
         "keptAnchor": True,
         "stillDeferred": True,
+    }
+
+
+def test_external_hide_completion_keeps_other_pickers_and_retires_its_own():
+    """The hide completion is owner-aware through the shipped routing.
+
+    An external-hide response for session A must keep a picker the user opened
+    for session B (the repaint defers and replays with A archived), and must
+    retire only a picker owned by A itself.
+    """
+    assert NODE is not None
+    script = (
+        r"""
+let _sessionListRepaintDeferredByPicker = false;
+let _sidebarRepaintBackgroundChurn = false;
+let _sidebarRepaintKeepProjectPicker = false;
+let _projectPickerTeardown = null;
+let _openProjectPicker = null;
+let retired = 0;
+let _allSessions = [{session_id: 'a', archived: false}, {session_id: 'b', archived: false}];
+const painted = [];
+function renderSessionListFromCache(){
+  if(_projectPickerBlocksRepaint()){
+    _sessionListRepaintDeferredByPicker = true;
+    return;
+  }
+  painted.push(_allSessions.map(s => !!s.archived));
+}
+"""
+        + _retire_project_picker_for_explicit_repaint_source()
+        + _repaint_sidebar_for_background_churn_source()
+        + _project_picker_blocks_repaint_source()
+        + _repaint_sidebar_after_session_completion_source()
+        + _optimistically_archive_session_in_list_source()
+        + r"""
+const openPicker = (sessionId) => {
+  const picker = {};
+  _projectPickerTeardown = () => {
+    retired += 1;
+    if(_openProjectPicker && _openProjectPicker.picker === picker) _openProjectPicker = null;
+  };
+  _openProjectPicker = {picker, sessionId};
+};
+// B is choosing a project for 'b' while A's hide response lands.
+openPicker('b');
+_optimisticallyArchiveSessionInList('a', true);
+const newerPickerKept = {
+  retired,
+  stillOpen: _openProjectPicker !== null && _openProjectPicker.sessionId === 'b',
+  deferralPending: _sessionListRepaintDeferredByPicker === true,
+  painted: painted.length,
+  archivedA: _allSessions[0].archived === true,
+};
+// Closing B's picker replays the deferred repaint with A's archived result.
+_projectPickerTeardown = null;
+_openProjectPicker = null;
+if(_sessionListRepaintDeferredByPicker){
+  _sessionListRepaintDeferredByPicker = false;
+  renderSessionListFromCache();
+}
+const replayed = {painted: painted.length, archivedA: painted[painted.length - 1][0]};
+// A's own picker is retired when A's hide completion lands.
+openPicker('a');
+_optimisticallyArchiveSessionInList('a', true);
+const ownPickerRetired = {
+  retired,
+  cleared: _projectPickerTeardown === null && _openProjectPicker === null,
+  deferralCleared: _sessionListRepaintDeferredByPicker === false,
+  painted: painted.length,
+  flagRestored: _sidebarRepaintBackgroundChurn === false,
+};
+console.log(JSON.stringify({newerPickerKept, replayed, ownPickerRetired}));
+"""
+    )
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "newerPickerKept": {
+            "retired": 0,
+            "stillOpen": True,
+            "deferralPending": True,
+            "painted": 0,
+            "archivedA": True,
+        },
+        "replayed": {"painted": 1, "archivedA": True},
+        "ownPickerRetired": {
+            "retired": 1,
+            "cleared": True,
+            "deferralCleared": True,
+            "painted": 2,
+            "flagRestored": True,
+        },
+    }
+
+
+def test_external_hide_handler_success_wiring_and_archive_failure_control():
+    """The handler's awaited completion is routed, and its failure path is inert.
+
+    Success: the archive POST resolves, the optimistic cache write and the
+    shared completion repaint run (deferring behind another session's picker),
+    and the full list refresh and success toast follow. Failure: the POST
+    rejecting must not write the cache, repaint, or retire any picker.
+    """
+    assert NODE is not None
+    handler_body = _external_hide_handler_source()
+    assert handler_body.startswith("{") and handler_body.endswith("}")
+    assert "_sidebarRepaintBackgroundChurn" not in handler_body
+    script = (
+        r"""
+let _sessionListRepaintDeferredByPicker = false;
+let _sidebarRepaintBackgroundChurn = false;
+let _sidebarRepaintKeepProjectPicker = false;
+let _projectPickerTeardown = null;
+let _openProjectPicker = null;
+let retired = 0;
+let renderListCalls = 0;
+let failMode = false;
+const toasts = [];
+let _allSessions = [{session_id: 'a', archived: false}, {session_id: 'b', archived: false}, {session_id: 'c', archived: false}];
+let session = {session_id: 'a', archived: false};
+const S = {session: {session_id: 'a', archived: false}};
+const painted = [];
+function renderSessionListFromCache(){
+  if(_projectPickerBlocksRepaint()){
+    _sessionListRepaintDeferredByPicker = true;
+    return;
+  }
+  painted.push(_allSessions.map(s => !!s.archived));
+}
+function closeSessionActionMenu(){}
+async function api(url, opts){ if(failMode) throw new Error('boom'); return {ok: true}; }
+function renderSessionList(){ renderListCalls += 1; }
+function showToast(msg){ toasts.push(String(msg)); }
+function t(key){ return key; }
+"""
+        + _retire_project_picker_for_explicit_repaint_source()
+        + _repaint_sidebar_for_background_churn_source()
+        + _project_picker_blocks_repaint_source()
+        + _repaint_sidebar_after_session_completion_source()
+        + _optimistically_archive_session_in_list_source()
+        + r"""
+const openPicker = (sessionId) => {
+  const picker = {};
+  _projectPickerTeardown = () => {
+    retired += 1;
+    if(_openProjectPicker && _openProjectPicker.picker === picker) _openProjectPicker = null;
+  };
+  _openProjectPicker = {picker, sessionId};
+};
+const handler = async ()=>"""
+        + handler_body
+        + r""";
+(async () => {
+  openPicker('b');
+  await handler();
+  const success = {
+    retired,
+    pickerKept: _openProjectPicker !== null && _openProjectPicker.sessionId === 'b',
+    deferralPending: _sessionListRepaintDeferredByPicker === true,
+    painted: painted.length,
+    renderListCalls,
+    sessionFlagSet: session.archived === true,
+    savedFlagSet: S.session.archived === true,
+    archivedA: _allSessions[0].archived === true,
+    toast: toasts[toasts.length - 1],
+  };
+  failMode = true;
+  session = {session_id: 'c', archived: false};
+  S.session = {session_id: 'c', archived: false};
+  await handler();
+  const failure = {
+    retired,
+    pickerKept: _openProjectPicker !== null && _openProjectPicker.sessionId === 'b',
+    deferralPending: _sessionListRepaintDeferredByPicker === true,
+    painted: painted.length,
+    renderListCalls,
+    cUntouched: _allSessions[2].archived === false,
+    sessionFlagStayedClear: session.archived === false,
+    toast: toasts[toasts.length - 1],
+  };
+  console.log(JSON.stringify({success, failure}));
+})();
+"""
+    )
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "success": {
+            "retired": 0,
+            "pickerKept": True,
+            "deferralPending": True,
+            "painted": 0,
+            "renderListCalls": 1,
+            "sessionFlagSet": True,
+            "savedFlagSet": True,
+            "archivedA": True,
+            "toast": "session_hidden",
+        },
+        "failure": {
+            "retired": 0,
+            "pickerKept": True,
+            "deferralPending": True,
+            "painted": 0,
+            "renderListCalls": 1,
+            "cUntouched": True,
+            "sessionFlagStayedClear": True,
+            "toast": "session_archive_failedboom",
+        },
     }
