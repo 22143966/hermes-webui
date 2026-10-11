@@ -10737,6 +10737,24 @@ function _retireProjectPickerForExplicitRepaint(claimEpoch){
   return true;
 }
 
+// A kept picker is older DOM than the durable cache update that triggered the
+// repaint. Refresh its radio state in place so the visual and screen-reader
+// selection agree with the sidebar, without rebuilding the menu or moving
+// keyboard focus.
+function _syncProjectPickerSelection(open){
+  if(!open||!open.picker||!open.sessionId||!Array.isArray(_allSessions)) return false;
+  const session=_allSessions.find(s=>s&&s.session_id===open.sessionId);
+  if(!session||typeof open.picker.querySelectorAll!=='function') return false;
+  const selected=session.project_id==null?'':String(session.project_id);
+  const items=Array.from(open.picker.querySelectorAll('.project-picker-item[data-project-id]'));
+  for(const item of items){
+    const active=String(item.getAttribute('data-project-id')||'')===selected;
+    if(item.classList&&typeof item.classList.toggle==='function') item.classList.toggle('active',active);
+    if(typeof item.setAttribute==='function') item.setAttribute('aria-checked',active?'true':'false');
+  }
+  return items.length>0;
+}
+
 // Qualify the open picker after a repaint rebuilt the sidebar rows. The repaint
 // itself always proceeds (view adoption and durable updates stay immediate);
 // this decides the overlay's fate independently. When the picker's anchor row
@@ -10748,6 +10766,7 @@ function _retireProjectPickerForExplicitRepaint(claimEpoch){
 function _reanchorProjectPickerAfterRepaint(){
   const open=(typeof _openProjectPicker!=='undefined')?_openProjectPicker:null;
   if(!open||!open.picker||open.picker.isConnected===false) return false;
+  if(typeof _syncProjectPickerSelection==='function') _syncProjectPickerSelection(open);
   const current=open.anchorEl;
   if(current&&current.isConnected!==false) return false;
   let next=(typeof _findSessionRenameRow==='function')?_findSessionRenameRow(open.sessionId):null;
@@ -10793,6 +10812,7 @@ function _showProjectPicker(session, anchorEl){
   picker.className='project-picker';
   // "No project" option
   const none=_projectPickerItem('',!session.project_id);
+  none.setAttribute('data-project-id','');
   none.textContent=t('project_picker_none');
   none.onclick=async()=>{
     teardown();
@@ -10829,6 +10849,7 @@ function _showProjectPicker(session, anchorEl){
   for(const p of _allProjects){
     if (_profileHidesProject(p.profile)) continue;
     const item=_projectPickerItem('',session.project_id===p.project_id);
+    item.setAttribute('data-project-id',String(p.project_id));
     if(p.color){
       const dot=document.createElement('span');
       dot.className='color-dot';

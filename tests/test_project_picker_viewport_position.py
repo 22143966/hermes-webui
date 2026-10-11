@@ -991,7 +991,8 @@ def _retire_project_picker_for_explicit_repaint_source() -> str:
     assert start >= 0, "_retireProjectPickerForExplicitRepaint not found in static/sessions.js"
     end = SESSIONS_JS.find("\nfunction ", start + 1)
     assert end > start
-    return SESSIONS_JS[start:end]
+    # Keep any trailing comments from swallowing the next concatenated helper.
+    return SESSIONS_JS[start:end] + "\n"
 
 
 @pytest.mark.parametrize("kind", ["trigger", "row", "actions", "topbar"])
@@ -1503,6 +1504,53 @@ def _reanchor_project_picker_after_repaint_source() -> str:
     end = SESSIONS_JS.find("\nfunction ", start + 1)
     assert end > start
     return SESSIONS_JS[start:end] + "\n"
+
+
+def _sync_project_picker_selection_source() -> str:
+    start = SESSIONS_JS.find("function _syncProjectPickerSelection(")
+    assert start >= 0, "_syncProjectPickerSelection not found in static/sessions.js"
+    end = SESSIONS_JS.find("\nfunction ", start + 1)
+    assert end > start
+    return SESSIONS_JS[start:end] + "\n"
+
+
+def test_kept_same_owner_picker_refreshes_selected_project_without_moving_focus():
+    """A held Move completion updates the reopened picker's radio state in place."""
+    assert NODE is not None
+    script = r"""
+let _allSessions=[{session_id:'s',project_id:'project-b'}];
+let _openProjectPicker=null;
+let positioned=0;
+let focused='project-a';
+const makeItem=(id,active)=>{
+  const attrs={'data-project-id':id,'aria-checked':active?'true':'false'};
+  const classes=new Set(active?['active']:[]);
+  return {
+    getAttribute:name=>attrs[name],
+    setAttribute:(name,value)=>{attrs[name]=String(value);},
+    classList:{toggle:(name,on)=>{if(on)classes.add(name);else classes.delete(name);}},
+    state:()=>({active:classes.has('active'),checked:attrs['aria-checked']}),
+  };
+};
+const a=makeItem('project-a',true);
+const b=makeItem('project-b',false);
+const picker={isConnected:true,querySelectorAll:()=>[a,b]};
+const anchor={isConnected:true};
+_openProjectPicker={picker,anchorEl:anchor,sessionId:'s'};
+function _positionProjectPicker(){positioned+=1;}
+""" + _sync_project_picker_selection_source() + _reanchor_project_picker_after_repaint_source() + r"""
+const result=_reanchorProjectPickerAfterRepaint();
+console.log(JSON.stringify({result,a:a.state(),b:b.state(),focused,positioned}));
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "result": False,
+        "a": {"active": False, "checked": "false"},
+        "b": {"active": True, "checked": "true"},
+        "focused": "project-a",
+        "positioned": 0,
+    }
 
 
 def test_completion_repaints_keep_and_reanchor_the_newer_picker():
