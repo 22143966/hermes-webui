@@ -138,7 +138,9 @@ def test_session_list_external_refresh_uses_sse_invalidation_not_polling():
     assert "void _refreshSessionListAfterSidebarResume('focus')" in SESSIONS_JS
     assert "void _refreshSessionListAfterSidebarResume('visible')" in SESSIONS_JS
     assert "void _refreshSessionListAfterSidebarResume('reconnect')" in SESSIONS_JS
-    assert "renderSessionList({deferWhileInteracting:!force})" in SESSIONS_JS
+    assert "const renderOpts={deferWhileInteracting:!force};" in SESSIONS_JS
+    assert "if(opts&&opts.keepProjectPicker===true) renderOpts.keepProjectPicker=true;" in SESSIONS_JS
+    assert "await renderSessionList(renderOpts);" in SESSIONS_JS
     assert "const refreshActive = !!(opts && opts.refreshActive)" in SESSIONS_JS
     assert "if(refreshActive) await refreshActiveSessionIfExternallyUpdated(reason||'session-list')" in SESSIONS_JS
     assert "_sessionListRefreshPendingRequest = {" in SESSIONS_JS

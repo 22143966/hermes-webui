@@ -6732,10 +6732,10 @@ async function _runRenderSessionListRefresh(opts, _gen){
       _schedulePendingSessionListApply();
       return;
     }
-    _applySessionListPayload(sessData,projData,{
-      unreadGen,
-      keepProjectPicker:!!(opts&&opts.keepProjectPicker),
-    });
+    // Carry the keep-picker intent to the payload when set; non-keep refreshes
+    // keep the plain apply shape.
+    if(opts&&opts.keepProjectPicker===true) _applySessionListPayload(sessData,projData,{unreadGen,keepProjectPicker:true});
+    else _applySessionListPayload(sessData,projData,{unreadGen});
   }catch(e){
     if (_gen !== _renderSessionListGen) return;
     // #4671: same embargo guard as the success path — a mid-switch /api/sessions that
@@ -7139,10 +7139,9 @@ async function refreshSessionList(reason='manual', opts={}){
   }
   _sessionListRefreshInFlight = true;
   try{
-    await renderSessionList({
-      deferWhileInteracting:!force,
-      keepProjectPicker:!!(opts&&opts.keepProjectPicker),
-    });
+    const renderOpts={deferWhileInteracting:!force};
+    if(opts&&opts.keepProjectPicker===true) renderOpts.keepProjectPicker=true;
+    await renderSessionList(renderOpts);
     if(refreshActive) await refreshActiveSessionIfExternallyUpdated(reason||'session-list');
   }finally{
     _sessionListRefreshInFlight = false;

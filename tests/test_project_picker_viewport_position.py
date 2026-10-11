@@ -1413,7 +1413,8 @@ def test_created_items_force_an_immediate_picker_preserving_payload_paint():
     assert "else _repaintSidebarForBackgroundChurn();" in apply_body
     assert "refreshSessionList('new-session',{force:true,keepProjectPicker:true})" in js
     assert "await renderSessionList({keepProjectPicker:true});" in js
-    assert "keepProjectPicker:!!(opts&&opts.keepProjectPicker)" in js
+    assert "if(opts&&opts.keepProjectPicker===true) renderOpts.keepProjectPicker=true;" in js
+    assert "if(opts&&opts.keepProjectPicker===true) _applySessionListPayload(sessData,projData,{unreadGen,keepProjectPicker:true});" in js
 
 
 def test_sidebar_repaint_guard_defers_background_churn_and_keeps_the_overlay_for_unclaimed_repaints():
