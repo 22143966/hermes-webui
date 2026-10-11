@@ -1397,6 +1397,25 @@ def _project_picker_blocks_repaint_source() -> str:
     return SESSIONS_JS[start:end] + "\n"
 
 
+def test_created_items_force_an_immediate_picker_preserving_payload_paint():
+    """A completed create paints now even when a newer picker is open.
+
+    The payload application chokepoint must distinguish ordinary background
+    refreshes (which defer behind an open picker) from the two create
+    completions.  The latter repaint immediately while preserving/reanchoring
+    a picker opened after the request began.
+    """
+    js = SESSIONS_JS
+    apply_start = js.index("function _applySessionListPayload(")
+    apply_end = js.index("\nfunction ", apply_start + 1)
+    apply_body = js[apply_start:apply_end]
+    assert "if(applyOpts.keepProjectPicker) _repaintSidebarKeepingProjectPicker();" in apply_body
+    assert "else _repaintSidebarForBackgroundChurn();" in apply_body
+    assert "refreshSessionList('new-session',{force:true,keepProjectPicker:true})" in js
+    assert "await renderSessionList({keepProjectPicker:true});" in js
+    assert "keepProjectPicker:!!(opts&&opts.keepProjectPicker)" in js
+
+
 def test_sidebar_repaint_guard_defers_background_churn_and_keeps_the_overlay_for_unclaimed_repaints():
     """The completion-safe picker guard: churn defers, unclaimed repaints keep.
 
@@ -1488,7 +1507,13 @@ let retired = 0;
 let dismissed = 0;
 let positioned = 0;
 const painted = [];
-const newRows = {b: {isConnected: true}};
+const contextPoint = {clientX: 310, clientY: 420};
+const replacementActions = {isConnected: true};
+const rebuiltB = {
+  isConnected: true,
+  querySelector: (selector) => selector === ':scope > .session-actions' ? replacementActions : null,
+};
+const newRows = {b: rebuiltB};
 function renderSessionListFromCache(){
   if(_projectPickerBlocksRepaint()){
     _sessionListRepaintDeferredByPicker = true;
@@ -1516,11 +1541,16 @@ const openPicker = (sessionId, epoch) => {
 // A completion repaint with B's picker open: B survives, the rows rebuild, and
 // the picker re-anchors to B's rebuilt row.
 const b = openPicker('b', 2);
-b.anchorEl.isConnected = false;   // the rebuild replaced B's row element
+b.anchorEl = {
+  isConnected: false,
+  classList: {contains: (name) => name === 'session-actions'},
+  _projectPickerContextPoint: contextPoint,
+}; // the rebuild replaced B's mouse-context action box
 renderSessionListFromCache();
 const kept = {retired, dismissed, painted: painted.length,
   stillOpen: _openProjectPicker === b,
-  reanchored: _openProjectPicker.anchorEl === newRows.b,
+  reanchored: _openProjectPicker.anchorEl === replacementActions,
+  contextPointKept: replacementActions._projectPickerContextPoint === contextPoint,
   positioned};
 // A rebuild where B's owner row is actually gone: retire the invalid owner.
 const c = openPicker('c', 2);
@@ -1539,7 +1569,7 @@ console.log(JSON.stringify({kept, invalidOwner, keptByGeneration}));
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout)
     assert data == {
-        "kept": {"retired": 0, "dismissed": 0, "painted": 1, "stillOpen": True, "reanchored": True, "positioned": 1},
+        "kept": {"retired": 0, "dismissed": 0, "painted": 1, "stillOpen": True, "reanchored": True, "contextPointKept": True, "positioned": 1},
         "invalidOwner": {"retired": 0, "dismissed": 1, "painted": 2, "closed": True},
         "keptByGeneration": {"teardownKept": True, "staleClaim": False, "stillOpen": True},
     }

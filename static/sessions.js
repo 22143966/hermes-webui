@@ -2201,7 +2201,7 @@ async function newSession(flash, options={}){
     // unpainted. A picker opened while this create was in flight is the newer
     // choice — the delayed completion keeps it and the render re-anchors it.
     if(typeof _retireProjectPickerForExplicitRepaint==='function') _retireProjectPickerForExplicitRepaint(newSessionClaim);
-    if(typeof refreshSessionList==='function'){Promise.resolve(refreshSessionList('new-session',{force:true})).catch(()=>{})}
+    if(typeof refreshSessionList==='function'){Promise.resolve(refreshSessionList('new-session',{force:true,keepProjectPicker:true})).catch(()=>{})}
   })();
   try{
     return await _newSessionInFlight;
@@ -6594,7 +6594,8 @@ function _applySessionListPayload(sessData, projData, opts){
     return;
   }
   if(_canRenderNow) _lastSessionListRenderSig = _renderSig;
-  _repaintSidebarForBackgroundChurn();  // no-ops if rename is in progress
+  if(applyOpts.keepProjectPicker) _repaintSidebarKeepingProjectPicker();
+  else _repaintSidebarForBackgroundChurn();
 }
 
 function _mergeRenderSessionListOptions(prev, next){
@@ -6602,6 +6603,9 @@ function _mergeRenderSessionListOptions(prev, next){
   // Immediate refreshes must not be downgraded by a later passive polling tick.
   if((prev&&prev.deferWhileInteracting===false)||(next&&next.deferWhileInteracting===false)){
     merged.deferWhileInteracting=false;
+  }
+  if((prev&&prev.keepProjectPicker===true)||(next&&next.keepProjectPicker===true)){
+    merged.keepProjectPicker=true;
   }
   return merged;
 }
@@ -6728,7 +6732,10 @@ async function _runRenderSessionListRefresh(opts, _gen){
       _schedulePendingSessionListApply();
       return;
     }
-    _applySessionListPayload(sessData,projData,{unreadGen});
+    _applySessionListPayload(sessData,projData,{
+      unreadGen,
+      keepProjectPicker:!!(opts&&opts.keepProjectPicker),
+    });
   }catch(e){
     if (_gen !== _renderSessionListGen) return;
     // #4671: same embargo guard as the success path — a mid-switch /api/sessions that
@@ -6867,6 +6874,7 @@ function _mergeSessionListRefreshOptions(prev, next){
   const merged = {...(prev||{}), ...(next||{})};
   if((prev&&prev.force===true)||(next&&next.force===true)) merged.force = true;
   if((prev&&prev.refreshActive===true)||(next&&next.refreshActive===true)) merged.refreshActive = true;
+  if((prev&&prev.keepProjectPicker===true)||(next&&next.keepProjectPicker===true)) merged.keepProjectPicker = true;
   return merged;
 }
 
@@ -7131,7 +7139,10 @@ async function refreshSessionList(reason='manual', opts={}){
   }
   _sessionListRefreshInFlight = true;
   try{
-    await renderSessionList({deferWhileInteracting:!force});
+    await renderSessionList({
+      deferWhileInteracting:!force,
+      keepProjectPicker:!!(opts&&opts.keepProjectPicker),
+    });
     if(refreshActive) await refreshActiveSessionIfExternallyUpdated(reason||'session-list');
   }finally{
     _sessionListRefreshInFlight = false;
@@ -10681,15 +10692,21 @@ function _reanchorProjectPickerAfterRepaint(){
   const current=open.anchorEl;
   if(current&&current.isConnected!==false) return false;
   let next=(typeof _findSessionRenameRow==='function')?_findSessionRenameRow(open.sessionId):null;
-  if(next&&current&&current.classList&&typeof current.classList.contains==='function'
-     &&current.classList.contains('session-actions-trigger')
-     &&typeof _projectPickerFocusReturnTarget==='function'){
-    next=_projectPickerFocusReturnTarget({session_id:open.sessionId},null)||next;
+  const contextPoint=current&&current._projectPickerContextPoint;
+  const currentClasses=current&&current.classList;
+  if(next&&currentClasses&&typeof currentClasses.contains==='function'
+     &&typeof next.querySelector==='function'){
+    if(currentClasses.contains('session-actions-trigger')){
+      next=next.querySelector(':scope > .session-actions > .session-actions-trigger')||next;
+    }else if(currentClasses.contains('session-actions')){
+      next=next.querySelector(':scope > .session-actions')||next;
+    }
   }
   if(!next||next.isConnected===false){
     if(typeof open.dismiss==='function') open.dismiss({restoreFocus:false});
     return false;
   }
+  if(contextPoint) next._projectPickerContextPoint=contextPoint;
   if(typeof open.retarget==='function') open.retarget(next);
   else open.anchorEl=next;
   if(typeof _positionProjectPicker==='function') _positionProjectPicker(open.picker,next);
@@ -11297,7 +11314,7 @@ function _startProjectCreate(bar, addBtn){
       // the user opened while the create was in flight is newer than this
       // completion, so it is kept and the repaint re-anchors it.
       _retireProjectPickerForExplicitRepaint(createClaim);
-      await renderSessionList();
+      await renderSessionList({keepProjectPicker:true});
       showToast('Project created');
     }else{
       inp.replaceWith(addBtn);
