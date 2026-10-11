@@ -808,13 +808,23 @@ def _persist_cleared_project_ids(project_id, sids, lock_timeout=None) -> int:
     written back over a sidecar that is ahead of it — not even when the message
     counts match, which is the hole the count-based freshness check leaves
     (maintainer re-gates 2026-10-10T23:49:54Z and 2026-10-11T02:08:20Z).
+
+    The live stream set is re-read INSIDE each session's lock, immediately before
+    that resolution, and the session is skipped outright when the read fails. A
+    snapshot taken once before the loop is stale for every session after the
+    first (the loop waits on each target's lock), and a stream that starts on a
+    session while we wait for its lock then reads as "not streaming": the
+    resolution reloads the OLDER sidecar into the live worker's own object, and
+    the worker's next checkpoint persists that older state — dropping the
+    provider it had just resolved. Reproduced over real HTTP against the real
+    streaming worker: the resolved provider went from ``openai-codex`` to
+    ``null`` and Chromium's next send targeted the wrong one; master preserved
+    Codex (maintainer re-gate 2026-10-11T06:53:38Z). Failing closed on a
+    read error costs nothing — the caller's index pass and the worker's own
+    next save still carry the unlink.
     """
     if not project_id or not sids:
         return 0
-    try:
-        active_ids = _active_stream_ids()
-    except Exception:
-        active_ids = set()
     written = 0
     for sid in sids:
         if not sid or not (SESSION_DIR / f"{sid}.json").exists():
@@ -833,6 +843,22 @@ def _persist_cleared_project_ids(project_id, sids, lock_timeout=None) -> int:
             )
             continue
         try:
+            # Read the live stream set HERE, under this session's lock: the
+            # snapshot must describe the moment the lock was won, because a
+            # stream that started while we waited is exactly the case where the
+            # refresh below would reload an older sidecar into the running
+            # worker's object. Skip on failure rather than guess: treating an
+            # unreadable set as "nothing streaming" is what overwrites a live
+            # session (maintainer re-gate 2026-10-11T06:53:38Z).
+            try:
+                active_ids = _active_stream_ids()
+            except Exception:
+                logger.debug(
+                    "projects/delete: could not read the live stream set; "
+                    "leaving the unlink on %s to the index pass",
+                    sid,
+                )
+                continue
             # Resolve the target from its SIDECAR, never from the LRU entry: a
             # FULL but STALE cache entry — the same message count, a newer draft
             # or a re-filed row on disk — used to be saved straight back over its
