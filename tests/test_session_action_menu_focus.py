@@ -200,12 +200,13 @@ def _picker_handoff_fixture_script(anchor_kind="trigger") -> str:
             "let _sessionActionMenuId = 0;",
             "let _projectPickerTeardown = null;",
             "let _sessionListRepaintDeferredByPicker = false;",
+            "let _sidebarRepaintBackgroundChurn = false;",
             "const esc = value => String(value);",
             "const ICONS = new Proxy({}, {get: () => ''});",
             "const S = {session: null};",
             "const _allSessions = [{session_id: 'parent', _child_sessions: [{session_id: 'picker-child'}]}, {session_id: 'other-row', pinned: true}];",
             "const t = key => ({session_unpin: 'Unpin conversation', session_pin: 'Pin conversation'}[key] || key);",
-            "const showToast = () => {};",
+            "const showToast = (message) => { (window.__pinToasts = window.__pinToasts || []).push(String(message)); };",
             "const setStatus = () => {};",
             "const syncTopbar = () => {};",
             "const renderSessionList = async () => {};",
@@ -248,6 +249,7 @@ def _picker_handoff_fixture_script(anchor_kind="trigger") -> str:
             "  return {picker, trigger:opener};",
             "}",
             "function renderSessionListFromCache(){ repaintCount += 1; paintRows(); }",
+            _function_source("_repaintSidebarForBackgroundChurn"),
             _function_source("_focusSessionActionMenuRestoreTarget"),
             _function_source("closeSessionActionMenu"),
             _function_source("_buildSessionAction"),
@@ -280,6 +282,8 @@ def _picker_handoff_fixture_script(anchor_kind="trigger") -> str:
               unpin.click();
               await new Promise(resolve => setTimeout(resolve, 0));
               result.persistedUnpin = persistedPinned === false;
+              result.unpinRepaintLanded = repaintCount === 2;
+              result.unpinNoFailureToast = !(window.__pinToasts || []).some(message => String(message).includes('session_pin_failed'));
 
               _allSessions[1].pinned = true;
               const second = paintRows();
@@ -380,6 +384,8 @@ def test_picker_handoff_rebuilds_other_row_menu_and_escape_focus_in_browser(anch
         "touchAnchorVisible": True,
         "menuSurvivesRelease": True,
         "persistedUnpin": True,
+        "unpinRepaintLanded": True,
+        "unpinNoFailureToast": True,
         "escapeFocusesReplacement": True,
         "parentAndNestedChildRemain": True,
     }
