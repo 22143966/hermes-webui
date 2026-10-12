@@ -2557,6 +2557,20 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(typeof updateThinking==='function') updateThinking(text, opts);
     else appendThinking(text, opts);
   }
+  function _flushPendingReasoningRender(){
+    if(!_reasoningRenderPending) return;
+    _reasoningRenderPending=false;
+    if(!_isActiveSession()||S.activeStreamId!==streamId) return;
+    const opts={deferRender:_streamFinalized};
+    if(!_upsertAnchorReasoning(_liveThinkingText(), opts)&&!_streamFinalized){
+      _updateLiveThinkingCard(_liveThinkingText(),{
+        ...opts,
+        anchorRenderFallback:true,
+        sessionId:activeSid,
+        streamId,
+      });
+    }
+  }
   // Split a content string into {reasoning, content} by extracting any <think>...
   // blocks (or other known reasoning-tag pairs). If reasoning is already
   // populated on the message (e.g. from a separate on_reasoning stream), the
@@ -2740,6 +2754,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   // settled the DOM — which was causing the thinking card to reappear below
   // the final answer or the response to render twice.
   let _streamFinalized=false;
+  let _reasoningRenderPending=false;
   let _pendingRafHandle=null;
   let _streamFadeVisibleText='';
   let _streamFadeLastTickMs=0;
@@ -2810,6 +2825,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   // Applying an event and painting it are separate outcomes. Reasoning uses the
   // optional holder to decide whether a temporary visible fallback is needed.
   function _applyToAnchor(sourceEventType, rawEventData, sseEvent, renderOutcome, options={}){
+    if(sourceEventType!=='reasoning') _flushPendingReasoningRender();
     if(renderOutcome&&typeof renderOutcome==='object') renderOutcome.rendered=false;
     if(!_anchorRegistry||!_anchorApi||typeof _anchorApi.applyAssistantTurnAnchorSourceEvent!=='function') return null;
     const raw=(rawEventData&&typeof rawEventData==='object')?rawEventData:{};
@@ -4272,6 +4288,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         status:options.sealed?'completed':'running',
         payload:{text:clean,activitySegmentSeq:segmentSeq,activityBurstId:_currentActivityBurstId},
       });
+      if(options.deferRender) return replaced;
       return _renderAnchorLiveScene()?replaced:null;
     }
     const renderOutcome={rendered:false};
@@ -4282,8 +4299,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       status:options.sealed?'completed':'running',
       activitySegmentSeq:segmentSeq,
       activityBurstId:_currentActivityBurstId,
-    },null,renderOutcome);
-    return renderOutcome.rendered?_findAnchorActivityEventByLocalId(localId,'reasoning'):null;
+    },null,renderOutcome,{render:!options.deferRender});
+    return (renderOutcome.rendered||options.deferRender)?_findAnchorActivityEventByLocalId(localId,'reasoning'):null;
   }
   function _compactVisibleEchoText(value){
     return String(value||'').replace(/\s+/g,'');
@@ -4597,6 +4614,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return _extractInlineThinkingFromContent(_stripXmlToolCalls(assistantText), liveReasoningText, {streaming:true});
   }
   function _renderLiveThinking(parsed){
+    if(_reasoningRenderPending){_flushPendingReasoningRender();return;}
     if(window._showThinking===false){removeThinking();return;}
     const text=(parsed&&parsed.thinkingText)||'';
     if(text||(parsed&&parsed.inThinking)){
@@ -4801,6 +4819,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _streamFadeSilentPrefixChars=0;
   }
   function _cancelAnimationFramePendingStreamRender(){
+    _flushPendingReasoningRender();
     if(_pendingRafHandle===null) return;
     cancelAnimationFrame(_pendingRafHandle);
     clearTimeout(_pendingRafHandle);
@@ -5520,6 +5539,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     step();
   }
   function _flushPendingSegmentRender(options={}){
+    _flushPendingReasoningRender();
     const force=!!(options&&options.force);
     const skipAnchorProcessProse=!!(options&&options.skipAnchorProcessProse);
     if(!assistantBody||(!force&&!_renderPending)) return;
@@ -5872,9 +5892,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _renderPending=false;
       // Guard: a pending setTimeout+rAF can outlive stream finalization.
       if(_streamFinalized) return;
-      // #6449: guard — the frontend session changed between rAF schedule and execution.
-      // Writing DOM into this stream's assistantBody would leak text into the wrong pane.
-      if(!_isActiveSession()) return;
+      if(!_isActiveSession()||S.activeStreamId!==streamId){
+        _reasoningRenderPending=false;
+        return;
+      }
       // Mobile scroll-jank guard: temporarily disable overflow-anchor before DOM
       // writes to suppress Chromium scroll re-anchoring during streaming growth.
       if(typeof window._fixMobileScrollJank==='function') window._fixMobileScrollJank();
@@ -6071,6 +6092,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         return;
       }
       if(reasoningEcho) _stripLiveReasoningEcho(visible);
+      _flushPendingReasoningRender();
       liveReasoningText='';
       if(alreadyStreamed){
         if(!S.session||S.session.session_id!==activeSid){
@@ -6154,16 +6176,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(d.text&&S.session&&S.session.session_id===activeSid) _completeAutomaticCompressionOnLiveProgress(activeSid);
       syncInflightAssistantMessage();
       if(text&&S.session&&S.session.session_id===activeSid&&S.activeStreamId===streamId){
-        const liveThinkingText=_liveThinkingText();
-        const anchorReasoningFallback={};
-        if(!_upsertAnchorReasoning(liveThinkingText, anchorReasoningFallback)){
-          _updateLiveThinkingCard(liveThinkingText,{
-            ...anchorReasoningFallback,
-            anchorRenderFallback:true,
-            sessionId:activeSid,
-            streamId,
-          });
-        }
+        // Replay can deliver hundreds of growing reasoning chunks at once.
+        _reasoningRenderPending=true;
+        _scheduleRender();
       }
     });
 

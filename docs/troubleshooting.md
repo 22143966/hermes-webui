@@ -242,6 +242,12 @@ bootstrap probe accepts either backend.
 
 ---
 
+## 浏览器在切换运行中会话时显示“页面无响应”
+
+如果 `/health` 仍正常返回且 `active_runs` 仍有任务，浏览器卡死不代表后台任务崩溃。长思考流在重连时会集中重放，逐条重绘活动视图可能长时间占用浏览器主线程。
+
+思考增量保留在每个会话的 `INFLIGHT` 状态中，显示刷新与回答输出共用合并调度；工具和终止边界同步尚未显示的尾部。切换后排队的刷新必须检查当前会话及 stream 所有权，不能改写另一个会话的页面。刷新页面可重新连接现有任务；无需为了浏览器卡顿重启后台。
+
 ## "Response interrupted." marker keeps saying "no agent output was recovered"
 
 **Symptom.** After a live response stream stops before a turn completes (manual restart, OOM, crash, browser/SSE disconnect, lost worker bookkeeping, …), the affected chat shows an `**Response interrupted.**` marker. If the run-journal for that turn is already visible on disk, the marker says the partial output was recovered; if not, it preserves the user turn and says no agent output was recovered yet.

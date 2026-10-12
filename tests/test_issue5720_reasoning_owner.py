@@ -24,6 +24,9 @@ def _run_reasoning_scene(
     stale_active_stream: bool = False,
     stale_live_turn: bool = False,
     show_thinking: bool = True,
+    reasoning_burst: bool = False,
+    switch_before_frame: bool = False,
+    reasoning_boundary: str = "",
 ) -> dict:
     assert NODE, "node is required for the #5720 browser-chain regression"
     env = os.environ.copy()
@@ -46,6 +49,12 @@ def _run_reasoning_scene(
         env["ISSUE5720_STALE_LIVE_TURN"] = "1"
     if not show_thinking:
         env["ISSUE5720_SHOW_THINKING"] = "0"
+    if reasoning_burst:
+        env["ISSUE5720_REASONING_BURST"] = "1"
+    if switch_before_frame:
+        env["ISSUE5720_SWITCH_BEFORE_FRAME"] = "1"
+    if reasoning_boundary:
+        env["ISSUE5720_REASONING_BOUNDARY"] = reasoning_boundary
     result = subprocess.run(
         [NODE, "-e", _NODE_SCENE],
         cwd=ROOT,
@@ -197,6 +206,32 @@ def test_later_deferred_anchor_paint_remains_hidden_in_final_answer_only_mode():
     assert result["anchor_render_attempts"] == 2
     assert result["anchor_reasoning_events"] == 1
     assert result["anchor_reasoning_text"] == "Plan step"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_reasoning_replay_burst_coalesces_paint_without_losing_text():
+    result = _run_reasoning_scene(reasoning_burst=True)
+    assert result["renders_before_frame"] == 0
+    assert result["renders_after_frame"] == 1
+    assert result["inflight_chars"] == 226_748
+    assert result["anchor_chars"] == 226_748
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_reasoning_frame_from_previous_session_cannot_paint_current_pane():
+    result = _run_reasoning_scene(reasoning_burst=True, switch_before_frame=True)
+    assert result["renders_after_frame"] == 0
+    assert result["inflight_chars"] == 226_748
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("boundary", ["tool", "terminal", "interim"])
+def test_reasoning_boundary_flushes_tail_before_pending_frame(boundary):
+    result = _run_reasoning_scene(reasoning_burst=True, reasoning_boundary=boundary)
+    assert result["anchor_chars"] == 226_748
+    assert result["inflight_chars"] == 226_748
+    if boundary == "terminal":
+        assert result["renders_after_frame"] == 0
 
 
 _NODE_SCENE = r"""
@@ -384,9 +419,22 @@ global.document={
 };
 global.location={href:'http://test.local/'};
 global.CSS={escape:value=>String(value)};
-global.requestAnimationFrame=fn=>{fn();return 1;};
-global.setTimeout=()=>1;
-global.clearTimeout=()=>{};
+const deferredFrames=process.env.ISSUE5720_REASONING_BURST==='1';
+const frames=new Map();
+let nextFrame=1, clock=1000;
+global.performance={now:()=>deferredFrames?clock:(clock+=100)};
+global.requestAnimationFrame=fn=>{
+  const id=nextFrame++;
+  if(deferredFrames) frames.set(id,fn); else fn();
+  return id;
+};
+global.cancelAnimationFrame=id=>frames.delete(id);
+global.setTimeout=(fn,ms)=>{
+  const id=nextFrame++;
+  if(deferredFrames&&ms<=100) frames.set(id,fn);
+  return id;
+};
+global.clearTimeout=id=>frames.delete(id);
 
 const emptyState=new FakeElement('div');
 const msgInner=new FakeElement('div');
@@ -532,11 +580,47 @@ const attachStart=messagesSrc.indexOf('function attachLiveStream(');
 const attachEnd=messagesSrc.indexOf('\nfunction transcript(){',attachStart);
 if(attachStart<0||attachEnd<0) throw new Error('attachLiveStream source boundary not found');
 eval(extractFunc(messagesSrc,'_dispatchExtensionTurnLifecycle'));
-eval(messagesSrc.slice(attachStart,attachEnd));
+let attachSrc=messagesSrc.slice(attachStart,attachEnd);
+if(process.env.ISSUE5720_REASONING_BOUNDARY){
+  const boundaryMarker='  (async()=>{\n    // Reattach path';
+  if(!attachSrc.includes(boundaryMarker)) throw new Error('stream boundary hook not found');
+  attachSrc=attachSrc.replace(boundaryMarker, `
+    window.reasoningBoundary=kind=>{
+      if(kind==='terminal'){
+        _streamFinalized=true;
+        _cancelAnimationFramePendingStreamRender();
+      }else{
+        _applyToAnchor('tool',{name:'terminal',tid:'qa-tool',args:{command:'pwd'}});
+      }
+    };
+    (async()=>{\n    // Reattach path`);
+}
+eval(attachSrc);
 attachLiveStream('sid-1','stream-1');
 const source=FakeEventSource.instances[0];
 if(!source) throw new Error('attachLiveStream did not create EventSource');
 if(process.env.ISSUE5720_STALE_ACTIVE_STREAM==='1') S.activeStreamId='stream-new';
+if(deferredFrames){
+  const text='R'.repeat(226748);
+  for(let i=0;i<text.length;i+=2000) source.emit('reasoning',{text:text.slice(i,i+2000)});
+  const rendersBeforeFrame=anchorRenderAttempts;
+  if(process.env.ISSUE5720_SWITCH_BEFORE_FRAME==='1') S.session={session_id:'sid-2'};
+  if(process.env.ISSUE5720_REASONING_BOUNDARY==='interim'){
+    source.emit('interim_assistant',{text:'Visible answer',already_streamed:true});
+  }else if(process.env.ISSUE5720_REASONING_BOUNDARY){
+    window.reasoningBoundary(process.env.ISSUE5720_REASONING_BOUNDARY);
+  }
+  for(const [id,fn] of Array.from(frames)){frames.delete(id);fn();}
+  const registry=window._liveAnchorRegistries.get('stream-1');
+  const event=registry.anchor.activity_events.find(e=>e.source_event_type==='reasoning');
+  process.stdout.write(JSON.stringify({
+    renders_before_frame:rendersBeforeFrame,
+    renders_after_frame:anchorRenderAttempts,
+    inflight_chars:INFLIGHT['sid-1'].lastReasoningText.length,
+    anchor_chars:event&&event.payload.text.length||0,
+  }));
+  process.exit(0);
+}
 
 function anchorReasoningRows(){
   return turn.querySelectorAll(
