@@ -2407,8 +2407,10 @@ const S={activeProfile:'default'};
 console.warn=()=>{};
 function $(){return {value:''};}
 function _sessionListQueryString(){return '';}
-function _isSessionListUserInteracting(){return false;}
-function _schedulePendingSessionListApply(){}
+let _queueUserInteracting=false;
+function _isSessionListUserInteracting(){return _queueUserInteracting;}
+const _queueDeferredApplies=[];
+function _schedulePendingSessionListApply(){_queueDeferredApplies.push(true);}
 function _requestedSessionSidebarSource(){return 'webui';}
 function _sessionListExcludeHiddenEnabled(){return false;}
 function _clearSessionSourceTabCounts(){}
@@ -2587,4 +2589,68 @@ def test_profile_scope_invalidation_cancels_queued_recovery_inheritance():
         "activeCleared": True,
         "afterInvalidateQueuedOpts": {},
         "appliedAfter": [{"unreadGen": 0}],
+    }
+
+
+def test_active_poll_does_not_downgrade_a_queued_native_create_refresh():
+    """An active background poll must not leak its deferWhileInteracting:true
+    into a refresh queued behind it.
+
+    The native create completion (the shipped ``renderSessionList`` call with
+    the keep-picker intent, editor still focused) must inherit only the active
+    request's upgrades: the successor settles immediately instead of parking
+    the payload as a deferred apply while the interaction continues. The
+    rename / default-render lane (a plain ``renderSessionList()``) must not
+    pick up a leaked deferral either.
+    """
+    assert NODE is not None
+    script = _QUEUE_HARNESS + _session_list_queue_and_refresh_sources() + r"""
+(async()=>{
+  const out={};
+
+  // Editor still focused: the list sees an active interaction throughout.
+  // Exactly two requests exist — one background poll, plus the create
+  // completion refresh queued behind it; no second queued poll.
+  _queueUserInteracting=true;
+  const poll=renderSessionList({deferWhileInteracting:true});
+  await waitForHeld(1);
+
+  const createRefresh=renderSessionList({keepProjectPicker:true});
+  out.createQueuedOpts=JSON.parse(JSON.stringify(_renderSessionListQueuedRequest.opts));
+
+  // The poll's discarded response settles, then the successor's real refresh.
+  held[0].resolve(payloadOk);
+  await waitForHeld(2);
+  held[1].resolve(payloadOk);
+  await createRefresh;
+  out.createApplied=applied.slice(); applied.length=0;
+  out.pendingPayloadCleared=_pendingSessionListPayload===null;
+  out.deferredApplies=_queueDeferredApplies.length;
+  out.stillInteracting=_isSessionListUserInteracting();
+
+  // Rename / default-render lane: a plain renderSessionList() queued behind
+  // an active poll gains no leaked deferral either.
+  const poll2=renderSessionList({deferWhileInteracting:true});
+  await waitForHeld(3);
+  renderSessionList();
+  out.renameQueuedOpts=JSON.parse(JSON.stringify(_renderSessionListQueuedRequest.opts));
+  held[2].resolve(payloadOk);
+  await waitForHeld(4);
+  held[3].resolve(payloadOk);
+  await poll2;
+  out.renameApplied=applied.slice();
+
+  console.log(JSON.stringify(out));
+})().catch(error=>{console.error(error&&error.stack||error);process.exit(1);});
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "createQueuedOpts": {"keepProjectPicker": True},
+        "createApplied": [{"unreadGen": 0, "keepProjectPicker": True}],
+        "pendingPayloadCleared": True,
+        "deferredApplies": 0,
+        "stillInteracting": True,
+        "renameQueuedOpts": {},
+        "renameApplied": [{"unreadGen": 0}],
     }

@@ -6157,10 +6157,10 @@ window.addEventListener('resize',()=>{
 let _renderSessionListGen = 0;
 let _renderSessionListInFlight = null;
 let _renderSessionListQueuedRequest = null;
-// The request currently being drained. A call that queues behind it merges
-// this request's options into the successor so recovery/repaint intent
-// (keep-picker, nondeferred recovery) survives the supersession — the active
-// response is discarded as stale and the successor is what paints.
+// The request currently being drained. A call that queues behind it inherits
+// this request's recovery/repaint upgrades into the successor — keep-picker,
+// nondeferred recovery — so the supersession cannot silently downgrade them;
+// the active response is discarded as stale and the successor is what paints.
 let _renderSessionListActiveRequest = null;
 let _sessionListRefreshAnimationPending = false;
 let _sessionListFirstRenderAnimated = false;
@@ -6830,15 +6830,22 @@ async function renderSessionList(opts={}){
   if(_renderSessionListInFlight){
     // The active request's response is discarded as stale when this call
     // supersedes its generation; the queued request is what actually settles
-    // and paints. Carry the active request's recovery/repaint intent into the
-    // successor through the same maintained merge so the supersession cannot
-    // silently downgrade it to ordinary background churn. Invalidation clears
-    // the queue instead of inheriting it.
-    const inherited=_mergeRenderSessionListOptions(
-      _renderSessionListActiveRequest&&_renderSessionListActiveRequest.opts,
+    // and paints. Carry only the active request's recovery/repaint upgrades
+    // into the successor — an explicit nondeferred intent and the keep-picker
+    // keep — so the supersession cannot silently downgrade them. Never inherit
+    // an active background request's deferWhileInteracting:true: a new caller
+    // (e.g. the project-create refresh) may rely on immediate rendering by
+    // default, and the inherited deferral would park its payload until the
+    // interaction ends. Invalidation clears the queue instead of inheriting it.
+    const activeOpts=_renderSessionListActiveRequest&&_renderSessionListActiveRequest.opts;
+    const inherited={};
+    if(activeOpts&&activeOpts.deferWhileInteracting===false) inherited.deferWhileInteracting=false;
+    if(activeOpts&&activeOpts.keepProjectPicker===true) inherited.keepProjectPicker=true;
+    const queuedOpts=_mergeRenderSessionListOptions(
+      inherited,
       _renderSessionListQueuedRequest&&_renderSessionListQueuedRequest.opts);
     _renderSessionListQueuedRequest={
-      opts:_mergeRenderSessionListOptions(inherited, request.opts),
+      opts:_mergeRenderSessionListOptions(queuedOpts, request.opts),
       gen:request.gen,
     };
     return _renderSessionListInFlight;
