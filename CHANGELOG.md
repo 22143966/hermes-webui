@@ -135,6 +135,12 @@
 
 ### Fixed
 
+- **A run that saved memory or a skill just before the WebUI restarted no longer loses that update.** If the server
+  stopped after the run journal recorded a `state_saved` side effect but before the session applied it, reconnecting
+  restored the Worklog rows but silently dropped the saved-state entry. Recovery now replays those side effects from
+  the journal into the turn, exactly once, without touching the journal; very large turns keep their Worklog rows
+  instead of failing the save. Thanks @franksong2702. (#7859)
+
 - **The same mermaid diagram in two replies now renders in both.** Identical replies reuse cached markdown, so both
   diagrams carried the same render id; drawing the second one silently emptied the first (and a later identical reply
   could fall back to a plain code block), even after a reload. Each diagram now gets its own id before it is drawn.
