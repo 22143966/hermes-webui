@@ -135,6 +135,23 @@
 
 ### Fixed
 
+- **The model picker no longer trusts a models cache that was only recently touched.** The session-visit freshness
+  check used the cache file's modified time, so anything that touched the file (a copy, a sync, a backup) kept a stale
+  catalog looking fresh. The cache now records when it was actually built (`_built_at`) and the 300 s refresh is measured
+  from that; caches written by older versions, or carrying an invalid or future stamp, fall back to the file time as
+  before. Cache hits still do no writes. Thanks @webtecnica. (#7932, refs #7723)
+
+- **A run that saved memory or a skill just before the WebUI restarted no longer loses that update.** If the server
+  stopped after the run journal recorded a `state_saved` side effect but before the session applied it, reconnecting
+  restored the Worklog rows but silently dropped the saved-state entry. Recovery now replays those side effects from
+  the journal into the turn, exactly once, without touching the journal; very large turns keep their Worklog rows
+  instead of failing the save. Thanks @franksong2702. (#7859)
+
+- **The same mermaid diagram in two replies now renders in both.** Identical replies reuse cached markdown, so both
+  diagrams carried the same render id; drawing the second one silently emptied the first (and a later identical reply
+  could fall back to a plain code block), even after a reload. Each diagram now gets its own id before it is drawn.
+  Thanks @johnDEFI. (#8159)
+
 - **New chats answer faster: the session ID no longer breaks the model's prompt cache.** Every new chat put its own
   session ID near the end of the system prompt, so no two chats ever shared a cacheable prompt and the model had to
   re-read it from that line on each time (on a local backend the reporter saw 15-18 s first responses drop to 2-3 s).
