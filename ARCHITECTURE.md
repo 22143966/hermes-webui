@@ -1660,6 +1660,14 @@ Complete list of all HTTP endpoints as of Sprint 1 (v0.3).
                                metadata. Outline jump and jump-to-start opt in to the
                                full transcript via the explicit `msg_limit=all`
                                escape hatch. See #7310 / #7625 / #7628.
+                               `messages=0` returns metadata without constructing
+                               canonical regeneration state or emitting
+                               `regeneration_revision`. Existing summary reads
+                               still detect external transcript growth. Clients
+                               obtain regeneration authority on the message-load
+                               path before regenerating. Existing read-only,
+                               `_messages_truncated`, and imported-turn ownership
+                               gates remain in force.
     /api/sessions              List of all session compact() dicts, sorted by updated_at
     /api/list                  ?session_id=X&path=. -> directory listing for session workspace
     /api/file                  ?session_id=X&path=rel -> file content (text, 200KB limit)

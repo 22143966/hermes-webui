@@ -14386,7 +14386,8 @@ def _handle_session_get(handler, parsed) -> bool:
             for row in _all_msgs
         )
         if (
-            not raw.get("read_only")
+            load_messages
+            and not raw.get("read_only")
             and not _truncated
             and (not raw.get("is_cli_session") or imported_turn_marker)
         ):
