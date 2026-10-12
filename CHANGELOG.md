@@ -135,6 +135,10 @@
 
 ### Fixed
 
+- **The Memory panel's Project Context section and the sidebar project chips are now translated.** They were
+  hard-coded English in every locale; all 15 locales now carry the strings (English text unchanged), and the residual
+  untranslated Russian values are filled in. Thanks @MuhammadUsamaMX. (#8178, refs #7579)
+
 - **Feishu and DingTalk chats now show up as messaging sessions in the sidebar.** Gateway sessions from those two
   platforms were classified as "other" with a raw source label, so they missed the messaging filter and the external
   session handling every other chat platform gets. Both are now in the messaging source set with proper labels, on the
