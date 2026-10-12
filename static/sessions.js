@@ -3104,7 +3104,7 @@ const _HANDOFF_THRESHOLD = 10;  // conversation rounds
 const _HANDOFF_STORAGE_PREFIX = 'handoff:';
 const _HANDOFF_SUFFIX_DISMISSED_AT = 'dismissed_at';
 const _HANDOFF_SUFFIX_SUMMARY_HANDLED_AT = 'summary_handled_at';
-const _MESSAGING_RAW_SOURCES = new Set(['weixin', 'telegram', 'discord', 'slack', 'email', 'wecom', 'wecom_callback', 'matrix', 'signal']);
+const _MESSAGING_RAW_SOURCES = new Set(['weixin', 'telegram', 'discord', 'slack', 'email', 'wecom', 'wecom_callback', 'matrix', 'signal', 'feishu', 'dingtalk']);
 const _MESSAGING_SOURCE_LABELS = {
   weixin: 'WeChat',
   telegram: 'Telegram',
@@ -3115,6 +3115,8 @@ const _MESSAGING_SOURCE_LABELS = {
   wecom_callback: 'WeCom Callback',
   matrix: 'Matrix',
   signal: 'Signal',
+  feishu: 'Feishu',
+  dingtalk: 'DingTalk',
 };
 
 function _isMessagingSession(session) {
