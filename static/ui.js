@@ -7327,10 +7327,36 @@ function _activityLastObservedAge(group){
   if(!Number.isFinite(stamp)||stamp<=0)return null;
   return Math.max(0,_activityNowSeconds()-stamp);
 }
+function _intlFormatter(locales, options){
+  // Shared Intl.DateTimeFormat cache for per-row timestamp labels: building a
+  // formatter per row dominated long-transcript renders. The browser's default
+  // locale/time zone can change while the page is open (OS time-zone change),
+  // so re-check it once per task (one probe per render, not per row) and drop
+  // every cached formatter when it differs.
+  const f=_intlFormatter;
+  if(!f._envChecked){
+    const o=new Intl.DateTimeFormat().resolvedOptions();
+    const env=o.locale+'|'+o.timeZone;
+    if(env!==f._env||!f._cache){ f._cache=new Map(); f._env=env; }
+    f._envChecked=true;
+    queueMicrotask(()=>{ f._envChecked=false; });
+  }
+  const key=JSON.stringify([locales,options]);
+  let fmt=f._cache.get(key);
+  if(!fmt){ fmt=new Intl.DateTimeFormat(locales,options); f._cache.set(key,fmt); }
+  return fmt;
+}
 function _activityClockLabel(ts){
   const stamp=Number(ts||_activityNowSeconds());
   if(!Number.isFinite(stamp)||stamp<=0)return'';
-  try{return new Date(stamp*1000).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});}catch(_){return'';}
+  try{
+    const d=new Date(stamp*1000);
+    // Date's locale methods return "Invalid Date", whereas Intl.format throws.
+    if(isNaN(d.getTime()))return d.toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+    const opts={hour:'numeric',minute:'2-digit'};
+    const fmt=typeof _intlFormatter==='function'?_intlFormatter([],opts):new Intl.DateTimeFormat([],opts);
+    return fmt.format(d);
+  }catch(_){return'';}
 }
 // Full date+time label for the worklog event-time tooltip (title attr). Guards the
 // same valid-Date range as _timestampSeconds so a bad epoch never yields "Invalid
@@ -7341,7 +7367,9 @@ function _activityFullClockLabel(ts){
   try{
     const d=new Date(stamp*1000);
     if(isNaN(d.getTime()))return'';
-    return d.toLocaleString([], {year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+    const opts={year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'};
+    const fmt=typeof _intlFormatter==='function'?_intlFormatter([],opts):new Intl.DateTimeFormat([],opts);
+    return fmt.format(d);
   }catch(_){return'';}
 }
 function _timestampSeconds(value){

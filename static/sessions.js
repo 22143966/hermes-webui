@@ -7633,17 +7633,35 @@ function _formatInServerTz(date, options) {
   // timeZone:'UTC' so no further conversion is applied — the formatted
   // output reads as the wall-clock time in the server's timezone.
   //
-  // Falls back to plain `date.toLocaleString(undefined, options)` (browser
-  // timezone) when _serverTz is absent, UTC, or malformed.
-  if (!_serverTz || _serverTz === '+0000' || _serverTz === '-0000') {
-    return date.toLocaleString(undefined, options);
+  // Uses the browser timezone when _serverTz is absent, UTC, or malformed.
+  // Reuse Intl formatters for the repeated options in message footers.
+  let adjusted = date;
+  let opts = options;
+  const m = _serverTz && _serverTz !== '+0000' && _serverTz !== '-0000'
+    ? _serverTz.match(/^([+-])(\d{2})(\d{2})$/) : null;
+  if (m) {
+    const sign = m[1] === '+' ? 1 : -1;
+    const offsetMin = sign * (parseInt(m[2]) * 60 + parseInt(m[3]));
+    adjusted = new Date(date.getTime() + offsetMin * 60 * 1000);
+    opts = { ...options, timeZone: 'UTC' };
   }
-  const m = _serverTz.match(/^([+-])(\d{2})(\d{2})$/);
-  if (!m) return date.toLocaleString(undefined, options);
-  const sign = m[1] === '+' ? 1 : -1;
-  const offsetMin = sign * (parseInt(m[2]) * 60 + parseInt(m[3]));
-  const adjusted = new Date(date.getTime() + offsetMin * 60 * 1000);
-  return adjusted.toLocaleString(undefined, { ...options, timeZone: 'UTC' });
+  // Keep Date's invalid-date and unusual options semantics on the native path.
+  // Intl reads non-enumerable options too, which a spread copy would drop.
+  if (isNaN(adjusted.getTime()) || (opts !== undefined &&
+      (opts === null || Object.getPrototypeOf(opts) !== Object.prototype ||
+       Object.getOwnPropertyNames(opts).some(k => !Object.prototype.propertyIsEnumerable.call(opts, k))))) {
+    return adjusted.toLocaleString(undefined, opts);
+  }
+  opts = { ...opts };
+  // toLocaleString defaults to BOTH date and time; DateTimeFormat defaults
+  // to date only. Supply the same defaults, including for the footer's {}.
+  if (['weekday','year','month','day','dayPeriod','hour','minute','second',
+       'fractionalSecondDigits','dateStyle','timeStyle'].every(key => opts[key] === undefined)) {
+    Object.assign(opts, {year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'numeric',second:'numeric'});
+  }
+  const fmt = typeof _intlFormatter === 'function'
+    ? _intlFormatter(undefined, opts) : new Intl.DateTimeFormat(undefined, opts);
+  return fmt.format(adjusted);
 }
 
 function _isoOffsetMinutes(iso) {
