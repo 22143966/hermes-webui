@@ -8878,7 +8878,7 @@ function renderSessionListFromCache(){
     // "All" chip
     const allChip=document.createElement('span');
     allChip.className='project-chip'+(!_activeProject?' active':'');
-    allChip.textContent='All';
+    allChip.textContent=t('project_chip_all');
     allChip.onclick=()=>{_setActiveProjectFilter(null);};
     bar.appendChild(allChip);
     // "Unassigned" chip — only when there are sessions with no project to
@@ -8887,8 +8887,8 @@ function renderSessionListFromCache(){
     if(hasUnprojected){
       const noneChip=document.createElement('span');
       noneChip.className='project-chip no-project'+(_activeProject===NO_PROJECT_FILTER?' active':'');
-      noneChip.textContent='Unassigned';
-      noneChip.title='Show conversations not yet assigned to a project';
+      noneChip.textContent=t('project_chip_unassigned');
+      noneChip.title=t('project_chip_unassigned_title');
       noneChip.onclick=()=>{_setActiveProjectFilter(NO_PROJECT_FILTER);};
       bar.appendChild(noneChip);
     }
