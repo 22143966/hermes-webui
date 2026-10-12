@@ -4357,6 +4357,23 @@ function _bumpMessagesGeneration() {
   return _messagesGeneration;
 }
 
+// #7882 (greptile round-6 P2): server-known transcript rows (older pages,
+// wholesale reloads, gateway imports) must never land inside the send's
+// optimistic visible-count bump. The snapshot pair
+// (_visibleBaselineLocal, _visibleBaselineServer) is sticky across sends, so
+// a transcript change that lands outside a send has to advance the local
+// half by exactly the visible rows that change added — otherwise the next
+// send's bump (localVisible − baseline) counts those rows a second time.
+// The server half stays anchored: the server's visible total already
+// includes these rows, so raising it would double-count them.
+function _advanceVisibleBaselineForServerKnownRows(sid, addedVisibleRows){
+  if(!(addedVisibleRows>0)) return;
+  if(!S.session || S.session.session_id !== sid) return;
+  if(typeof S.session._visibleBaselineLocal==='number'){
+    S.session._visibleBaselineLocal+=addedVisibleRows;
+  }
+}
+
 async function _loadOlderMessages() {
   if (_loadingOlder || !_messagesTruncated) return;
   const sid = S.session ? S.session.session_id : null;
@@ -4486,14 +4503,17 @@ async function _loadOlderMessages() {
     // #7882 (greptile round-4 P2): older rows prepended during an in-flight
     // send are server-known rows — advance the send's optimistic-count
     // baseline by exactly the prepended visible rows so the send's eventual
-    // bump stays its own rows only. When idle there is no pending bump to
-    // protect; the next send snapshots fresh anyway.
-    if(S.session && S.session.session_id === sid && S.busy){
-      const prependedVisible=olderMsgs.filter(m=>m&&m.role&&m._source!=='delegation_wakeup').length;
-      if(typeof S.session._visibleBaselineLocal==='number'){
-        S.session._visibleBaselineLocal+=prependedVisible;
-      }
-    }
+    // bump stays its own rows only.
+    // #7882 (greptile round-6 P2): apply the same advance while IDLE. The
+    // snapshot pair is sticky across sends: after idle pagination it still
+    // reflects the pre-paginated tail, so the next send's bump
+    // (localVisible − baseline) would count every prepended row a second
+    // time (30 older + 1 send → +31). Prepends are rows the server already
+    // counts, so moving the local half keeps the send's delta send-scoped in
+    // both states; the server half stays anchored (the server total already
+    // includes the prepends — raising it would double-count them).
+    _advanceVisibleBaselineForServerKnownRows(sid,
+      olderMsgs.filter(m=>m&&m.role&&m._source!=='delegation_wakeup').length);
     // renderMessages() windows long transcripts from the end. If we do not
     // expand that window before rendering, the newly prepended page stays
     // hidden and the "hidden" counter rises while the viewport appears stuck.
@@ -4595,6 +4615,10 @@ async function _ensureAllMessagesLoaded() {
     // Loading older messages also does a wholesale replace of S.messages
     // and would otherwise drop _turnUsage/_turnDuration/_turnTps/
     // _gatewayRouting/_statusCard/_anchor_stream_id on the existing turns.
+    // #7882 (greptile round-6 P2): snapshot the visible tail length BEFORE the
+    // wholesale replace so the in-flight-send baseline advance below can
+    // compute exactly how many visible rows the replace added.
+    const _visibleLenBeforeReplace=(Array.isArray(S.messages)?S.messages:[]).filter(m=>m&&m.role&&m._source!=='delegation_wakeup').length;
     let _msgsToAssign = msgs;
     if (typeof window._carryForwardEphemeralTurnFields === 'function') {
       _msgsToAssign = window._carryForwardEphemeralTurnFields(S.messages || [], msgs);
@@ -4613,11 +4637,29 @@ async function _ensureAllMessagesLoaded() {
       // sidebar falls back from to the RAW count — counting hidden wakeups
       // again. The stale server value is also simply wrong for the fresh
       // transcript: data.session.visible_message_count is its authority.
+      // #7882 (greptile round-6 P2): while a send is IN FLIGHT, the replace
+      // only added server-known rows — advance the send's local baseline by
+      // the visible-row delta instead of re-deriving the pair, so the
+      // in-flight bump stays scoped to the send's own rows (same rule as
+      // _loadOlderMessages). Retiring the pair outright would make the
+      // updater's fallback re-snapshot adopt the caller's pre-send
+      // localVisibleBeforePush — stale after the replace — and re-count the
+      // replaced rows.
       if(!S.busy){
         S.session._visibleBaselineLocal=(Array.isArray(S.messages)?S.messages:[]).filter(m=>m&&m.role&&m._source!=='delegation_wakeup').length;
         S.session._visibleBaselineServer=(typeof data.session.visible_message_count==='number'&&data.session.visible_message_count>=0)
           ?data.session.visible_message_count
           :S.session._visibleBaselineLocal;
+      }else{
+        // #7882 (greptile round-6 P2): a send is in flight — the replace only
+        // added server-known rows, so advance the send's local baseline by
+        // the visible-row delta (same rule as _loadOlderMessages). Retiring
+        // the pair outright would make the updater's fallback re-snapshot
+        // adopt the caller's pre-send localVisibleBeforePush — stale after
+        // the replace — and re-count the replaced rows.
+        const _visibleLenAfterReplace=(Array.isArray(S.messages)?S.messages:[]).filter(m=>m&&m.role&&m._source!=='delegation_wakeup').length;
+        _advanceVisibleBaselineForServerKnownRows(sid,
+          Math.max(0,_visibleLenAfterReplace-_visibleLenBeforeReplace));
       }
       if (Object.prototype.hasOwnProperty.call(data.session, 'regeneration_revision')) {
         S.session.regeneration_revision = data.session.regeneration_revision;
@@ -7237,6 +7279,61 @@ function _isDuplicateGatewaySessionSnapshot(sessions){
   return _gatewaySessionSnapshotKey(incoming)===_gatewaySessionSnapshotKey(currentGatewaySessions);
 }
 
+// Gateway SSE 'sessions_changed' → the active external session's transcript
+// may have changed on the CLI/gateway side. Applies a validated import_cli
+// refresh result to the live pane. Extracted from startGatewaySSE()'s inline
+// .then callback (#7882 greptile round-6 P2) so the transcript replacement —
+// including the optimistic-count baseline re-pair — is executable as a unit
+// instead of only reachable through a live EventSource.
+// Guards preserved from the inline version: session still active, transcript
+// grew, and (when a transcript already exists) the fresh rows extend the
+// local prefix rather than diverging from it.
+function _applyGatewayCliImportRefresh(activeSid,res){
+  if(!S.session || S.session.session_id !== activeSid) return;
+  if(!res || !res.session || !Array.isArray(res.session.messages)) return;
+  const prev = S.messages.length;
+  const next = res.session.messages.filter(m => m && m.role);
+  if (next.length < prev) return;
+  if (prev > 0 && !_isCliImportRefreshPrefixMatch(S.messages, next)) return;
+  // Carry forward ephemeral turn fields (_turnUsage/
+  // _turnDuration/_turnTps/_gatewayRouting/_statusCard/
+  // _anchor_stream_id) so
+  // gateway-driven CLI refreshes do not drop the badge.
+  let _nextToAssign = next;
+  if (typeof window._carryForwardEphemeralTurnFields === 'function') {
+    _nextToAssign = window._carryForwardEphemeralTurnFields(S.messages || [], next);
+  }
+  S.messages = _nextToAssign;
+  if(S.session && S.session.session_id === activeSid){
+    S.session.message_count = next.length;
+    // #7882 (greptile round-5 P2): gateway refresh replaced the transcript
+    // while idle — re-baseline the optimistic-count snapshot. Both halves
+    // move together (see _ensureMessagesLoaded): a local-only baseline
+    // NaN-poisons the next send's visible-count bump.
+    // #7882 (greptile round-6 P2): take the server half from the import
+    // response's visible_message_count (compact() always carries it) instead
+    // of mirroring the local count — hidden delegation rows make the two
+    // differ, and the sticky pair must track the server's visible total or
+    // the next send's bump re-counts those rows. This helper only runs while
+    // idle (guarded by !S.busy upstream in startGatewaySSE), so no
+    // in-flight-send branch is needed.
+    S.session._visibleBaselineLocal=(Array.isArray(S.messages)?S.messages:[]).filter(m=>m&&m.role&&m._source!=='delegation_wakeup').length;
+    S.session._visibleBaselineServer=(typeof res.session.visible_message_count==='number'&&res.session.visible_message_count>=0)
+      ?res.session.visible_message_count
+      :S.session._visibleBaselineLocal;
+    const newest = next.length ? next[next.length - 1] : null;
+    const newestTs = Number((newest && (newest.timestamp || newest._ts)) || 0);
+    if(newestTs){
+      S.session.last_message_at = newestTs;
+      S.session.updated_at = newestTs;
+    }
+  }
+  if(S.messages.length !== prev){
+    renderMessages({preserveScroll:true});
+    if(typeof highlightCode==='function') highlightCode();
+  }
+}
+
 async function probeGatewaySSEStatus(){
   if(_gatewayProbeInFlight || !window._showCliSessions) return;
   _gatewayProbeInFlight = true;
@@ -7308,46 +7405,7 @@ function startGatewaySSE(){
               // If the user switches sessions while the fetch is in-flight, discard the result.
               const activeSid = S.session.session_id;
               api('/api/session/import_cli',{method:'POST',body:JSON.stringify(_externalImportPayload(S.session))})
-                .then(res=>{
-                  if(!S.session || S.session.session_id !== activeSid) return;
-                  if(res && res.session && Array.isArray(res.session.messages)){
-                    const prev = S.messages.length;
-                    const next = res.session.messages.filter(m => m && m.role);
-                    if (next.length < prev) return;
-                    if (prev > 0 && !_isCliImportRefreshPrefixMatch(S.messages, next)) return;
-                    // Carry forward ephemeral turn fields (_turnUsage/
-                    // _turnDuration/_turnTps/_gatewayRouting/_statusCard/
-                    // _anchor_stream_id) so
-                    // gateway-driven CLI refreshes do not drop the badge.
-                    let _nextToAssign = next;
-                    if (typeof window._carryForwardEphemeralTurnFields === 'function') {
-                      _nextToAssign = window._carryForwardEphemeralTurnFields(S.messages || [], next);
-                    }
-                    S.messages = _nextToAssign;
-                    if(S.session && S.session.session_id === activeSid){
-                      S.session.message_count = next.length;
-                      // #7882 (greptile round-5 P2): gateway refresh replaced
-                      // the transcript while idle — re-baseline the
-                      // optimistic-count snapshot. Both halves move together
-                      // (see _ensureMessagesLoaded): a local-only baseline
-                      // NaN-poisons the next send's visible-count bump.
-                      if(!S.busy){
-                        S.session._visibleBaselineLocal=(Array.isArray(S.messages)?S.messages:[]).filter(m=>m&&m.role&&m._source!=='delegation_wakeup').length;
-                        S.session._visibleBaselineServer=S.session._visibleBaselineLocal;
-                      }
-                      const newest = next.length ? next[next.length - 1] : null;
-                      const newestTs = Number((newest && (newest.timestamp || newest._ts)) || 0);
-                      if(newestTs){
-                        S.session.last_message_at = newestTs;
-                        S.session.updated_at = newestTs;
-                      }
-                    }
-                    if(S.messages.length !== prev){
-                      renderMessages({preserveScroll:true});
-                      if(typeof highlightCode==='function') highlightCode();
-                    }
-                  }
-                })
+                .then(res=>_applyGatewayCliImportRefresh(activeSid,res))
                 .catch(()=>{ /* ignore — next poll will retry */ });
             }
           }
