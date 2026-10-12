@@ -1369,6 +1369,19 @@ def _deduplicate_exact_stable_messages(messages):
     def _is_missing_or_blank(value):
         return value is None or (type(value) is str and not value.strip())
 
+    def _fingerprint(message):
+        try:
+            canonical = json.dumps(
+                message,
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            return None
+        return hashlib.sha256(canonical).digest()
+
     for message in messages_snapshot:
         if not isinstance(message, dict):
             guarded.append(message)
@@ -1388,19 +1401,24 @@ def _deduplicate_exact_stable_messages(messages):
             "timestamp",
             timestamp_component,
         )
-        try:
-            canonical = json.dumps(
-                message,
-                allow_nan=False,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        except (TypeError, ValueError):
+        seen = seen_by_identity.get(identity)
+        if seen is None:
+            # A unique identity cannot authorize a deletion. Retain its deep
+            # snapshot now and defer canonicalization until it actually repeats.
+            seen_by_identity[identity] = (message, None)
             guarded.append(message)
             continue
-        fingerprint = hashlib.sha256(canonical).digest()
-        identity_variants = seen_by_identity.setdefault(identity, {})
+        first, identity_variants = seen
+        if identity_variants is None:
+            identity_variants = {}
+            first_fingerprint = _fingerprint(first)
+            if first_fingerprint is not None:
+                identity_variants[first_fingerprint] = [first]
+            seen_by_identity[identity] = (first, identity_variants)
+        fingerprint = _fingerprint(message)
+        if fingerprint is None:
+            guarded.append(message)
+            continue
         prior_variants = identity_variants.setdefault(fingerprint, [])
         if any(prior == message for prior in prior_variants):
             removed += 1
