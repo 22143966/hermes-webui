@@ -135,6 +135,12 @@
 
 ### Fixed
 
+- **The model picker no longer trusts a models cache that was only recently touched.** The session-visit freshness
+  check used the cache file's modified time, so anything that touched the file (a copy, a sync, a backup) kept a stale
+  catalog looking fresh. The cache now records when it was actually built (`_built_at`) and the 300 s refresh is measured
+  from that; caches written by older versions, or carrying an invalid or future stamp, fall back to the file time as
+  before. Cache hits still do no writes. Thanks @webtecnica. (#7932, refs #7723)
+
 - **A run that saved memory or a skill just before the WebUI restarted no longer loses that update.** If the server
   stopped after the run journal recorded a `state_saved` side effect but before the session applied it, reconnecting
   restored the Worklog rows but silently dropped the saved-state entry. Recovery now replays those side effects from
