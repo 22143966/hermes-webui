@@ -181,7 +181,9 @@ def test_frequently_accessed_but_old_built_catalog_still_refreshes(tmp_path, mon
 
     monkeypatch.setattr(cfg, "_SESSION_VISIT_MODELS_FRESHNESS_SECONDS", 300.0, raising=False)
     monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
-    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: None)
+    # The disk cache is present and loadable: only the _built_at stamp can force the
+    # refresh here (returning None would force a rebuild on any tree).
+    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: stale_catalog)
     monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: stale_catalog)
     monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "demo"})
 
