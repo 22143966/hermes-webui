@@ -7711,20 +7711,40 @@ def _sanitize_messages_for_agent(
     against the Agent's returned list, so it must model the Agent's merge or
     every second successive follow-up drops its prompt and reply.
     """
+    # #7237 round 5: the cancelled-history block decisions pre-computed on the
+    # RAW rows (see the first branch below). Declared up front so the second
+    # branch can pass it unconditionally.
+    _blocked_pairs: set = set()
     if normalize_bare_assistant_adjacency:
-        # Normalize on the RAW rows BEFORE the API-safe projection: the
-        # cancelled-history block criterion below reads provenance that the
-        # projection strips (``_state_db_row_id``, ``_partial``,
-        # ``_recovered*``, timestamps), so the merge decision must happen
-        # while that provenance is still visible (#7237 round 4, cancelled
-        # readers/boundary regressions). The normalizer only ever collapses
-        # bare pairs the sanitizer's own pass-0 merge deliberately leaves
-        # alone, so running it first cannot conflict with that merge.
+        # #7237 round 5: pre-compute the cancelled-history block decisions on
+        # the RAW rows and carry them into the post-projection merge. The
+        # block list reads provenance (``_state_db_row_id``, ``_partial``,
+        # ``_recovered*``, float clocks) that ``_sanitize_messages_for_api``
+        # strips, so the decision cannot be re-derived on the projected rows.
+        # The projection preserves row order, so the raw indices still name
+        # the same pair.
+        _blocked_pairs = set()
+        for _idx in range(1, len(messages)):
+            _prev = messages[_idx - 1]
+            _msg = messages[_idx]
+            if (
+                isinstance(_prev, dict)
+                and isinstance(_msg, dict)
+                and _prev.get("role") == "assistant"
+                and _msg.get("role") == "assistant"
+                and _replay_merge_blocked_by_cancelled_history(
+                    _prev,
+                    _msg,
+                    messages[_idx + 1] if _idx + 1 < len(messages) else None,
+                )
+            ):
+                _blocked_pairs.add((_idx - 1, _idx))
         # The user-pair merge mirrors the installed Agent's pass-3
-        # consecutive-user repair; it runs before the assistant merge so
-        # both Agent passes are modelled on the same input.
+        # consecutive-user repair. It stays BEFORE the projection (the
+        # reviewer's direction): plain-text user rows carry no provenance the
+        # block list needs, and merging them early cannot interact with the
+        # sanitizer's own pass-0.
         messages = _merge_agent_replay_bare_user_rows(messages)
-        messages = _merge_agent_replay_bare_assistant_rows(messages)
     sanitized = _sanitize_messages_for_api(
         messages,
         cfg=cfg,
@@ -7734,6 +7754,33 @@ def _sanitize_messages_for_agent(
         preserve_api_content=True,
         requested_provider=requested_provider,
     )
+    if normalize_bare_assistant_adjacency:
+        # #7237 round 5 (re-gate 10/11, both regressions): the bare-assistant
+        # normalization runs AFTER the API sanitizer, not before it.
+        #
+        # Before it, two regressions the reviewer reproduced on this head:
+        #
+        # 1. Verification supersession was defeated. The pre-sanitizer merge
+        #    CONCATENATED a provisional ``verification_required`` row with its
+        #    final replacement, so the sanitizer's own pass-0 merge — which
+        #    REPLACES such a row instead of unioning it — never saw the pair,
+        #    and the provisional text plus its finish reason survived.
+        # 2. The cancelled-history block list read provenance
+        #    (``_state_db_row_id``, ``_partial``, float clocks) to keep durable
+        #    rows addressable, but the merge still ran BEFORE that provenance
+        #    was stripped, so the outbound snapshot could hold separate rows
+        #    for a pair the installed Agent merges — the shape that dropped the
+        #    next exchange in the reviewer's controlled replay.
+        #
+        # With the sanitizer first, its pass-0 owns the assistant-adjacency
+        # contract (union for plain pairs, REPLACE for a superseded
+        # verification candidate) on the projected rows, and this merge only
+        # re-applies the Agent's unconditional collapse to the BARE pairs the
+        # pass-0 deliberately leaves alone. The pre-computed block set above
+        # keeps the cancelled-history rows separate across the projection. The
+        # user merge still runs on the raw rows, which is where its contract
+        # lives.
+        sanitized = _merge_agent_replay_bare_assistant_rows(sanitized, _blocked_pairs)
     return sanitized
 
 
@@ -7869,7 +7916,7 @@ def _merge_agent_replay_bare_user_rows(messages):
     return merged
 
 
-def _merge_agent_replay_bare_assistant_rows(messages):
+def _merge_agent_replay_bare_assistant_rows(messages, blocked_pairs=None):
     """Mirror the installed Agent's merge of adjacent bare assistant rows.
 
     The Agent's ``repair_message_sequence`` merges consecutive assistant turns
@@ -7900,9 +7947,20 @@ def _merge_agent_replay_bare_assistant_rows(messages):
       ``api_content`` sidecar (mirror of the Agent's
       ``drop_stale_api_content``), so the replay never resends pre-merge
       bytes the rewrite discarded.
+
+    ``blocked_pairs`` is the round-5 addition: the set of ``(prev_idx,
+    msg_idx)`` index pairs the caller pre-computed on the RAW rows. The
+    cancelled-history block list reads provenance (``_state_db_row_id``,
+    ``_partial``, float clocks) that ``_sanitize_messages_for_api`` strips, so
+    when this helper runs on the PROJECTED rows — which is where round 5 put
+    it — the block decision must be carried in rather than re-derived. The
+    caller computes it before the projection; the indices are positions in the
+    same list the sanitizer received, and the projection preserves row order,
+    so they still name the same pair.
     """
     if not isinstance(messages, list):
         return messages
+    _blocked = blocked_pairs if blocked_pairs is not None else set()
     merged: list = []
     for idx, msg in enumerate(messages):
         if not isinstance(msg, dict):
@@ -7910,6 +7968,17 @@ def _merge_agent_replay_bare_assistant_rows(messages):
             continue
         prev = merged[-1] if merged and isinstance(merged[-1], dict) else None
         next_row = messages[idx + 1] if idx + 1 < len(messages) else None
+        # #7237 round 5: the cancelled-history block decision. When the caller
+        # pre-computed it on the RAW rows (the projected-row call path), the
+        # pair is blocked iff it is in that set — re-deriving it here would
+        # read provenance the projection already stripped and silently
+        # un-block a pair that must stay separate. Without a pre-computed set
+        # (a raw-row caller) the live predicate still applies.
+        _pair_blocked = (
+            (idx - 1, idx) in _blocked
+            if _blocked
+            else _replay_merge_blocked_by_cancelled_history(prev, msg, next_row)
+        )
         if (
             prev is not None
             and prev.get("role") == "assistant"
@@ -7922,7 +7991,7 @@ def _merge_agent_replay_bare_assistant_rows(messages):
             and not _is_reasoning_only_assistant_message(msg)
             and not _is_non_replayable_history_row(prev)
             and not _is_non_replayable_history_row(msg)
-            and not _replay_merge_blocked_by_cancelled_history(prev, msg, next_row)
+            and not _pair_blocked
         ):
             survivor = copy.deepcopy(prev)
             prev_content = survivor.get("content")
