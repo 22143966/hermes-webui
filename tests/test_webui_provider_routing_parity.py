@@ -26,6 +26,12 @@ These tests:
     NOT env-expanded; only the main get_config() loader is), with the
     profile-scoped env taking precedence over process env, matching the
     streaming path's expanded config;
+  * structurally assert (AST) that the sync seam call runs inside
+    ``with profile_env_for_background_worker(s, ...)`` so a named profile's
+    ``provider_routing`` resolves against that profile's own .env on the
+    HTTP handler thread, not the server process env; and behaviorally prove
+    the binding: with the session profile env bound the profile .env value
+    wins, unbound the process env value is what the expansion picks up;
   * prove a stub ``AIAgent`` whose ``__init__`` lacks the routing params is
     still constructible through the sync gating (no TypeError);
   * prove the per-session agent-cache signature CHANGES when
@@ -42,6 +48,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import types
 
 ROUTING_KWARGS = {
     "provider_sort",
@@ -395,3 +402,135 @@ def test_sync_routing_kwargs_expand_env_vars(monkeypatch):
         "the profile-scoped env value must win over the process env"
     )
     assert "${" not in str(out2)
+
+
+# ── Sync-path profile env binding ──────────────────────────────────────────
+
+def _call_name(call: ast.Call):
+    """The callable's name for a bare or module-qualified call."""
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def test_chat_sync_routing_expansion_binds_session_profile_env():
+    """The sync seam's ``${VAR}`` expansion must run with the session's
+    profile env bound.
+
+    ``_expand_env_vars()`` resolves ``${VAR}`` thread-local-first, then
+    process env. The streaming worker binds the session profile's ``.env``
+    into the thread-local before reading its config, but the sync HTTP
+    handler thread (``POST /api/chat``) binds nothing. Unbound, a named
+    profile's ``provider_routing`` would resolve against the server process
+    env (the process-wide profile's ``.env``): an unset variable leaks
+    through as a literal, and a different process value applies the wrong
+    provider routing. Wrapping the seam call in
+    ``profile_env_for_background_worker(s, ...)`` makes the sync path expand
+    exactly like the streaming path; the manager is a no-op for
+    default-profile sessions."""
+    from api import routes as routes_mod
+    src_mod = inspect.getsource(routes_mod)
+    tree = ast.parse(src_mod)
+    fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "_handle_chat_sync"),
+        None,
+    )
+    assert fn is not None, "_handle_chat_sync not found in api/routes.py"
+
+    seam_calls = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_sync_routing_kwargs"
+    ]
+    assert seam_calls, (
+        "_handle_chat_sync must build routing kwargs via _sync_routing_kwargs"
+    )
+
+    for call in seam_calls:
+        bound = any(
+            isinstance(w, ast.With)
+            and any(
+                isinstance(item.context_expr, ast.Call)
+                and _call_name(item.context_expr)
+                == "profile_env_for_background_worker"
+                for item in w.items
+            )
+            and any(c is call for c in ast.walk(w))
+            for w in ast.walk(fn)
+        )
+        assert bound, (
+            "the _sync_routing_kwargs seam call must run inside "
+            "`with profile_env_for_background_worker(s, ...)` so ${VAR} in a "
+            "named profile's provider_routing resolves against that "
+            "profile's own .env instead of the server process env"
+        )
+
+
+def test_sync_routing_kwargs_resolve_named_profile_env_not_process_env(
+    tmp_path, monkeypatch
+):
+    """A named profile's ``provider_routing`` ``${VAR}`` must resolve
+    against that profile's ``.env`` on the sync path, not the server
+    process env.
+
+    This is the review finding's repro: with nothing bound on the handler
+    thread, the unbound expansion of
+    ``provider_routing.only = [${ROUTE_PROVIDER}]`` either leaked the
+    literal (variable unset in the process env) or picked up an unrelated
+    process value (wrong provider routing). ``profile_env_for_background_
+    worker`` binds the profile's ``.env`` into the thread-local and blocks
+    the process-env fallback, exactly what the streaming worker does before
+    reading its config."""
+    from api import config as config_mod
+    from api import profiles as profiles_mod
+    from api import routes as routes_mod
+
+    profile_home = tmp_path / "route-profile-home"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text(
+        "ROUTE_PROVIDER=profile-openrouter\n", encoding="utf-8"
+    )
+    # The manager resolves the profile home through this function.
+    monkeypatch.setattr(
+        profiles_mod, "get_hermes_home_for_profile",
+        lambda name: profile_home,
+    )
+    # A conflicting process-env value: exactly the wrong value the unbound
+    # (pre-fix) sync expansion would pick up.
+    monkeypatch.setenv("ROUTE_PROVIDER", "process-openrouter")
+    config_mod._clear_thread_env()
+    config_mod._thread_ctx.block_process_env_fallback = False
+
+    cfg = {"provider_routing": {"only": ["${ROUTE_PROVIDER}"], "sort": "price"}}
+    session = types.SimpleNamespace(profile="route-profile", session_id="s1")
+
+    # Unbound (the pre-fix handler state): the process env value is what the
+    # expansion resolves to.
+    unbound = routes_mod._sync_routing_kwargs(cfg, ROUTING_KWARGS)
+    assert unbound["providers_allowed"] == ["process-openrouter"], (
+        "baseline: without the profile env bound, the process env value is "
+        "what the unbound sync expansion resolves to"
+    )
+
+    # Bound, the way the handler now wraps the seam call:
+    with profiles_mod.profile_env_for_background_worker(
+        session, "sync provider routing", scope_skill_modules=False
+    ):
+        bound = routes_mod._sync_routing_kwargs(cfg, ROUTING_KWARGS)
+    assert bound["providers_allowed"] == ["profile-openrouter"], (
+        "with the session profile env bound, the profile's .env value must "
+        "win over the process env"
+    )
+    assert bound["provider_sort"] == "price"
+    assert "${" not in str(bound), (
+        "a literal ${...} reference must never reach the Agent"
+    )
+
+    # The manager restores the prior env state on exit.
+    after = routes_mod._sync_routing_kwargs(cfg, ROUTING_KWARGS)
+    assert after["providers_allowed"] == ["process-openrouter"]
+    assert config_mod._thread_ctx.block_process_env_fallback is False

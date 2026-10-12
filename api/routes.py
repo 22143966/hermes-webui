@@ -25290,11 +25290,26 @@ def _handle_chat_sync(handler, body):
             # resolved, never as a literal ${...} string in OpenRouter's
             # request body. Falls back to the active profile's config for
             # profile-less sessions.
+            # The expansion must run with this session's profile env bound:
+            # the HTTP handler thread for POST /api/chat has no profile-
+            # scoped thread-local env, so an unbound _expand_env_vars() would
+            # resolve ${VAR} against the server process env (the process-
+            # wide profile's .env). An unset variable would leak through as
+            # a literal and a different process value would apply the wrong
+            # provider routing, while the streaming path (which binds the
+            # profile env in its worker) does not. The manager is a no-op
+            # for default-profile sessions, so profile-less behavior is
+            # unchanged.
             try:
                 _sync_routing_params = set(inspect.signature(AIAgent.__init__).parameters)
             except (TypeError, ValueError):
                 _sync_routing_params = set()
-            _routing_kwargs = _sync_routing_kwargs(_pp_cfg, _sync_routing_params)
+            from api.profiles import profile_env_for_background_worker
+            with profile_env_for_background_worker(
+                s, "sync provider routing", logger_override=logger,
+                scope_skill_modules=False,
+            ):
+                _routing_kwargs = _sync_routing_kwargs(_pp_cfg, _sync_routing_params)
             agent = AIAgent(
                 model=_model,
                 provider=_provider,
