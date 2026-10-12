@@ -17065,7 +17065,7 @@ def handle_post(handler, parsed) -> bool:
                 next_draft["files"] = files
             next_draft = _project_session_draft_write(
                 {"text": text, "files": files, "goal_continuation_id": goal_continuation_id},
-                next_draft,
+                current_draft,
             )
             if next_draft == current_draft:
                 unchanged = True
@@ -26351,8 +26351,15 @@ def _handle_goal_command(handler, body):
     # goals. The runner does not drive the browser's queued continuation, so
     # there is no record to clear, and the sweep below runs on the runner's
     # traffic for goals it owns locally.
+    # #7855 re-gate CORE: only a CLEARED goal has no continuation coming. PAUSE
+    # keeps the goal (and its pending continuation) alive: pausing then resuming a
+    # deferred continuation used to delete the admission record here, and the
+    # resume path restored the active goal WITHOUT replacing the token — so the
+    # retry launched with `goal_related=false` and the goal loop silently stopped.
+    # Verified through real HTTP with the installed native GoalManager: master
+    # launches the retry with `goal_related=true`, this branch with `false`.
     if not runner_goal_owned:
-        if goal_adapter_action in ("clear", "pause"):
+        if goal_adapter_action == "clear":
             from api.goals import clear_pending_goal_continuation
 
             try:
