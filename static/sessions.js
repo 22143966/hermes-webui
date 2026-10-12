@@ -6413,9 +6413,9 @@ function _schedulePendingSessionListApply(){
     if(payload.gen!==_renderSessionListGen) return;
     // Profile switch may have bumped unread gen after the list gen check
     // window; still drop completion-marking for the stale pre-switch payload.
-    _applySessionListPayload(payload.sessData,payload.projData,{
-      unreadGen:payload.unreadGen,
-    });
+    const applyOpts={unreadGen:payload.unreadGen};
+    if(payload.keepProjectPicker===true) applyOpts.keepProjectPicker=true;
+    _applySessionListPayload(payload.sessData,payload.projData,applyOpts);
   }, Math.max(120, SESSION_LIST_INTERACTION_IDLE_MS));
 }
 
@@ -6738,6 +6738,7 @@ async function _runRenderSessionListRefresh(opts, _gen){
     if (_profileSwitchListEmbargo) return;
     if(deferWhileInteracting&&_isSessionListUserInteracting()){
       _pendingSessionListPayload={gen:_gen,sessData,projData,unreadGen};
+      if(opts&&opts.keepProjectPicker===true) _pendingSessionListPayload.keepProjectPicker=true;
       _schedulePendingSessionListApply();
       return;
     }

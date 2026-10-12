@@ -2654,3 +2654,82 @@ def test_active_poll_does_not_downgrade_a_queued_native_create_refresh():
         "renameQueuedOpts": {},
         "renameApplied": [{"unreadGen": 0}],
     }
+
+
+def test_deferred_superseding_poll_preserves_native_create_keep_picker_intent():
+    """A passive poll queued behind native project creation may add interaction
+    deferral, but it must not drop the creation's keep-picker intent when its
+    payload is parked and later replayed after the newer picker closes."""
+    assert NODE is not None
+    script = _QUEUE_HARNESS + _session_list_queue_and_refresh_sources() + r"""
+(async()=>{
+  _queueUserInteracting=true;
+
+  // Project creation owns the active request. While it is held, the user opens
+  // a newer picker and a passive poll supersedes the response. The successor
+  // correctly carries both the creation keep and the poll's deferral.
+  const creation=renderSessionList({keepProjectPicker:true});
+  await waitForHeld(1);
+  renderSessionList({deferWhileInteracting:true});
+  const queuedOpts=JSON.parse(JSON.stringify(_renderSessionListQueuedRequest.opts));
+
+  held[0].resolve(payloadOk);
+  await waitForHeld(2);
+  held[1].resolve(payloadOk);
+  await creation;
+
+  console.log(JSON.stringify({
+    queuedOpts,
+    pendingPayload:JSON.parse(JSON.stringify(_pendingSessionListPayload)),
+    applied:applied.slice(),
+    deferredApplies:_queueDeferredApplies.length,
+  }));
+})().catch(error=>{console.error(error&&error.stack||error);process.exit(1);});
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "queuedOpts": {"keepProjectPicker": True, "deferWhileInteracting": True},
+        "pendingPayload": {
+            "gen": 2,
+            "sessData": {"sessions": [{"session_id": "kept"}]},
+            "projData": {"projects": []},
+            "unreadGen": 0,
+            "keepProjectPicker": True,
+        },
+        "applied": [],
+        "deferredApplies": 1,
+    }
+
+    scheduler_start = SESSIONS_JS.find("function _schedulePendingSessionListApply(")
+    scheduler_end = SESSIONS_JS.find("\n\nfunction _sessionAttentionSoundSignature(", scheduler_start)
+    assert scheduler_start >= 0 and scheduler_end > scheduler_start
+    scheduler = SESSIONS_JS[scheduler_start:scheduler_end]
+    assert "if(payload.keepProjectPicker===true) applyOpts.keepProjectPicker=true;" in scheduler
+    assert "_applySessionListPayload(payload.sessData,payload.projData,applyOpts);" in scheduler
+
+    replay_script = r"""
+let _pendingSessionListPayload=null, _pendingSessionListApplyTimer=0;
+let _renderSessionListGen=2;
+const SESSION_LIST_INTERACTION_IDLE_MS=1;
+const applied=[];
+function _isSessionListUserInteracting(){return false;}
+function _applySessionListPayload(_sess,_proj,opts){applied.push({...opts});}
+""" + scheduler + r"""
+const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+(async()=>{
+  _pendingSessionListPayload={gen:2,sessData:{},projData:{},unreadGen:0,keepProjectPicker:true};
+  _schedulePendingSessionListApply();
+  await wait(150);
+  _pendingSessionListPayload={gen:2,sessData:{},projData:{},unreadGen:1};
+  _schedulePendingSessionListApply();
+  await wait(150);
+  console.log(JSON.stringify(applied));
+})().catch(error=>{console.error(error&&error.stack||error);process.exit(1);});
+"""
+    replay = subprocess.run([NODE, "-e", replay_script], check=False, capture_output=True, text=True, timeout=20)
+    assert replay.returncode == 0, replay.stderr
+    assert json.loads(replay.stdout) == [
+        {"unreadGen": 0, "keepProjectPicker": True},
+        {"unreadGen": 1},
+    ]
