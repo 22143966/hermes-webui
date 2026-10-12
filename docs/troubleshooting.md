@@ -242,11 +242,11 @@ bootstrap probe accepts either backend.
 
 ---
 
-## 浏览器在切换运行中会话时显示“页面无响应”
+## Browser becomes unresponsive while switching running conversations
 
-如果 `/health` 仍正常返回且 `active_runs` 仍有任务，浏览器卡死不代表后台任务崩溃。长思考流在重连时会集中重放，逐条重绘活动视图可能长时间占用浏览器主线程。
+If `/health` is healthy and `active_runs` still contains the tasks, a frozen browser does not mean the backend workers have crashed. Reconnecting to a long reasoning stream can replay many chunks at once; repainting the activity scene for every chunk can block the browser main thread.
 
-思考增量保留在每个会话的 `INFLIGHT` 状态中，显示刷新与回答输出共用合并调度；工具和终止边界同步尚未显示的尾部。切换后排队的刷新必须检查当前会话及 stream 所有权，不能改写另一个会话的页面。刷新页面可重新连接现有任务；无需为了浏览器卡顿重启后台。
+Reasoning deltas remain in each conversation's `INFLIGHT` state. Display updates share the answer's coalesced render scheduler, with synchronous tail flushes at interim-answer, tool, and terminal boundaries. Queued renders check the current conversation and stream ownership before updating the pane. Reloading the page reconnects to existing tasks; the backend does not need to restart just because the browser froze.
 
 ## "Response interrupted." marker keeps saying "no agent output was recovered"
 
