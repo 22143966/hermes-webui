@@ -508,27 +508,32 @@ def _codex_durations_ready(payload):
     return bool(windows) and all(window.get("limit_window_seconds") is not None for window in windows)
 
 
-def _apply_codex_duration_source(payload, raw_payload):
+def _apply_codex_duration_source(payload, raw_payload, same_response=False):
     if not isinstance(raw_payload, dict):
         return payload
     if not isinstance(payload, dict):
         return raw_payload
-    # Join on label rather than position. Both parsers walk the same fixed
-    # (primary_window, secondary_window) order, but they issue separate requests
-    # and each skips a window whose used_percent is missing. If one list is short
-    # a positional join would hand Session's duration to Weekly, which is the
-    # mislabeling this change exists to prevent.
-    raw_by_label = {}
-    for raw_window in raw_payload.get("windows") or ():
-        label = str(raw_window.get("label") or "").strip().lower()
-        if label and label not in raw_by_label:
-            raw_by_label[label] = raw_window
-    for window in payload.get("windows") or ():
-        if window.get("limit_window_seconds") is not None:
+    # Two windows can share a label (86400s and 18000s both read "Session").
+    # The same response joins by position, guarded by label; a separate probe
+    # joins only on a label that is unique on both sides.
+    def _label(window):
+        return str(window.get("label") or "").strip().lower()
+
+    raw_windows = list(raw_payload.get("windows") or ())
+    raw_labels = [_label(w) for w in raw_windows]
+    windows = list(payload.get("windows") or ())
+    labels = [_label(w) for w in windows]
+    for index, window in enumerate(windows):
+        if window.get("limit_window_seconds") is not None or not labels[index]:
             continue
-        raw_window = raw_by_label.get(str(window.get("label") or "").strip().lower())
-        if raw_window is None:
-            continue
+        if same_response:
+            if index >= len(raw_windows) or raw_labels[index] != labels[index]:
+                continue
+            raw_window = raw_windows[index]
+        else:
+            if labels.count(labels[index]) != 1 or raw_labels.count(labels[index]) != 1:
+                continue
+            raw_window = raw_windows[raw_labels.index(labels[index])]
         window["limit_window_seconds"] = raw_window.get("limit_window_seconds")
     return payload
 
@@ -537,12 +542,12 @@ def _codex_singleton_payload(snapshot, api_key=None):
     payload = _snapshot_payload(snapshot)
     if _codex_durations_ready(payload):
         return payload
-    # Installed Agent windows omit duration; snapshot.raw is the usage body that
-    # already has it. Backfill before probing so a 503 cannot drop those labels.
+    # Older Agent windows omit duration: backfill snapshot.raw first, then make
+    # an extra usage request only if a window duration is still missing.
     raw_body = getattr(snapshot, "raw", None)
     if isinstance(raw_body, dict):
         payload = _apply_codex_duration_source(
-            payload, _snapshot_payload(_codex_snapshot_from_usage_payload(raw_body))
+            payload, _snapshot_payload(_codex_snapshot_from_usage_payload(raw_body)), same_response=True
         )
         if _codex_durations_ready(payload):
             return payload

@@ -2262,6 +2262,12 @@ def test_codex_singleton_backfill_matches_windows_by_label_not_position(monkeypa
     # A positional join would have written 18000 here, mislabeling Weekly as 5-hour.
     assert windows[0]["limit_window_seconds"] == 604_800
 
+    for payload_count, probe_count in ((2, 2), (1, 2), (2, 1)):
+        agent_snapshot.windows = (SimpleNamespace(label="Session"),) * payload_count
+        raw_snapshot.windows = (raw_snapshot.windows[0],) * probe_count
+        payload = namespace["_codex_singleton_payload"](agent_snapshot)
+        assert [w["limit_window_seconds"] for w in payload["windows"]] == [None] * payload_count
+
 
 def test_codex_singleton_raw_durations_survive_failed_probe(monkeypatch):
     """Durations already on snapshot.raw survive a failed usage probe.
@@ -2310,6 +2316,25 @@ def test_codex_singleton_raw_durations_survive_failed_probe(monkeypatch):
         ("Weekly", 604_800),
         ("Session", 18_000),
     ]
+
+    duplicate = SimpleNamespace(
+        provider="openai-codex", windows=(_window("Session", 42), _window("Session", 7)),
+        raw={"rate_limit": {
+            "primary_window": {"used_percent": 42, "limit_window_seconds": 86400},
+            "secondary_window": {"used_percent": 7, "limit_window_seconds": 18000},
+        }},
+    )
+    payload = namespace["_codex_singleton_payload"](duplicate)
+    assert [w["limit_window_seconds"] for w in payload["windows"]] == [86400, 18000]
+    assert probe_calls == []
+
+    shifted = SimpleNamespace(
+        provider="openai-codex", windows=(_window("Weekly", 40.0), _window("Session", 15.0)),
+        raw={"rate_limit": {"secondary_window": {"used_percent": 15, "limit_window_seconds": 18000}}},
+    )
+    payload = namespace["_codex_singleton_payload"](shifted)
+    assert [w["limit_window_seconds"] for w in payload["windows"]] == [None, None]
+    probe_calls.clear()
 
     partial = SimpleNamespace(
         provider="openai-codex",
