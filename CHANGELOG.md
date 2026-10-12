@@ -135,6 +135,11 @@
 
 ### Fixed
 
+- **Feishu and DingTalk chats now show up as messaging sessions in the sidebar.** Gateway sessions from those two
+  platforms were classified as "other" with a raw source label, so they missed the messaging filter and the external
+  session handling every other chat platform gets. Both are now in the messaging source set with proper labels, on the
+  server and in the sidebar's fallback tables. Thanks @HenryLoveMiller. (#8174)
+
 - **The model picker no longer trusts a models cache that was only recently touched.** The session-visit freshness
   check used the cache file's modified time, so anything that touched the file (a copy, a sync, a backup) kept a stale
   catalog looking fresh. The cache now records when it was actually built (`_built_at`) and the 300 s refresh is measured
