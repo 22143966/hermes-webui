@@ -11456,7 +11456,12 @@ function _startProjectRename(proj, chip){
     if(save&&inp.value.trim()&&inp.value.trim()!==proj.name){
       try {
         await api('/api/projects/rename',{method:'POST',body:JSON.stringify({project_id:proj.project_id,name:inp.value.trim()})});
-        await renderSessionList();
+        // The API-success transition (editor -> chip) must paint now. Use the
+        // explicit nondeferred keep-picker contract: a picker opened while the
+        // rename was in flight is newer than this completion, so repaint
+        // immediately and keep/re-anchor that picker instead of deferring
+        // behind the open interaction.
+        await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
         showToast('Project renamed');
       } catch(e) {
         _finishDone=false;

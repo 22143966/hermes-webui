@@ -2733,3 +2733,88 @@ const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
         {"unreadGen": 0, "keepProjectPicker": True},
         {"unreadGen": 1},
     ]
+
+
+def test_rename_success_ships_the_immediate_keep_picker_contract():
+    """The project-rename success transition (editor -> chip) must paint now.
+
+    A picker opened while the rename POST was in flight is newer than the
+    completion, so the success path ships the explicit user-action contract:
+    an immediate (nondeferred) refresh that keeps and re-anchors that picker,
+    instead of a plain call that defers behind the open interaction.
+    """
+    start = SESSIONS_JS.find("function _startProjectRename(")
+    assert start >= 0, "_startProjectRename not found in static/sessions.js"
+    end = SESSIONS_JS.find("\nfunction ", start + 1)
+    assert end > start
+    body = SESSIONS_JS[start:end]
+    rename_post = body.find("/api/projects/rename")
+    completion = body.find("await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});")
+    toast = body.find("showToast('Project renamed')")
+    assert rename_post >= 0, "rename POST not found in _startProjectRename"
+    assert completion > rename_post, (
+        "rename success must repaint with the explicit nondeferred keep-picker contract"
+    )
+    assert toast > completion, "the renamed toast must follow the completion refresh"
+    assert "await renderSessionList();" not in body, (
+        "rename success must not fall back to a plain renderSessionList()"
+    )
+
+
+def test_rename_completion_settles_immediately_through_the_queue():
+    """The rename completion refresh settles immediately through the real queue.
+
+    Queued behind an active background poll (or superseded by a later poll
+    tick) while the interaction continues, the successor must keep the
+    explicit nondeferred keep-picker contract: no parked deferred payload, an
+    apply carrying the keep intent, and no downgrade to the churn lane.
+    """
+    assert NODE is not None
+    script = _QUEUE_HARNESS + _session_list_queue_and_refresh_sources() + r"""
+(async()=>{
+  const out={};
+
+  // Rename completion queues behind an active background poll while the user
+  // still interacts (the newer picker). The successor must settle immediately
+  // with the keep intent instead of parking a deferred payload.
+  _queueUserInteracting=true;
+  const poll=renderSessionList({deferWhileInteracting:true});
+  await waitForHeld(1);
+  const renameRefresh=renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
+  out.behindPollQueuedOpts=JSON.parse(JSON.stringify(_renderSessionListQueuedRequest.opts));
+  held[0].resolve(payloadOk);
+  await waitForHeld(2);
+  held[1].resolve(payloadOk);
+  await renameRefresh;
+  out.behindPollApplied=applied.slice(); applied.length=0;
+  out.behindPollPendingCleared=_pendingSessionListPayload===null;
+  out.behindPollDeferredApplies=_queueDeferredApplies.length;
+
+  // A later passive poll tick supersedes an in-flight rename completion: the
+  // successor still carries the immediate keep-picker contract — a passive
+  // tick cannot downgrade an explicit repaint.
+  const renameRefresh2=renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
+  await waitForHeld(3);
+  renderSessionList({deferWhileInteracting:true});
+  out.supersededQueuedOpts=JSON.parse(JSON.stringify(_renderSessionListQueuedRequest.opts));
+  held[2].resolve(payloadOk);
+  await waitForHeld(4);
+  held[3].resolve(payloadOk);
+  await renameRefresh2;
+  out.supersededApplied=applied.slice(); applied.length=0;
+  out.supersededDeferredApplies=_queueDeferredApplies.length;
+
+  console.log(JSON.stringify(out));
+})().catch(error=>{console.error(error&&error.stack||error);process.exit(1);});
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "behindPollQueuedOpts": {"deferWhileInteracting": False, "keepProjectPicker": True},
+        "behindPollApplied": [{"unreadGen": 0, "keepProjectPicker": True}],
+        "behindPollPendingCleared": True,
+        "behindPollDeferredApplies": 0,
+        "supersededQueuedOpts": {"deferWhileInteracting": False, "keepProjectPicker": True},
+        "supersededApplied": [{"unreadGen": 0, "keepProjectPicker": True}],
+        "supersededDeferredApplies": 0,
+    }
