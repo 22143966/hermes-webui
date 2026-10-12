@@ -5698,7 +5698,7 @@ const LOCALES = {
     expand_all: 'Развернуть всё',
     collapse_all: 'Свернуть всё',
     show_earlier_step_one: 'Показать 1 предыдущий шаг',
-    show_earlier_steps: 'Показать {0} предыдущих шагов',
+    show_earlier_steps: 'Показать предыдущие шаги: {0}',
     edit_failed: 'Не удалось отредактировать: ',
     regen_failed: 'Не удалось сгенерировать заново: ',
     reconnect_active: 'Ответ всё ещё генерируется. Обновить, когда будет готово?',
@@ -7322,7 +7322,7 @@ const LOCALES = {
     settings_send_key_enter: 'Enter (Shift+Enter — новая строка)',
     settings_send_key_ctrl_enter: 'Ctrl+Enter (Enter — новая строка)',
     settings_send_key_shift_enter: 'Shift+Enter (Enter — новая строка)',
-    settings_tts_voice_default_system: 'Системная голосовая по умолчанию',
+    settings_tts_voice_default_system: 'Системный голос по умолчанию',
   },
 
   es: {
