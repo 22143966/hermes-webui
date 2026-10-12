@@ -6157,6 +6157,11 @@ window.addEventListener('resize',()=>{
 let _renderSessionListGen = 0;
 let _renderSessionListInFlight = null;
 let _renderSessionListQueuedRequest = null;
+// The request currently being drained. A call that queues behind it merges
+// this request's options into the successor so recovery/repaint intent
+// (keep-picker, nondeferred recovery) survives the supersession — the active
+// response is discarded as stale and the successor is what paints.
+let _renderSessionListActiveRequest = null;
 let _sessionListRefreshAnimationPending = false;
 let _sessionListFirstRenderAnimated = false;
 let _sessionListEnterAllAnimationPending = false;
@@ -6172,6 +6177,9 @@ function _invalidateSessionListRenders(){
   _renderSessionListGen++;
   _pendingSessionListPayload = null;
   _renderSessionListQueuedRequest = null;
+  // A successor queued after this invalidation must not inherit the cancelled
+  // render's recovery intent (profile/scope switch cancels obsolete work).
+  _renderSessionListActiveRequest = null;
   // A retry whose fetch is invalidated here (e.g. a profile switch mid-retry)
   // would otherwise leave the error note stuck as an inert "Retrying…" button
   // with no request in flight — the stale fetch returns before
@@ -6800,6 +6808,7 @@ async function _drainRenderSessionListQueue(initialRequest){
   let request=initialRequest;
   try{
     while(request){
+      _renderSessionListActiveRequest=request;
       await _runRenderSessionListRefresh(request.opts, request.gen);
       request=_renderSessionListQueuedRequest;
       _renderSessionListQueuedRequest=null;
@@ -6810,6 +6819,8 @@ async function _drainRenderSessionListQueue(initialRequest){
       const next=_renderSessionListQueuedRequest;
       _renderSessionListQueuedRequest=null;
       _renderSessionListInFlight=_drainRenderSessionListQueue(next);
+    }else{
+      _renderSessionListActiveRequest=null;
     }
   }
 }
@@ -6817,8 +6828,17 @@ async function _drainRenderSessionListQueue(initialRequest){
 async function renderSessionList(opts={}){
   const request={opts:opts||{},gen:++_renderSessionListGen};
   if(_renderSessionListInFlight){
+    // The active request's response is discarded as stale when this call
+    // supersedes its generation; the queued request is what actually settles
+    // and paints. Carry the active request's recovery/repaint intent into the
+    // successor through the same maintained merge so the supersession cannot
+    // silently downgrade it to ordinary background churn. Invalidation clears
+    // the queue instead of inheriting it.
+    const inherited=_mergeRenderSessionListOptions(
+      _renderSessionListActiveRequest&&_renderSessionListActiveRequest.opts,
+      _renderSessionListQueuedRequest&&_renderSessionListQueuedRequest.opts);
     _renderSessionListQueuedRequest={
-      opts:_mergeRenderSessionListOptions(_renderSessionListQueuedRequest&&_renderSessionListQueuedRequest.opts, request.opts),
+      opts:_mergeRenderSessionListOptions(inherited, request.opts),
       gen:request.gen,
     };
     return _renderSessionListInFlight;

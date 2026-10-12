@@ -2346,3 +2346,245 @@ const handler = async ()=>"""
             "toast": "session_archive_failedboom",
         },
     }
+
+
+def _session_list_queue_and_refresh_sources() -> str:
+    """The real coalescing queue — option merge, drain loop, entry point — plus
+    the refresh runner and error setter the queue tests drive."""
+    parts = [
+        ("function _mergeRenderSessionListOptions(", "\nfunction _showSessionListLoadError("),
+        ("function _showSessionListLoadError(", "\nfunction _renderSessionListLoadErrorNote("),
+        ("async function _runRenderSessionListRefresh(", "\nasync function _loadSidebarSessionListPayload("),
+        ("async function _drainRenderSessionListQueue(", "\nasync function renderSessionList("),
+        ("async function renderSessionList(", "\n// ── Gateway session SSE"),
+    ]
+    chunks = []
+    for start_marker, end_marker in parts:
+        start = SESSIONS_JS.find(start_marker)
+        assert start >= 0, f"{start_marker} not found in static/sessions.js"
+        end = SESSIONS_JS.find(end_marker, start + 1)
+        assert end > start, f"{end_marker} not found after {start_marker}"
+        chunks.append(SESSIONS_JS[start:end] + "\n")
+    return "".join(chunks)
+
+
+def _invalidate_session_list_renders_source() -> str:
+    start = SESSIONS_JS.find("function _invalidateSessionListRenders(")
+    assert start >= 0, "_invalidateSessionListRenders not found in static/sessions.js"
+    end = SESSIONS_JS.find("\nif(typeof window", start + 1)
+    assert end > start
+    return SESSIONS_JS[start:end] + "\n"
+
+
+def _refresh_session_list_sources() -> str:
+    """The creation-refresh sibling lane: option merge and entry point."""
+    parts = [
+        ("function _mergeSessionListRefreshOptions(", "\nfunction _refreshSessionListAfterSidebarResume("),
+        ("async function refreshSessionList(", "\nfunction _scheduleSessionEventsRefresh("),
+    ]
+    chunks = []
+    for start_marker, end_marker in parts:
+        start = SESSIONS_JS.find(start_marker)
+        assert start >= 0, f"{start_marker} not found in static/sessions.js"
+        end = SESSIONS_JS.find(end_marker, start + 1)
+        assert end > start, f"{end_marker} not found after {start_marker}"
+        chunks.append(SESSIONS_JS[start:end] + "\n")
+    return "".join(chunks)
+
+
+_QUEUE_HARNESS = r"""
+let _renderSessionListGen=0, _renderSessionListInFlight=null, _renderSessionListQueuedRequest=null, _renderSessionListActiveRequest=null;
+let _pendingSessionListPayload=null;
+let _sessionListLoadError=null;
+let _contentSearchResults=[];
+let _allSessions=[], _sidebarReferenceSessions=[];
+let _allSessionsScope={profile:'default',allProfiles:false,sidebarSource:'webui',excludeHidden:false};
+let _showAllProfiles=false, _profileSwitchListEmbargo=false, _cronPollGeneration=0;
+let _sessionListHasLoadedOnce=true;
+let _sessionListRefreshInFlight=false, _sessionListRefreshPendingRequest=null;
+const _SESSION_LIST_BOOT_TIMEOUT_MS=8000;
+const S={activeProfile:'default'};
+console.warn=()=>{};
+function $(){return {value:''};}
+function _sessionListQueryString(){return '';}
+function _isSessionListUserInteracting(){return false;}
+function _schedulePendingSessionListApply(){}
+function _requestedSessionSidebarSource(){return 'webui';}
+function _sessionListExcludeHiddenEnabled(){return false;}
+function _clearSessionSourceTabCounts(){}
+function _scheduleSessionEventsRefresh(){}
+function refreshActiveSessionIfExternallyUpdated(){return Promise.resolve();}
+const applied=[];
+function _applySessionListPayload(sessData,projData,opts){applied.push(JSON.parse(JSON.stringify(opts||{})));}
+const paints=[];
+function _repaintSidebarKeepingProjectPicker(){paints.push('keep');}
+function _repaintSidebarForBackgroundChurn(){paints.push('churn');}
+const held=[];
+function _loadSidebarSessionListPayload(){return new Promise((resolve,reject)=>{held.push({resolve,reject});});}
+const tick=()=>new Promise(r=>setTimeout(r,0));
+async function waitForHeld(n){for(let i=0;i<400&&held.length<n;i++)await tick();if(held.length<n)throw new Error('held<'+n);}
+const payloadOk={sessData:{sessions:[{session_id:'kept'}]},projData:{projects:[]}};
+"""
+
+
+def test_queued_successor_keeps_retry_recovery_intent_on_both_outcomes():
+    """A native Retry's keep-picker / nondeferred intent must survive the
+    supersession that discards its response: the queued successor carries it
+    through the real queue and settles through the keep-picker lanes on both a
+    successful and a distinct failed GET."""
+    assert NODE is not None
+    script = _QUEUE_HARNESS + _session_list_queue_and_refresh_sources() + r"""
+(async()=>{
+  const out={};
+
+  // A Retry (immediate keep-picker recovery) is in flight; a plain caller
+  // queues behind it; the discarded active response is replaced by a successor
+  // that settles successfully.
+  const retrySuccess=renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
+  await waitForHeld(1);
+  renderSessionList();
+  out.retrySuccessQueuedOpts=JSON.parse(JSON.stringify(_renderSessionListQueuedRequest.opts));
+  held[0].resolve(payloadOk);
+  await waitForHeld(2);
+  held[1].resolve(payloadOk);
+  await retrySuccess;
+  out.retrySuccessApplied=applied.slice(); applied.length=0;
+  out.retrySuccessPaints=paints.slice(); paints.length=0;
+
+  // Same supersession, but the successor settles with a distinct injected 500.
+  _sessionListLoadError={message:'Could not load conversations.',detail:'previous',retrying:true};
+  const retryFailure=renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
+  await waitForHeld(3);
+  renderSessionList();
+  out.retryFailureQueuedOpts=JSON.parse(JSON.stringify(_renderSessionListQueuedRequest.opts));
+  held[2].resolve(payloadOk);
+  await waitForHeld(4);
+  const http500=new Error('sessions endpoint returned 500');
+  http500.status=500;
+  held[3].reject(http500);
+  await retryFailure;
+  out.retryFailureApplied=applied.slice(); applied.length=0;
+  out.retryFailurePaints=paints.slice(); paints.length=0;
+  out.retryFailureError={message:_sessionListLoadError.message,detail:_sessionListLoadError.detail,retrying:!!_sessionListLoadError.retrying};
+  _sessionListLoadError=null;
+
+  // Control: a plain request superseded by a plain request gains nothing, and
+  // the drained queue leaves no active request behind.
+  const plain=renderSessionList({});
+  await waitForHeld(5);
+  renderSessionList();
+  out.plainQueuedOpts=JSON.parse(JSON.stringify(_renderSessionListQueuedRequest.opts));
+  held[4].resolve(payloadOk);
+  await waitForHeld(6);
+  held[5].resolve(payloadOk);
+  await plain;
+  out.plainApplied=applied.slice();
+  out.activeCleared=_renderSessionListActiveRequest===null;
+
+  console.log(JSON.stringify(out));
+})().catch(error=>{console.error(error&&error.stack||error);process.exit(1);});
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "retrySuccessQueuedOpts": {"deferWhileInteracting": False, "keepProjectPicker": True},
+        "retrySuccessApplied": [{"unreadGen": 0, "keepProjectPicker": True}],
+        "retrySuccessPaints": [],
+        "retryFailureQueuedOpts": {"deferWhileInteracting": False, "keepProjectPicker": True},
+        "retryFailureApplied": [],
+        "retryFailurePaints": ["keep"],
+        "retryFailureError": {
+            "message": "Could not load conversations.",
+            "detail": "sessions endpoint returned 500",
+            "retrying": False,
+        },
+        "plainQueuedOpts": {},
+        "plainApplied": [{"unreadGen": 0}],
+        "activeCleared": True,
+    }
+
+
+def test_queued_successor_keeps_creation_refresh_intent_through_refresh_session_list():
+    """Sibling lane: a session-creation refresh (refreshSessionList with
+    force+keep-picker) that gets superseded by a passive tick still settles
+    through the same carried intent on both outcomes."""
+    assert NODE is not None
+    script = _QUEUE_HARNESS + _session_list_queue_and_refresh_sources() + _refresh_session_list_sources() + r"""
+(async()=>{
+  const out={};
+
+  const creationSuccess=refreshSessionList('new-session',{force:true,keepProjectPicker:true});
+  await waitForHeld(1);
+  renderSessionList();
+  out.creationSuccessQueuedOpts=JSON.parse(JSON.stringify(_renderSessionListQueuedRequest.opts));
+  held[0].resolve(payloadOk);
+  await waitForHeld(2);
+  held[1].resolve(payloadOk);
+  await creationSuccess;
+  out.creationSuccessApplied=applied.slice(); applied.length=0;
+  out.creationSuccessPaints=paints.slice(); paints.length=0;
+
+  const creationFailure=refreshSessionList('new-session',{force:true,keepProjectPicker:true});
+  await waitForHeld(3);
+  renderSessionList();
+  out.creationFailureQueuedOpts=JSON.parse(JSON.stringify(_renderSessionListQueuedRequest.opts));
+  held[2].resolve(payloadOk);
+  await waitForHeld(4);
+  held[3].reject(new Error('sessions endpoint returned 500'));
+  await creationFailure;
+  out.creationFailureApplied=applied.slice();
+  out.creationFailurePaints=paints.slice();
+
+  console.log(JSON.stringify(out));
+})().catch(error=>{console.error(error&&error.stack||error);process.exit(1);});
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "creationSuccessQueuedOpts": {"deferWhileInteracting": False, "keepProjectPicker": True},
+        "creationSuccessApplied": [{"unreadGen": 0, "keepProjectPicker": True}],
+        "creationSuccessPaints": [],
+        "creationFailureQueuedOpts": {"deferWhileInteracting": False, "keepProjectPicker": True},
+        "creationFailureApplied": [],
+        "creationFailurePaints": ["keep"],
+    }
+
+
+def test_profile_scope_invalidation_cancels_queued_recovery_inheritance():
+    """The carried intent stays cancellable: a profile/scope invalidation drops
+    both the queued successor and the active tracker, so a successor queued
+    after the switch cannot inherit the cancelled request's intent."""
+    assert NODE is not None
+    script = _QUEUE_HARNESS + _session_list_queue_and_refresh_sources() + _invalidate_session_list_renders_source() + r"""
+(async()=>{
+  const out={};
+
+  const active=renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
+  await waitForHeld(1);
+  renderSessionList();
+  out.beforeInvalidate=JSON.parse(JSON.stringify(_renderSessionListQueuedRequest.opts));
+
+  _invalidateSessionListRenders();
+  out.queuedCleared=_renderSessionListQueuedRequest===null;
+  out.activeCleared=_renderSessionListActiveRequest===null;
+
+  renderSessionList();
+  out.afterInvalidateQueuedOpts=JSON.parse(JSON.stringify(_renderSessionListQueuedRequest.opts));
+  held[0].resolve(payloadOk);
+  await waitForHeld(2);
+  held[1].resolve(payloadOk);
+  await active;
+  out.appliedAfter=applied.slice();
+
+  console.log(JSON.stringify(out));
+})().catch(error=>{console.error(error&&error.stack||error);process.exit(1);});
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "beforeInvalidate": {"deferWhileInteracting": False, "keepProjectPicker": True},
+        "queuedCleared": True,
+        "activeCleared": True,
+        "afterInvalidateQueuedOpts": {},
+        "appliedAfter": [{"unreadGen": 0}],
+    }
