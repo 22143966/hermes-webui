@@ -99,8 +99,9 @@ def test_attachment_choice_is_visible_across_mobile_render_matrix(tmp_path):
                     assert popup.is_hidden()
                     playwright.expect(page.locator("#btnAttach")).to_have_attribute("aria-expanded", "false")
                     page.locator("#btnAttach").click()
-                    with page.expect_file_chooser():
+                    with page.expect_file_chooser() as chooser:
                         photo.click()
+                    chooser.value.set_files([])
                     playwright.expect(page.locator("#btnAttach")).to_be_focused()
                     assert popup.is_hidden()
                     context.close()
@@ -111,8 +112,9 @@ def test_attachment_choice_is_visible_across_mobile_render_matrix(tmp_path):
             attach.wait_for()
             for attr in ("aria-expanded", "aria-controls", "aria-haspopup"):
                 assert attach.get_attribute(attr) is None
-            with page.expect_file_chooser():
+            with page.expect_file_chooser() as chooser:
                 attach.click()
+            chooser.value.set_files([])
             assert page.locator("#attachChoicePopup").is_hidden()
             context.close()
             browser.close()
