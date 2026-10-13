@@ -193,6 +193,17 @@ def test_discover_python_precedence_keeps_explicit_nested_and_proven_interpreter
     assert config._discover_python(agent_dir, str(tmp_path / "proven-python")) == str(tmp_path / "proven-python")
 
 
+def test_python_probe_ignores_run_agent_from_working_directory(monkeypatch, tmp_path):
+    from api import startup
+
+    writable_cwd = tmp_path / "writable-cwd"
+    writable_cwd.mkdir()
+    (writable_cwd / "run_agent.py").write_text("", encoding="utf-8")
+    monkeypatch.chdir(writable_cwd)
+
+    assert startup._agent_dir_from_python(sys.executable) != writable_cwd.resolve()
+
+
 def test_discovery_checks_hermes_home_without_explicit_override(monkeypatch, tmp_path):
     from api import startup
 

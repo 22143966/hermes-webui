@@ -59,6 +59,12 @@ def _agent_dir_from_python(python_exe: str) -> Path | None:
     """Resolve an Agent root from a selected interpreter without importing it."""
     script = (
         "import importlib.util\n"
+        "import os, sys\n"
+        "cwd = os.path.normcase(os.path.realpath(os.getcwd()))\n"
+        "sys.path[:] = [\n"
+        "    entry for entry in sys.path\n"
+        "    if os.path.normcase(os.path.realpath(entry or cwd)) != cwd\n"
+        "]\n"
         'spec = importlib.util.find_spec("run_agent")\n'
         'print(spec.origin if spec else "")\n'
     )
