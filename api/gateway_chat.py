@@ -1777,7 +1777,7 @@ def _run_gateway_chat_streaming(
             err_body = ""
         put_gateway_event(
             "apperror",
-            _gateway_http_error_event(exc, err_body, api_key_configured=bool(_gateway_api_key())),
+            _gateway_http_error_event(exc, err_body, api_key_configured=bool(api_key)),
         )
     except Exception as exc:
         safe = _redact_text(str(exc))[:500]

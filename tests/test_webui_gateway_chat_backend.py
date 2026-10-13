@@ -1857,3 +1857,56 @@ def test_gateway_worker_skips_runs_api_when_opt_in_absent():
     finally:
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
+
+
+def test_gateway_chat_401_hint_reports_the_session_profile_key_not_the_process_key(tmp_path, monkeypatch):
+    """A 401 on a profile's request must be explained by the key that request carried.
+
+    The worker now resolves the endpoint (URL and key) from the session's profile. The
+    HTTP error path used to ask the process environment whether a key was configured,
+    so a profile with its own key was told "set HERMES_WEBUI_GATEWAY_API_KEY" (and the
+    inverse case claimed a mismatch when the profile sent no key at all).
+    """
+    import io
+    from unittest.mock import MagicMock
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    # The process-wide environment has NO key; the 'coder' profile has one.
+    monkeypatch.delenv("HERMES_WEBUI_GATEWAY_API_KEY", raising=False)
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    monkeypatch.setattr(
+        gateway_chat, "_gateway_endpoint_for_profile",
+        lambda profile_name: ("http://gateway.local/p/coder", "coder-key"),
+    )
+    monkeypatch.setattr(streaming, "_load_webui_prefill_context", lambda cfg: {"status": "not_configured", "source": "none", "label": "", "message_count": 0, "messages": []})
+    monkeypatch.setattr(streaming, "_prefill_messages_with_webui_context", lambda ctx, cfg: [])
+
+    def fake_urlopen(req, timeout=0):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", Message(), io.BytesIO(b"{}"))
+
+    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", fake_urlopen)
+
+    events = []
+    channel = MagicMock()
+    channel.put_nowait = events.append
+    s = new_session()
+    s.profile = "coder"
+    stream_id = "stream-gateway-401-profile-key-hint-test"
+    s.active_stream_id = stream_id
+    s.pending_user_message = "Say hi"
+    s.pending_started_at = 444
+    s.save()
+    STREAMS[stream_id] = channel
+
+    gateway_chat._run_gateway_chat_streaming(s.session_id, "Say hi", "m", str(tmp_path), stream_id, [])
+
+    blob = repr(events)
+    assert "gateway_auth_error" in blob, "the 401 was not classified as an auth error"
+    # The profile DID send a key, so the hint is the "check it matches" one, never "Set ...".
+    assert "Check that HERMES_WEBUI_GATEWAY_API_KEY matches" in blob
+    assert "Set HERMES_WEBUI_GATEWAY_API_KEY to the same value" not in blob
