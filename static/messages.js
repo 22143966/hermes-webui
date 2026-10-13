@@ -2084,11 +2084,12 @@ function _shouldForceCompletionNotification(sid, streamId){
   return wasHidden||wasBackgrounded;
 }
 
-function closeLiveStream(sessionId, streamId, source){
+function closeLiveStream(sessionId, streamId, source, reconnecting=false){
   const live=LIVE_STREAMS[sessionId];
   if(!live) return;
   if(streamId&&live.streamId!==streamId) return;
   if(source&&live.source!==source) return;
+  if(typeof live.dispose==='function') live.dispose(reconnecting);
   if(typeof live.cancelIdleRecovery==='function') live.cancelIdleRecovery();
   // Snapshot the current live-turn DOM BEFORE tearing the stream down. The
   // per-event snapshot (snapshotLiveTurn) only fires on content/tool_complete
@@ -2453,7 +2454,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _persistTimer=setTimeout(()=>{_persistTimer=null;persistInflightState();},2000);
   }
   function _closeSource(source){
-    closeLiveStream(activeSid, streamId, source);
+    // Transport recovery reuses this attachment's accumulators and handlers.
+    closeLiveStream(activeSid, streamId, source, true);
   }
   function _clearStreamEndRecovery(){
     if(_streamEndRecoveryTimer){
@@ -2560,10 +2562,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _flushPendingReasoningRender(){
     if(!_reasoningRenderPending) return;
     _reasoningRenderPending=false;
-    if(!_isActiveSession()||S.activeStreamId!==streamId) return;
-    const opts={deferRender:_streamFinalized};
-    if(!_upsertAnchorReasoning(_liveThinkingText(), opts)&&!_streamFinalized){
-      _updateLiveThinkingCard(_liveThinkingText(),{
+    const text=String(liveReasoningText||'').trim();
+    if(!text) return;
+    const active=_isActiveSession()&&S.activeStreamId===streamId;
+    const opts={deferRender:_streamFinalized||!active};
+    if(!_upsertAnchorReasoning(text, opts)&&!opts.deferRender){
+      _updateLiveThinkingCard(text,{
         ...opts,
         anchorRenderFallback:true,
         sessionId:activeSid,
@@ -4391,6 +4395,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return removed||anchorRemoved||domRemoved;
   }
   function _flushReasoningToAnchor(){
+    _flushPendingReasoningRender();
     if(_anchorReasoningFlushed||!reasoningText) return;
     _anchorReasoningFlushed=true;
     if(_anchorHasReasoningEvents()) return;
@@ -5893,7 +5898,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // Guard: a pending setTimeout+rAF can outlive stream finalization.
       if(_streamFinalized) return;
       if(!_isActiveSession()||S.activeStreamId!==streamId){
-        _reasoningRenderPending=false;
+        _flushPendingReasoningRender();
         return;
       }
       // Mobile scroll-jank guard: temporarily disable overflow-anchor before DOM
@@ -5945,7 +5950,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(sinceLastMs>=frameIntervalMs){
       _pendingRafHandle=requestAnimationFrame(_doRender);
     } else {
-      _pendingRafHandle=setTimeout(()=>requestAnimationFrame(_doRender), frameIntervalMs-sinceLastMs);
+      _pendingRafHandle=setTimeout(()=>{_pendingRafHandle=requestAnimationFrame(_doRender);}, frameIntervalMs-sinceLastMs);
     }
   }
 
@@ -6037,10 +6042,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _wireSSE(source){
     const existingLive=LIVE_STREAMS[activeSid];
     if(existingLive&&existingLive.source&&existingLive.source!==source){
+      if(typeof existingLive.dispose==='function') existingLive.dispose(true);
       if(typeof existingLive.cancelIdleRecovery==='function') existingLive.cancelIdleRecovery();
       try{if(existingLive.source.readyState!==2)existingLive.source.close();}catch(_){ }
     }
-    LIVE_STREAMS[activeSid]={streamId,source};
+    LIVE_STREAMS[activeSid]={streamId,source,dispose:(reconnecting=false)=>{
+      if(!reconnecting) _streamFinalized=true;
+      _cancelAnimationFramePendingStreamRender();
+    }};
     _bindSidebarIdleRecovery(LIVE_STREAMS[activeSid]);
 
     // Note on #631 Bug B: the original PR description stated the server

@@ -27,6 +27,7 @@ def _run_reasoning_scene(
     reasoning_burst: bool = False,
     switch_before_frame: bool = False,
     reasoning_boundary: str = "",
+    lifecycle_case: str = "",
 ) -> dict:
     assert NODE, "node is required for the #5720 browser-chain regression"
     env = os.environ.copy()
@@ -55,6 +56,8 @@ def _run_reasoning_scene(
         env["ISSUE5720_SWITCH_BEFORE_FRAME"] = "1"
     if reasoning_boundary:
         env["ISSUE5720_REASONING_BOUNDARY"] = reasoning_boundary
+    if lifecycle_case:
+        env["ISSUE5720_LIFECYCLE_CASE"] = lifecycle_case
     result = subprocess.run(
         [NODE, "-e", _NODE_SCENE],
         cwd=ROOT,
@@ -222,16 +225,44 @@ def test_reasoning_frame_from_previous_session_cannot_paint_current_pane():
     result = _run_reasoning_scene(reasoning_burst=True, switch_before_frame=True)
     assert result["renders_after_frame"] == 0
     assert result["inflight_chars"] == 226_748
+    assert result["anchor_chars"] == 226_748
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-@pytest.mark.parametrize("boundary", ["tool", "terminal", "interim"])
+@pytest.mark.parametrize("boundary", ["tool", "done", "cancel", "apperror", "interim"])
 def test_reasoning_boundary_flushes_tail_before_pending_frame(boundary):
     result = _run_reasoning_scene(reasoning_burst=True, reasoning_boundary=boundary)
+    assert result["renders_before_frame"] == 0
     assert result["anchor_chars"] == 226_748
     assert result["inflight_chars"] == 226_748
-    if boundary == "terminal":
-        assert result["renders_after_frame"] == 0
+    assert result["renders_after_frame"] == result["renders_at_boundary"]
+    if boundary in ("done", "cancel", "apperror"):
+        assert result["settled"] is True
+        assert result["inflight_cleared"] is True
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_echo_before_frame_does_not_persist_a_thinking_placeholder():
+    result = _run_reasoning_scene(reasoning_burst=True, lifecycle_case="echo")
+    assert result["texts"] == []
+    assert result["retained_reasoning"] == ""
+    assert result["settled"] is True
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("transport", ["reattach", "reconnect"])
+def test_closed_attachment_frame_cannot_overwrite_new_reasoning(transport):
+    result = _run_reasoning_scene(reasoning_burst=True, lifecycle_case=transport)
+    assert result["texts"] == ["OLD reasoning NEW tail"]
+    assert result["old_source_closed"] is True
+    assert result["renders_after_old_frame"] == result["renders_before_old_frame"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_sse_error_with_first_reasoning_pending_keeps_one_reasoning_event():
+    result = _run_reasoning_scene(reasoning_burst=True, lifecycle_case="sse_error")
+    assert result["texts"] == ["OLD reasoning"]
+    assert result["settled"] is True
 
 
 _NODE_SCENE = r"""
@@ -421,6 +452,7 @@ global.location={href:'http://test.local/'};
 global.CSS={escape:value=>String(value)};
 const deferredFrames=process.env.ISSUE5720_REASONING_BURST==='1';
 const frames=new Map();
+const timers=new Map();
 let nextFrame=1, clock=1000;
 global.performance={now:()=>deferredFrames?clock:(clock+=100)};
 global.requestAnimationFrame=fn=>{
@@ -432,9 +464,10 @@ global.cancelAnimationFrame=id=>frames.delete(id);
 global.setTimeout=(fn,ms)=>{
   const id=nextFrame++;
   if(deferredFrames&&ms<=100) frames.set(id,fn);
+  else if(ms<600000) timers.set(id,fn);
   return id;
 };
-global.clearTimeout=id=>frames.delete(id);
+global.clearTimeout=id=>{frames.delete(id);timers.delete(id);};
 
 const emptyState=new FakeElement('div');
 const msgInner=new FakeElement('div');
@@ -550,6 +583,7 @@ const S=global.S={
   session:{session_id:'sid-1',pending_started_at:1},
   messages:[{role:'user',content:'question'}],
   activeStreamId:'stream-1',
+  toolCalls:[],
 };
 const INFLIGHT=global.INFLIGHT={};
 const LIVE_STREAMS=global.LIVE_STREAMS={};
@@ -558,7 +592,7 @@ const _STREAM_NOTIFICATION_BACKGROUND=global._STREAM_NOTIFICATION_BACKGROUND={};
 const _desktopBackgroundedForNotifications=false;
 global._bindStreamHiddenTracker=()=>{};
 global.closeOtherLiveStreams=()=>{};
-global.closeLiveStream=()=>{};
+global._resumeSessionStreamAfterLiveChat=()=>{};
 global.resetTurnWorkspaceMutations=()=>{};
 global._resetStreamScrollFollow=()=>{};
 global._suspendSessionStreamForLiveChat=()=>{};
@@ -571,7 +605,7 @@ class FakeEventSource {
   static CONNECTING=0;
   constructor(){ this.listeners=Object.create(null);this.readyState=1;FakeEventSource.instances.push(this); }
   addEventListener(name,fn){ (this.listeners[name]||(this.listeners[name]=[])).push(fn); }
-  emit(name,data){ for(const fn of this.listeners[name]||[]) fn({data:JSON.stringify(data),lastEventId:''}); }
+  emit(name,data){ return Promise.all((this.listeners[name]||[]).map(fn=>fn({data:JSON.stringify(data),lastEventId:''}))); }
   close(){ this.readyState=2; }
 }
 global.EventSource=FakeEventSource;
@@ -580,47 +614,118 @@ const attachStart=messagesSrc.indexOf('function attachLiveStream(');
 const attachEnd=messagesSrc.indexOf('\nfunction transcript(){',attachStart);
 if(attachStart<0||attachEnd<0) throw new Error('attachLiveStream source boundary not found');
 eval(extractFunc(messagesSrc,'_dispatchExtensionTurnLifecycle'));
-let attachSrc=messagesSrc.slice(attachStart,attachEnd);
-if(process.env.ISSUE5720_REASONING_BOUNDARY){
-  const boundaryMarker='  (async()=>{\n    // Reattach path';
-  if(!attachSrc.includes(boundaryMarker)) throw new Error('stream boundary hook not found');
-  attachSrc=attachSrc.replace(boundaryMarker, `
-    window.reasoningBoundary=kind=>{
-      if(kind==='terminal'){
-        _streamFinalized=true;
-        _cancelAnimationFramePendingStreamRender();
-      }else{
-        _applyToAnchor('tool',{name:'terminal',tid:'qa-tool',args:{command:'pwd'}});
-      }
-    };
-    (async()=>{\n    // Reattach path`);
-}
-eval(attachSrc);
+eval(extractFunc(messagesSrc,'closeLiveStream'));
+eval(messagesSrc.slice(attachStart,attachEnd));
 attachLiveStream('sid-1','stream-1');
 const source=FakeEventSource.instances[0];
 if(!source) throw new Error('attachLiveStream did not create EventSource');
 if(process.env.ISSUE5720_STALE_ACTIVE_STREAM==='1') S.activeStreamId='stream-new';
 if(deferredFrames){
+  let settled=false;
+  global.renderMessages=()=>{settled=!S.activeStreamId;};
+  for(const name of ['renderSessionList','finalizeThinkingCard','appendLiveToolCard','clearLiveToolCards','setBusy','setComposerStatus','syncTopbar','loadDir','playNotificationSound','sendBrowserNotification','_markSessionViewed','clearInflightState','clearInflightStateStorage','saveInflightState','snapshotLiveTurnHtmlForSession','scrollToBottom','_clearStreamHidden','_clearStreamNotificationBackground','_syncCtxIndicator','removeThinking']) global[name]=()=>{};
+  global._activityStatusNode=()=>new FakeElement('div');
+  global._shouldForceCompletionNotification=()=>false;
+  global._isDocumentVisibleAndFocused=()=>true;
+  eval(extractFunc(messagesSrc,'_isSessionCurrentPane'));
+  eval(extractFunc(messagesSrc,'_isSessionActivelyViewed'));
+  global._deferStreamErrorIfOffline=()=>false;
+  for(const name of ['clearInflight','_clearApprovalPendingForSession','_clearClarifyPendingForSession','stopApprovalPolling','hideApprovalCard','stopClarifyPolling','hideClarifyCard']) global[name]=()=>{};
+  global._approvalSessionId=null;
+  global._clarifySessionId=null;
+  global._completionNotificationPreviewText=()=>'';
+  global._carryForwardEphemeralTurnFields=(_,messages)=>messages;
+  global._filterRecoveryControlMessages=messages=>messages;
+  global._pendingTitleUpdates=new Map();
+  global._pendingTitleExpectedCurrent=new Map();
+  global._queueDrainSid=null;
+  global.localStorage={setItem:()=>{}};
+  global.api=async path=>path.includes('/stream/status')?{active:true}:null;
+  function reasoningEvents(){
+    return window._liveAnchorRegistries.get('stream-1').anchor.activity_events.filter(e=>e.source_event_type==='reasoning');
+  }
+  function drainFrames(){
+    while(frames.size){
+      const [id,fn]=frames.entries().next().value;frames.delete(id);clock+=100;fn();
+    }
+  }
+  function finalSession(reasoning=''){
+    return {session_id:'sid-1',messages:[{role:'user',content:'question'},{role:'assistant',content:'Final answer',reasoning}],active_stream_id:null};
+  }
+  const lifecycle=process.env.ISSUE5720_LIFECYCLE_CASE;
+  if(lifecycle){
+    (async()=>{
+      const initial=lifecycle==='echo'?'Visible echo answer with enough text':'OLD reasoning';
+      await source.emit('reasoning',{text:initial});
+      const oldFrames=Array.from(frames.values());
+      if(lifecycle==='reattach'||lifecycle==='reconnect') frames.clear();
+      if(lifecycle==='echo'){
+        await source.emit('interim_assistant',{text:initial,already_streamed:true,reasoning_echo:true});
+        await source.emit('done',{session:finalSession(),usage:{}});
+      }else if(lifecycle==='reattach'){
+        S.session={session_id:'sid-2'};
+        closeLiveStream('sid-1');
+        S.session={session_id:'sid-1'};S.activeStreamId='stream-1';
+        attachLiveStream('sid-1','stream-1',[],{reconnecting:true});
+        await Promise.resolve();
+        await FakeEventSource.instances.at(-1).emit('reasoning',{text:' NEW tail'});
+        drainFrames();
+      }else if(lifecycle==='reconnect'){
+        await source.emit('error',{});
+        const [id,probe]=Array.from(timers).at(-1);
+        timers.delete(id);await probe();
+        for(let i=0;i<10;i++) await Promise.resolve();
+        await FakeEventSource.instances.at(-1).emit('reasoning',{text:' NEW tail'});
+        drainFrames();
+      }else if(lifecycle==='sse_error'){
+        global.api=async()=>null;
+        await source.emit('error',{});
+        for(let i=0;i<50&&!settled;i++){
+          if(timers.size){
+            const [id,fn]=timers.entries().next().value;timers.delete(id);await fn();
+          }
+          for(let j=0;j<10;j++) await Promise.resolve();
+        }
+      }
+      const rendersBeforeOldFrame=anchorRenderAttempts;
+      if(lifecycle==='reattach'||lifecycle==='reconnect') oldFrames.forEach(fn=>fn());
+      drainFrames();
+      process.stdout.write(JSON.stringify({
+        texts:reasoningEvents().map(e=>e.payload.text),settled,
+        retained_reasoning:S.messages.at(-1).reasoning||'',
+        old_source_closed:source.readyState===2,
+        renders_before_old_frame:rendersBeforeOldFrame,
+        renders_after_old_frame:anchorRenderAttempts,
+      }));
+    })().catch(error=>{console.error(error);process.exitCode=1;});
+  }else{
   const text='R'.repeat(226748);
   for(let i=0;i<text.length;i+=2000) source.emit('reasoning',{text:text.slice(i,i+2000)});
   const rendersBeforeFrame=anchorRenderAttempts;
   if(process.env.ISSUE5720_SWITCH_BEFORE_FRAME==='1') S.session={session_id:'sid-2'};
   if(process.env.ISSUE5720_REASONING_BOUNDARY==='interim'){
     source.emit('interim_assistant',{text:'Visible answer',already_streamed:true});
+  }else if(process.env.ISSUE5720_REASONING_BOUNDARY==='tool'){
+    source.emit('tool',{name:'terminal',tid:'qa-tool',args:{command:'pwd'}});
   }else if(process.env.ISSUE5720_REASONING_BOUNDARY){
-    window.reasoningBoundary(process.env.ISSUE5720_REASONING_BOUNDARY);
+    source.emit(process.env.ISSUE5720_REASONING_BOUNDARY,{session:finalSession(text),session_id:'sid-1',usage:{}});
   }
-  for(const [id,fn] of Array.from(frames)){frames.delete(id);fn();}
+  const rendersAtBoundary=anchorRenderAttempts;
+  const inflightChars=INFLIGHT['sid-1']?INFLIGHT['sid-1'].lastReasoningText.length:S.messages.at(-1).reasoning.length;
+  drainFrames();
   const registry=window._liveAnchorRegistries.get('stream-1');
   const event=registry.anchor.activity_events.find(e=>e.source_event_type==='reasoning');
   process.stdout.write(JSON.stringify({
     renders_before_frame:rendersBeforeFrame,
     renders_after_frame:anchorRenderAttempts,
-    inflight_chars:INFLIGHT['sid-1'].lastReasoningText.length,
+    renders_at_boundary:rendersAtBoundary,
+    settled,inflight_cleared:!INFLIGHT['sid-1'],
+    inflight_chars:inflightChars,
     anchor_chars:event&&event.payload.text.length||0,
   }));
   process.exit(0);
-}
+  }
+}else{
 
 function anchorReasoningRows(){
   return turn.querySelectorAll(
@@ -755,4 +860,5 @@ process.stdout.write(JSON.stringify({
   inflight_reasoning_text:String(INFLIGHT['sid-1']&&INFLIGHT['sid-1'].lastReasoningText||''),
   multi_segment_exact_fallback:multiSegmentExactFallback,
 }));
+}
 """
