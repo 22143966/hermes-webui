@@ -1230,23 +1230,52 @@ def test_closing_the_action_menu_replays_an_explicit_completion_with_a_newer_pic
 const timers = [];
 const setTimeout = fn => { timers.push(fn); return timers.length; };
 let keptRepaints = 0;
-function _repaintSidebarKeepingProjectPicker() { keptRepaints += 1; }
+const document = {body: {id: 'body'}, activeElement: null};
+const replacementAction = {
+  isConnected: true,
+  focus(){ document.activeElement = replacementAction; },
+};
+const replacementRow = {
+  querySelector(selector){
+    return selector.includes('session-actions-trigger') ? replacementAction : null;
+  },
+};
+const staleAction = {
+  isConnected: true,
+  classList: {contains(){ return true; }, remove(){}},
+  setAttribute(){}, removeAttribute(){},
+  closest(){ return null; },
+  focus(){ document.activeElement = staleAction; },
+};
+function _repaintSidebarKeepingProjectPicker() {
+  keptRepaints += 1;
+  staleAction.isConnected = false;
+  document.activeElement = document.body;
+}
 function renderSessionListFromCache() { throw new Error('plain repaint used'); }
-function _focusSessionActionMenuRestoreTarget() { return true; }
+function _focusSessionActionMenuRestoreTarget(target) {
+  if(!target || !target.isConnected || typeof target.focus !== 'function') return false;
+  target.focus();
+  return document.activeElement === target;
+}
+function _findSessionRenameRow(sessionId) {
+  return sessionId === 's1' ? replacementRow : null;
+}
 let _sessionActionMenu = {remove(){}};
-let _sessionActionAnchor = null;
+let _sessionActionAnchor = staleAction;
 let _sessionActionSessionId = 's1';
 let _sessionActionPreviousFocus = null;
 let _projectPickerTeardown = () => {}; // newer picker opened by the menu action
 let _sessionListRepaintDeferredByPicker = false;
 let _sessionListRepaintDeferredByActionMenu = true;
 """ + _close_session_action_menu_source() + r"""
-closeSessionActionMenu();
+closeSessionActionMenu({restoreFocus:true});
 timers.splice(0).forEach(fn => fn());
 console.log(JSON.stringify({
   keptRepaints,
   flagCleared: _sessionListRepaintDeferredByActionMenu === false,
   pickerKept: _projectPickerTeardown !== null,
+  focusedReplacement: document.activeElement === replacementAction,
 }));
 """
     result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
@@ -1255,6 +1284,7 @@ console.log(JSON.stringify({
         "keptRepaints": 1,
         "flagCleared": True,
         "pickerKept": True,
+        "focusedReplacement": True,
     }
 
 

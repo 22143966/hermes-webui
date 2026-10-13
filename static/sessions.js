@@ -5348,6 +5348,33 @@ function closeSessionActionMenu({restoreFocus=false}={}){
   _sessionActionSessionId = null;
   _sessionActionPreviousFocus = null;
   if(!_focusSessionActionMenuRestoreTarget(focusTarget)) _focusSessionActionMenuRestoreTarget(fallbackFocusTarget);
+  // A repaint replaces the rows this menu was anchored on, so focus restored
+  // above may disappear with the old trigger. Re-home it to the replacement
+  // owner control without ever selecting an expanded fork descendant.
+  const restoreFocusAfterRepaint=()=>{
+    if(!restoreFocus) return;
+    const active=document.activeElement;
+    if(active&&active!==document.body&&active.isConnected) return;
+    const row=typeof _findSessionRenameRow==='function'?_findSessionRenameRow(restoreSessionId):null;
+    if(!row) return;
+    const ownAction=row.querySelector(':scope > .session-actions-trigger, :scope > .session-actions > .session-actions-trigger');
+    const ownMain=row.querySelector(':scope > .session-child-session-main');
+    // A top-level row can contain expanded fork buttons. Try direct controls
+    // first. A touch layout can keep its direct action trigger hidden, so only
+    // make the owner row focusable after neither direct control accepted focus.
+    let restored=false;
+    const candidates=[ownAction,ownMain];
+    for(const candidate of candidates){
+      if(candidate&&_focusSessionActionMenuRestoreTarget(candidate)){
+        restored=true;
+        break;
+      }
+    }
+    if(!restored){
+      row.tabIndex=-1;
+      _focusSessionActionMenuRestoreTarget(row);
+    }
+  };
   // A mutation completion is durable user-visible state, not background churn.
   // Replay it even when this menu action opened a newer project picker; the
   // keep-picker path re-anchors that overlay after rebuilding the sidebar.
@@ -5360,7 +5387,9 @@ function closeSessionActionMenu({restoreFocus=false}={}){
         else if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
       }catch(_){
         _sessionListRepaintDeferredByActionMenu=true;
+        return;
       }
+      restoreFocusAfterRepaint();
     },0);
   }
   // Drain a sidebar repaint the project picker deferred while this menu was
@@ -5372,35 +5401,7 @@ function closeSessionActionMenu({restoreFocus=false}={}){
       if(typeof _projectPickerTeardown!=='undefined'&&_projectPickerTeardown!==null) return;
       _sessionListRepaintDeferredByPicker=false;
       if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
-      // The repaint replaces the rows this menu was anchored on, so a focus
-      // this close just restored into one of them is gone with it and would
-      // fall to the page. Hand it to the row now showing the session: its
-      // trigger, else the fork row's own button, else the row itself, so
-      // keyboard users keep their place in the sidebar.
-      if(!restoreFocus) return;
-      const active=document.activeElement;
-      if(active&&active!==document.body&&active.isConnected) return;
-      const row=typeof _findSessionRenameRow==='function'?_findSessionRenameRow(restoreSessionId):null;
-      if(!row) return;
-      const ownAction=row.querySelector(':scope > .session-actions-trigger, :scope > .session-actions > .session-actions-trigger');
-      const ownMain=row.querySelector(':scope > .session-child-session-main');
-      // A top-level row can contain expanded fork buttons. Never hand focus to
-      // one of those descendants when restoring the owning conversation. If
-      // Try direct controls first. A touch layout can keep its direct action
-      // trigger in the DOM while hiding it, so only make the owner row
-      // programmatically focusable after neither direct control accepted focus.
-      let restored=false;
-      const candidates=[ownAction,ownMain];
-      for(const candidate of candidates){
-        if(candidate&&_focusSessionActionMenuRestoreTarget(candidate)){
-          restored=true;
-          break;
-        }
-      }
-      if(!restored){
-        row.tabIndex=-1;
-        _focusSessionActionMenuRestoreTarget(row);
-      }
+      restoreFocusAfterRepaint();
     },0);
   }
 }
