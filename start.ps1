@@ -162,7 +162,7 @@ if ($AgentDir -and -not (Test-Path (Join-Path $AgentDir 'hermes_cli') -PathType 
     exit 1
 }
 if (-not $AgentDir) {
-    # Prefer source roots and proved runtimes before marker-only directories.
+    # Prefer authoritative source roots, then proved runtimes and fallback roots.
     $serverCandidates = @()
     $serverCandidates += (Join-Path $env:HERMES_HOME 'hermes-agent')
     $repoParent = Split-Path -Parent $RepoRoot
@@ -191,6 +191,11 @@ if (-not $AgentDir) {
     # De-dup server-equivalent list (HERMES_HOME may coincide with platform default).
     $serverCandidates = $serverCandidates | Select-Object -Unique
     if (-not $AgentDir) {
+        foreach ($c in $serverCandidates) {
+            if (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf -ErrorAction SilentlyContinue) { $AgentDir = $c; break }
+        }
+    }
+    if (-not $AgentDir) {
         try {
             $runtimeCandidates = @(& $Python -c 'import sys; sys.path.insert(0, sys.argv[1]); from api.startup import _agent_dir_from_hermes_cli, _agent_dir_from_python; root = _agent_dir_from_hermes_cli() or _agent_dir_from_python(sys.executable); print(root or "")' $RepoRoot 2>$null)
             if ($LASTEXITCODE -eq 0) {
@@ -200,23 +205,29 @@ if (-not $AgentDir) {
             }
         } catch { }
     }
-    if (-not $AgentDir) {
-        # Source roots remain a fallback when no runtime is proved.
-        foreach ($c in $serverCandidates) {
-            if (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf -ErrorAction SilentlyContinue) { $AgentDir = $c; break }
-        }
-    }
     $launcherOnlyCandidates = @()
     $launcherOnlyCandidates += (Join-Path $env:USERPROFILE '.hermes\hermes-agent')
+    $programFilesCandidates = @()
     foreach ($root in @(${env:ProgramW6432}, ${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
-        if ($root) { $launcherOnlyCandidates += (Join-Path $root 'hermes\hermes-agent') }
+        if ($root) { $programFilesCandidates += (Join-Path $root 'hermes\hermes-agent') }
     }
+    $launcherOnlyCandidates += $programFilesCandidates
     # De-dup: WOW64 can make ProgramFiles == ProgramFiles(x86); legacy may equal
     # a prior server candidate when HERMES_HOME already points there.
     $launcherOnlyCandidates = $launcherOnlyCandidates | Select-Object -Unique
     if (-not $AgentDir) {
         foreach ($c in $launcherOnlyCandidates) {
-            if (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf -ErrorAction SilentlyContinue) { $AgentDir = $c; break }
+            if (-not (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf -ErrorAction SilentlyContinue)) { continue }
+            if ($programFilesCandidates -contains $c -and (
+                (Test-Path (Join-Path $c 'hermes_cli') -PathType Container -ErrorAction SilentlyContinue) -or
+                -not (Test-Path (Join-Path $c 'hermes_bootstrap.py') -PathType Leaf -ErrorAction SilentlyContinue)
+            )) {
+                # A Program Files checkout without its managed bootstrap is a
+                # stale fallback. Let an installed user Agent win the marker pass.
+                continue
+            }
+            $AgentDir = $c
+            break
         }
     }
     if (-not $AgentDir) {

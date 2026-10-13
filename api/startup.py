@@ -159,7 +159,10 @@ def _discover_agent_identity(
         user_home / "hermes-agent",
         Path("/usr/local/lib/hermes-agent"),
     ]
-    # Runtime provenance takes precedence over potentially stale source checkouts.
+    found = _first_valid_agent_candidate(authoritative_candidates)
+    if found:
+        return _AgentDiscovery(found)
+
     found = launcher_finder()
     if found:
         return _AgentDiscovery(found)
@@ -172,10 +175,6 @@ def _discover_agent_identity(
         found = python_finder(candidate)
         if found:
             return _AgentDiscovery(found, candidate)
-
-    found = _first_valid_agent_candidate(authoritative_candidates)
-    if found:
-        return _AgentDiscovery(found)
 
     fallback_candidates = [
         Path(os.getenv("XDG_DATA_HOME", str(user_home / ".local" / "share"))).expanduser()

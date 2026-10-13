@@ -210,7 +210,7 @@ def test_root_fhs_layout_is_in_candidate_list(monkeypatch, tmp_path):
     )
 
 
-def test_working_launcher_precedes_unproved_legacy_fhs_root(monkeypatch, tmp_path):
+def test_authoritative_fhs_source_precedes_working_launcher(monkeypatch, tmp_path):
     fhs_root = bootstrap.Path("/usr/local/lib/hermes-agent")
     install, venv_python = _make_agent_install(tmp_path)
     hermes = _make_hermes_cli(tmp_path, str(venv_python))
@@ -223,7 +223,7 @@ def test_working_launcher_precedes_unproved_legacy_fhs_root(monkeypatch, tmp_pat
         return real_exists(path)
 
     monkeypatch.setattr(bootstrap.Path, "exists", isolated_exists)
-    assert bootstrap.discover_agent_dir() == install.resolve()
+    assert bootstrap.discover_agent_dir() == fhs_root.resolve()
 
 
 def test_launcher_precedes_new_system_fallback(monkeypatch, tmp_path):
@@ -427,7 +427,7 @@ def test_hermes_cli_takes_precedence_over_configured_python(monkeypatch, tmp_pat
 
 @pytest.mark.parametrize("stale_source", [False, True])
 @pytest.mark.parametrize("runtime", ["launcher", "interpreter"])
-def test_stale_root_does_not_hide_working_runtime(monkeypatch, tmp_path, stale_source, runtime):
+def test_runtime_beats_marker_root_and_source_root_beats_runtime(monkeypatch, tmp_path, stale_source, runtime):
     install, venv_python = _make_agent_install(tmp_path)
     (install / "run_agent.py").write_text("class AIAgent: pass\n", encoding="utf-8")
     hermes = _make_hermes_cli(tmp_path, str(venv_python))
@@ -442,5 +442,6 @@ def test_stale_root_does_not_hide_working_runtime(monkeypatch, tmp_path, stale_s
     if runtime == "interpreter":
         monkeypatch.setattr(bootstrap, "_agent_dir_from_hermes_cli", lambda: None)
         monkeypatch.setattr(bootstrap, "_agent_dir_from_python", lambda _python: install)
-    assert bootstrap.discover_agent_dir() == install.resolve()
-    assert bootstrap._python_can_run_webui_and_agent(sys.executable, install)
+    expected = stale.resolve() if stale_source else install.resolve()
+    assert bootstrap.discover_agent_dir() == expected
+    assert bootstrap._python_can_run_webui_and_agent(sys.executable, expected) is not stale_source

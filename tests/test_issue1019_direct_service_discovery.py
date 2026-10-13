@@ -97,6 +97,39 @@ def test_direct_service_uses_active_agent_venv_identity(tmp_path, monkeypatch):
             local_python_visible = pathlib.Path(
                 os.environ["ISSUE1019_LOCAL_PYTHON"]
             ).exists()
+            bootstrap.ensure_python_has_webui_deps = lambda python, _agent_dir: python
+            bootstrap._check_port_available = lambda *_args: None
+            handoff = {}
+
+            def capture_execv(python, argv):
+                import api.config as config
+
+                handoff["python"] = python
+                handoff["config_python"] = config.PYTHON_EXE
+                handoff["agent_dir"] = str(config._AGENT_DIR)
+                raise RuntimeError("intercepted server exec")
+
+            if sys.platform == "win32":
+                real_popen = bootstrap.subprocess.Popen
+
+                def capture_spawn(argv, **_kwargs):
+                    if (
+                        len(argv) > 1
+                        and pathlib.Path(argv[1]) == bootstrap.REPO_ROOT / "server.py"
+                    ):
+                        capture_execv(argv[0], argv[1:])
+                    return real_popen(argv, **_kwargs)
+
+                bootstrap.subprocess.Popen = capture_spawn
+            else:
+                bootstrap.os.execv = capture_execv
+            sys.argv = ["bootstrap.py", "--foreground", "--no-browser"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    bootstrap.main()
+                except RuntimeError as exc:
+                    if str(exc) != "intercepted server exec":
+                        raise
             import api.config as config
 
         with contextlib.redirect_stdout(io.StringIO()) as captured:
@@ -105,6 +138,7 @@ def test_direct_service_uses_active_agent_venv_identity(tmp_path, monkeypatch):
             "bootstrap": str(bootstrap_result) if bootstrap_result else None,
             "config": str(config._AGENT_DIR) if config._AGENT_DIR else None,
             "python_exe": config.PYTHON_EXE,
+            "handoff": handoff,
             "local_python_visible": local_python_visible,
             "found": config._HERMES_FOUND,
             "imports": config.verify_hermes_imports(),
@@ -135,6 +169,10 @@ def test_direct_service_uses_active_agent_venv_identity(tmp_path, monkeypatch):
 
     assert observed["bootstrap"] == observed["config"]
     assert observed["python_exe"] == str(venv_python)
+    assert observed["handoff"]["config_python"] == str(venv_python)
+    assert observed["handoff"]["agent_dir"] == observed["bootstrap"]
+    assert Path(observed["handoff"]["python"]).parent == venv_python.parent
+    assert Path(observed["handoff"]["python"]).name in {"python.exe", "pythonw.exe"}
     assert observed["local_python_visible"] is True
     assert observed["found"] is True
     assert observed["imports"][0] is True
@@ -169,6 +207,86 @@ def test_interpreter_only_identity_does_not_authorize_auto_install(monkeypatch, 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
     monkeypatch.setenv("HERMES_WEBUI_PYTHON", str(tmp_path / "agent-python"))
     assert startup._agent_dir() is None
+
+
+def test_bootstrap_prefers_working_launcher_to_authoritative_marker_root(
+    monkeypatch, tmp_path
+):
+    import bootstrap
+
+    marker_root = tmp_path / "hermes-home" / "hermes-agent"
+    (marker_root / "hermes_cli").mkdir(parents=True)
+    (marker_root / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    launcher_root = tmp_path / "launcher-agent"
+    launcher_root.mkdir()
+    (launcher_root / "run_agent.py").write_text("", encoding="utf-8")
+
+    monkeypatch.delenv("HERMES_WEBUI_AGENT_DIR", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_PYTHON", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setattr(bootstrap.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    monkeypatch.setattr(
+        bootstrap._startup, "_platform_default_hermes_home", lambda: tmp_path / "default"
+    )
+    monkeypatch.setattr(bootstrap, "REPO_ROOT", tmp_path / "webui")
+    monkeypatch.setattr(bootstrap, "_agent_dir_from_hermes_cli", lambda: launcher_root)
+    monkeypatch.setattr(bootstrap, "_agent_dir_from_python", lambda _python: None)
+    monkeypatch.setattr(bootstrap, "_LAST_DISCOVERY", None)
+
+    assert bootstrap.discover_agent_dir() == launcher_root
+
+
+@pytest.mark.parametrize("runtime", ["launcher", "interpreter"])
+def test_authoritative_source_precedes_launcher_and_interpreter(monkeypatch, tmp_path, runtime):
+    from api import startup
+
+    source_root = tmp_path / "hermes-home" / "hermes-agent"
+    source_root.mkdir(parents=True)
+    (source_root / "run_agent.py").write_text("", encoding="utf-8")
+    runtime_root = tmp_path / "runtime-agent"
+    runtime_root.mkdir()
+    (runtime_root / "run_agent.py").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_WEBUI_AGENT_DIR", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_PYTHON", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+
+    assert startup.discover_agent_dir(
+        repo_root=tmp_path / "webui",
+        hermes_home=tmp_path / "hermes-home",
+        default_hermes_home=tmp_path / "default",
+        user_home=tmp_path / "home",
+        python_exe=str(tmp_path / "agent-python"),
+        launcher_finder=lambda: runtime_root if runtime == "launcher" else None,
+        python_finder=lambda _python: runtime_root if runtime == "interpreter" else None,
+    ) == source_root.resolve()
+
+
+def test_direct_service_prefers_xdg_source_to_authoritative_marker_root(
+    monkeypatch, tmp_path
+):
+    from api import startup
+
+    marker_root = tmp_path / "hermes-home" / "hermes-agent"
+    (marker_root / "hermes_cli").mkdir(parents=True)
+    (marker_root / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    xdg_root = tmp_path / "xdg" / "hermes-agent"
+    xdg_root.mkdir(parents=True)
+    (xdg_root / "run_agent.py").write_text("", encoding="utf-8")
+
+    monkeypatch.delenv("HERMES_WEBUI_AGENT_DIR", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_PYTHON", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+
+    assert startup.discover_agent_dir(
+        repo_root=tmp_path / "webui",
+        hermes_home=tmp_path / "hermes-home",
+        default_hermes_home=tmp_path / "default",
+        user_home=tmp_path / "home",
+        python_exe=str(tmp_path / "missing-python"),
+        launcher_finder=lambda: None,
+        python_finder=lambda _python: None,
+    ) == xdg_root.resolve()
 
 
 def test_discover_python_precedence_keeps_explicit_nested_and_proven_interpreters(
@@ -221,19 +339,29 @@ def test_discovery_checks_hermes_home_without_explicit_override(monkeypatch, tmp
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows launcher regression")
-@pytest.mark.parametrize("runtime", ["fallback", "interpreter", "launcher", "bare-fallback"])
-def test_windows_launcher_defers_stale_marker_root_until_working_runtime(tmp_path, runtime):
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        "fallback", "interpreter", "launcher", "bare-fallback",
+        "stale-program-files-checkout", "authoritative-source",
+    ],
+)
+def test_windows_launcher_prefers_proven_runtime_and_skips_stale_sources(tmp_path, runtime):
     import shutil
 
     pwsh = shutil.which("pwsh")
     if not pwsh:
         pytest.skip("PowerShell is unavailable")
     stale = tmp_path / "home" / "hermes-agent"
-    working = (tmp_path / "programs" / "hermes" / "hermes-agent" if runtime in ("fallback", "bare-fallback") else tmp_path / "runtime-agent")
+    working = (
+        tmp_path / "programs" / "hermes" / "hermes-agent"
+        if runtime in (
+            "fallback", "bare-fallback", "stale-program-files-checkout",
+        )
+        else tmp_path / "runtime-agent"
+    )
     (stale / "hermes_cli").mkdir(parents=True)
     (stale / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
-    if runtime in ("interpreter", "launcher"):
-        (stale / "run_agent.py").write_text("raise ImportError('stale checkout')\n", encoding="utf-8")
     (stale / "venv" / "Scripts").mkdir(parents=True)
     (stale / "venv" / "Scripts" / "python.exe").write_text("", encoding="utf-8")
     working.mkdir(parents=True)
@@ -244,10 +372,16 @@ def test_windows_launcher_defers_stale_marker_root_until_working_runtime(tmp_pat
         (working / "hermes_cli").mkdir()
         (working / "venv" / "Scripts").mkdir(parents=True)
         (working / "venv" / "Scripts" / "python.exe").write_text("", encoding="utf-8")
+    elif runtime == "stale-program-files-checkout":
+        (working / "run_agent.py").write_text("", encoding="utf-8")
+        (working / "hermes_cli").mkdir()
+        (working / "hermes_bootstrap.py").write_text("", encoding="utf-8")
     else:
         (working / "run_agent.py").write_text("", encoding="utf-8")
         if runtime == "fallback":
             (working / "hermes_bootstrap.py").write_text("", encoding="utf-8")
+    if runtime == "authoritative-source":
+        (stale / "run_agent.py").write_text("", encoding="utf-8")
     source = (REPO_ROOT / "start.ps1").read_text(encoding="utf-8")
     start = source.index("$AgentDir = $env:HERMES_WEBUI_AGENT_DIR")
     end = source.index("# === Resolve bind + state defaults", start)
@@ -268,7 +402,12 @@ def test_windows_launcher_defers_stale_marker_root_until_working_runtime(tmp_pat
         "TEST_REPO_ROOT": str(tmp_path / "repo"), "TEST_PYTHON": sys.executable,
         "PYTHONPATH": str(REPO_ROOT), "PATH": str(tmp_path / "empty-path"),
     })
-    if runtime == "interpreter":
+    if runtime == "authoritative-source":
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "hermes.cmd").write_text("#!" + str(working / "python.exe") + "\n", encoding="utf-8")
+        env["PATH"] = str(bin_dir)
+    elif runtime == "interpreter":
         env["PYTHONPATH"] = str(working) + os.pathsep + str(REPO_ROOT)
     elif runtime == "launcher":
         bin_dir = tmp_path / "bin"
@@ -278,12 +417,24 @@ def test_windows_launcher_defers_stale_marker_root_until_working_runtime(tmp_pat
     result = _run_hidden([pwsh, "-NoProfile", "-File", str(script)], cwd=tmp_path, env=env)
     assert result.returncode == 0, result.stderr
     selected_root, selected_python = result.stdout.strip().splitlines()
-    assert Path(selected_root) == working
-    assert Path(selected_python) == (working / "venv" / "Scripts" / "python.exe" if runtime == "bare-fallback" else Path(sys.executable))
+    expected_root = (
+        stale
+        if runtime in ("stale-program-files-checkout", "authoritative-source")
+        else working
+    )
+    expected_python = (
+        stale / "venv" / "Scripts" / "python.exe"
+        if runtime in ("stale-program-files-checkout", "authoritative-source")
+        else working / "venv" / "Scripts" / "python.exe"
+        if runtime == "bare-fallback"
+        else Path(sys.executable)
+    )
+    assert Path(selected_root) == expected_root
+    assert Path(selected_python) == expected_python
 
 
 @pytest.mark.parametrize("runtime", ["launcher", "interpreter"])
-def test_direct_service_does_not_install_into_stale_source_root(monkeypatch, tmp_path, runtime):
+def test_direct_service_does_not_install_into_stale_marker_root(monkeypatch, tmp_path, runtime):
     from api import auth, config, models, session_recovery, startup
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -295,7 +446,6 @@ def test_direct_service_does_not_install_into_stale_source_root(monkeypatch, tmp
     (stale / "cron").mkdir()
     (stale / "cron" / "jobs.py").write_text("", encoding="utf-8")
     (stale / "requirements.txt").write_text("stale-package\n", encoding="utf-8")
-    (stale / "run_agent.py").write_text("raise ImportError('stale checkout')\n", encoding="utf-8")
     working = tmp_path / "working-agent"
     working.mkdir()
     (working / "run_agent.py").write_text("", encoding="utf-8")

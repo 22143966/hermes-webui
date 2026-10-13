@@ -814,6 +814,7 @@ def main() -> int:
     os.environ["HERMES_WEBUI_HOST"] = args.host
     os.environ["HERMES_WEBUI_PORT"] = str(args.port)
     os.environ.setdefault("HERMES_WEBUI_STATE_DIR", str(state_dir))
+    os.environ["HERMES_WEBUI_PYTHON"] = python_exe
     if agent_dir:
         os.environ["HERMES_WEBUI_AGENT_DIR"] = str(agent_dir)
 

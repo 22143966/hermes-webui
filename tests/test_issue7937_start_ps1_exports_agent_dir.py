@@ -261,14 +261,14 @@ def test_home_hermes_agent_precedes_program_files_roots():
     assert "$env:LOCALAPPDATA, ${env:ProgramW6432}" not in server_block
 
 
-def test_source_and_runtime_discovery_precede_marker_only_roots():
-    """Working source roots and runtimes beat stale package directories."""
+def test_authoritative_sources_runtime_and_fallback_precede_marker_roots():
+    """Authoritative sources beat runtimes; all usable paths beat markers."""
     block = _discovery_block(_start_ps1_source())
     server_run = block.index("foreach ($c in $serverCandidates)")
     runtime = block.index("$runtimeCandidates =")
     fallback_run = block.index("foreach ($c in $launcherOnlyCandidates)")
     marker_pass = block.index("foreach ($c in @($serverCandidates) + @($launcherOnlyCandidates))")
-    assert runtime < server_run < fallback_run < marker_pass
+    assert server_run < runtime < fallback_run < marker_pass
     assert "_agent_dir_from_hermes_cli() or _agent_dir_from_python(sys.executable)" in block
     assert "Test-Path (Join-Path $c 'run_agent.py')" in block[fallback_run:marker_pass]
     assert "Test-Path (Join-Path $c 'hermes_cli')" in block[marker_pass:]
@@ -344,7 +344,9 @@ def test_marker_only_roots_follow_authoritative_then_fallback_path_order():
     """Marker-only compatibility roots keep their path order in the final tier."""
     block = _discovery_block(_start_ps1_source())
     marker_pass = block.index("foreach ($c in @($serverCandidates) + @($launcherOnlyCandidates))")
-    marker_check = block.index("Test-Path (Join-Path $c 'hermes_cli') -PathType Container")
+    marker_check = block.index(
+        "Test-Path (Join-Path $c 'hermes_cli') -PathType Container", marker_pass
+    )
     assert marker_pass < marker_check
     assert "if (-not $AgentDir)" in block[marker_pass - 40:marker_pass]
 
