@@ -135,6 +135,12 @@
 
 ### Fixed
 
+- **Metadata-only session reads no longer rebuild a conversation's regeneration history.** A `GET /api/session?messages=0`
+  built the canonical regeneration state even though it returns no messages. It now skips that work, and the browser
+  takes regeneration authority from its message load instead, keeping the history it already has loaded, including
+  after you switch away and back while a refresh is in flight. Metadata-only responses no longer carry
+  `regeneration_revision`. Thanks @tobenot. (#8173)
+
 - **A turn's unanswered tool call no longer passes as answered because a later turn reused its id.** The model context
   kept any tool call whose id appeared anywhere in the history's tool results, so an earlier interrupted call could pair
   with a later, unrelated result and send a malformed tool sequence to the provider. Tool calls now pair only with a
