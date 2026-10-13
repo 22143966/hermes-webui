@@ -434,10 +434,11 @@ async function _manualTitleRegenerateTimeoutMs(){
 function _formatSessionModelWithGateway(s){
   if(!s||!s.model)return'';
   const routing=(typeof _latestGatewayRoutingForSession==='function')?_latestGatewayRoutingForSession(s):(s.gateway_routing||null);
+  const fallbackModel=s.last_used_model||s.model;
   if(typeof _formatGatewayModelLabel==='function'){
-    return _formatGatewayModelLabel(s.model,s.model,routing)||getModelLabel(s.model);
+    return _formatGatewayModelLabel(fallbackModel,getModelLabel(fallbackModel),routing)||getModelLabel(fallbackModel);
   }
-  return s.model;
+  return fallbackModel;
 }
 
 function _getSessionViewedCounts() {
@@ -2494,6 +2495,13 @@ async function loadSession(sid){
     const _msgInner = $('msgInner');
     if (_msgInner && currentSid !== sid) _msgInner.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;padding:40px;text-align:center;">Loading conversation...</div>';
   }
+  // A superseded navigation can return here with this session's transcript
+  // still cached. Snapshot its width before metadata replaces S.session and
+  // drops the old message count and regeneration revision. If an interrupted
+  // forced refresh already cleared the rows, retain its saved width instead.
+  if(currentSid === sid && !forceReload && Array.isArray(S.messages) && S.messages.length > 0){
+    _captureSameSessionForceReloadHint(sid);
+  }
   // Phase 1: Load metadata only (~1KB) for fast session switching. Keep model
   // resolution out of the first-paint path; old provider-shaped model IDs are
   // repaired by the deferred resolver after S.session is assigned.
@@ -3104,7 +3112,7 @@ const _HANDOFF_THRESHOLD = 10;  // conversation rounds
 const _HANDOFF_STORAGE_PREFIX = 'handoff:';
 const _HANDOFF_SUFFIX_DISMISSED_AT = 'dismissed_at';
 const _HANDOFF_SUFFIX_SUMMARY_HANDLED_AT = 'summary_handled_at';
-const _MESSAGING_RAW_SOURCES = new Set(['weixin', 'telegram', 'discord', 'slack', 'email', 'wecom', 'wecom_callback', 'matrix', 'signal']);
+const _MESSAGING_RAW_SOURCES = new Set(['weixin', 'telegram', 'discord', 'slack', 'email', 'wecom', 'wecom_callback', 'matrix', 'signal', 'feishu', 'dingtalk']);
 const _MESSAGING_SOURCE_LABELS = {
   weixin: 'WeChat',
   telegram: 'Telegram',
@@ -3115,6 +3123,8 @@ const _MESSAGING_SOURCE_LABELS = {
   wecom_callback: 'WeCom Callback',
   matrix: 'Matrix',
   signal: 'Signal',
+  feishu: 'Feishu',
+  dingtalk: 'DingTalk',
 };
 
 function _isMessagingSession(session) {
@@ -3831,8 +3841,10 @@ async function _ensureMessagesLoaded(sid, opts) {
   const _loadGeneration = Number.isFinite(opts.loadGeneration) ? Number(opts.loadGeneration) : null;
   const _ownsLoad = () => _loadingSessionId === sid && (_loadGeneration === null || _loadSessionGeneration === _loadGeneration);
   if (!_ownsLoad()) return;
-  // Already have messages? (e.g. from INFLIGHT restore path, already set)
-  if (!opts.force && S.messages && S.messages.length > 0 && S.messages[0] && S.messages[0].role) {
+  // Metadata-only reads omit regeneration authority. Cached rows alone do
+  // not prove that the current session payload can authorize regeneration.
+  if (!opts.force && S.messages && S.messages.length > 0 && S.messages[0] && S.messages[0].role &&
+      S.session && S.session.session_id === sid && S.session.regeneration_revision) {
     _clearSameSessionForceReloadHint(sid);
     return;
   }
@@ -8876,7 +8888,7 @@ function renderSessionListFromCache(){
     // "All" chip
     const allChip=document.createElement('span');
     allChip.className='project-chip'+(!_activeProject?' active':'');
-    allChip.textContent='All';
+    allChip.textContent=t('project_chip_all');
     allChip.onclick=()=>{_setActiveProjectFilter(null);};
     bar.appendChild(allChip);
     // "Unassigned" chip — only when there are sessions with no project to
@@ -8885,8 +8897,8 @@ function renderSessionListFromCache(){
     if(hasUnprojected){
       const noneChip=document.createElement('span');
       noneChip.className='project-chip no-project'+(_activeProject===NO_PROJECT_FILTER?' active':'');
-      noneChip.textContent='Unassigned';
-      noneChip.title='Show conversations not yet assigned to a project';
+      noneChip.textContent=t('project_chip_unassigned');
+      noneChip.title=t('project_chip_unassigned_title');
       noneChip.onclick=()=>{_setActiveProjectFilter(NO_PROJECT_FILTER);};
       bar.appendChild(noneChip);
     }

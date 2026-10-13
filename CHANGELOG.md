@@ -101,6 +101,12 @@
 
 ### Security
 
+- **A malformed passkey response is refused with 400/401, never a server error.** Registering or signing in with a
+  crafted passkey response, for example one whose declared credential ID is longer than the real one, could make the
+  CBOR reader raise an unexpected error and answer `500 Internal server error`. Every malformed registration or login
+  response now gets a clean 400/401 with nothing stored and no session issued, and valid passkeys register and sign in
+  exactly as before. Thanks @ybai08. (#8138, fixes #8126)
+
 - **Remote images in chat no longer load until you click them (zero-click exfiltration fix).** Any assistant-rendered
   `![x](https://host/?d=…)` used to fetch the moment it rendered, which let a prompt-injected reply beacon chat data to
   an outside server. The default CSP `img-src` no longer allows arbitrary `https:` images, and a non-allowlisted remote
@@ -134,6 +140,55 @@
   @laitekin. (#7297, fixes #7294)
 
 ### Fixed
+
+- **Insights: the Models card gets three times the width of its neighbours in the usage row.** Long model ids such as
+  `anthropic/claude-...` and `openrouter/...` were cut to an 80 px name column, so several rows read identically. The card
+  now takes a 3x share of the row, and on narrow screens its table stays inside the card instead of spilling past
+  the window. Thanks @aleesposito85. (#8157)
+
+- **Metadata-only session reads no longer rebuild a conversation's regeneration history.** A `GET /api/session?messages=0`
+  built the canonical regeneration state even though it returns no messages. It now skips that work, and the browser
+  takes regeneration authority from its message load instead, keeping the history it already has loaded, including
+  after you switch away and back while a refresh is in flight. Metadata-only responses no longer carry
+  `regeneration_revision`. Thanks @tobenot. (#8173)
+
+- **A turn's unanswered tool call no longer passes as answered because a later turn reused its id.** The model context
+  kept any tool call whose id appeared anywhere in the history's tool results, so an earlier interrupted call could pair
+  with a later, unrelated result and send a malformed tool sequence to the provider. Tool calls now pair only with a
+  result immediately after them, in both model-facing projections. Thanks @happy5318. (#8194)
+
+- **Switching back to a long-running conversation no longer freezes the browser.** Reconnecting to a conversation
+  whose agent has been reasoning for a long time replayed every reasoning chunk with its own render. A 500-chunk replay
+  now paints once per frame instead, cutting the longest main-thread task from about 8-9 s to under 100 ms with the
+  same text. A dropped connection also paints the last words received before it reconnects, without rewinding text in
+  the fade modes. Thanks @UncleLiu-0306. (#8171)
+
+- **The composer model chip and the sidebar now name the model that actually answered after a provider fallback.**
+  When a direct-provider turn fell back to another model, the chip and sidebar kept the configured model. The session
+  now records the served model only when the turn's route still matches the conversation's model/provider, so a mid-turn
+  model pick is never mislabelled. Reopening a session keeps that attribution until you pick a different model in that
+  tab. Thanks @Guts1005. (#7438, fixes #6594)
+
+- **Browser chats now honour a profile's OpenRouter `provider_routing` block** (`sort`, `only`, `ignore`, `order`,
+  `require_parameters`, `data_collection`), as Discord, Telegram and the TUI already did. Both the streaming and the
+  non-streaming chat paths forward it to the agent, editing it takes effect on the next turn, and a `${VAR}` the
+  profile doesn't define is dropped with a warning instead of being sent to OpenRouter as a literal provider name.
+  Thanks @TheDevMoth. (#7812)
+
+- **Chats no longer fail on every message with older Hermes Agent builds.** Each streaming turn re-registers the
+  agent's `cronjob` tool to scope it to the chat's profile, and it copied `ToolEntry.dynamic_schema_overrides`
+  unconditionally; Agent builds from before that field existed raised `AttributeError` before the agent ran, so every
+  chat failed. The field is now forwarded only when both the entry and `register()` support it. Thanks @Yi-111-a.
+  (#8187, fixes #8186)
+
+- **The Memory panel's Project Context section and the sidebar project chips are now translated.** They were
+  hard-coded English in every locale; all 15 locales now carry the strings (English text unchanged), and the residual
+  untranslated Russian values are filled in. Thanks @MuhammadUsamaMX. (#8178, refs #7579)
+
+- **Feishu and DingTalk chats now show up as messaging sessions in the sidebar.** Gateway sessions from those two
+  platforms were classified as "other" with a raw source label, so they missed the messaging filter and the external
+  session handling every other chat platform gets. Both are now in the messaging source set with proper labels, on the
+  server and in the sidebar's fallback tables. Thanks @HenryLoveMiller. (#8174)
 
 - **The model picker no longer trusts a models cache that was only recently touched.** The session-visit freshness
   check used the cache file's modified time, so anything that touched the file (a copy, a sync, a backup) kept a stale
