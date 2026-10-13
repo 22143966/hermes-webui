@@ -378,6 +378,7 @@ const _sessionStreamingById = new Map();
 const _sessionListSnapshotById = new Map();
 const _sessionListSourceById = new Map();
 let _sessionListPointerActive = false;
+let _sessionRowReleaseAt = 0;
 let _sessionListLastScrollAt = 0;
 let _pendingSessionListPayload = null;
 let _pendingSessionListApplyTimer = 0;
@@ -390,9 +391,9 @@ const SESSION_SWIPE_REFLOW_LEAD_MS = 220;
 const SESSION_REFLOW_TIMEOUT_MS = 420;
 const SESSION_LIST_FLIP_TIMEOUT_MS = 460;
 const SESSION_LONG_PRESS_DELAY_MS = 400;
-// A click this soon after a real press on a session row belongs to the
-// pointer/touch gesture path; a bare click is keyboard or screen-reader input.
-const SESSION_ROW_PRESS_CLICK_WINDOW_MS = 5000;
+// A click this soon after a primary pointer/touch release on a session row
+// belongs to the gesture path; a bare click is keyboard or screen-reader input.
+const SESSION_ROW_RELEASE_CLICK_WINDOW_MS = 800;
 const SESSION_ARCHIVE_SWIPE_THRESHOLD_PX = 128;
 const SESSION_DELETE_SWIPE_THRESHOLD_PX = 128;
 const SESSION_SWIPE_CANCEL_RATIO = 0.75;
@@ -9331,7 +9332,10 @@ function renderSessionListFromCache(){
       title.onkeydown=(e)=>{
         if(e.key!=='Enter'||e.ctrlKey||e.metaKey||e.altKey||e.shiftKey) return;
         e.preventDefault();
-        title.click();
+        // Keep this Enter from the document-level shortcuts: with a tool
+        // approval card visible, a bare Enter there means "Allow once".
+        e.stopPropagation();
+        if(!e.repeat) title.click();
       };
     }
     const tsMs=_sessionTimestampMs(s);
@@ -10125,17 +10129,16 @@ function renderSessionListFromCache(){
     };
     // Keyboard and assistive-technology activation. Enter on the title link and
     // a screen reader's activate command (NVDA browse mode in Firefox) dispatch
-    // a bare click with no pointerdown/touchstart before it, so the gesture
-    // machine never arms and the row would not open. A click that follows a
-    // real press on this row belongs to pointerup/touchend and is skipped here.
-    // Capture phase so inner controls that stop propagation still consume the
-    // press marker; a press that never produced a click expires on its own.
-    let _rowPressAt=0;
-    const _markRowPress=()=>{_rowPressAt=Date.now();};
+    // a bare click with no pointer/touch release before it, so the gesture
+    // machine never arms and the row would not open. The click a browser sends
+    // right after a primary pointer or touch release belongs to the gesture
+    // path and is skipped here. The release marker is list-wide, so a click
+    // that lands on a row rebuilt mid-tap is still recognised. Capture phase so
+    // inner controls that stop propagation still consume the marker.
     el.addEventListener('click',(e)=>{
-      const pressed=_rowPressAt&&Date.now()-_rowPressAt<SESSION_ROW_PRESS_CLICK_WINDOW_MS;
-      _rowPressAt=0;
-      if(pressed) return;
+      const released=_sessionRowReleaseAt&&Date.now()-_sessionRowReleaseAt<SESSION_ROW_RELEASE_CLICK_WINDOW_MS;
+      _sessionRowReleaseAt=0;
+      if(released) return;
       if(_isSessionActionTarget(e.target)) return;
       if(e.target&&e.target.closest&&e.target.closest('.session-select-cb-wrapper,.session-tag,.session-title-input,.session-child-count,.session-child-sessions,.session-child-session,.session-lineage-count,.session-lineage-segments,.session-lineage-segment')) return;
       if(_sessionActionMenu){closeSessionActionMenu();return;}
@@ -10144,7 +10147,6 @@ function renderSessionListFromCache(){
       void _openRowSession();
     },true);
     el.onpointerdown=(e)=>{
-      _markRowPress();
       if(e.pointerType==='touch') return;
       if(e.pointerType==='mouse' && e.button!==0) return;
       if(_isSessionActionTarget(e.target)) return;
@@ -10168,6 +10170,7 @@ function renderSessionListFromCache(){
       if(_gesturePointerType==='mouse'&&_gestureState!=='idle') _clearPointerDragState();
     };
     el.onpointerup=(e)=>{
+      if(e.button===0) _sessionRowReleaseAt=Date.now();
       if(e.pointerType==='touch') return;
       if(e.pointerType==='mouse' && e.button!==0) return;  // ignore right/middle click
       if((e.ctrlKey||e.metaKey) && !_sessionSelectMode && !_renamingSid && _gestureState!=='idle' && !_longPressMenuOpened && (typeof _newTabOpenSupported!=='function'||_newTabOpenSupported())){
@@ -10214,7 +10217,6 @@ function renderSessionListFromCache(){
       startRename();
     };
     el.addEventListener('touchstart',(e)=>{
-      _markRowPress();
       if(_isSessionActionTarget(e.target)) return;
       const touch=e.changedTouches&&e.changedTouches[0];
       if(!touch) return;
@@ -10228,6 +10230,7 @@ function renderSessionListFromCache(){
     },{passive:false});
     el.addEventListener('touchcancel',_clearPointerDragState,{passive:true});
     el.addEventListener('touchend',(e)=>{
+      _sessionRowReleaseAt=Date.now();
       const touch=e.changedTouches&&e.changedTouches[0];
       if(!touch) return;
       if(_finishSessionGesture(touch.clientX,touch.clientY,e.target,'touch')) e.stopPropagation();

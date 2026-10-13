@@ -197,7 +197,10 @@ conversation's title. Mouse events without pointer events (how Firefox performs
 a screen reader's activate command, e.g. NVDA in browse mode), a bare
 `element.click()`, and Enter on the focused title must each open the
 conversation, and a sidebar repaint must never move focus to a title (a screen
-reader would pull its reading cursor back to the list). A real
+reader would pull its reading cursor back to the list). A held (auto-repeated)
+Enter must not open it again, Enter on a title must not answer a visible tool
+approval card (the document-level "Enter = Allow once" shortcut), and a
+right-click on a row must not swallow the next keyboard activation. A real
 mouse click and a touch tap must still open it exactly once; Enter on the row's
 ⋮ trigger must open its menu, not the conversation; and in selection mode the
 title must not be a link. The checks run in Chromium, and in Firefox as well

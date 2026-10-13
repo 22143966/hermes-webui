@@ -19,7 +19,10 @@ WHAT IT CHECKS (Chromium, and Firefox when its Playwright build is installed)
   - mouse events without pointer events (how Firefox performs an assistive
     technology's activate action) open the conversation, once;
   - a bare element.click() opens the conversation;
-  - Tab focus on a title plus Enter opens it;
+  - Tab focus on a title plus Enter opens it; a held (auto-repeated) Enter
+    does not open again; with a tool approval card visible, that Enter does
+    not answer the approval (document-level Enter shortcut);
+  - a right-click on a row does not swallow the next keyboard activation;
   - a sidebar repaint never moves focus to a title (a screen reader's reading
     cursor would be pulled back to the list);
   - a real mouse click still opens the conversation exactly once;
@@ -208,6 +211,8 @@ def _check_desktop(page, seed, name):
     if not _wait_until(page, ACTIVE_JS, alpha):
         fail("a bare click() did not open the conversation")
     page.wait_for_timeout(SETTLE_MS)
+    if _opens(page) != [alpha]:
+        fail(f"a bare click() opened {_opens(page)}, expected exactly [alpha]")
 
     _open(page, alpha)
     page.evaluate(COUNT_OPENS_JS)
@@ -221,6 +226,53 @@ def _check_desktop(page, seed, name):
     current = {t["sid"]: t["current"] for t in page.evaluate(TITLES_JS)}
     if current.get(beta) != "page" or current.get(alpha) is not None:
         fail(f"aria-current did not follow the open conversation: {current}")
+
+    # A held Enter auto-repeats; only the first keydown may open.
+    page.evaluate(COUNT_OPENS_JS)
+    page.evaluate("""(el) => {
+      el.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', repeat: true, bubbles: true, cancelable: true}));
+    }""", _title(page, alpha))
+    page.wait_for_timeout(SETTLE_MS)
+    if _opens(page):
+        fail(f"an auto-repeated Enter opened {_opens(page)}")
+
+    # With a tool approval card visible, a bare Enter elsewhere means
+    # "Allow once" (document-level shortcut). Enter on a title must not reach it.
+    page.evaluate("""() => {
+      window.__approvals = [];
+      window.respondApproval = (choice) => { window.__approvals.push(choice); };
+      const card = document.getElementById('approvalCard');
+      if (card) card.classList.add('visible');
+    }""")
+    page.evaluate(COUNT_OPENS_JS)
+    _title(page, alpha).focus()
+    page.keyboard.press("Enter")
+    if not _wait_until(page, ACTIVE_JS, alpha):
+        fail("Enter on a title did not open the conversation with an approval card visible")
+    page.wait_for_timeout(SETTLE_MS)
+    approvals = page.evaluate("() => window.__approvals")
+    if approvals:
+        fail(f"Enter on a conversation title answered the pending approval: {approvals}")
+    page.evaluate("""() => {
+      const card = document.getElementById('approvalCard');
+      if (card) card.classList.remove('visible');
+    }""")
+
+    # A right-click (no click event follows) must not leave a marker that
+    # swallows the next keyboard activation.
+    _open(page, alpha)
+    page.evaluate(COUNT_OPENS_JS)
+    _title(page, beta).click(button="right")
+    page.keyboard.press("Escape")
+    page.evaluate("() => typeof closeSessionActionMenu === 'function' && closeSessionActionMenu()")
+    page.wait_for_timeout(300)
+    _title(page, beta).focus()
+    page.keyboard.press("Enter")
+    if not _wait_until(page, ACTIVE_JS, beta):
+        fail("Enter right after a right-click on the row did not open the conversation")
+    page.wait_for_timeout(SETTLE_MS)
+    if _opens(page) != [beta]:
+        fail(f"Enter after a right-click opened {_opens(page)}, expected exactly [beta]")
 
     # A screen reader leaves the browser focus on the activated title while its
     # reading cursor moves through the conversation. A background repaint must
@@ -258,13 +310,16 @@ def _check_desktop(page, seed, name):
         .find(node => node.dataset.sid === sid);
       return row && row.querySelector('.session-actions-trigger');
     }""", beta).as_element()
-    trigger.focus()
-    page.keyboard.press("Enter")
-    page.wait_for_timeout(300)
-    if not page.evaluate("() => !!document.querySelector('.session-action-menu')"):
-        fail("Enter on the actions trigger did not open its menu")
-    if _opens(page) or not page.evaluate(ACTIVE_JS, alpha):
-        fail(f"Enter on the actions trigger opened a conversation: {_opens(page)}")
+    if trigger is None:
+        fail("the beta row has no actions trigger")
+    else:
+        trigger.focus()
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(300)
+        if not page.evaluate("() => !!document.querySelector('.session-action-menu')"):
+            fail("Enter on the actions trigger did not open its menu")
+        if _opens(page) or not page.evaluate(ACTIVE_JS, alpha):
+            fail(f"Enter on the actions trigger opened a conversation: {_opens(page)}")
     page.keyboard.press("Escape")
     page.evaluate("() => typeof closeSessionActionMenu === 'function' && closeSessionActionMenu()")
     page.wait_for_timeout(300)
