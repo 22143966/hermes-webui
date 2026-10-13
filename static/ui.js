@@ -5466,7 +5466,7 @@ function renderModelDropdown(){
       // not be reset to the top of the list and not have it jump unpredictably.
       if(firstNewRow && typeof firstNewRow.offsetTop==='number' && typeof requestAnimationFrame==='function'){
         const _targetTop=Math.max(0,firstNewRow.offsetTop-48);
-        const _doScroll=()=>{ try{ dd.scrollTop=_targetTop; }catch(_){} };
+        const _doScroll=()=>{ try{ dd.scrollTop=_targetTop;if(typeof _nudgeModelRowBelowStickyStack==='function') _nudgeModelRowBelowStickyStack(dd,firstNewRow); }catch(_){} };
         _doScroll();                                   // immediate
         requestAnimationFrame(()=>{ _doScroll(); requestAnimationFrame(_doScroll); });
         if(typeof setTimeout==='function') setTimeout(_doScroll,80); // after any refocus settles
