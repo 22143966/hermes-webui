@@ -21692,6 +21692,8 @@ def _handle_tts(handler, parsed):
         "zh-CN-XiaoxiaoNeural", "zh-CN-XiaoyiNeural", "zh-CN-YunxiNeural",
         "zh-CN-YunjianNeural", "zh-CN-YunyangNeural",
         "en-US-AriaNeural", "en-US-GuyNeural",
+        "en-US-AndrewMultilingualNeural", "en-US-AvaMultilingualNeural",
+        "en-US-BrianMultilingualNeural", "en-US-EmmaMultilingualNeural",
         "fr-CA-AntoineNeural", "fr-CA-JeanNeural",
         "fr-CA-SylvieNeural", "fr-CA-ThierryNeural",
         "fr-FR-DeniseNeural", "fr-FR-EloiseNeural", "fr-FR-HenriNeural",
