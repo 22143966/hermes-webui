@@ -59,6 +59,7 @@ from api.config import (
     CUSTOM_ROUTE_NO_ENDPOINT,
     custom_provider_route_error,
     raise_for_custom_provider_route,
+    _parse_provider_qualified_model_id,
     model_with_provider_context,
     warm_models_catalog_provenance_if_cold,
     load_settings,
@@ -3310,6 +3311,7 @@ _GATEWAY_ROUTING_TOP_LEVEL_KEYS = {
     'used_provider',
     'used_model',
     'requested_provider',
+    'requested_route_provider',
     'requested_model',
 }
 _GATEWAY_ROUTING_CONTAINER_KEYS = (
@@ -3350,7 +3352,7 @@ def _find_gateway_metadata_payload(payload):
     return None
 
 
-def _normalize_gateway_routing_metadata(payload, requested_model=None, requested_provider=None):
+def _normalize_gateway_routing_metadata(payload, requested_model=None, requested_provider=None, requested_route_provider=None):
     """Return safe LLM Gateway routing metadata, or None when absent.
 
     LLM Gateway response metadata can contain provider/model routing details,
@@ -3375,6 +3377,10 @@ def _normalize_gateway_routing_metadata(payload, requested_model=None, requested
         fallback_provider = _clean_gateway_routing_scalar(requested_provider)
         if fallback_provider is not None:
             normalized['requested_provider'] = fallback_provider
+    if 'requested_route_provider' not in normalized:
+        fallback_route_provider = _clean_gateway_routing_scalar(requested_route_provider)
+        if fallback_route_provider is not None:
+            normalized['requested_route_provider'] = fallback_route_provider
 
     routing = []
     raw_routing = src.get('routing')
@@ -3420,7 +3426,7 @@ def _normalize_gateway_routing_metadata(payload, requested_model=None, requested
     return normalized
 
 
-def _extract_gateway_routing_metadata(agent, result, requested_model=None, requested_provider=None):
+def _extract_gateway_routing_metadata(agent, result, requested_model=None, requested_provider=None, requested_route_provider=None):
     candidates = []
     if isinstance(result, dict):
         candidates.extend([
@@ -3447,10 +3453,29 @@ def _extract_gateway_routing_metadata(agent, result, requested_model=None, reque
             candidate,
             requested_model=requested_model,
             requested_provider=requested_provider,
+            requested_route_provider=requested_route_provider,
         )
         if normalized:
             return normalized
     return None
+
+
+def _capture_turn_served_model(s, agent) -> str | None:
+    """Capture the model that actually served this turn onto the session.
+
+    #6068: the served model must be read AFTER agent.run: the agent
+    mutates agent.model when a fallback fires, so the pre-run
+    resolved_model would mis-attribute exactly the turns where
+    attribution matters most.
+    The configured selection is not proof that it served this turn.
+    Sets s.last_used_model from observed agent.model only, and to None
+    when nothing was observed.
+    """
+    _observed_model = getattr(agent, 'model', None)
+    _used_model = _observed_model.strip() if isinstance(_observed_model, str) else None
+    if s is not None:
+        s.last_used_model = (_used_model[:240]) if _used_model else None
+    return _used_model
 
 
 def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, session_id: str, profile_home: str) -> dict:
@@ -11992,6 +12017,7 @@ def _run_agent_streaming(
             else getattr(s, "model_provider", None)
         )
         provider_context = str(provider_context).strip().lower() if provider_context else None
+        _turn_route_provider = provider_context
         _agent_lock = _get_session_agent_lock(session_id)
         # #4251: the route layer already persisted this turn's model under the
         # session lock before dispatch, so a mismatch here means a newer picker
@@ -12011,6 +12037,8 @@ def _run_agent_streaming(
                 _last_persisted_model = model
                 _last_persisted_provider = provider_context
                 _turn_owns_persisted_model = True
+                _turn_route_model = model
+                _turn_route_provider = provider_context
 
         # TD1: set thread-local env context so concurrent sessions don't clobber globals
         # Check for pre-flight cancel (user cancelled before agent even started)
@@ -12074,6 +12102,11 @@ def _run_agent_streaming(
                 s.model_provider = provider_context
                 if _repaired and model != (s.model or ""):
                     s.model = model
+                _last_persisted_model = s.model
+                _last_persisted_provider = s.model_provider
+                # ponytail: finalize route snapshot when profile normalization is accepted
+                _turn_route_model = s.model
+                _turn_route_provider = s.model_provider
 
         # Capture the resolved profile name now, while profile context is
         # reliable. Used in the compression migration block to stamp s.profile
@@ -12924,6 +12957,7 @@ def _run_agent_streaming(
             # detached worker for a NAMED profile paired that profile's endpoint
             # with the DEFAULT profile's API key (finding #3). No-op for the
             # default/root profile.
+            _session_requested_provider = None
             with profiles_api.profile_scope_for_detached_worker(
                 _resolved_profile_name, "model + credential resolution", logger_override=logger
             ):
@@ -14673,18 +14707,48 @@ def _run_agent_streaming(
                 _gateway_routing = _extract_gateway_routing_metadata(
                     agent,
                     result,
+                    # The resolved (bare) model, as on master: a qualified
+                    # route hint such as @openrouter:gpt-4o served by gpt-4o
+                    # is not a model switch. The route provider rides along
+                    # separately for the settlement guard.
                     requested_model=resolved_model or model,
                     requested_provider=resolved_provider,
+                    requested_route_provider=_turn_route_provider,
                 )
-                # #6068: the served model must be read AFTER agent.run — the agent
+                # #6068: the served model must be read AFTER agent.run: the agent
                 # mutates agent.model when a fallback fires, so the pre-run
                 # resolved_model would mis-attribute exactly the turns where
                 # attribution matters most.
                 # The configured selection is not proof that it served this turn.
-                _observed_model = getattr(agent, 'model', None)
-                _used_model = _observed_model.strip() if isinstance(_observed_model, str) else None
+                # ponytail: normalize empty/whitespace to None for route equality
+                def _norm_str(v):
+                    val = str(v or '').strip().lower()
+                    return val if val else None
+
+                # ponytail: reuse shared parser for @provider:model tags
+                def _bare_route_model(v):
+                    val = str(v or '').strip()
+                    if val.startswith('@') and ':' in val:
+                        parsed = _parse_provider_qualified_model_id(val)
+                        if parsed:
+                            return parsed[0].strip().lower()
+                        return val.split(':', 1)[1].strip().lower()
+                    return val.lower() if val else None
+
+                _route_matches = True
+                if s is not None:
+                    _cur_m = getattr(s, 'model', None)
+                    _cur_p = getattr(s, 'model_provider', None)
+                    _target_m = _turn_route_model or resolved_model or model
+                    if _bare_route_model(_cur_m) != _bare_route_model(_target_m):
+                        _route_matches = False
+                    if _norm_str(_cur_p) != _norm_str(_turn_route_provider):
+                        _route_matches = False
+
+                _used_model = _capture_turn_served_model(s if _route_matches else None, agent)
                 if _gateway_routing:
-                    s.gateway_routing = _gateway_routing
+                    if _route_matches:
+                        s.gateway_routing = _gateway_routing
                     _history = list(getattr(s, 'gateway_routing_history', None) or [])
                     _history.append(_gateway_routing)
                     s.gateway_routing_history = _history[-50:]

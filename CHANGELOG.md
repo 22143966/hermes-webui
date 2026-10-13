@@ -135,6 +135,12 @@
 
 ### Fixed
 
+- **The composer model chip and the sidebar now name the model that actually answered after a provider fallback.**
+  When a direct-provider turn fell back to another model, the chip and sidebar kept the configured model. The session
+  now records the served model only when the turn's route still matches the conversation's model/provider, so a mid-turn
+  model pick is never mislabelled. Reopening a session keeps that attribution until you pick a different model in that
+  tab. Thanks @Guts1005. (#7438, fixes #6594)
+
 - **Browser chats now honour a profile's OpenRouter `provider_routing` block** (`sort`, `only`, `ignore`, `order`,
   `require_parameters`, `data_collection`), as Discord, Telegram and the TUI already did. Both the streaming and the
   non-streaming chat paths forward it to the agent, editing it takes effect on the next turn, and a `${VAR}` the
