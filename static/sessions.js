@@ -390,6 +390,9 @@ const SESSION_SWIPE_REFLOW_LEAD_MS = 220;
 const SESSION_REFLOW_TIMEOUT_MS = 420;
 const SESSION_LIST_FLIP_TIMEOUT_MS = 460;
 const SESSION_LONG_PRESS_DELAY_MS = 400;
+// A click this soon after a real press on a session row belongs to the
+// pointer/touch gesture path; a bare click is keyboard or screen-reader input.
+const SESSION_ROW_PRESS_CLICK_WINDOW_MS = 5000;
 const SESSION_ARCHIVE_SWIPE_THRESHOLD_PX = 128;
 const SESSION_DELETE_SWIPE_THRESHOLD_PX = 128;
 const SESSION_SWIPE_CANCEL_RATIO = 0.75;
@@ -9318,6 +9321,19 @@ function renderSessionListFromCache(){
     if(titleMatched) _appendHighlightedText(title,displayTitle,searchQueryRaw,'session-search-hit');
     else title.textContent=displayTitle;
     title.title=_sessionFullTitleTooltip(rawTitle,cleanTitle,s);
+    // The title is the row's keyboard/screen-reader handle: a focusable link
+    // that opens the conversation (Enter, or a screen reader's activate
+    // command). Select mode hands that role to the row checkbox instead.
+    if(!_sessionSelectMode){
+      title.setAttribute('role','link');
+      title.tabIndex=0;
+      if(isActive) title.setAttribute('aria-current','page');
+      title.onkeydown=(e)=>{
+        if(e.key!=='Enter'||e.ctrlKey||e.metaKey||e.altKey||e.shiftKey) return;
+        e.preventDefault();
+        title.click();
+      };
+    }
     const tsMs=_sessionTimestampMs(s);
     const ts=document.createElement('span');
     const hasAttentionState=isStreaming||hasUnread||Boolean(attention);
@@ -10094,17 +10110,41 @@ function renderSessionListFromCache(){
       _tapTimer=setTimeout(async()=>{
         _tapTimer=null;
         _lastTapTime=0;
-        if(_renamingSid) return;
-        try{
-          if(($('sessionSearch').value||'').trim()) _hideSearchPreviewsAfterSelect=true;
-          await _openSidebarSession(s);
-        }finally{
-          el.classList.remove('loading');
-        }
+        await _openRowSession();
       }, delay);
       return false;
     };
+    const _openRowSession=async()=>{
+      if(_renamingSid) return;
+      try{
+        if(($('sessionSearch').value||'').trim()) _hideSearchPreviewsAfterSelect=true;
+        await _openSidebarSession(s);
+      }finally{
+        el.classList.remove('loading');
+      }
+    };
+    // Keyboard and assistive-technology activation. Enter on the title link and
+    // a screen reader's activate command (NVDA browse mode in Firefox) dispatch
+    // a bare click with no pointerdown/touchstart before it, so the gesture
+    // machine never arms and the row would not open. A click that follows a
+    // real press on this row belongs to pointerup/touchend and is skipped here.
+    // Capture phase so inner controls that stop propagation still consume the
+    // press marker; a press that never produced a click expires on its own.
+    let _rowPressAt=0;
+    const _markRowPress=()=>{_rowPressAt=Date.now();};
+    el.addEventListener('click',(e)=>{
+      const pressed=_rowPressAt&&Date.now()-_rowPressAt<SESSION_ROW_PRESS_CLICK_WINDOW_MS;
+      _rowPressAt=0;
+      if(pressed) return;
+      if(_isSessionActionTarget(e.target)) return;
+      if(e.target&&e.target.closest&&e.target.closest('.session-select-cb-wrapper,.session-tag,.session-title-input,.session-child-count,.session-child-sessions,.session-child-session,.session-lineage-count,.session-lineage-segments,.session-lineage-segment')) return;
+      if(_sessionActionMenu){closeSessionActionMenu();return;}
+      if(_sessionSelectMode){if(!readOnly)toggleSessionSelect(s.session_id);return;}
+      clearTimeout(_tapTimer);_tapTimer=null;_lastTapTime=0;
+      void _openRowSession();
+    },true);
     el.onpointerdown=(e)=>{
+      _markRowPress();
       if(e.pointerType==='touch') return;
       if(e.pointerType==='mouse' && e.button!==0) return;
       if(_isSessionActionTarget(e.target)) return;
@@ -10174,6 +10214,7 @@ function renderSessionListFromCache(){
       startRename();
     };
     el.addEventListener('touchstart',(e)=>{
+      _markRowPress();
       if(_isSessionActionTarget(e.target)) return;
       const touch=e.changedTouches&&e.changedTouches[0];
       if(!touch) return;
