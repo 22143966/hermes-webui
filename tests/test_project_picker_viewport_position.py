@@ -9,6 +9,7 @@ strings.
 
 from pathlib import Path
 import json
+import re
 import shutil
 import subprocess
 
@@ -1471,6 +1472,39 @@ def _repaint_sidebar_for_background_churn_source() -> str:
     return SESSIONS_JS[start:end] + "\n"
 
 
+def test_session_list_refresh_defaults_to_immediate_picker_preserving_repaint():
+    """User-owned refreshes are the default; background churn must opt in.
+
+    A bare ``renderSessionList()`` is used by many durable user actions.  Keep
+    that path immediate and preserve/re-anchor an open project picker.  The
+    comparatively small polling/SSE surface must be the only code allowed to
+    request interaction deferral, through one named helper.
+    """
+    render_start = SESSIONS_JS.index("async function renderSessionList(")
+    render_end = SESSIONS_JS.index("\n// ── Gateway session SSE", render_start)
+    render_body = SESSIONS_JS[render_start:render_end]
+    assert "_normalizeRenderSessionListOptions(opts)" in render_body
+
+    normalize_start = SESSIONS_JS.index("function _normalizeRenderSessionListOptions(")
+    normalize_end = SESSIONS_JS.index("\nfunction ", normalize_start + 1)
+    normalize_body = SESSIONS_JS[normalize_start:normalize_end]
+    assert "deferWhileInteracting:false" in normalize_body
+    assert "keepProjectPicker:true" in normalize_body
+
+    helper_start = SESSIONS_JS.index("function _refreshSidebarForBackgroundChurn(")
+    helper_end = SESSIONS_JS.index("\nfunction ", helper_start + 1)
+    helper_body = SESSIONS_JS[helper_start:helper_end]
+    deferred_call = "renderSessionList({deferWhileInteracting:true,keepProjectPicker:false})"
+    assert deferred_call in helper_body
+    assert SESSIONS_JS.count(deferred_call) == 1
+
+    outside_helper = SESSIONS_JS[:helper_start] + SESSIONS_JS[helper_end:]
+    assert re.search(
+        r"renderSessionList\(\{[^}]*deferWhileInteracting:true",
+        outside_helper,
+    ) is None
+
+
 def _repaint_sidebar_keeping_project_picker_source() -> str:
     start = SESSIONS_JS.find("function _repaintSidebarKeepingProjectPicker(")
     assert start >= 0, "_repaintSidebarKeepingProjectPicker not found in static/sessions.js"
@@ -1519,7 +1553,8 @@ def test_created_items_force_an_immediate_picker_preserving_payload_paint():
     assert "else _repaintSidebarForBackgroundChurn();" in apply_body
     assert "refreshSessionList('new-session',{force:true,keepProjectPicker:true})" in js
     assert "await renderSessionList({keepProjectPicker:true});" in js
-    assert "if(opts&&opts.keepProjectPicker===true) renderOpts.keepProjectPicker=true;" in js
+    assert "if(userOwnedRefresh){" in js
+    assert "await _refreshSidebarForBackgroundChurn();" in js
     assert "if(opts&&opts.keepProjectPicker===true) _applySessionListPayload(sessData,projData,{unreadGen,keepProjectPicker:true});" in js
 
 
@@ -2689,8 +2724,8 @@ def test_queued_successor_keeps_retry_recovery_intent_on_both_outcomes():
             "detail": "sessions endpoint returned 500",
             "retrying": False,
         },
-        "plainQueuedOpts": {},
-        "plainApplied": [{"unreadGen": 0}],
+        "plainQueuedOpts": {"deferWhileInteracting": False, "keepProjectPicker": True},
+        "plainApplied": [{"unreadGen": 0, "keepProjectPicker": True}],
         "activeCleared": True,
     }
 
@@ -2776,8 +2811,8 @@ def test_profile_scope_invalidation_cancels_queued_recovery_inheritance():
         "beforeInvalidate": {"deferWhileInteracting": False, "keepProjectPicker": True},
         "queuedCleared": True,
         "activeCleared": True,
-        "afterInvalidateQueuedOpts": {},
-        "appliedAfter": [{"unreadGen": 0}],
+        "afterInvalidateQueuedOpts": {"deferWhileInteracting": False, "keepProjectPicker": True},
+        "appliedAfter": [{"unreadGen": 0, "keepProjectPicker": True}],
     }
 
 
@@ -2835,20 +2870,22 @@ def test_active_poll_does_not_downgrade_a_queued_native_create_refresh():
     result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {
-        "createQueuedOpts": {"keepProjectPicker": True},
+        "createQueuedOpts": {"deferWhileInteracting": False, "keepProjectPicker": True},
         "createApplied": [{"unreadGen": 0, "keepProjectPicker": True}],
         "pendingPayloadCleared": True,
         "deferredApplies": 0,
         "stillInteracting": True,
-        "renameQueuedOpts": {},
-        "renameApplied": [{"unreadGen": 0}],
+        "renameQueuedOpts": {"deferWhileInteracting": False, "keepProjectPicker": True},
+        "renameApplied": [{"unreadGen": 0, "keepProjectPicker": True}],
     }
 
 
-def test_deferred_superseding_poll_preserves_native_create_keep_picker_intent():
-    """A passive poll queued behind native project creation may add interaction
-    deferral, but it must not drop the creation's keep-picker intent when its
-    payload is parked and later replayed after the newer picker closes."""
+def test_deferred_superseding_poll_cannot_downgrade_native_create_intent():
+    """A passive poll queued behind native project creation cannot defer it.
+
+    The default user-owned lane is immediate and picker-preserving, so the
+    background request coalesced behind it must retain that stronger intent.
+    """
     assert NODE is not None
     script = _QUEUE_HARNESS + _session_list_queue_and_refresh_sources() + r"""
 (async()=>{
@@ -2878,16 +2915,10 @@ def test_deferred_superseding_poll_preserves_native_create_keep_picker_intent():
     result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {
-        "queuedOpts": {"keepProjectPicker": True, "deferWhileInteracting": True},
-        "pendingPayload": {
-            "gen": 2,
-            "sessData": {"sessions": [{"session_id": "kept"}]},
-            "projData": {"projects": []},
-            "unreadGen": 0,
-            "keepProjectPicker": True,
-        },
-        "applied": [],
-        "deferredApplies": 1,
+        "queuedOpts": {"keepProjectPicker": True, "deferWhileInteracting": False},
+        "pendingPayload": None,
+        "applied": [{"unreadGen": 0, "keepProjectPicker": True}],
+        "deferredApplies": 0,
     }
 
     scheduler_start = SESSIONS_JS.find("function _schedulePendingSessionListApply(")

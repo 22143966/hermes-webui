@@ -6635,6 +6635,18 @@ function _mergeRenderSessionListOptions(prev, next){
   return merged;
 }
 
+function _normalizeRenderSessionListOptions(opts){
+  // A session-list refresh is user-owned unless its caller explicitly enters
+  // the background-churn lane below. User-owned updates paint immediately and
+  // preserve/re-anchor an open project picker. This inverted default keeps the
+  // long tail of durable actions safe as new call sites are added.
+  return {
+    deferWhileInteracting:false,
+    keepProjectPicker:true,
+    ...((opts&&typeof opts==='object')?opts:{}),
+  };
+}
+
 function _showSessionListLoadError(error){
   console.warn('renderSessionList',error);
   const isTimeout=Boolean(error&&(error.timeout===true||error.name==='TimeoutError'));
@@ -6843,7 +6855,7 @@ async function _drainRenderSessionListQueue(initialRequest){
 }
 
 async function renderSessionList(opts={}){
-  const request={opts:opts||{},gen:++_renderSessionListGen};
+  const request={opts:_normalizeRenderSessionListOptions(opts),gen:++_renderSessionListGen};
   if(_renderSessionListInFlight){
     // The active request's response is discarded as stale when this call
     // supersedes its generation; the queued request is what actually settles
@@ -6869,6 +6881,13 @@ async function renderSessionList(opts={}){
   }
   _renderSessionListInFlight=_drainRenderSessionListQueue(request);
   return _renderSessionListInFlight;
+}
+
+function _refreshSidebarForBackgroundChurn(){
+  // Polling/SSE is the only refresh class allowed to defer behind active
+  // sidebar interaction or an open project picker. Keep this option pair at a
+  // single auditable call site; producers invoke this helper instead.
+  return renderSessionList({deferWhileInteracting:true,keepProjectPicker:false});
 }
 
 // ── Gateway session SSE (real-time sync for agent sessions) ──
@@ -6939,11 +6958,11 @@ function startStreamingPoll(){
     // brings the list current the moment the tab is shown again, so no update is
     // lost — the background tab just stops burning network + DOM churn.
     if(typeof document !== 'undefined' && document.hidden) return;
-    void renderSessionList({deferWhileInteracting:true});
+    void _refreshSidebarForBackgroundChurn();
   }, _streamingPollMs);
   if(typeof document !== 'undefined' && !_streamingPollVisibilityHandler){
     _streamingPollVisibilityHandler = () => {
-      if(!document.hidden) void renderSessionList({deferWhileInteracting:true});
+      if(!document.hidden) void _refreshSidebarForBackgroundChurn();
     };
     document.addEventListener('visibilitychange', _streamingPollVisibilityHandler);
   }
@@ -7186,9 +7205,12 @@ async function refreshSessionList(reason='manual', opts={}){
   }
   _sessionListRefreshInFlight = true;
   try{
-    const renderOpts={deferWhileInteracting:!force};
-    if(opts&&opts.keepProjectPicker===true) renderOpts.keepProjectPicker=true;
-    await renderSessionList(renderOpts);
+    const userOwnedRefresh = (opts&&opts.keepProjectPicker===true) || reason==='pull';
+    if(userOwnedRefresh){
+      await renderSessionList();
+    }else{
+      await _refreshSidebarForBackgroundChurn();
+    }
     if(refreshActive) await refreshActiveSessionIfExternallyUpdated(reason||'session-list');
   }finally{
     _sessionListRefreshInFlight = false;
@@ -7358,7 +7380,7 @@ function startGatewayPollFallback(ms){
     // and avoids redundant DOM renders during active streaming (#4704).
     if(typeof document !== 'undefined' && document.hidden) return;
     if(typeof S !== 'undefined' && (S.busy || S.activeStreamId)) return;
-    renderSessionList({deferWhileInteracting:true});
+    void _refreshSidebarForBackgroundChurn();
   }, intervalMs);
   // Visibility catch-up: refresh immediately when tab re-gains focus,
   // so no gateway updates are dropped during hidden-skip periods.
@@ -7421,7 +7443,7 @@ async function probeGatewaySSEStatus(){
     }
     if(resp.status === 503 || data.watcher_running === false){
       startGatewayPollFallback(data.fallback_poll_ms || _gatewayFallbackPollMs);
-      renderSessionList({deferWhileInteracting:true});
+      void _refreshSidebarForBackgroundChurn();
       if(!_gatewaySSEWarningShown && typeof showToast === 'function'){
         showToast('Gateway sync unavailable — falling back to periodic refresh.', 5000);
         _gatewaySSEWarningShown = true;
@@ -7432,7 +7454,7 @@ async function probeGatewaySSEStatus(){
     // Start fallback polling as a safe default; it will self-cancel
     // when the SSE connection recovers and sessions_changed fires.
     startGatewayPollFallback(_gatewayFallbackPollMs);
-    renderSessionList({deferWhileInteracting:true});
+    void _refreshSidebarForBackgroundChurn();
   }finally{
     _gatewayProbeInFlight = false;
   }
@@ -7465,7 +7487,7 @@ function startGatewaySSE(){
           stopGatewayPollFallback();
           _gatewaySSEWarningShown = false;
           if(!_isDuplicateGatewaySessionSnapshot(data.sessions)){
-            renderSessionList({deferWhileInteracting:true}); // re-fetch and re-render
+            void _refreshSidebarForBackgroundChurn(); // re-fetch and re-render
           }
           // If the active session received new gateway messages, refresh the conversation view.
           // S.busy check prevents stomping on an in-progress WebUI response.
