@@ -1474,12 +1474,8 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
             // still carries the token in-page as well as across a reload.
             _setRestoredGoalContinuationDraft(_restoreContId,restore);
           }
-          const _liveMatchesRestore=String(liveText||'').trim()===String(restore||'').trim();
-          if(_liveMatchesRestore&&_restoreContId){
-            _saveComposerDraftNow(sid, liveText, S.pendingFiles?[...S.pendingFiles]:[], _restoreContId);
-          } else {
-            _saveComposerDraftNow(sid, liveText, S.pendingFiles?[...S.pendingFiles]:[]);
-          }
+          _saveComposerDraftNow(sid, liveText, S.pendingFiles?[...S.pendingFiles]:[],
+            String(liveText||'').trim()===String(restore||'').trim()?_restoreContId:'');
         } else if(!restoredVisible){
           // Background failure (sid was never the visible session): no live
           // composer to read, so persist the captured snapshot — it's the only copy.
