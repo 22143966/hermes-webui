@@ -13131,10 +13131,22 @@ function _restoreWorklogDetailDisclosureState(root, state){
         // A live body whose follow state was never established — the first
         // open was interrupted by this very rebuild and its settle window died
         // with the old body — must finish opening, or it stays follow-less
-        // forever (#7988 review). _thinkingCardOpened arms the settle window
-        // on the REPLACEMENT body so it seeds from its real position.
-        if(destLive&&body.classList&&body.classList.contains('thinking-card-body')&&body._thinkingTailFollow===undefined&&typeof _thinkingCardOpened==='function'){
-          _thinkingCardOpened(el);
+        // forever (#7988 review).
+        if(destLive&&body.classList&&body.classList.contains('thinking-card-body')&&body._thinkingTailFollow===undefined){
+          // A body that is inserted and opened in the same task runs no
+          // transition, so it is already at final layout and can be seeded
+          // immediately. This is the common case in compact_worklog, where
+          // every delta recreates the row and a replacement body would be
+          // discarded before its settle window ever fires (#7988 review).
+          if(elOpen&&!body._thinkingTailSettling&&(Number(body.clientHeight)||0)>0&&typeof _bindThinkingTailFollow==='function'){
+            _bindThinkingTailFollow(body, _worklogDetailBodyAtTail(body));
+            if(body._thinkingTailFollow===true) body.scrollTop=Math.max(0,(Number(body.scrollHeight)||0)-(Number(body.clientHeight)||0));
+          }else if(typeof _thinkingCardOpened==='function'){
+            // Mid-transition replacement (clientHeight still 0): arm the
+            // settle window on the REPLACEMENT body so it seeds from its real
+            // position once the open finishes.
+            _thinkingCardOpened(el);
+          }
         }
       }
     }

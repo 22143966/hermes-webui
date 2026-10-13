@@ -699,8 +699,10 @@ const out={};
   const state=_captureWorklogDetailDisclosureState(row);
   const entry=state.get('thinking::k1#0');
   out.s21_snap_has_atbottom=!!(entry&&('atBottom' in entry));
-  // Scene update rebuilds mid-open: the armed body is discarded.
+  // Scene update rebuilds mid-open: the armed body is discarded. The
+  // replacement is mid-transition (clientHeight 0), so it re-arms.
   const rebuilt=makeThinkingRow('thinking');
+  rebuilt.body.clientHeight=0;
   rebuilt.body.scrollHeight=1000;
   _restoreWorklogDetailDisclosureState(rebuilt.row,state);
   out.s21_armed_after_restore=rebuilt.body._thinkingTailSettling===true;
@@ -712,6 +714,48 @@ const out={};
   rebuilt.body.scrollHeight=1400;
   _renderThinkingInto(rebuilt.row,'thinking grew after the rebuild');
   out.s21_follows=rebuilt.body.scrollTop;
+}
+
+// ── S22: a body inserted at FINAL layout seeds immediately ─────────────────
+{
+  // compact_worklog recreates the thinking row on every delta, so a replacement
+  // body is discarded before its settle window fires and follow never latched.
+  // A body inserted and opened in the same task runs no transition: it is
+  // already at final layout and must seed immediately (#7988 review).
+  // Case A: short card that fits when opened while streaming.
+  const a=makeThinkingRow('thinking');   // live
+  a.card.classList.remove('open');
+  a.body.clientHeight=0;
+  a.body.scrollHeight=200;
+  _toggleThinkingCard(a.card);   // click open mid-stream; latch not set yet
+  const stA=_captureWorklogDetailDisclosureState(a.row);
+  const rebuiltA=makeThinkingRow('thinking');   // replacement at final layout
+  rebuiltA.body.clientHeight=200;
+  rebuiltA.body.scrollHeight=200;   // fits
+  _restoreWorklogDetailDisclosureState(rebuiltA.row,stA);
+  out.s22_short_latch=String(rebuiltA.body._thinkingTailFollow);
+  out.s22_short_armed=rebuiltA.body._thinkingTailSettling===true;
+  rebuiltA.body.scrollHeight=1200;
+  _renderThinkingInto(rebuiltA.row,'thinking grew while streaming');
+  out.s22_short_follows=rebuiltA.body.scrollTop;
+  // Case B: long card the reader wheeled to the bottom before the rebuild.
+  const b=makeThinkingRow('thinking');   // live
+  b.card.classList.remove('open');
+  b.body.clientHeight=0;
+  b.body.scrollHeight=1000;
+  _toggleThinkingCard(b.card);   // click open; settle window armed
+  b.body.scrollTop=800;           // wheel to the bottom (no latch yet)
+  const stB=_captureWorklogDetailDisclosureState(b.row);
+  out.s22_long_snap=stB.get('thinking::k1#0')?{atBottom:'atBottom' in stB.get('thinking::k1#0')}:null;
+  const rebuiltB=makeThinkingRow('thinking');
+  rebuiltB.body.clientHeight=200;
+  rebuiltB.body.scrollHeight=1000;
+  _restoreWorklogDetailDisclosureState(rebuiltB.row,stB);
+  out.s22_long_latch=String(rebuiltB.body._thinkingTailFollow);
+  out.s22_long_scroll=rebuiltB.body.scrollTop;
+  rebuiltB.body.scrollHeight=1200;
+  _renderThinkingInto(rebuiltB.row,'thinking grew more');
+  out.s22_long_follows=rebuiltB.body.scrollTop;
 }
 
 console.log(JSON.stringify(out, null, 2));
@@ -979,6 +1023,24 @@ def test_rebuild_that_interrupts_the_first_open_finishes_the_open():
     assert out["s21_latch_after_settle"] == "true"
     # Growth after the rebuild is followed again.
     assert out["s21_follows"] == 1200
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_final_layout_body_seeds_immediately():
+    out = _run_scenarios()
+
+    # Case A: a short card that fits is seeded on insertion — no transition
+    # runs, no settle window is armed, and growth is followed at once.
+    assert out["s22_short_latch"] == "true"
+    assert out["s22_short_armed"] is False
+    assert out["s22_short_follows"] == 1000
+    # Case B: a long card the reader wheeled to the bottom seeds at the tail
+    # and keeps following (capture recorded no atBottom — the latch was never
+    # set while the settle window was armed).
+    assert out["s22_long_snap"] == {"atBottom": False}
+    assert out["s22_long_latch"] == "true"
+    assert out["s22_long_scroll"] == 800
+    assert out["s22_long_follows"] == 1000
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
