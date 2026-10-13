@@ -27,11 +27,21 @@ These tests:
     profile-scoped env taking precedence over process env, matching the
     streaming path's expanded config;
   * structurally assert (AST) that the sync seam call runs inside
-    ``with profile_env_for_background_worker(s, ...)`` so a named profile's
-    ``provider_routing`` resolves against that profile's own .env on the
-    HTTP handler thread, not the server process env; and behaviorally prove
-    the binding: with the session profile env bound the profile .env value
-    wins, unbound the process env value is what the expansion picks up;
+    ``with profile_env_for_thread_readonly(s, ...)`` and NOT inside
+    ``profile_env_for_background_worker``: a named profile's
+    ``provider_routing`` must resolve against that profile's own .env on
+    the HTTP handler thread, not the server process env, and the pure
+    in-memory expansion must bind the env to the handler thread ONLY (the
+    background worker mirrors it into os.environ under a lock that covers
+    setup/restore only, so interleaved sync and streaming scopes restore
+    over each other's process env); and behaviorally prove the binding:
+    with the session profile env bound the profile .env value wins, unbound
+    the process env value is what the expansion picks up, and os.environ is
+    never mutated by the thread-only scope;
+  * prove a ``${VAR}`` that only the server process env defines (or that
+    is defined nowhere) is DROPPED from the sync routing kwargs with a
+    warning, never forwarded as a literal (which would make OpenRouter
+    target a nonexistent provider and fail a turn master completes);
   * prove a stub ``AIAgent`` whose ``__init__`` lacks the routing params is
     still constructible through the sync gating (no TypeError);
   * prove the per-session agent-cache signature CHANGES when
@@ -417,7 +427,7 @@ def _call_name(call: ast.Call):
 
 def test_chat_sync_routing_expansion_binds_session_profile_env():
     """The sync seam's ``${VAR}`` expansion must run with the session's
-    profile env bound.
+    profile env bound to the handler thread ONLY.
 
     ``_expand_env_vars()`` resolves ``${VAR}`` thread-local-first, then
     process env. The streaming worker binds the session profile's ``.env``
@@ -426,10 +436,16 @@ def test_chat_sync_routing_expansion_binds_session_profile_env():
     profile's ``provider_routing`` would resolve against the server process
     env (the process-wide profile's ``.env``): an unset variable leaks
     through as a literal, and a different process value applies the wrong
-    provider routing. Wrapping the seam call in
-    ``profile_env_for_background_worker(s, ...)`` makes the sync path expand
-    exactly like the streaming path; the manager is a no-op for
-    default-profile sessions."""
+    provider routing.
+
+    The binding must be ``profile_env_for_thread_readonly`` (thread-local
+    channel only), NOT ``profile_env_for_background_worker``: the seam does
+    a pure in-memory expansion and reads nothing from ``os.environ``, but
+    the background worker mirrors the profile env into ``os.environ`` and
+    its ``_ENV_LOCK`` covers setup/restore only, not the body, so a sync
+    scope and a concurrent streaming worker (``CHAT_LOCK`` does not
+    protect streaming workers) restore over each other's mirrored env.
+    The thread-only scope is a no-op for default-profile sessions."""
     from api import routes as routes_mod
     src_mod = inspect.getsource(routes_mod)
     tree = ast.parse(src_mod)
@@ -450,23 +466,32 @@ def test_chat_sync_routing_expansion_binds_session_profile_env():
         "_handle_chat_sync must build routing kwargs via _sync_routing_kwargs"
     )
 
-    for call in seam_calls:
-        bound = any(
+    def _inside_with(call: ast.Call, manager_name: str) -> bool:
+        return any(
             isinstance(w, ast.With)
             and any(
                 isinstance(item.context_expr, ast.Call)
-                and _call_name(item.context_expr)
-                == "profile_env_for_background_worker"
+                and _call_name(item.context_expr) == manager_name
                 for item in w.items
             )
             and any(c is call for c in ast.walk(w))
             for w in ast.walk(fn)
         )
-        assert bound, (
+
+    for call in seam_calls:
+        assert _inside_with(call, "profile_env_for_thread_readonly"), (
             "the _sync_routing_kwargs seam call must run inside "
-            "`with profile_env_for_background_worker(s, ...)` so ${VAR} in a "
+            "`with profile_env_for_thread_readonly(s, ...)` so ${VAR} in a "
             "named profile's provider_routing resolves against that "
-            "profile's own .env instead of the server process env"
+            "profile's own .env instead of the server process env, bound to "
+            "the handler thread only"
+        )
+        assert not _inside_with(call, "profile_env_for_background_worker"), (
+            "the sync routing seam must NOT use "
+            "profile_env_for_background_worker: it mirrors the profile env "
+            "into os.environ under a lock that covers setup/restore only, "
+            "so a sync scope and a concurrent streaming turn clobber each "
+            "other's process env"
         )
 
 
@@ -475,16 +500,19 @@ def test_sync_routing_kwargs_resolve_named_profile_env_not_process_env(
 ):
     """A named profile's ``provider_routing`` ``${VAR}`` must resolve
     against that profile's ``.env`` on the sync path, not the server
-    process env.
+    process env, without mutating the process env.
 
     This is the review finding's repro: with nothing bound on the handler
     thread, the unbound expansion of
     ``provider_routing.only = [${ROUTE_PROVIDER}]`` either leaked the
     literal (variable unset in the process env) or picked up an unrelated
-    process value (wrong provider routing). ``profile_env_for_background_
-    worker`` binds the profile's ``.env`` into the thread-local and blocks
-    the process-env fallback, exactly what the streaming worker does before
-    reading its config."""
+    process value (wrong provider routing). ``profile_env_for_thread_readonly``
+    binds the profile's ``.env`` into the thread-local channel and blocks the process-env fallback, exactly what the sync seam needs
+    for a pure in-memory read; unlike
+    ``profile_env_for_background_worker`` it must leave ``os.environ``
+    untouched."""
+    import os
+
     from api import config as config_mod
     from api import profiles as profiles_mod
     from api import routes as routes_mod
@@ -504,6 +532,7 @@ def test_sync_routing_kwargs_resolve_named_profile_env_not_process_env(
     monkeypatch.setenv("ROUTE_PROVIDER", "process-openrouter")
     config_mod._clear_thread_env()
     config_mod._thread_ctx.block_process_env_fallback = False
+    old_hermes_home = os.environ.get("HERMES_HOME")
 
     cfg = {"provider_routing": {"only": ["${ROUTE_PROVIDER}"], "sort": "price"}}
     session = types.SimpleNamespace(profile="route-profile", session_id="s1")
@@ -516,11 +545,14 @@ def test_sync_routing_kwargs_resolve_named_profile_env_not_process_env(
         "what the unbound sync expansion resolves to"
     )
 
-    # Bound, the way the handler now wraps the seam call:
-    with profiles_mod.profile_env_for_background_worker(
-        session, "sync provider routing", scope_skill_modules=False
+    # Bound, the way the handler now wraps the seam call (thread-only):
+    with profiles_mod.profile_env_for_thread_readonly(
+        session, "sync provider routing"
     ):
         bound = routes_mod._sync_routing_kwargs(cfg, ROUTING_KWARGS)
+        # The scope must not mirror the profile env into the process env.
+        assert os.environ.get("ROUTE_PROVIDER") == "process-openrouter"
+        assert os.environ.get("HERMES_HOME") == old_hermes_home
     assert bound["providers_allowed"] == ["profile-openrouter"], (
         "with the session profile env bound, the profile's .env value must "
         "win over the process env"
@@ -530,7 +562,143 @@ def test_sync_routing_kwargs_resolve_named_profile_env_not_process_env(
         "a literal ${...} reference must never reach the Agent"
     )
 
-    # The manager restores the prior env state on exit.
+    # The scope restores the prior thread state on exit AND leaves
+    # os.environ exactly as it found it.
     after = routes_mod._sync_routing_kwargs(cfg, ROUTING_KWARGS)
     assert after["providers_allowed"] == ["process-openrouter"]
     assert config_mod._thread_ctx.block_process_env_fallback is False
+    assert os.environ.get("ROUTE_PROVIDER") == "process-openrouter"
+    assert os.environ.get("HERMES_HOME") == old_hermes_home
+
+
+# ── Sync-path drop of process-env-only references ───────────────────────────
+
+def test_sync_routing_kwargs_drop_process_env_only_refs(tmp_path, monkeypatch):
+    """A ``${VAR}`` that only the server process env defines must be DROPPED
+    from the sync routing kwargs, not forwarded as the literal ``${VAR}``.
+
+    The fail-closed profile scope (block_process_env_fallback) refuses to
+    expand a variable the profile's ``.env`` does not define. Forwarding the
+    surviving literal would make OpenRouter restrict the request to a
+    provider that does not exist and fail the turn, where master (which
+    forwards no routing on the sync path at all) succeeds. Dropping the
+    affected field gives master's outcome (no preference sent for it) with
+    a warning, without widening what a profile may read from the server
+    environment. This is the review's requested repro: a named profile's
+    routing referencing a process-env-only variable on the sync endpoint."""
+    from api import config as config_mod
+    from api import profiles as profiles_mod
+    from api import routes as routes_mod
+
+    profile_home = tmp_path / "proc-only-home"
+    profile_home.mkdir()
+    # The profile defines an unrelated variable; NOT PROC_ONLY.
+    (profile_home / ".env").write_text("UNRELATED=keep\n", encoding="utf-8")
+    monkeypatch.setattr(
+        profiles_mod, "get_hermes_home_for_profile",
+        lambda name: profile_home,
+    )
+    # Defined ONLY in the server process env: exactly the SHOULD-FIX case.
+    monkeypatch.setenv("PROC_ONLY", "proc-value")
+    config_mod._clear_thread_env()
+
+    cfg = {"provider_routing": {"only": ["${PROC_ONLY}"], "sort": "price"}}
+    session = types.SimpleNamespace(profile="proc-only", session_id="s2")
+
+    # Bound, the way the handler wraps the seam call:
+    with profiles_mod.profile_env_for_thread_readonly(session, "test"):
+        out = routes_mod._sync_routing_kwargs(cfg, ROUTING_KWARGS)
+    assert out["providers_allowed"] is None, (
+        f"a process-env-only ${{...}} reference must be dropped (no "
+        f"preference forwarded), got {out.get('providers_allowed')!r}"
+    )
+    assert "${" not in str(out), (
+        "a literal ${...} reference must never reach the Agent"
+    )
+    assert out == {**_defaults(), "provider_sort": "price"}, (
+        "unaffected fields keep forwarding; the dropped field equals the "
+        f"constructor default (master's outcome): {out!r}"
+    )
+
+    # A partially-resolvable list keeps its resolvable items and drops the
+    # unresolved one.
+    cfg_partial = {
+        "provider_routing": {"only": ["anthropic", "${PROC_ONLY}"]}
+    }
+    with profiles_mod.profile_env_for_thread_readonly(session, "test"):
+        out_partial = routes_mod._sync_routing_kwargs(cfg_partial, ROUTING_KWARGS)
+    assert out_partial["providers_allowed"] == ["anthropic"], (
+        "resolvable list items must be kept; only the unresolved one drops"
+    )
+    assert "${" not in str(out_partial)
+
+    # Default profile (no scope bound, process-env fallback allowed): a
+    # variable defined NOWHERE still survives expansion as a literal and is
+    # dropped the same way, so a broken reference never reaches OpenRouter
+    # on the sync path regardless of profile.
+    config_mod._clear_thread_env()
+    config_mod._thread_ctx.block_process_env_fallback = False
+    monkeypatch.delenv("NEVER_DEFINED_ANYWHERE", raising=False)
+    cfg_missing = {"provider_routing": {"ignore": ["${NEVER_DEFINED_ANYWHERE}"]}}
+    out_missing = routes_mod._sync_routing_kwargs(cfg_missing, ROUTING_KWARGS)
+    assert out_missing["providers_ignored"] is None
+    assert "${" not in str(out_missing)
+
+
+def test_profile_env_for_thread_readonly_touches_no_process_env(
+    tmp_path, monkeypatch
+):
+    """The sync seam's profile binding must not mutate process-wide
+    ``os.environ`` (the review's P1).
+
+    ``profile_env_for_background_worker`` mirrors the profile env into
+    ``os.environ`` under an ``_ENV_LOCK`` that covers setup/restore only,
+    not the body, so if a streaming turn starts while a sync scope is open,
+    the sync cleanup restores the earlier env over the running turn's
+    settings, and the streaming cleanup can leave the sync profile's values
+    behind. ``CHAT_LOCK`` does not protect streaming workers. The thread-only
+    manager binds ``_thread_ctx`` on the current thread and leaves
+    ``os.environ`` untouched, so concurrent scopes cannot clobber each
+    other."""
+    import os
+
+    from api import config as config_mod
+    from api import profiles as profiles_mod
+
+    profile_home = tmp_path / "no-process-mirror"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text(
+        "ROUTE_PROVIDER=profile-openrouter\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        profiles_mod, "get_hermes_home_for_profile",
+        lambda name: profile_home,
+    )
+    monkeypatch.delenv("ROUTE_PROVIDER", raising=False)
+    old_hermes_home = os.environ.get("HERMES_HOME")
+    config_mod._clear_thread_env()
+
+    session = types.SimpleNamespace(profile="no-process-mirror", session_id="s3")
+    with profiles_mod.profile_env_for_thread_readonly(session, "test"):
+        # Thread scope is bound: the expansion resolves the profile value...
+        assert config_mod._expand_env_vars(
+            {"k": "${ROUTE_PROVIDER}"}
+        )["k"] == "profile-openrouter"
+        # ...while the process env is untouched:
+        assert "ROUTE_PROVIDER" not in os.environ, (
+            "the thread-only scope must not mirror the profile .env into "
+            "os.environ"
+        )
+        assert os.environ.get("HERMES_HOME") == old_hermes_home
+
+    # Thread state is restored on exit.
+    assert not getattr(config_mod._thread_ctx, "env", {})
+    assert config_mod._thread_ctx.block_process_env_fallback is False
+
+    # Default profile: no-op, the thread's existing env state is preserved.
+    config_mod._set_thread_env(SENTINEL="pre")
+    default_session = types.SimpleNamespace(profile="default", session_id="s4")
+    with profiles_mod.profile_env_for_thread_readonly(default_session, "test"):
+        assert config_mod._thread_ctx.env.get("SENTINEL") == "pre"
+        assert config_mod._thread_ctx.block_process_env_fallback is False
+    config_mod._clear_thread_env()

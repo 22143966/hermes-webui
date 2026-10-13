@@ -7466,6 +7466,54 @@ def _read_profile_config_cached(profile_name: str, cfg_path: str) -> dict | None
     return parsed
 
 
+_ROUTING_ENV_REF_RE = re.compile(r"\$\{[^}]+\}")
+
+
+def _drop_unresolved_routing_refs(block):
+    """Drop ``provider_routing`` values that still carry an unexpanded
+    ``${...}`` reference after env expansion.
+
+    The sync seam expands under the fail-closed profile scope
+    (``block_process_env_fallback``), so a ``${VAR}`` the profile's ``.env``
+    does not define (e.g. a variable only the server process env holds)
+    survives expansion as its literal text. Forwarding that literal would
+    make OpenRouter restrict the request to a provider that does not exist
+    and fail the turn, where master (which forwards no routing on the sync
+    path at all) succeeds. Dropping the affected value restores master's
+    outcome for it, with a warning, without widening what a profile may
+    read from the server environment.
+
+    A list item is dropped individually; a field is dropped when its scalar
+    value is unresolved or its list empties. Non-string values are kept as
+    is. Never mutates ``block``; returns ``(clean_block, dropped)`` where
+    ``dropped`` maps field name to the number of dropped values.
+    """
+    if not isinstance(block, dict):
+        return {}, {}
+    clean = {}
+    dropped = {}
+    for key, value in block.items():
+        if isinstance(value, str):
+            if _ROUTING_ENV_REF_RE.search(value):
+                dropped[key] = 1
+            else:
+                clean[key] = value
+        elif isinstance(value, list):
+            kept = [
+                item for item in value
+                if not (isinstance(item, str)
+                        and _ROUTING_ENV_REF_RE.search(item))
+            ]
+            lost = len(value) - len(kept)
+            if lost:
+                dropped[key] = lost
+            if kept:
+                clean[key] = kept
+        else:
+            clean[key] = value
+    return clean, dropped
+
+
 def _sync_routing_kwargs(profile_cfg: dict | None, agent_params: set) -> dict:
     """Build the sync POST /api/chat provider_routing kwargs from a profile config.
 
@@ -7480,6 +7528,16 @@ def _sync_routing_kwargs(profile_cfg: dict | None, agent_params: set) -> dict:
     both paths agree. ``_expand_env_vars()`` returns a fresh structure, so the
     cached raw dict is never mutated.
 
+    The seam runs under the thread-only fail-closed profile scope
+    (``profile_env_for_thread_readonly``), so a ``${VAR}`` only the server
+    process env defines is NOT expanded here. Any routing value that still
+    contains ``${...}`` after expansion is dropped (with a warning) via
+    ``_drop_unresolved_routing_refs()`` instead of being forwarded literally:
+    a literal would make OpenRouter target a nonexistent provider and fail a
+    turn master (no routing on this path) completes, and re-enabling the
+    process-env fallback to avoid the drop would widen what a profile can
+    read from the server environment.
+
     Falls back to ``get_config()`` (already env-expanded) when the session has
     no usable profile config, matching the previous ``_pp_cfg or get_config()``
     semantics at the sync site. Mapping to AIAgent kwargs stays in the shared
@@ -7489,6 +7547,23 @@ def _sync_routing_kwargs(profile_cfg: dict | None, agent_params: set) -> dict:
         cfg = _expand_env_vars(profile_cfg)
     else:
         cfg = get_config()
+    pr = (cfg or {}).get("provider_routing")
+    if isinstance(pr, dict):
+        cleaned, dropped = _drop_unresolved_routing_refs(pr)
+        # Fresh shallow view: cfg may be the shared get_config() cache, and
+        # the cleaned block is a new dict, so nothing shared is mutated.
+        cfg = dict(cfg)
+        cfg["provider_routing"] = cleaned
+    else:
+        dropped = {}
+    for key, count in dropped.items():
+        logger.warning(
+            "provider_routing.%s references an environment variable this "
+            "profile does not define; dropping %d value(s) for the sync "
+            "turn instead of forwarding the literal ${...} text",
+            key,
+            count,
+        )
     return _provider_routing_kwargs_for_agent(cfg, agent_params)
 
 
@@ -25294,20 +25369,30 @@ def _handle_chat_sync(handler, body):
             # the HTTP handler thread for POST /api/chat has no profile-
             # scoped thread-local env, so an unbound _expand_env_vars() would
             # resolve ${VAR} against the server process env (the process-
-            # wide profile's .env). An unset variable would leak through as
-            # a literal and a different process value would apply the wrong
-            # provider routing, while the streaming path (which binds the
-            # profile env in its worker) does not. The manager is a no-op
-            # for default-profile sessions, so profile-less behavior is
-            # unchanged.
+            # wide profile's .env). A different process value would apply the
+            # wrong provider routing, while the streaming path (which binds
+            # the profile env in its worker) does not.
+            # The binding is THREAD-ONLY (profile_env_for_thread_readonly):
+            # the seam does a pure in-memory expansion and reads nothing from
+            # os.environ, so mirroring the profile env into the process env
+            # (as profile_env_for_background_worker does for agent bodies)
+            # would only let this request's setup/restore clobber a
+            # concurrent streaming turn's mirrored env, and vice versa. The
+            # thread-only scope also sets the fail-closed
+            # block_process_env_fallback boundary: a ${VAR} only the server
+            # process env defines does not expand here, and
+            # _sync_routing_kwargs drops any routing value that still carries
+            # ${...} after expansion (with a warning) instead of forwarding
+            # the literal, which would make OpenRouter target a nonexistent
+            # provider. The scope is a no-op for default-profile sessions, so
+            # profile-less behavior is unchanged.
             try:
                 _sync_routing_params = set(inspect.signature(AIAgent.__init__).parameters)
             except (TypeError, ValueError):
                 _sync_routing_params = set()
-            from api.profiles import profile_env_for_background_worker
-            with profile_env_for_background_worker(
+            from api.profiles import profile_env_for_thread_readonly
+            with profile_env_for_thread_readonly(
                 s, "sync provider routing", logger_override=logger,
-                scope_skill_modules=False,
             ):
                 _routing_kwargs = _sync_routing_kwargs(_pp_cfg, _sync_routing_params)
             agent = AIAgent(
