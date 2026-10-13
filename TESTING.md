@@ -93,6 +93,12 @@ original input. Other credential passes remain active without `=`. Cache policy,
 runtime pattern registration, and public API redaction settings are unchanged.
 Call counts prove omitted impossible scans, not latency, RSS, or responsiveness.
 
+Run `./scripts/test.sh tests/test_redaction_benchmark_statistics.py` for the
+benchmark's statistical regression. It executes the real benchmark entry point
+with deterministic clocks and synthetic redactors, then checks that console and
+JSON speedups both use the median of per-pair ratios. Its fixed samples make this
+measure differ from the ratio of timing medians; it does not test wall-time speed.
+
 Run a synthetic, uncached direct-function comparison against an explicit Git base:
 
 ```bash

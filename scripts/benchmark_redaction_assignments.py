@@ -108,8 +108,10 @@ def main():
                 for kind in ("wall_ms", "cpu_ms")
             } for version in functions
         }
-        ratio = (summary["base"]["wall_ms"]["median_ms"]
-                 / summary["candidate"]["wall_ms"]["median_ms"])
+        ratio = statistics.median(
+            s["timings"]["base"]["wall_ms"] / s["timings"]["candidate"]["wall_ms"]
+            for s in samples
+        )
         row = {"shape": name, "characters": len(text),
                "input_sha256": hashlib.sha256(text.encode()).hexdigest(),
                "samples": samples, "summary": summary,
