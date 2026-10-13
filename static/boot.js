@@ -937,6 +937,7 @@ $('btnSend').onclick=()=>{
 };
 $('mainChat')?.addEventListener('pointerdown', closeMobileWorkspacePanelFromChat);
 let _attachChoiceOpen=false;
+let _attachChoicePointerDown=false;
 const _attachChoiceCapabilityQueries={
   coarse:matchMedia('(pointer:coarse)'),
   fine:matchMedia('(any-pointer:fine)'),
@@ -1012,17 +1013,23 @@ function _handleCameraFiles(files){
   addFiles(normalized);
 }
 $('btnAttach').onclick=e=>{
+  _attachChoicePointerDown=false;
   if(e&&e.preventDefault)e.preventDefault();
   if(_shouldOfferCameraChoice())_setAttachChoiceOpen(!_attachChoiceOpen);
   else {$('fileInput').value='';$('fileInput').click();}
 };
+$('btnAttach').addEventListener('pointerdown',()=>{_attachChoicePointerDown=_attachChoiceOpen;});
+$('btnAttach').addEventListener('pointercancel',()=>{_attachChoicePointerDown=false;});
 $('attachChoicePopup')?.addEventListener('click',e=>{
   const choice=e.target.closest('[data-attach-choice]')?.dataset.attachChoice;
   if(choice==='camera')_openAttachInput($('cameraFileInput'));
   if(choice==='files')_openAttachInput($('fileInput'));
 });
 $('attachChoicePopup')?.addEventListener('focusout',e=>{
-  if(!e.currentTarget.contains(e.relatedTarget))_dismissAttachChoice();
+  if(!e.currentTarget.contains(e.relatedTarget)){
+    if(_attachChoicePointerDown&&e.relatedTarget===$('btnAttach'))return;
+    _dismissAttachChoice();
+  }
 });
 document.addEventListener('pointerdown',e=>{
   if(_attachChoiceOpen&&!e.target.closest('#attachChoicePopup,#btnAttach'))_dismissAttachChoice();
