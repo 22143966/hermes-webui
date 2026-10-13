@@ -943,16 +943,19 @@ const _attachChoiceCapabilityQueries={
 };
 function _shouldOfferCameraChoice(){
   try{
-    return _isPhoneWidthViewport()
-      && _attachChoiceCapabilityQueries.coarse.matches
-      && !_attachChoiceCapabilityQueries.fine.matches;
+    return _isTouchOnlyDevice();
   }catch(_){return false;}
 }
 function _syncAttachChoiceSemantics(){
   const attach=$('btnAttach');
   if(!attach)return;
-  if(_shouldOfferCameraChoice())attach.setAttribute('aria-haspopup','menu');
-  else attach.removeAttribute('aria-haspopup');
+  if(_shouldOfferCameraChoice()){
+    attach.setAttribute('aria-haspopup','menu');
+    attach.setAttribute('aria-controls','attachChoicePopup');
+    attach.setAttribute('aria-expanded',String(_attachChoiceOpen));
+  }else{
+    ['aria-haspopup','aria-controls','aria-expanded'].forEach(name=>attach.removeAttribute(name));
+  }
 }
 function _handleAttachChoiceCapabilityChange(){
   if(!_shouldOfferCameraChoice())_dismissAttachChoice();
@@ -965,7 +968,6 @@ function _setAttachChoiceOpen(open,restoreFocus){
   _attachChoiceOpen=!!open;
   popup.hidden=!_attachChoiceOpen;
   popup.setAttribute('aria-hidden',String(!_attachChoiceOpen));
-  attach.setAttribute('aria-expanded',String(_attachChoiceOpen));
   if(_attachChoiceOpen) popup.querySelector('[data-attach-choice]')?.focus();
   else if(restoreFocus) attach.focus();
   _syncAttachChoiceSemantics();
@@ -975,7 +977,7 @@ function _dismissAttachChoice(restoreFocus){
 }
 window._dismissAttachChoice=_dismissAttachChoice;
 function _openAttachInput(input){
-  _dismissAttachChoice();
+  _dismissAttachChoice(true);
   if(!input)return;
   input.value='';
   input.click();
@@ -1008,6 +1010,9 @@ $('attachChoicePopup')?.addEventListener('click',e=>{
   const choice=e.target.closest('[data-attach-choice]')?.dataset.attachChoice;
   if(choice==='camera')_openAttachInput($('cameraFileInput'));
   if(choice==='files')_openAttachInput($('fileInput'));
+});
+$('attachChoicePopup')?.addEventListener('focusout',e=>{
+  if(!e.currentTarget.contains(e.relatedTarget)&&e.relatedTarget!==$('btnAttach'))_dismissAttachChoice();
 });
 document.addEventListener('pointerdown',e=>{
   if(_attachChoiceOpen&&!e.target.closest('#attachChoicePopup,#btnAttach'))_dismissAttachChoice();

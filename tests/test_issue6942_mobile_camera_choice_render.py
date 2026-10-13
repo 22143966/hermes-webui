@@ -63,7 +63,7 @@ def test_attachment_choice_is_visible_across_mobile_render_matrix(tmp_path):
         _wait_for_health(f"http://127.0.0.1:{port}/health")
         with playwright.sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            for width in (320, 400, 480, 768, 1280):
+            for width in (320, 400, 480, 768, 844, 1280):
                 for locale in ("en", "ru", "de"):
                     context = browser.new_context(
                         viewport={"width": width, "height": 320},
@@ -71,26 +71,50 @@ def test_attachment_choice_is_visible_across_mobile_render_matrix(tmp_path):
                         has_touch=True,
                     )
                     page = context.new_page()
-                    page.add_init_script(f"localStorage.setItem('lang', {locale!r});")
+                    page.add_init_script(f"localStorage.setItem('hermes-lang', {locale!r});")
                     page.goto(f"http://127.0.0.1:{port}/", wait_until="domcontentloaded")
                     page.wait_for_selector("#btnAttach", timeout=10000)
                     page.locator("#btnAttach").click()
                     popup = page.locator("#attachChoicePopup")
-                    if width <= 640:
-                        popup.wait_for(state="visible", timeout=5000)
-                        box = popup.bounding_box()
-                        assert box and box["x"] >= 0 and box["y"] >= 0
-                        assert box["x"] + box["width"] <= width
-                        assert box["y"] + box["height"] <= 320
-                        for choice in popup.locator("[data-attach-choice]").all():
-                            choice_box = choice.bounding_box()
-                            assert choice_box and choice_box["x"] >= 0 and choice_box["y"] >= 0
-                            assert choice_box["x"] + choice_box["width"] <= width
-                            assert choice_box["y"] + choice_box["height"] <= 320
-                    else:
-                        assert page.locator("#fileInput").count() == 1
-                        assert popup.is_hidden()
+                    if width == 400 and locale == "en":
+                        page.screenshot(path=str(tmp_path / "attachment-choice.png"))
+                    labels = {
+                        "en": ("Take photo", "Choose files"),
+                        "ru": ("Сделать фото", "Выбрать файлы"),
+                        "de": ("Foto aufnehmen", "Dateien auswählen"),
+                    }[locale]
+                    photo = popup.locator('[data-i18n="composer_attach_photo"]')
+                    files = popup.locator('[data-i18n="composer_attach_files"]')
+                    playwright.expect(photo).to_have_text(labels[0])
+                    playwright.expect(files).to_have_text(labels[1])
+                    popup.wait_for(state="visible", timeout=5000)
+                    box = popup.bounding_box()
+                    assert box and box["x"] >= 0 and box["y"] >= 0
+                    assert box["x"] + box["width"] <= width
+                    assert box["y"] + box["height"] <= 320
+                    assert popup.locator(".ws-opt-icon svg").count() == 2
+                    page.keyboard.press("Tab")
+                    assert popup.is_visible()
+                    page.keyboard.press("Tab")
+                    assert popup.is_hidden()
+                    playwright.expect(page.locator("#btnAttach")).to_have_attribute("aria-expanded", "false")
+                    page.locator("#btnAttach").click()
+                    with page.expect_file_chooser():
+                        photo.click()
+                    playwright.expect(page.locator("#btnAttach")).to_be_focused()
+                    assert popup.is_hidden()
                     context.close()
+            context = browser.new_context(viewport={"width": 1280, "height": 720})
+            page = context.new_page()
+            page.goto(f"http://127.0.0.1:{port}/", wait_until="domcontentloaded")
+            attach = page.locator("#btnAttach")
+            attach.wait_for()
+            for attr in ("aria-expanded", "aria-controls", "aria-haspopup"):
+                assert attach.get_attribute(attr) is None
+            with page.expect_file_chooser():
+                attach.click()
+            assert page.locator("#attachChoicePopup").is_hidden()
+            context.close()
             browser.close()
     finally:
         proc.terminate()

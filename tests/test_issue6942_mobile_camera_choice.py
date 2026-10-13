@@ -60,6 +60,8 @@ def test_choice_accessibility_layout_and_locale_parity():
 def test_popup_file_routes_and_media_query_semantics_behave():
     boot = read("static/boot.js")
     block = boot[boot.index("let _attachChoiceOpen"):boot.index("// ── Voice input")]
+    touch = boot[boot.index("function _hasFinePointerCoexisting"):boot.index("function _isNumpadEnter")]
+    block = touch + "\n" + block
     script = f"""
 const assert = require('node:assert/strict');
 const state = {{ width: 400, coarse: true, fine: false }};
@@ -72,6 +74,7 @@ class Element {{
   focus() {{ this.focused=true; }}
   click() {{ this.clicks++; }}
   querySelector() {{ return choice; }}
+  contains(target) {{ return target===choice; }}
   closest(selector) {{
     if (this.id === 'choice' && selector.includes('[data-attach-choice]')) return this;
     if (this.id === 'popup' && selector.includes('#attachChoicePopup')) return this;
@@ -88,6 +91,7 @@ const elements = {{ btnAttach:attach, attachChoicePopup:popup, fileInput:files, 
 const document = {{ listeners:{{}}, addEventListener(k,fn){{this.listeners[k]=fn;}} }};
 const mediaQueries = {{}};
 const window = {{ listeners:{{}}, addEventListener(k,fn){{this.listeners[k]=fn;}}, matchMedia(q){{
+  if(mediaQueries[q]) return mediaQueries[q];
   const query = {{
     get matches() {{ return q.includes('max-width: 640px') ? state.width <= 640 : q.includes('pointer:coarse') ? state.coarse : q.includes('any-pointer:fine') ? state.fine : false; }},
     listeners:[],
@@ -99,7 +103,7 @@ const window = {{ listeners:{{}}, addEventListener(k,fn){{this.listeners[k]=fn;}
 globalThis.document=document; globalThis.window=window;
 globalThis.matchMedia=(q)=>window.matchMedia(q);
 globalThis.$=(id)=>elements[id];
-globalThis._isPhoneWidthViewport=()=>state.width <= 640;
+Object.defineProperty(globalThis,'navigator',{{value:{{userAgent:''}},configurable:true}});
 globalThis.S={{ pendingFiles:[] }};
 globalThis.addFiles=(items)=>{{ S.pendingFiles.push(...items); globalThis.admitted=items; }};
 globalThis.console={{ log(){{}} }};
@@ -108,25 +112,35 @@ assert.equal(attach.getAttribute('aria-haspopup'),'menu');
 attach.onclick({{preventDefault(){{}}}});
 assert.equal(popup.hidden,false); assert.equal(attach.getAttribute('aria-expanded'),'true');
 state.width=1280; state.coarse=false; state.fine=true; window.listeners.resize();
-assert.equal(popup.hidden,true); assert.equal(attach.getAttribute('aria-expanded'),'false');
+assert.equal(popup.hidden,true); assert.equal(attach.getAttribute('aria-expanded'),null);
+assert.equal(attach.getAttribute('aria-controls'),null);
 state.width=400; state.coarse=true; state.fine=false; window.listeners.resize();
 attach.onclick({{preventDefault(){{}}}});
 assert.equal(popup.hidden,false); assert.equal(attach.getAttribute('aria-expanded'),'true');
 state.fine=true; mediaQueries['(any-pointer:fine)'].listeners.forEach(fn=>fn());
-assert.equal(popup.hidden,true); assert.equal(attach.getAttribute('aria-expanded'),'false');
-state.fine=false;
+assert.equal(popup.hidden,true); assert.equal(attach.getAttribute('aria-expanded'),null);
+state.fine=false; window.listeners.resize();
+attach.onclick({{preventDefault(){{}}}});
+popup.listeners.focusout({{currentTarget:popup,relatedTarget:choice}}); assert.equal(popup.hidden,false);
+popup.listeners.focusout({{currentTarget:popup,relatedTarget:files}}); assert.equal(popup.hidden,true);
+state.width=844; window.listeners.resize(); attach.onclick({{preventDefault(){{}}}}); assert.equal(popup.hidden,false);
 popup.listeners.click({{target:choice}});
-assert.equal(camera.clicks,1); assert.equal(popup.hidden,true); assert.equal(attach.getAttribute('aria-expanded'),'false');
+assert.equal(attach.focused,true); assert.equal(camera.clicks,1); assert.equal(popup.hidden,true); assert.equal(attach.getAttribute('aria-expanded'),'false');
 state.width=1280; state.coarse=false; state.fine=true; window.listeners.resize();
 assert.equal(attach.getAttribute('aria-haspopup'),null);
+assert.equal(attach.getAttribute('aria-expanded'),null);
+assert.equal(attach.getAttribute('aria-controls'),null);
 attach.onclick({{preventDefault(){{}}}}); assert.equal(files.clicks,1);
-state.width=400; state.coarse=true; state.fine=false; window.listeners.resize();
+state.width=844; state.coarse=true; state.fine=true; navigator.userAgent='iPhone'; window.listeners.resize();
+attach.onclick({{preventDefault(){{}}}}); assert.equal(popup.hidden,false);
+assert.equal(attach.getAttribute('aria-haspopup'),'menu');
 const first=new File(['x'],'image.jpg',{{type:'image/jpeg'}});
 const second=new File(['y'],'image.jpg',{{type:'image/jpeg'}});
 _handleCameraFiles([first,second]);
 assert.deepEqual(admitted.map(file=>file.name),['image.jpg','image (1).jpg']);
 """
-    subprocess.run(["node", "--eval", script], cwd=REPO, check=True, capture_output=True, text=True)
+    result = subprocess.run(["node", "--eval", script], cwd=REPO, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_camera_choice_preserves_direct_desktop_and_hybrid_paths():
@@ -139,7 +153,7 @@ def test_camera_choice_preserves_direct_desktop_and_hybrid_paths():
     assert "getUserMedia" not in attach
     assert 'id="btnAttach"' in read("static/index.html")
     assert '.composer-left{display:flex' in read("static/style.css")
-    assert '.attach-choice-popup{position:absolute;left:10px' in read("static/style.css")
+    assert '.attach-choice-popup{position:absolute;left:8px' in read("static/style.css")
 
 
 def test_popup_dismissal_has_one_owner_across_lifecycle_boundaries():
