@@ -3038,3 +3038,123 @@ def test_rename_completion_settles_immediately_through_the_queue():
         "supersededApplied": [{"unreadGen": 0, "keepProjectPicker": True}],
         "supersededDeferredApplies": 0,
     }
+
+
+def _position_session_action_menu_source() -> str:
+    start = SESSIONS_JS.find("function _positionSessionActionMenu(")
+    assert start >= 0, "_positionSessionActionMenu not found in static/sessions.js"
+    end = SESSIONS_JS.find("\nfunction ", start + 1)
+    assert end > start
+    return SESSIONS_JS[start:end]
+
+
+def _project_picker_anchor_helpers_source() -> str:
+    start = SESSIONS_JS.find("function _projectPickerAnchorRect(")
+    assert start >= 0, "_projectPickerAnchorRect not found in static/sessions.js"
+    end = SESSIONS_JS.find("function _projectPickerItem(", start)
+    assert end > start, "_projectPickerItem sentinel not found after the anchor helpers"
+    return SESSIONS_JS[start:end]
+
+
+_ACTION_MENU_ANCHOR_PREFIX = r"""
+let _sessionActionMenu = {style: {}, scrollWidth: 180, offsetHeight: 140};
+const menuRowRect = {top: 380, bottom: 428, left: 16, right: 374, width: 358, height: 48};
+const menuSessionList = {
+  getBoundingClientRect: () => ({top: 0, bottom: 620, left: 0, right: 390}),
+};
+const menuRow = {isConnected: true, getBoundingClientRect: () => menuRowRect};
+const menuAnchorEl = {
+  isConnected: true,
+  getBoundingClientRect: () => ({top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0}),
+  closest: selector => selector === '.session-child-session-fork,.session-item'
+    ? menuRow
+    : (selector === '.session-list' ? menuSessionList : null),
+};
+const window = {innerWidth: 768, innerHeight: 620,
+  visualViewport: {offsetTop: 0, offsetLeft: 0, width: 768, height: 620}};
+"""
+
+
+def test_action_menu_places_from_the_context_point_when_its_anchor_has_no_size():
+    """The ⋮ menu must borrow the anchor geometry the picker places from.
+
+    Coarse-pointer CSS hides `.session-actions`, so the menu that launches the
+    picker is anchored on a 0×0 element and opened at the window's top-left
+    corner, over the chat header and the filter box. It must place from the
+    recorded click point, or, without one, from the visible row.
+    """
+    assert NODE is not None
+    script = (
+        _ACTION_MENU_ANCHOR_PREFIX
+        + _position_session_action_menu_source()
+        + _project_picker_anchor_helpers_source()
+        + r"""
+menuAnchorEl._projectPickerContextPoint = {clientX: 250, clientY: 300};
+_positionSessionActionMenu(menuAnchorEl);
+const withPoint = {left: _sessionActionMenu.style.left, top: _sessionActionMenu.style.top};
+delete menuAnchorEl._projectPickerContextPoint;
+_positionSessionActionMenu(menuAnchorEl);
+const rowOnly = {left: _sessionActionMenu.style.left, top: _sessionActionMenu.style.top};
+console.log(JSON.stringify({withPoint, rowOnly}));
+"""
+    )
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    # Right edge at the recorded point (250), not the window corner (8, 8).
+    assert data["withPoint"] == {"left": "31px", "top": "307px"}, (
+        "A zero-sized menu anchor must place from the recorded context point; "
+        f"got {data['withPoint']}"
+    )
+    # No recorded point: borrow the visible row — right-aligned to its right
+    # edge, opened under it.
+    assert data["rowOnly"] == {"left": "154px", "top": "434px"}, (
+        "Without a recorded point the menu must borrow the visible row; "
+        f"got {data['rowOnly']}"
+    )
+
+
+def test_context_point_picker_keeps_its_left_edge_at_the_pointer():
+    """A point-anchored picker opens like an OS context menu.
+
+    Right-aligning to a 1px point clamped it to the left margin, over the
+    icon rail, at tablet widths; the left edge must sit at the pointer.
+    """
+    data = _run_picker_cases("""
+const pointRow = {isConnected: true, getBoundingClientRect: () => ({top: 380, bottom: 428, left: 16, right: 374, width: 358, height: 48})};
+anchorEl.closest = selector => selector === '.session-child-session-fork,.session-item'
+  ? pointRow
+  : (selector === '.session-list' ? sessionList : null);
+_recordProjectPickerContextPoint(anchorEl, {clientX: 40, clientY: 420});
+setViewport(620, 390);
+setAnchor({top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0});
+openPicker(120);
+console.log(JSON.stringify(placement()));
+""")
+    assert data["removed"] is False
+    assert data["left"] == 40, (
+        "The picker's left edge must sit at the pointer (x=40), not clamp to "
+        f"the 8px margin; got left={data['left']}"
+    )
+    assert data["right"] <= 390 - 8
+
+
+def test_context_point_picker_shifts_left_to_stay_inside_the_viewport():
+    data = _run_picker_cases("""
+const pointRow = {isConnected: true, getBoundingClientRect: () => ({top: 380, bottom: 428, left: 16, right: 374, width: 358, height: 48})};
+anchorEl.closest = selector => selector === '.session-child-session-fork,.session-item'
+  ? pointRow
+  : (selector === '.session-list' ? sessionList : null);
+_recordProjectPickerContextPoint(anchorEl, {clientX: 368, clientY: 420});
+setViewport(620, 390);
+setAnchor({top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0});
+openPicker(120);
+console.log(JSON.stringify(placement()));
+""")
+    assert data["removed"] is False
+    assert data["right"] == 390 - 8, (
+        "A pointer near the right edge must shift the picker left just enough "
+        f"to keep the 8px margin; got {data['right']}"
+    )
+    assert data["left"] == 390 - 8 - data["width"]
+    assert data["left"] < 368

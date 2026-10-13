@@ -5419,7 +5419,16 @@ function _sessionActionMenuShouldRepositionOnScroll(target){
 
 function _positionSessionActionMenu(anchorEl){
   if(!_sessionActionMenu || !anchorEl) return;
-  const rect=anchorEl.getBoundingClientRect();
+  let rect=anchorEl.getBoundingClientRect();
+  if(!rect.width||!rect.height){
+    // A zero-sized anchor — coarse-pointer CSS hides `.session-actions`, or a
+    // repaint left a stale trigger — borrows the geometry the project picker
+    // places from: the recorded context-menu point, else the visible row.
+    // typeof-guarded so extracted-function Node harnesses stay self-contained.
+    if(typeof _projectPickerAnchorRect==='function'&&typeof _projectPickerVisibleBounds==='function'){
+      rect=_projectPickerAnchorRect(anchorEl,_projectPickerVisibleBounds());
+    }
+  }
   const menuW=Math.min(280, Math.max(220, _sessionActionMenu.scrollWidth || 220));
   let left=rect.right-menuW;
   if(left<8) left=8;
@@ -11204,9 +11213,14 @@ function _positionProjectPicker(picker, anchorEl){
       picker.style.top=capTop+'px';
     }
   }
-  // Align right edge of picker with right edge of button; keep within viewport
+  // Align right edge of picker with right edge of button; keep within viewport.
+  // A picker anchored on the recorded context point opens like an OS context
+  // menu instead: its left edge at the pointer, shifted left only when it
+  // would leave the viewport — right-aligning to a 1px point clamps to the
+  // left margin, over the icon rail, at tablet widths.
   const pickerW=picker.offsetWidth;
-  const left=Math.max(bounds.left+margin,Math.min(rect.right-pickerW,bounds.right-margin-pickerW));
+  const preferredLeft=rect.pointAnchored?rect.left:rect.right-pickerW;
+  const left=Math.max(bounds.left+margin,Math.min(preferredLeft,bounds.right-margin-pickerW));
   picker.style.left=left+'px';
 }
 
@@ -11296,6 +11310,7 @@ function _projectPickerAnchorRect(anchorEl, bounds){
           top:pointY,bottom:pointY+1,
           left:pointX,right:pointX+1,
           width:1,height:1,
+          pointAnchored:true,
         };
       }else{
         rect=rowRect;
