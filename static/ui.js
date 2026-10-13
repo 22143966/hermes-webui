@@ -23981,10 +23981,31 @@ function _showUploadTooLarge(file){
   if(typeof setStatus==='function')setStatus(`\u274c ${message}`);
   else if(typeof showToast==='function')showToast(message,5000,'error');
 }
+// Mobile camera/photo pickers (iOS Safari in particular) hand every photo the
+// same generic name ("image.jpg"). Dropping a file just because its name is
+// taken silently loses the second photo. Only skip a true duplicate (same
+// name, size and mtime); otherwise keep the file under a collision-free name.
+function _pendingFileUniqueName(name){
+  const taken=new Set((S.pendingFiles||[]).map(p=>p&&p.name));
+  if(!taken.has(name))return name;
+  const dot=name.lastIndexOf('.');
+  const stem=dot>0?name.slice(0,dot):name;
+  const ext=dot>0?name.slice(dot):'';
+  for(let i=2;;i++){
+    const candidate=`${stem}-${i}${ext}`;
+    if(!taken.has(candidate))return candidate;
+  }
+}
 function addFiles(files){
   for(const f of files){
     if(f&&f.size>MAX_UPLOAD_BYTES){_showUploadTooLarge(f);continue;}
-    if(!S.pendingFiles.find(p=>p.name===f.name))S.pendingFiles.push(f);
+    const clash=S.pendingFiles.find(p=>p.name===f.name);
+    if(clash){
+      if(clash.size===f.size&&clash.lastModified===f.lastModified)continue;
+      S.pendingFiles.push(new File([f],_pendingFileUniqueName(f.name),{type:f.type,lastModified:f.lastModified}));
+      continue;
+    }
+    S.pendingFiles.push(f);
   }
   renderTray();
 }
