@@ -14707,7 +14707,11 @@ def _run_agent_streaming(
                 _gateway_routing = _extract_gateway_routing_metadata(
                     agent,
                     result,
-                    requested_model=_turn_route_model or resolved_model or model,
+                    # The resolved (bare) model, as on master: a qualified
+                    # route hint such as @openrouter:gpt-4o served by gpt-4o
+                    # is not a model switch. The route provider rides along
+                    # separately for the settlement guard.
+                    requested_model=resolved_model or model,
                     requested_provider=resolved_provider,
                     requested_route_provider=_turn_route_provider,
                 )

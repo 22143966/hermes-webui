@@ -4526,7 +4526,13 @@ function syncModelChip(){
   };
   const _pickerProv=String(pickerState.model_provider||'').trim().toLowerCase();
   const _sessProv=String((S.session&&S.session.model_provider)||'').trim().toLowerCase();
-  const routeMatches=!S.session||!S.session.model||(
+  // Only an explicit picker pick (the user chose a model in this tab) can make
+  // the session's served-model attribution stale. A dropdown that restored a
+  // fallback option on its own is not a user choice, so keep the attribution.
+  const _explicitPick=(S.session&&typeof _readExplicitPickerPick==='function')
+    ? _readExplicitPickerPick(S.session.session_id)
+    : null;
+  const routeMatches=!S.session||!S.session.model||!_explicitPick||(
     _bareRouteModel(pickerModel).toLowerCase()===_bareRouteModel(S.session.model).toLowerCase()
     &&(!_pickerProv||!_sessProv||_pickerProv===_sessProv)
   );

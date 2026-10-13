@@ -95,6 +95,17 @@ def _production_event_harness(eval_code: str) -> str:
     fn_sync_model_chip = _extract_function(ui_source, "syncModelChip")
     fn_select_model = _extract_function(ui_source, "selectModelFromDropdown")
     fn_apply_ctx = _extract_function(boot_source, "_applySessionContextMetadataUpdate")
+    # The explicit-pick marker gates the composer route guard: wire the real
+    # helpers (and a sessionStorage shim) so onchange writes a real marker.
+    fn_explicit_pick = "\n".join(
+        _extract_function(ui_source, name)
+        for name in (
+            "_pickerExplicitPickKey",
+            "_rememberExplicitPickerPick",
+            "_readExplicitPickerPick",
+            "_clearExplicitPickerPick",
+        )
+    )
     onchange_block = _extract_block(boot_source, "$('modelSelect').onchange=")
 
     harness = f"""
@@ -181,6 +192,15 @@ async function api(endpoint, opts) {{
 {fn_format_gateway_model_label}
 {fn_latest_gateway_routing}
 {fn_format_session_model_with_gateway}
+const sessionStorage = (() => {{
+  const store = new Map();
+  return {{
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => {{ store.set(k, String(v)); }},
+    removeItem: (k) => {{ store.delete(k); }},
+  }};
+}})();
+{fn_explicit_pick}
 {fn_sync_model_chip}
 {fn_select_model}
 {fn_apply_ctx}
@@ -927,6 +947,36 @@ console.log(JSON.stringify(res));
     assert results["openrouter"] == "Model(gpt-5-mini)"
 
 
+def test_composer_chip_keeps_attribution_when_dropdown_restores_without_user_pick():
+    """A restored session whose dropdown fell back to a different option (no
+    explicit pick in this tab) keeps its served-model attribution (#7438 r4).
+
+    Only an explicit picker pick may make the attribution stale; after one, the
+    chip follows the pick as before.
+    """
+    raw_output = _production_event_harness("""
+const res = [];
+S.session = {
+  session_id: 'restored_gateway_1',
+  model: '@openrouter:gpt-4o',
+  model_provider: 'openrouter',
+  last_used_model: 'gpt-4o-mini',
+  gateway_routing: null,
+  gateway_routing_history: []
+};
+elements.modelSelect.value = 'openai/gpt-4o';
+syncModelChip();
+res.push({ case: 'restored_no_pick', label: elements.composerModelLabel.textContent });
+_rememberExplicitPickerPick('restored_gateway_1', 'openai/gpt-4o', 'openai');
+syncModelChip();
+res.push({ case: 'after_explicit_pick', label: elements.composerModelLabel.textContent });
+console.log(JSON.stringify(res));
+""")
+    results = {item["case"]: item["label"] for item in json.loads(raw_output)}
+    assert results["restored_no_pick"] == "Model(gpt-4o-mini)"
+    assert results["after_explicit_pick"] != "Model(gpt-4o-mini)"
+
+
 def test_named_custom_gateway_routing_no_false_failover():
     """Named custom request with canonical used_provider does not falsely trigger failover (#7438)."""
     from api.streaming import _extract_gateway_routing_metadata
@@ -1022,6 +1072,7 @@ class _WorkerTestAgent:
     mid_turn_hook = None
     served_model = "fallback-served-model"
     entry_count = 0
+    gateway_metadata = None
 
     def __init__(self, **kwargs):
         self.model = _WorkerTestAgent.served_model
@@ -1038,12 +1089,15 @@ class _WorkerTestAgent:
         _WorkerTestAgent.entry_count += 1
         if _WorkerTestAgent.mid_turn_hook:
             _WorkerTestAgent.mid_turn_hook()
-        return {
+        result = {
             "messages": [
                 {"role": "user", "content": kwargs.get("persist_user_message", "test")},
                 {"role": "assistant", "content": "test reply"},
             ]
         }
+        if _WorkerTestAgent.gateway_metadata is not None:
+            result["llm_gateway"] = dict(_WorkerTestAgent.gateway_metadata)
+        return result
 
     def interrupt(self, _message):
         return None
@@ -1060,6 +1114,8 @@ def _run_worker_test_turn(
     mid_turn_hook=None,
     profile_enrichment_hook=None,
     config=None,
+    resolved_model=None,
+    gateway_metadata=None,
 ):
     from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
 
@@ -1082,7 +1138,7 @@ def _run_worker_test_turn(
     monkeypatch.setattr(
         streaming,
         "resolve_model_provider",
-        lambda *_args, **_kwargs: (dispatch_model, dispatch_provider or "anthropic", None),
+        lambda *_args, **_kwargs: (resolved_model or dispatch_model, dispatch_provider or "anthropic", None),
     )
     _cfg = dict(config or {})
     monkeypatch.setattr("api.config.get_config", lambda: _cfg)
@@ -1099,6 +1155,7 @@ def _run_worker_test_turn(
         )
 
     _WorkerTestAgent.served_model = served_model
+    _WorkerTestAgent.gateway_metadata = gateway_metadata
     _WorkerTestAgent.mid_turn_hook = mid_turn_hook
     _WorkerTestAgent.entry_count = 0
 
@@ -1311,6 +1368,34 @@ _NAMED_CUSTOM_BACKUP_CONFIG = {
         {"name": "backup", "base_url": "http://127.0.0.1:9/v1", "api_key": "k", "model": "gpt-4o"},
     ],
 }
+
+
+def test_worker_turn_qualified_route_served_unchanged_is_not_a_model_switch(monkeypatch):
+    """@openrouter:gpt-4o resolved to gpt-4o and served by gpt-4o is not a
+    switch: the gateway metadata keeps model_changed False, as on master
+    (#7438 r4; the qualified hint must not replace the resolved model)."""
+    session = _WorkerTestSession(
+        "sess-worker-qualified-unchanged",
+        model="@openrouter:gpt-4o",
+        model_provider="openrouter",
+    )
+
+    _run_worker_test_turn(
+        monkeypatch,
+        session,
+        stream_id="stream-test-qualified-unchanged",
+        dispatch_model="@openrouter:gpt-4o",
+        dispatch_provider="openrouter",
+        resolved_model="gpt-4o",
+        served_model="gpt-4o",
+        gateway_metadata={"used_model": "gpt-4o", "used_provider": "openrouter"},
+        mid_turn_hook=None,
+    )
+
+    routing = session.gateway_routing
+    assert routing, "the worker should persist the gateway routing metadata"
+    assert routing.get("model_changed") is False
+    assert routing.get("requested_model") == "gpt-4o"
 
 
 def test_worker_turn_named_custom_plain_preserves_attribution(monkeypatch):
