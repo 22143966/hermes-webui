@@ -5358,13 +5358,24 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(/[:;]["\x27)\]]*$/.test(trimmed)) return 30;
     return 0;
   }
-  function _streamFadeNextText(targetText){
+  function _streamFadeNextText(targetText, revealAll=false){
     targetText=String(targetText||'');
     const now=performance.now();
     if(!targetText){
       const hadVisible=!!_streamFadeVisibleText;
       _resetStreamFadeState();
       return {text:'', caughtUp:true, changed:hadVisible};
+    }
+    if(revealAll){
+      // Synchronous flush (transport recovery): show the whole backlog now and
+      // move the playout cursor to the end, so the next fade frame continues
+      // from the painted text instead of rewinding to the last revealed word.
+      const changed=_streamFadeVisibleText!==targetText;
+      _streamFadeVisibleText=targetText;
+      _streamFadeVisibleWords=_streamFadeWordCountOf(targetText);
+      _streamFadeWordCarry=0;
+      _streamFadeHoldUntilMs=0;
+      return {text:targetText, caughtUp:true, changed};
     }
     if(!_streamFadeVisibleText||!targetText.startsWith(_streamFadeVisibleText)){
       // Markdown/tool stripping can rewrite the visible prefix. Shrink the
@@ -5467,9 +5478,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(_streamFadeVisibleText.length>targetText.length) _streamFadeVisibleText=targetText;
     return {text:_streamFadeVisibleText,caughtUp:_streamFadeVisibleText===targetText,changed:true};
   }
-  function _renderStreamingFadeMarkdown(displayText){
+  function _renderStreamingFadeMarkdown(displayText, revealAll=false){
     if(!assistantBody) return true;
-    const next=_streamFadeNextText(displayText);
+    const next=_streamFadeNextText(displayText, revealAll);
     if(!next.changed) return next.caughtUp;
     assistantBody.classList.add('stream-fade-active');
     if(!_shouldUseTransparentStreamFade()){
@@ -5556,6 +5567,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const displayText=segmentStart===0
       ? _parseStreamState().displayText
       : _stripXmlToolCalls(assistantText.slice(segmentStart));
+    if(!force&&_shouldUseLiveProseFade()){
+      // Transport recovery keeps this segment open. Paint through the fade
+      // renderer so its playout cursor and DOM stay consistent; the plain smd
+      // path below would be rewound by the next fade frame.
+      _renderStreamingFadeMarkdown(displayText,true);
+      const fadeText=_streamFadeDomText||displayText;
+      if(!skipAnchorProcessProse) _upsertAnchorProcessProse(fadeText);
+      if(typeof _syncLiveWorklogReasonsForAnchor==='function') _syncLiveWorklogReasonsForAnchor(assistantRow, fadeText);
+      return;
+    }
     if(_smdParser){
       _smdWrite(displayText);
     } else if(window.smd){
