@@ -1059,6 +1059,7 @@ def _run_worker_test_turn(
     served_model="fallback-served-model",
     mid_turn_hook=None,
     profile_enrichment_hook=None,
+    config=None,
 ):
     from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
 
@@ -1083,7 +1084,8 @@ def _run_worker_test_turn(
         "resolve_model_provider",
         lambda *_args, **_kwargs: (dispatch_model, dispatch_provider or "anthropic", None),
     )
-    monkeypatch.setattr("api.config.get_config", lambda: {})
+    _cfg = dict(config or {})
+    monkeypatch.setattr("api.config.get_config", lambda: _cfg)
     monkeypatch.setattr("api.config._resolve_cli_toolsets", lambda *_args, **_kwargs: [])
     monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
     monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", fake_runtime_module)
@@ -1300,6 +1302,17 @@ def test_worker_turn_openrouter_free_suffix_preserves_attribution(monkeypatch):
     assert asst_msg.get("_usedModel") == "tencent/hy3-preview:free-served"
 
 
+# Current master fails closed on a named custom:<slug> route that no
+# custom_providers[] row owns (raise_for_custom_provider_route), before the
+# agent is built. These attribution tests need a configured provider so the
+# turn actually reaches the worker.
+_NAMED_CUSTOM_BACKUP_CONFIG = {
+    "custom_providers": [
+        {"name": "backup", "base_url": "http://127.0.0.1:9/v1", "api_key": "k", "model": "gpt-4o"},
+    ],
+}
+
+
 def test_worker_turn_named_custom_plain_preserves_attribution(monkeypatch):
     """Named custom routes like @custom:backup:gpt-4o preserve session attribution (#7438)."""
     session = _WorkerTestSession(
@@ -1312,6 +1325,7 @@ def test_worker_turn_named_custom_plain_preserves_attribution(monkeypatch):
         monkeypatch,
         session,
         stream_id="stream-test-custom-plain",
+        config=_NAMED_CUSTOM_BACKUP_CONFIG,
         dispatch_model="@custom:backup:gpt-4o",
         dispatch_provider="custom:backup",
         served_model="gpt-4o-mini",
@@ -1335,6 +1349,7 @@ def test_worker_turn_named_custom_free_suffix_preserves_attribution(monkeypatch)
         monkeypatch,
         session,
         stream_id="stream-test-custom-free",
+        config=_NAMED_CUSTOM_BACKUP_CONFIG,
         dispatch_model="@custom:backup:some-model:free",
         dispatch_provider="custom:backup",
         served_model="custom-served-free",
