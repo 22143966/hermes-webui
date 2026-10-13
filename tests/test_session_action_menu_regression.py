@@ -41,11 +41,12 @@ def test_archive_action_repaints_sidebar_before_full_refresh():
 
     api_call = "const response=await api('/api/session/archive'"
     optimistic = "if(cached) cached.archived=archived;"
-    # The archive response lands after an await, so its repaint runs as
-    # background churn through _repaintSidebarAfterSessionCompletion() instead of
-    # a bare renderSessionListFromCache(), which would retire a project picker
-    # the user opened while the request was in flight (gate L6). The helper
-    # still repaints from cache before the full refresh.
+    # The archive response lands after an await, so its repaint routes through
+    # _repaintSidebarAfterSessionCompletion(), which paints the durable result
+    # immediately while keeping a project picker the user opened for another
+    # conversation — instead of a bare renderSessionListFromCache(), which
+    # would retire it, or a deferral (gate L6). The helper still repaints from
+    # cache before the full refresh.
     cached_render = "_repaintSidebarAfterSessionCompletion(session.session_id);"
     full_refresh = "void renderSessionList();"
 

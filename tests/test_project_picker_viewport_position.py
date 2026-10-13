@@ -1835,13 +1835,15 @@ def _external_hide_handler_source() -> str:
 
 # A response that lands after an await is a completion, not fresh user intent.
 # Each entry pairs the durable cache write that makes the response observable
-# with the repaint that must run as background churn. The gate charged these
-# sites as L1-L6 plus the delete-failure rollback lead; the external-hide
-# completion was added when a warm-up found it was the remaining sibling path.
+# with the routed repaint that must paint the result immediately while keeping
+# any newer picker (the shared completion helper, or the explicit keep-picker
+# repaint). The gate charged these sites as L1-L6 plus the delete-failure
+# rollback lead; the external-hide completion was added when a warm-up found it
+# was the remaining sibling path.
 LATE_COMPLETION_REPAINTS = [
-    ("L1 title regenerate", "cached.title=nextTitle;", "_repaintSidebarForBackgroundChurn();"),
-    ("L2 pin toggle", "if(cached) cached.pinned=newPinned;", "_repaintSidebarForBackgroundChurn();"),
-    ("L3 share create/refresh", "cached.share_token=session.share_token;", "_repaintSidebarForBackgroundChurn();"),
+    ("L1 title regenerate", "cached.title=nextTitle;", "_repaintSidebarKeepingProjectPicker();"),
+    ("L2 pin toggle", "if(cached) cached.pinned=newPinned;", "_repaintSidebarKeepingProjectPicker();"),
+    ("L3 share create/refresh", "cached.share_token=session.share_token;", "_repaintSidebarKeepingProjectPicker();"),
     ("L4 move to project", "_allSessions[idx].project_id=p.project_id;", "_repaintSidebarAfterSessionCompletion(session.session_id,pickerEpoch);"),
     ("L5 unassign project", "_allSessions[idx].project_id=null;", "_repaintSidebarAfterSessionCompletion(session.session_id,pickerEpoch);"),
     ("L6 archive", "if(cached) cached.archived=archived;", "_repaintSidebarAfterSessionCompletion(session.session_id);"),
@@ -1851,14 +1853,15 @@ LATE_COMPLETION_REPAINTS = [
 
 
 @pytest.mark.parametrize("label,durable_write,repaint_call", LATE_COMPLETION_REPAINTS)
-def test_delayed_response_repaints_defer_while_a_newer_picker_is_open(label, durable_write, repaint_call):
-    """Gate L1-L6: an awaited response must defer, not dismiss a newer picker.
+def test_delayed_response_completions_paint_immediately_while_keeping_a_newer_picker(label, durable_write, repaint_call):
+    """Gate L1-L6: an awaited response must paint its result, keeping any newer picker.
 
     Start an action for A, hold its POST, open B's project picker, then release
     A's response. An unmarked ``renderSessionListFromCache()`` retires B's
-    picker as if the user had asked for that repaint. Each completion writes its
-    durable result into the cache first, then repaints through the
-    background-churn wrapper so the picker owned by another session survives.
+    picker as if the user had asked for that repaint, and the background-churn
+    wrapper parks the result behind it. Each completion writes its durable
+    result into the cache first, then routes the repaint through the immediate
+    keep-picker contract so A's result paints now while B's picker survives.
     """
     assert SESSIONS_JS.count(durable_write) == 1, f"{label}: durable write is not unique"
     durable_at = SESSIONS_JS.index(durable_write)
@@ -1876,6 +1879,100 @@ def test_delayed_response_repaints_defer_while_a_newer_picker_is_open(label, dur
         f"{label}: the completion retires whatever picker is open instead of "
         "only one owned by the session it mutated"
     )
+    assert "_repaintSidebarForBackgroundChurn();" not in window, (
+        f"{label}: the completion defers its durable result behind a newer "
+        "picker instead of painting it while keeping the overlay"
+    )
+
+
+def _completion_slice(start_marker: str, end_marker: str) -> str:
+    start = SESSIONS_JS.index(start_marker)
+    end = SESSIONS_JS.index(end_marker, start)
+    return SESSIONS_JS[start:end]
+
+
+def _completion_function_body(name: str) -> str:
+    """Extract a top-level function body with balanced braces."""
+    start = SESSIONS_JS.index(f"function {name}(")
+    brace = SESSIONS_JS.index("{", start)
+    depth = 0
+    i = brace
+    while i < len(SESSIONS_JS):
+        char = SESSIONS_JS[i]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    assert depth == 0, f"{name} body did not close"
+    return SESSIONS_JS[start:i + 1]
+
+
+KEEP_PICKER_REFETCH = "await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});"
+
+
+def test_batch_completions_ship_the_immediate_keep_picker_contract():
+    """All four batch-completion refetches must paint now, keeping newer pickers.
+
+    Archived or deleted rows, and moved assignments, stay on screen as stale
+    until an open picker closes when the completion refetch defers. Each batch
+    completion must use the explicit nondeferred keep-picker contract instead.
+    """
+    bar = _completion_function_body("_renderBatchActionBar")
+    picker = _completion_function_body("_showBatchProjectPicker")
+    assert bar.count(KEEP_PICKER_REFETCH) == 2, (
+        "the batch archive and delete completions must use the keep-picker refetch"
+    )
+    assert picker.count(KEEP_PICKER_REFETCH) == 2, (
+        "the batch unassign and move completions must use the keep-picker refetch"
+    )
+    assert "await renderSessionList();" not in bar
+    assert "await renderSessionList();" not in picker
+
+
+def test_pin_completion_ships_the_immediate_keep_picker_contract():
+    """Pin's success transition must move the row now, keeping a newer picker."""
+    body = _completion_slice("const newPinned=!session.pinned;", "t('session_pin_failed')")
+    assert "_repaintSidebarKeepingProjectPicker();" in body
+    assert "void renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});" in body
+    assert "_repaintSidebarForBackgroundChurn();" not in body
+
+
+def test_title_regenerate_completion_uses_the_keep_picker_repaint():
+    """A regenerated title must paint now, keeping a picker opened in flight."""
+    body = _completion_slice(
+        "const nextTitle=(response&&response.title)",
+        "showToast(t('session_title_regenerated'",
+    )
+    assert "_repaintSidebarKeepingProjectPicker();" in body
+    assert "_repaintSidebarForBackgroundChurn();" not in body
+
+
+def test_rename_release_repaint_keeps_a_newer_picker():
+    """The rename completion's final repaint must not defer behind a picker."""
+    body = _completion_function_body("_buildSessionRenameStarter")
+    assert "_repaintSidebarKeepingProjectPicker();" in body
+    assert "_repaintSidebarForBackgroundChurn" not in body
+
+
+def test_share_refresh_completion_ships_the_immediate_keep_picker_contract():
+    """The share completion must paint the share state now and refetch keeping."""
+    body = _completion_function_body("_syncSessionShareState")
+    assert "_repaintSidebarKeepingProjectPicker();" in body
+    assert "void renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});" in body
+    assert "_repaintSidebarForBackgroundChurn();" not in body
+    assert "void renderSessionList();" not in body
+
+
+def test_completion_helper_final_repaint_keeps_the_picker():
+    """The shared completion helper must never route its final repaint as churn."""
+    body = _repaint_sidebar_after_session_completion_source()
+    assert body.count("_repaintSidebarKeepingProjectPicker();") == 2, (
+        "the newer-same-owner branch and the final repaint must both keep the picker"
+    )
+    assert "_repaintSidebarForBackgroundChurn();" not in body
 
 
 def test_share_completion_and_archive_have_no_bare_cache_repaint():
@@ -1939,7 +2036,7 @@ console.log(JSON.stringify({staleCompletion,currentCompletion}));
             "closed": True,
             "paints": [
                 {"background": False, "keep": True},
-                {"background": True, "keep": False},
+                {"background": False, "keep": True},
             ],
         },
     }
@@ -2116,10 +2213,11 @@ console.log(JSON.stringify({
 def test_completion_repaint_retires_only_the_mutated_sessions_picker():
     """Owner half of the routing fix, driven through the shipped guards.
 
-    A completion for session A must keep a picker the user opened for session B:
-    the repaint defers through the background wrapper, so B's picker survives
-    and the durable result for A paints on the replay. A completion for the
-    session that owns the open picker retires that picker instead.
+    A completion for session A must keep a picker the user opened for session B
+    and paint A's durable result on the spot: the keep-picker repaint rebuilds
+    the rows, keeps B's overlay for the render to re-anchor, and never parks
+    the result behind the open picker. A completion for the session that owns
+    the open picker retires that picker instead.
     """
     assert NODE is not None
     script = r"""
@@ -2139,7 +2237,7 @@ function renderSessionListFromCache(){
   }
   painted.push(_allSessions.map(s => s.pinned));
 }
-""" + _retire_project_picker_for_explicit_repaint_source() + _repaint_sidebar_for_background_churn_source() + _repaint_sidebar_after_session_completion_source() + r"""
+""" + _retire_project_picker_for_explicit_repaint_source() + _repaint_sidebar_for_background_churn_source() + _repaint_sidebar_keeping_project_picker_source() + _repaint_sidebar_after_session_completion_source() + r"""
 const openPicker = (sessionId) => {
   const picker = {};
   _projectPickerTeardown = () => {
@@ -2148,7 +2246,7 @@ const openPicker = (sessionId) => {
   };
   _openProjectPicker = {picker, sessionId};
 };
-// B is choosing a project for 'b' while A's pin response lands.
+// B is choosing a project for 'b' while A's pin response lands: A's result must paint now.
 openPicker('b');
 _allSessions[0].pinned = true;
 _repaintSidebarAfterSessionCompletion('a');
@@ -2158,7 +2256,7 @@ const newerPickerKept = {
   deferralPending: _sessionListRepaintDeferredByPicker === true,
   painted: painted.length,
 };
-// Closing B's picker replays the deferred repaint with A's durable result.
+// Closing B's picker replays nothing: A's result already painted.
 _projectPickerTeardown = null;
 _openProjectPicker = null;
 if(_sessionListRepaintDeferredByPicker){
@@ -2181,7 +2279,7 @@ console.log(JSON.stringify({newerPickerKept, replayed, ownPickerRetired}));
     result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {
-        "newerPickerKept": {"retired": 0, "stillOpen": True, "deferralPending": True, "painted": 0},
+        "newerPickerKept": {"retired": 0, "stillOpen": True, "deferralPending": False, "painted": 1},
         "replayed": {"painted": 1, "durableA": True},
         "ownPickerRetired": {"retired": 1, "cleared": True, "deferralCleared": True, "painted": 2, "flagRestored": True},
     }
@@ -2232,8 +2330,8 @@ console.log(JSON.stringify({
 def test_external_hide_completion_keeps_other_pickers_and_retires_its_own():
     """The hide completion is owner-aware through the shipped routing.
 
-    An external-hide response for session A must keep a picker the user opened
-    for session B (the repaint defers and replays with A archived), and must
+    An external-hide response for session A must paint A's archived result
+    immediately while keeping a picker the user opened for session B, and must
     retire only a picker owned by A itself.
     """
     assert NODE is not None
@@ -2258,6 +2356,7 @@ function renderSessionListFromCache(){
         + _retire_project_picker_for_explicit_repaint_source()
         + _repaint_sidebar_for_background_churn_source()
         + _project_picker_blocks_repaint_source()
+        + _repaint_sidebar_keeping_project_picker_source()
         + _repaint_sidebar_after_session_completion_source()
         + _optimistically_archive_session_in_list_source()
         + r"""
@@ -2269,7 +2368,7 @@ const openPicker = (sessionId) => {
   };
   _openProjectPicker = {picker, sessionId};
 };
-// B is choosing a project for 'b' while A's hide response lands.
+// B is choosing a project for 'b' while A's hide response lands: A's archived result must paint now.
 openPicker('b');
 _optimisticallyArchiveSessionInList('a', true);
 const newerPickerKept = {
@@ -2279,7 +2378,7 @@ const newerPickerKept = {
   painted: painted.length,
   archivedA: _allSessions[0].archived === true,
 };
-// Closing B's picker replays the deferred repaint with A's archived result.
+// Closing B's picker replays nothing: A's archived result already painted.
 _projectPickerTeardown = null;
 _openProjectPicker = null;
 if(_sessionListRepaintDeferredByPicker){
@@ -2306,8 +2405,8 @@ console.log(JSON.stringify({newerPickerKept, replayed, ownPickerRetired}));
         "newerPickerKept": {
             "retired": 0,
             "stillOpen": True,
-            "deferralPending": True,
-            "painted": 0,
+            "deferralPending": False,
+            "painted": 1,
             "archivedA": True,
         },
         "replayed": {"painted": 1, "archivedA": True},
@@ -2325,9 +2424,9 @@ def test_external_hide_handler_success_wiring_and_archive_failure_control():
     """The handler's awaited completion is routed, and its failure path is inert.
 
     Success: the archive POST resolves, the optimistic cache write and the
-    shared completion repaint run (deferring behind another session's picker),
-    and the full list refresh and success toast follow. Failure: the POST
-    rejecting must not write the cache, repaint, or retire any picker.
+    shared completion repaint run immediately (keeping another session's
+    picker), and the full list refresh and success toast follow. Failure: the
+    POST rejecting must not write the cache, repaint, or retire any picker.
     """
     assert NODE is not None
     handler_body = _external_hide_handler_source()
@@ -2364,6 +2463,7 @@ function t(key){ return key; }
         + _retire_project_picker_for_explicit_repaint_source()
         + _repaint_sidebar_for_background_churn_source()
         + _project_picker_blocks_repaint_source()
+        + _repaint_sidebar_keeping_project_picker_source()
         + _repaint_sidebar_after_session_completion_source()
         + _optimistically_archive_session_in_list_source()
         + r"""
@@ -2416,8 +2516,8 @@ const handler = async ()=>"""
         "success": {
             "retired": 0,
             "pickerKept": True,
-            "deferralPending": True,
-            "painted": 0,
+            "deferralPending": False,
+            "painted": 1,
             "renderListCalls": 1,
             "sessionFlagSet": True,
             "savedFlagSet": True,
@@ -2427,8 +2527,8 @@ const handler = async ()=>"""
         "failure": {
             "retired": 0,
             "pickerKept": True,
-            "deferralPending": True,
-            "painted": 0,
+            "deferralPending": False,
+            "painted": 1,
             "renderListCalls": 1,
             "cUntouched": True,
             "sessionFlagStayedClear": True,

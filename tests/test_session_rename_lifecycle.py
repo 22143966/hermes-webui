@@ -55,15 +55,15 @@ def test_session_rename_guard_releases_after_save_path_completes():
     )
 
 
-def test_session_rename_completion_is_background_sidebar_churn():
+def test_session_rename_completion_paints_while_keeping_a_newer_picker():
     block = _session_rename_block()
     release_pos = block.index("const releaseRename=()=>{")
     timer_pos = block.index("setTimeout", release_pos)
     timer_end = block.index("};", timer_pos)
     timer = block[timer_pos:timer_end]
-    assert "_repaintSidebarForBackgroundChurn()" in timer, (
+    assert "_repaintSidebarKeepingProjectPicker()" in timer, (
         "a held rename response can finish after another row opens its picker; "
-        "the delayed completion must preserve that picker"
+        "the delayed completion must paint now while keeping that picker"
     )
 
 

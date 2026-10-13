@@ -5239,7 +5239,7 @@ function _renderBatchActionBar(){
         return {response,session:sessionsById.get(sid)||null};
       }));
       const retainedCount=_worktreeResponseCount(results);
-      showToast(retainedCount?t('session_archived_worktree'):t('session_archived'));exitSessionSelectMode();await renderSessionList();
+      showToast(retainedCount?t('session_archived_worktree'):t('session_archived'));exitSessionSelectMode();await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
     }catch(e){showToast('Archive failed: '+(e.message||e));}
   };bar.appendChild(archiveBtn);
   // Move
@@ -5283,7 +5283,7 @@ function _renderBatchActionBar(){
       }
       if(cleanupFailedCount) showToast(t('delete_failed')+' ('+cleanupFailedCount+'/'+ids.length+')',0,'error');
       else showToast((retainedCount?t('session_deleted_worktree'):t('session_delete'))+' ('+ids.length+')');
-      exitSessionSelectMode();await renderSessionList();
+      exitSessionSelectMode();await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
     }catch(e){showToast('Delete failed: '+(e.message||e));}
   };bar.appendChild(deleteBtn);
 }
@@ -5295,7 +5295,7 @@ function _showBatchProjectPicker(openerEl){
   const none=_projectPickerItem();none.textContent=t('project_picker_none');
   none.onclick=async()=>{picker.remove();
     try{await Promise.all(ids.map(sid=>api('/api/session/move',{method:'POST',body:JSON.stringify({session_id:sid,project_id:null})})));
-      showToast('Removed from project');exitSessionSelectMode();await renderSessionList();
+      showToast('Removed from project');exitSessionSelectMode();await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
     }catch(e){showToast('Move failed: '+(e.message||e));}
   };picker.appendChild(none);
   for(const p of(_allProjects||[])){
@@ -5305,7 +5305,7 @@ function _showBatchProjectPicker(openerEl){
     const name=document.createElement('span');name.textContent=p.name;item.appendChild(name);
     item.onclick=async()=>{picker.remove();
       try{await Promise.all(ids.map(sid=>api('/api/session/move',{method:'POST',body:JSON.stringify({session_id:sid,project_id:p.project_id})})));
-        showToast('Moved to '+p.name);exitSessionSelectMode();await renderSessionList();
+        showToast('Moved to '+p.name);exitSessionSelectMode();await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
       }catch(e){showToast('Move failed: '+(e.message||e));}
     };picker.appendChild(item);
   }
@@ -5609,7 +5609,7 @@ function _buildSessionRenameStarter(session, displayEl, renderDisplay){
         if(inp.isConnected) inp.replaceWith(displayEl);
         setTimeout(()=>{
           if(_renamingSid!==null) return;
-          if(typeof _repaintSidebarForBackgroundChurn==='function') _repaintSidebarForBackgroundChurn();
+          if(typeof _repaintSidebarKeepingProjectPicker==='function') _repaintSidebarKeepingProjectPicker();
           else if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
         },50);
       };
@@ -5680,8 +5680,8 @@ function _syncSessionShareState(session, nextSession){
     S.session.share_created_at=session.share_created_at;
     if(typeof _syncHermesPanelSessionActions==='function') _syncHermesPanelSessionActions();
   }
-  _repaintSidebarForBackgroundChurn();
-  void renderSessionList();
+  _repaintSidebarKeepingProjectPicker();
+  void renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
 }
 
 async function _createOrRefreshSessionShare(session){
@@ -6017,8 +6017,8 @@ function _openSessionActionMenu(session, anchorEl){
         const cached=(_allSessions||[]).find(s=>s&&s.session_id===session.session_id);
         if(cached) cached.pinned=newPinned;
         if(S.session&&S.session.session_id===session.session_id) S.session.pinned=newPinned;
-        _repaintSidebarForBackgroundChurn();
-        void renderSessionList();
+        _repaintSidebarKeepingProjectPicker();
+        void renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
       }catch(err){
         showToast(t('session_pin_failed')+err.message);
         await renderSessionList();
@@ -6098,7 +6098,7 @@ function _openSessionActionMenu(session, anchorEl){
           const cached=(_allSessions||[]).find(item=>item&&item.session_id===session.session_id);
           if(cached) cached.title=nextTitle;
           if(S.session&&S.session.session_id===session.session_id){S.session.title=nextTitle;syncTopbar();}
-          _repaintSidebarForBackgroundChurn();
+          _repaintSidebarKeepingProjectPicker();
         }
         if(typeof showToast==='function') showToast(t('session_title_regenerated', nextTitle||t('untitled')), 2400);
       }catch(err){
@@ -10672,8 +10672,9 @@ function _repaintSidebarForBackgroundChurn(){
 // delete rollback) must not paint as fresh user intent just because the user
 // started the action earlier: the open picker is the newer choice. Retire only
 // a picker anchored to the session this response mutated — its row is going
-// away — then repaint as background churn so a picker owned by another session
-// survives. Callers run after the awaited response, never across it.
+// away — then paint the durable result now, keeping and re-anchoring a picker
+// owned by another session instead of deferring the result behind it. Callers
+// run after the awaited response, never across it.
 function _repaintSidebarAfterSessionCompletion(sessionId,claimEpoch){
   const open=typeof _openProjectPicker!=='undefined'?_openProjectPicker:null;
   if(open&&sessionId&&open.sessionId===sessionId&&typeof _retireProjectPickerForExplicitRepaint==='function'){
@@ -10687,7 +10688,7 @@ function _repaintSidebarAfterSessionCompletion(sessionId,claimEpoch){
       return;
     }
   }
-  _repaintSidebarForBackgroundChurn();
+  _repaintSidebarKeepingProjectPicker();
 }
 
 // Resolve picker ownership through the same cache/filter/lineage pipeline the

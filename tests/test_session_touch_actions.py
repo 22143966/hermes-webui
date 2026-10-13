@@ -281,8 +281,8 @@ def test_session_removal_reflows_surviving_rows_smoothly():
     archive_body = SESSIONS_JS[archive_start:archive_end]
     toast_idx = archive_body.find("showToast(session.archived?_sessionArchiveToast(response,session):t('session_restored'));")
     hold_idx = archive_body.find("if(renderHold) await renderHold;")
-    # The archive completion repaints as background churn through the helper
-    # (gate L6) so a picker opened while the request was in flight survives.
+    # The archive completion repaints through the helper (gate L6), painting
+    # the durable result immediately while a picker opened in flight is kept.
     cache_render_idx = archive_body.find("_repaintSidebarAfterSessionCompletion(session.session_id);")
     reconcile_idx = archive_body.find("void renderSessionList();")
     assert 0 <= toast_idx < hold_idx < cache_render_idx < reconcile_idx
