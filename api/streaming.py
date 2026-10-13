@@ -32,7 +32,6 @@ from api.config import (
     get_config,
     STREAMS, STREAMS_LOCK, CANCEL_FLAGS, AGENT_INSTANCES, STREAM_PARTIAL_TEXT,
     STREAM_REASONING_TEXT, STREAM_LIVE_TOOL_CALLS,
-    STREAM_GOAL_RELATED,
     STREAM_LAST_EVENT_ID,
     stream_owned_registries,
     release_stream_owned_registries,

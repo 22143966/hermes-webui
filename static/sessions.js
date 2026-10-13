@@ -2440,27 +2440,27 @@ async function loadSession(sid){
   // Persist the current composer draft before switching away so it can be
   // restored when the user switches back (#1060). Save to server now so the
   // draft survives page refresh and syncs across clients.
+  // #7855 CORE (round 7): the departing session's composer may hold a
+  // restored goal-continuation binding. Saving only the text/files dropped
+  // the token, so switching away from a restored queued continuation and
+  // coming back restored an ordinary draft — the retry then posted no id
+  // and admission scored goal_related=false (Chromium + real HTTP: master
+  // scores true).
+  //
+  // Read the binding WITHOUT consuming it (the one-shot marker stays armed
+  // for a same-session resend) and only persist it when it still describes
+  // the text being saved — an edited draft must not carry the old token.
+  let _switchContId = '';
+  if (typeof _peekRestoredGoalContinuationDraft === 'function') {
+    const _peeked = _peekRestoredGoalContinuationDraft();
+    if (_peeked && _peeked.id
+        && String(_peeked.text || '').trim() === String(($('msg') || {}).value || '').trim()) {
+      _switchContId = _peeked.id;
+    }
+  }
   if (currentSid && currentSid !== sid) {
     if(typeof window._clearPendingSelections==='function') window._clearPendingSelections();
     if(typeof _clearQueueCardDisplay==='function') _clearQueueCardDisplay(currentSid);
-    // #7855 CORE (round 7): the departing session's composer may hold a
-    // restored goal-continuation binding. Saving only the text/files dropped
-    // the token, so switching away from a restored queued continuation and
-    // coming back restored an ordinary draft — the retry then posted no id
-    // and admission scored goal_related=false (Chromium + real HTTP: master
-    // scores true).
-    //
-    // Read the binding WITHOUT consuming it (the one-shot marker stays armed
-    // for a same-session resend) and only persist it when it still describes
-    // the text being saved — an edited draft must not carry the old token.
-    let _switchContId = '';
-    if (typeof _peekRestoredGoalContinuationDraft === 'function') {
-      const _peeked = _peekRestoredGoalContinuationDraft();
-      if (_peeked && _peeked.id
-          && String(_peeked.text || '').trim() === String(($('msg') || {}).value || '').trim()) {
-        _switchContId = _peeked.id;
-      }
-    }
     await _saveComposerDraftNow(currentSid, ($('msg') || {}).value || '', S.pendingFiles ? [...S.pendingFiles] : [], _switchContId);
     // The awaited draft save above yields the event loop. If another
     // loadSession() started for a different session while we were waiting
