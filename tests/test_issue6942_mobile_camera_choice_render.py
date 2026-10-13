@@ -82,8 +82,14 @@ def test_attachment_choice_is_visible_across_mobile_render_matrix(tmp_path):
                         "document.getElementById('onboardingOverlay').style.display !== 'flex'"
                     )
                     page.wait_for_selector("#btnAttach", timeout=10000)
-                    page.locator("#btnAttach").click()
+                    attach = page.locator("#btnAttach")
                     popup = page.locator("#attachChoicePopup")
+                    attach.click()
+                    popup.wait_for(state="visible", timeout=5000)
+                    attach.click()
+                    playwright.expect(popup).to_be_hidden()
+                    playwright.expect(attach).to_have_attribute("aria-expanded", "false")
+                    attach.click()
                     if width == 400 and locale == "en":
                         page.screenshot(path=str(tmp_path / "attachment-choice.png"))
                     labels = {
