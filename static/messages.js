@@ -1474,8 +1474,12 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
             // still carries the token in-page as well as across a reload.
             _setRestoredGoalContinuationDraft(_restoreContId,restore);
           }
-          _saveComposerDraftNow(sid, liveText, S.pendingFiles?[...S.pendingFiles]:[],
-            String(liveText||'').trim()===String(restore||'').trim()?_restoreContId:'');
+          const _liveMatchesRestore=String(liveText||'').trim()===String(restore||'').trim();
+          if(_liveMatchesRestore&&_restoreContId){
+            _saveComposerDraftNow(sid, liveText, S.pendingFiles?[...S.pendingFiles]:[], _restoreContId);
+          } else {
+            _saveComposerDraftNow(sid, liveText, S.pendingFiles?[...S.pendingFiles]:[]);
+          }
         } else if(!restoredVisible){
           // Background failure (sid was never the visible session): no live
           // composer to read, so persist the captured snapshot — it's the only copy.
@@ -1484,7 +1488,11 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
           // session and a retry posted no id and start admission scored it
           // goal_related=false (master scores true). Pass the restored
           // continuation id alongside the exact text it belongs to.
-          _saveComposerDraftNow(sid, restore, files, _restoreContId);
+          if(_restoreContId){
+            _saveComposerDraftNow(sid, restore, files, _restoreContId);
+          } else {
+            _saveComposerDraftNow(sid, restore, files);
+          }
         }
         // else: restored the visible composer, then the user switched away — the
         // session-switch save path already saved sid's composer; skip stale write.
