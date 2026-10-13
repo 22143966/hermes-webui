@@ -2496,8 +2496,9 @@ async function loadSession(sid){
   }
   // A superseded navigation can return here with this session's transcript
   // still cached. Snapshot its width before metadata replaces S.session and
-  // drops the old message count and regeneration revision.
-  if(currentSid === sid && !forceReload){
+  // drops the old message count and regeneration revision. If an interrupted
+  // forced refresh already cleared the rows, retain its saved width instead.
+  if(currentSid === sid && !forceReload && Array.isArray(S.messages) && S.messages.length > 0){
     _captureSameSessionForceReloadHint(sid);
   }
   // Phase 1: Load metadata only (~1KB) for fast session switching. Keep model

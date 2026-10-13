@@ -1669,11 +1669,16 @@ Complete list of all HTTP endpoints as of Sprint 1 (v0.3).
                                `_messages_truncated`, and imported-turn ownership
                                gates remain in force. Cached messages bypass a load
                                only with current same-session authority. A returning
-                               navigation snapshots loaded width and message count
-                               before replacing metadata; authority refetches reuse
-                               the existing bounded/full reload-width policy, not
-                               the initial tail. Missing authority never creates an
-                               automatic refetch loop.
+                               navigation snapshots resident width and message count
+                               before replacing metadata. If an interrupted forced
+                               refresh temporarily cleared the rows, it retains the
+                               existing same-session hint instead of recapturing an
+                               empty window. Authority refetches reuse the existing
+                               bounded/full reload-width policy, not the initial
+                               tail. Hints remain session-scoped and superseded load
+                               generations cannot overwrite the winning transcript.
+                               Missing authority never creates an automatic refetch
+                               loop.
     /api/sessions              List of all session compact() dicts, sorted by updated_at
     /api/list                  ?session_id=X&path=. -> directory listing for session workspace
     /api/file                  ?session_id=X&path=rel -> file content (text, 200KB limit)

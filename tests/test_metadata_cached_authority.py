@@ -29,6 +29,7 @@ def _source():
     ui = (ROOT / "static/ui.js").read_text()
     messages = (ROOT / "static/messages.js").read_text()
     names = (
+        "_sessionProfileMismatchFromError",
         "_adoptRegenerationRevision",
         "_currentLoadedRenderableMessageCount",
         "_captureSameSessionForceReloadHint",
@@ -54,6 +55,10 @@ let releaseDraft;
 const draft=new Promise(resolve=>{releaseDraft=resolve;});
 let releaseMessages;
 const delayedMessages=new Promise(resolve=>{releaseMessages=resolve;});
+let releaseMetadata;
+const delayedMetadata=new Promise(resolve=>{releaseMetadata=resolve;});
+let metadataReads=0,messageReads=0;
+let savedHint,beforeOlderSettles;
 const composer={value:'unsaved synthetic draft'};
 const msgInner={innerHTML:''};
 const stored=new Map();
@@ -95,8 +100,19 @@ c.api=async(path,options)=>{
   requests.push(path);
   const params=new URL(path,'https://synthetic.invalid').searchParams;
   const sid=params.get('session_id');
-  if(params.get('messages')==='0')return {session:{session_id:sid,message_count:spec.total,messages:[]}};
-  if(spec.delayed)await delayedMessages;
+  if(params.get('messages')==='0'){
+    const first=++metadataReads===1;
+    if(spec.mode==='interrupted-refresh'&&first&&spec.pendingStage==='metadata'){
+      await delayedMetadata;
+      if(spec.olderFailure)throw Object.assign(new Error('superseded metadata failure'),{status:503});
+    }
+    return {session:{session_id:sid,message_count:spec.total,messages:[],payloadOwner:first?'older':'winning'}};
+  }
+  const firstMessage=++messageReads===1;
+  if(spec.delayed||(spec.mode==='interrupted-refresh'&&firstMessage&&spec.pendingStage==='messages'))await delayedMessages;
+  if(spec.mode==='interrupted-refresh'&&firstMessage&&spec.pendingStage==='messages'&&spec.olderFailure){
+    throw Object.assign(new Error('superseded message failure'),{status:503});
+  }
   if(spec.error){const e=new Error('synthetic read rejection');e.status=spec.error;throw e;}
   if(spec.authRedirect)return undefined;
   const raw=params.get('msg_limit');
@@ -110,7 +126,31 @@ c.api=async(path,options)=>{
 vm.createContext(c);
 vm.runInContext(SOURCE,c);
 (async()=>{
- if(spec.mode==='navigation'){
+ const snapshot=()=>({sid:c.S.session?.session_id,owner:c.S.session?.payloadOwner,
+   count:c.S.messages.length,first:c.S.messages[0]?.content,last:c.S.messages.at(-1)?.content,
+   offset:c._oldestIdx,truncated:c._messagesTruncated,loadingSid:c._loadingSessionId,
+   generation:c._loadSessionGeneration,hint:c._sameSessionForceReloadHint,
+   renders:renders.length,revision:c.S.session?.regeneration_revision});
+ if(spec.mode==='interrupted-refresh'){
+   // Use the full production forced-load entry point, not a pre-seeded hint.
+   const pendingA=c.loadSession('A',{force:true,keepStaleUntilLoaded:!!spec.keepStale});
+   for(let i=0;i<12&&spec.pendingStage==='messages'&&messageReads===0;i++)await Promise.resolve();
+   if(metadataReads!==1||(spec.pendingStage==='messages'&&messageReads!==1))throw new Error('forced refresh did not reach pending transport');
+   if(c.S.messages.length!==(spec.keepStale?cached.length:0))throw new Error('forced row-clear seam was not reached');
+   savedHint=JSON.parse(JSON.stringify(c._sameSessionForceReloadHint));
+   if(savedHint.session_id!=='A'||savedHint.loaded_message_count!==cached.length)throw new Error('forced load did not save the actual window');
+   const pendingB=c.loadSession('B');
+   if(c._loadingSessionId!=='B'||draftSaves.length!==1||c.S.session.session_id!=='A')throw new Error('pending B draft seam was not reached');
+   if(spec.foreignHint)c._sameSessionForceReloadHint={...savedHint,session_id:'B'};
+   const winning=c.loadSession(spec.returnSid||'A');
+   const releaseOlder=()=>{releaseDraft();releaseMetadata();releaseMessages();};
+   if(spec.releaseOrder==='older-first')releaseOlder();
+   if(spec.returnSid&&spec.returnSid!=='A')releaseDraft();
+   await winning;
+   beforeOlderSettles=snapshot();
+   releaseOlder();
+   await Promise.all([pendingA,pendingB]);
+ }else if(spec.mode==='navigation'){
    const pendingB=c.loadSession('B');
    // B waits inside the real draft-save await; A remains on screen.
    if(c._loadingSessionId!=='B'||draftSaves.length!==1)throw new Error('draft seam was not reached');
@@ -141,7 +181,8 @@ vm.runInContext(SOURCE,c);
    await c.regenerateResponse({closest:()=>({dataset:{msgIdx:String(c.S.messages.length-1)}})});
  }
  process.stdout.write(JSON.stringify({requests,accepted,streams,statuses,renders,draftSaves:draftSaves.length,
-   beforeRegeneration,activeSid:c.S.session?.session_id,loadingSid:c._loadingSessionId,
+   beforeRegeneration,savedHint,beforeOlderSettles,afterOlderSettles:snapshot(),
+   activeSid:c.S.session?.session_id,loadingSid:c._loadingSessionId,
    hint:c._sameSessionForceReloadHint,messageCount:c.S.messages.length,loadingOlder:c._loadingOlder}));
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
@@ -284,3 +325,110 @@ def test_rejected_regeneration_restores_full_transcript_after_authority_fetch():
     assert result["streams"] == []
     assert result["messageCount"] == 80
     assert result["statuses"] == ["regen_failedsynthetic regeneration rejection"]
+
+
+@pytest.mark.parametrize("pending_stage", ["metadata", "messages"])
+@pytest.mark.parametrize("release_order", ["winner-first", "older-first"])
+@pytest.mark.parametrize(
+    "total,initial,offset,ceiling,expected_count,expected_offset,limit",
+    [(80,80,0,500,80,0,None), (100,100,40,500,60,40,60),
+     (1000,1000,340,500,1000,0,None), (100,100,30,60,100,0,None),
+     (102,100,40,500,62,40,62)],
+)
+def test_interrupted_forced_refresh_retains_saved_window_after_all_responses(
+    pending_stage, release_order, total, initial, offset, ceiling,
+    expected_count, expected_offset, limit,
+):
+    result = _run_case(
+        mode="interrupted-refresh", pendingStage=pending_stage, releaseOrder=release_order,
+        total=total, initialTotal=initial, offset=offset, ceiling=ceiling,
+    )
+    assert result["savedHint"]["loaded_message_count"] == initial - offset
+    assert result["savedHint"]["truncated"] == (offset > 0)
+    state = result["afterOlderSettles"]
+    assert state["count"] == expected_count
+    assert state["first"] == f"row {expected_offset}"
+    assert state["last"] == f"row {total - 1}"
+    assert state["offset"] == expected_offset
+    assert state["truncated"] == (expected_offset > 0)
+    assert state["sid"] == "A"
+    assert state["owner"] == "winning"
+    assert state["loadingSid"] is None
+    assert state["generation"] == 3
+    assert state["hint"] is None
+    assert state == result["beforeOlderSettles"]
+    fetches = _message_requests(result)
+    assert len(fetches) == (1 if pending_stage == "metadata" else 2)
+    if limit is None:
+        assert "msg_limit=" not in fetches[-1]
+    else:
+        assert f"msg_limit={limit}&" in fetches[-1]
+    assert result["draftSaves"] == 1
+    assert result["statuses"] == []
+
+
+@pytest.mark.parametrize("pending_stage", ["metadata", "messages"])
+@pytest.mark.parametrize("release_order", ["winner-first", "older-first"])
+def test_interrupted_keep_stale_refresh_recaptures_resident_window(pending_stage, release_order):
+    result = _run_case(
+        mode="interrupted-refresh", pendingStage=pending_stage,
+        releaseOrder=release_order, keepStale=True,
+    )
+    assert result["afterOlderSettles"]["count"] == 80
+    assert result["afterOlderSettles"]["first"] == "row 0"
+    assert result["afterOlderSettles"] == result["beforeOlderSettles"]
+    assert "msg_limit=" not in _message_requests(result)[-1]
+
+
+@pytest.mark.parametrize("pending_stage", ["metadata", "messages"])
+@pytest.mark.parametrize("release_order", ["winner-first", "older-first"])
+@pytest.mark.parametrize("isolation", ["foreign-hint", "different-session"])
+def test_interrupted_refresh_cannot_apply_another_sessions_saved_width(
+    pending_stage, release_order, isolation,
+):
+    result = _run_case(
+        mode="interrupted-refresh", pendingStage=pending_stage, releaseOrder=release_order,
+        foreignHint=isolation == "foreign-hint",
+        returnSid="C" if isolation == "different-session" else "A",
+    )
+    state = result["afterOlderSettles"]
+    assert state["sid"] == ("C" if isolation == "different-session" else "A")
+    assert state["owner"] == "winning"
+    assert state["count"] == 30
+    assert state["first"] == "row 50"
+    assert state["offset"] == 50
+    assert state["generation"] == 3
+    assert state["loadingSid"] is None
+    assert state == result["beforeOlderSettles"]
+    assert "msg_limit=30&" in _message_requests(result)[-1]
+
+
+def test_interrupted_forced_refresh_still_restores_regeneration_authority():
+    result = _run_case(
+        mode="interrupted-refresh", pendingStage="metadata",
+        releaseOrder="winner-first", regenerate=True,
+    )
+    assert result["beforeOlderSettles"]["count"] == 80
+    assert result["beforeRegeneration"]["revision"] == "fresh-revision"
+    assert result["accepted"] == [["A", "fresh-revision"]]
+    assert result["streams"] == [["A", "synthetic-stream", []]]
+    assert result["statuses"] == []
+
+
+@pytest.mark.parametrize("pending_stage", ["metadata", "messages"])
+@pytest.mark.parametrize("release_order", ["winner-first", "older-first"])
+def test_superseded_refresh_failure_cannot_clear_winning_window(pending_stage, release_order):
+    result = _run_case(
+        mode="interrupted-refresh", pendingStage=pending_stage,
+        releaseOrder=release_order, olderFailure=True,
+    )
+    state = result["afterOlderSettles"]
+    assert state["count"] == 80
+    assert state["first"] == "row 0"
+    assert state["offset"] == 0
+    assert state["sid"] == "A"
+    assert state["owner"] == "winning"
+    assert state["loadingSid"] is None
+    assert state["hint"] is None
+    assert state == result["beforeOlderSettles"]
+    assert result["statuses"] == []
