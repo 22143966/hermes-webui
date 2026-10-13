@@ -59,6 +59,7 @@ from api.config import (
     CUSTOM_ROUTE_NO_ENDPOINT,
     custom_provider_route_error,
     raise_for_custom_provider_route,
+    _parse_provider_qualified_model_id,
     model_with_provider_context,
     warm_models_catalog_provenance_if_cold,
     load_settings,
@@ -534,7 +535,7 @@ def _install_streaming_cronjob_profile_wrapper() -> None:
 
     _profile_scoped_cronjob_handler.__dict__["_webui_streaming_profile_wrapper"] = True
     _profile_scoped_cronjob_handler.__dict__["_webui_original_handler"] = original_handler
-    registry.register(
+    register_kwargs = dict(
         name=entry.name,
         toolset=entry.toolset,
         schema=entry.schema,
@@ -545,8 +546,15 @@ def _install_streaming_cronjob_profile_wrapper() -> None:
         description=entry.description,
         emoji=entry.emoji,
         max_result_size_chars=entry.max_result_size_chars,
-        dynamic_schema_overrides=entry.dynamic_schema_overrides,
     )
+    # Older hermes-agent builds predate ``ToolEntry.dynamic_schema_overrides``
+    # (and the matching ``register()`` kwarg). Forward it only when both sides
+    # know it, otherwise every chat stream fails with AttributeError (#8186).
+    if hasattr(entry, "dynamic_schema_overrides") and _supports_kwarg(
+        registry.register, "dynamic_schema_overrides"
+    ):
+        register_kwargs["dynamic_schema_overrides"] = entry.dynamic_schema_overrides
+    registry.register(**register_kwargs)
     _STREAMING_CRONJOB_WRAPPER_INSTALLED = True
 
 
@@ -1005,6 +1013,87 @@ def _runtime_preferred_base_url(
     return configured_base_url
 
 
+_ROUTING_ENV_REF_RE = re.compile(r"\$\{[^}]+\}")
+
+
+def _drop_unresolved_routing_refs(block):
+    """Drop ``provider_routing`` values that still carry an unexpanded
+    ``${...}`` reference after env expansion.
+
+    Both chat paths expand ``${VAR}`` references before routing reaches the
+    Agent: the sync seam under the fail-closed profile scope
+    (``block_process_env_fallback``) and the streaming path via the expanded
+    config loader. A ``${VAR}`` that the profile does not define (for example
+    a variable only the server process env holds, or one defined nowhere)
+    survives expansion as its literal text. Forwarding that literal would
+    make OpenRouter restrict the request to a provider that does not exist
+    and fail a turn that master (which forwarded no routing) completes. Dropping the affected value restores master's
+    outcome for it, with a warning, without widening what a profile may
+    read from the server environment.
+
+    A list item is dropped individually; a field is dropped when its scalar
+    value is unresolved or its list empties. Non-string values are kept as
+    is. Never mutates ``block``; returns ``(clean_block, dropped)`` where
+    ``dropped`` maps field name to the number of dropped values.
+    """
+    if not isinstance(block, dict):
+        return {}, {}
+    clean = {}
+    dropped = {}
+    for key, value in block.items():
+        if isinstance(value, str):
+            if _ROUTING_ENV_REF_RE.search(value):
+                dropped[key] = 1
+            else:
+                clean[key] = value
+        elif isinstance(value, list):
+            kept = [
+                item for item in value
+                if not (isinstance(item, str)
+                        and _ROUTING_ENV_REF_RE.search(item))
+            ]
+            lost = len(value) - len(kept)
+            if lost:
+                dropped[key] = lost
+            if kept:
+                clean[key] = kept
+        else:
+            clean[key] = value
+    return clean, dropped
+
+
+def _provider_routing_kwargs_for_agent(cfg, agent_params):
+    """Map a profile config's ``provider_routing`` block to AIAgent kwargs.
+
+    Returns only the routing kwargs the installed hermes-agent build accepts
+    (``agent_params``), so older builds degrade gracefully. The WebUI
+    in-process runtime reads the session's own profile config and must forward
+    these, or OpenRouter provider routing (sort/ignore/only/order) is silently
+    dropped for browser chat turns. Mirrors the gateway's TurnRunner.
+    """
+    pr = (cfg or {}).get("provider_routing") or {}
+    if not isinstance(pr, dict):
+        pr = {}
+    pr, dropped = _drop_unresolved_routing_refs(pr)
+    for key, count in dropped.items():
+        logger.warning(
+            "provider_routing.%s references an environment variable this "
+            "profile does not define; dropping %d value(s) for this turn "
+            "instead of forwarding the literal ${...} text",
+            key,
+            count,
+        )
+    mapping = {
+        "providers_allowed": pr.get("only"),
+        "providers_ignored": pr.get("ignore"),
+        "providers_order": pr.get("order"),
+        "provider_sort": pr.get("sort"),
+        "provider_require_parameters": pr.get("require_parameters", False),
+        "provider_data_collection": pr.get("data_collection"),
+    }
+    return {k: v for k, v in mapping.items() if k in agent_params}
+
+
 def _is_fallback_lifecycle_message(kind: str, message: str) -> bool:
     """Return True if an agent lifecycle status should surface as a fallback warning."""
     k = str(kind or '').strip().lower()
@@ -1330,9 +1419,13 @@ def _webui_surface_context_prompt(surface_context: Optional[dict]) -> str:
         "- Write to external notes or durable memory only for explicit captures, durable user preferences, decisions, blockers/open issues, runbook-worthy workflows, or other clearly reusable signals; otherwise leave notes unchanged.",
         "- When you do write or update a durable note, briefly tell the user what note/section changed so the write is reviewable.",
     ]
+    # #8148: no per-session value here. This block sits above the progress and
+    # delivery prompts, and the agent appends the whole ephemeral prompt to the
+    # end of the system text, so a session id on this list made every new chat's
+    # system text differ from that line on and no provider prefix cache could
+    # be reused across chats. See _webui_session_id_prompt().
     fields = (
         ("source", "Source"),
-        ("session_id", "Session ID"),
         ("profile", "Profile"),
         ("workspace", "Workspace"),
     )
@@ -1342,6 +1435,31 @@ def _webui_surface_context_prompt(surface_context: Optional[dict]) -> str:
         if value:
             lines.append(f"- {label}: {value}")
     return "\n".join(lines)
+
+
+def _webui_session_id_prompt(
+    surface_context: Optional[dict], config_data: Optional[dict] = None
+) -> str:
+    """Return the session id line, only when ``webui.pass_session_id`` asks for it.
+
+    Off by default, like hermes-agent's own ``pass_session_id``: the id is
+    different for every chat, so it is the one line that two new chats cannot
+    share (#8148). When it is asked for, the caller emits it last, so everything
+    before it stays a shared prefix.
+    """
+    if not isinstance(surface_context, dict):
+        return ""
+    cfg = config_data if isinstance(config_data, dict) else get_config()
+    webui_cfg = cfg.get("webui") if isinstance(cfg, dict) else None
+    if not isinstance(webui_cfg, dict):
+        return ""
+    if str(webui_cfg.get("pass_session_id") or "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return ""
+    raw = surface_context.get("session_id")
+    value = str(raw).strip() if raw is not None else ""
+    if not value:
+        return ""
+    return f"WebUI session:\n- Session ID: {value}"
 
 
 def _webui_ephemeral_system_prompt(
@@ -1360,6 +1478,10 @@ def _webui_ephemeral_system_prompt(
     delivery_prompt = _webui_delivery_context_prompt(config_data)
     if delivery_prompt:
         parts.append(delivery_prompt)
+    # Last on purpose (#8148): the only per-session text in this prompt.
+    session_id_prompt = _webui_session_id_prompt(surface_context, config_data)
+    if session_id_prompt:
+        parts.append(session_id_prompt)
     return "\n\n".join(part for part in parts if part)
 
 
@@ -1613,7 +1735,7 @@ def _webui_delivery_context_prompt(config_data: Optional[dict] = None) -> str:
     Gemma) reject.
 
     NOTE: This function only covers platform/delivery info.  The session
-    framing (\"Source: WebUI\", \"Session ID\", \"Profile\", \"Workspace\") is
+    framing (\"Source: WebUI\", \"Profile\", \"Workspace\") is
     emitted by ``_webui_surface_context_prompt()``, which is called from
     ``_webui_ephemeral_system_prompt()`` before this helper.  If you
     refactor this area, keep that surface call in place — the two helpers
@@ -3189,6 +3311,7 @@ _GATEWAY_ROUTING_TOP_LEVEL_KEYS = {
     'used_provider',
     'used_model',
     'requested_provider',
+    'requested_route_provider',
     'requested_model',
 }
 _GATEWAY_ROUTING_CONTAINER_KEYS = (
@@ -3229,7 +3352,7 @@ def _find_gateway_metadata_payload(payload):
     return None
 
 
-def _normalize_gateway_routing_metadata(payload, requested_model=None, requested_provider=None):
+def _normalize_gateway_routing_metadata(payload, requested_model=None, requested_provider=None, requested_route_provider=None):
     """Return safe LLM Gateway routing metadata, or None when absent.
 
     LLM Gateway response metadata can contain provider/model routing details,
@@ -3254,6 +3377,10 @@ def _normalize_gateway_routing_metadata(payload, requested_model=None, requested
         fallback_provider = _clean_gateway_routing_scalar(requested_provider)
         if fallback_provider is not None:
             normalized['requested_provider'] = fallback_provider
+    if 'requested_route_provider' not in normalized:
+        fallback_route_provider = _clean_gateway_routing_scalar(requested_route_provider)
+        if fallback_route_provider is not None:
+            normalized['requested_route_provider'] = fallback_route_provider
 
     routing = []
     raw_routing = src.get('routing')
@@ -3299,7 +3426,7 @@ def _normalize_gateway_routing_metadata(payload, requested_model=None, requested
     return normalized
 
 
-def _extract_gateway_routing_metadata(agent, result, requested_model=None, requested_provider=None):
+def _extract_gateway_routing_metadata(agent, result, requested_model=None, requested_provider=None, requested_route_provider=None):
     candidates = []
     if isinstance(result, dict):
         candidates.extend([
@@ -3326,10 +3453,29 @@ def _extract_gateway_routing_metadata(agent, result, requested_model=None, reque
             candidate,
             requested_model=requested_model,
             requested_provider=requested_provider,
+            requested_route_provider=requested_route_provider,
         )
         if normalized:
             return normalized
     return None
+
+
+def _capture_turn_served_model(s, agent) -> str | None:
+    """Capture the model that actually served this turn onto the session.
+
+    #6068: the served model must be read AFTER agent.run: the agent
+    mutates agent.model when a fallback fires, so the pre-run
+    resolved_model would mis-attribute exactly the turns where
+    attribution matters most.
+    The configured selection is not proof that it served this turn.
+    Sets s.last_used_model from observed agent.model only, and to None
+    when nothing was observed.
+    """
+    _observed_model = getattr(agent, 'model', None)
+    _used_model = _observed_model.strip() if isinstance(_observed_model, str) else None
+    if s is not None:
+        s.last_used_model = (_used_model[:240]) if _used_model else None
+    return _used_model
 
 
 def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, session_id: str, profile_home: str) -> dict:
@@ -8107,6 +8253,30 @@ def _message_identity(msg):
     )
 
 
+def _durable_tool_row_identity(msg):
+    """Return (tool_call_id, row_id) for a tool row with a valid durable row.
+
+    Agent-side compression rewrites old tool results in model context to a
+    one-line summary while keeping the state.db row, so content-based identity
+    differs from the visible full-output row. A durable row ID proves row
+    identity (run-state contract), so backfill can match on it instead.
+    """
+    if not isinstance(msg, dict) or msg.get('role') != 'tool':
+        return None
+    # Read the row through the canonical provenance helper: messages loaded
+    # from state.db (and IDs preserved from older Agents) carry
+    # ``_state_db_row_id`` rather than ``_row_id``, and both sides of the
+    # backfill must normalize to the same identity. Contradictory aliases are
+    # invalid and fall back to content-based matching.
+    row_id, valid = _state_db_row_identity_details(msg)
+    if not valid or row_id is None or int(row_id) <= 0:
+        return None
+    tool_call_id = msg.get('tool_call_id')
+    if not isinstance(tool_call_id, str) or not tool_call_id:
+        return None
+    return (tool_call_id, row_id)
+
+
 def _messages_have_prefix(messages, prefix, *, key_fn=None):
     key_fn = key_fn or _message_identity
     if len(messages or []) < len(prefix or []):
@@ -9077,27 +9247,48 @@ def _merge_display_messages_after_agent_result(
             )
         )
         _display_id_set = {_message_identity(m) for m in previous_display}
-        _context_id_set = {
-            _message_identity(m)
-            for m in previous_context
-            if not (
+        # A context tool row whose durable row is already displayed is the same
+        # row (e.g. an Agent-pruned summary of the visible full output), never
+        # a context-only turn, regardless of how its content was rewritten.
+        # Map it to its display twin's identity so it is never inserted but
+        # still anchors the backfill cursor at the visible tool result.
+        _display_identity_by_durable_tool_row = {}
+        for m in previous_display:
+            _durable = _durable_tool_row_identity(m)
+            if _durable is not None:
+                _display_identity_by_durable_tool_row.setdefault(_durable, _message_identity(m))
+
+        def _is_displayed_native_image_context_row(m):
+            return (
                 isinstance(m, dict)
                 and m.get('_active_turn_token') in _displayed_native_image_context_tokens
             )
+
+        def _displayed_durable_tool_twin_identity(m):
+            _durable = _durable_tool_row_identity(m)
+            if _durable is None:
+                return None
+            return _display_identity_by_durable_tool_row.get(_durable)
+
+        _context_id_set = {
+            _message_identity(m)
+            for m in previous_context
+            if not _is_displayed_native_image_context_row(m)
+            if _displayed_durable_tool_twin_identity(m) is None
             if not _is_context_compression_marker(m)
             and not _is_compressed_context_tool_result_summary_message(m)
         }
         _has_context_only_turns = bool(_context_id_set - _display_id_set)
         if _has_context_only_turns:
-            context_keys = [
-                None
-                if (
-                    isinstance(m, dict)
-                    and m.get('_active_turn_token') in _displayed_native_image_context_tokens
+            context_keys = []
+            for m in previous_context:
+                if _is_displayed_native_image_context_row(m):
+                    context_keys.append(None)
+                    continue
+                _twin_identity = _displayed_durable_tool_twin_identity(m)
+                context_keys.append(
+                    _twin_identity if _twin_identity is not None else _message_identity(m)
                 )
-                else _message_identity(m)
-                for m in previous_context
-            ]
             # Precompute display keys once; avoids repeated json.dumps calls inside
             # the inner any() loop (was O(D²·C) — see perf fix below).
             _display_keys = [_message_identity(m) for m in previous_display]
@@ -10916,6 +11107,7 @@ def _compute_agent_cache_signature(
     reasoning_config=None,
     main_request_overrides=None,
     _main_request_overrides=None,
+    provider_routing_kwargs=None,
     prefill_context=None,
     profile_home: str | None = None,
     safe_profile_runtime_env: dict | None = None,
@@ -10942,6 +11134,7 @@ def _compute_agent_cache_signature(
         sorted(toolsets) if toolsets else [],
         reasoning_config or {},
         _main_request_overrides or {},
+        provider_routing_kwargs or {},
         _public_prefill_context_status(prefill_context),
         profile_home or '',
         _env.get('TERMINAL_ENV', '') or '',
@@ -11853,6 +12046,7 @@ def _run_agent_streaming(
             else getattr(s, "model_provider", None)
         )
         provider_context = str(provider_context).strip().lower() if provider_context else None
+        _turn_route_provider = provider_context
         _agent_lock = _get_session_agent_lock(session_id)
         # #4251: the route layer already persisted this turn's model under the
         # session lock before dispatch, so a mismatch here means a newer picker
@@ -11872,6 +12066,8 @@ def _run_agent_streaming(
                 _last_persisted_model = model
                 _last_persisted_provider = provider_context
                 _turn_owns_persisted_model = True
+                _turn_route_model = model
+                _turn_route_provider = provider_context
 
         # TD1: set thread-local env context so concurrent sessions don't clobber globals
         # Check for pre-flight cancel (user cancelled before agent even started)
@@ -11935,6 +12131,11 @@ def _run_agent_streaming(
                 s.model_provider = provider_context
                 if _repaired and model != (s.model or ""):
                     s.model = model
+                _last_persisted_model = s.model
+                _last_persisted_provider = s.model_provider
+                # ponytail: finalize route snapshot when profile normalization is accepted
+                _turn_route_model = s.model
+                _turn_route_provider = s.model_provider
 
         # Capture the resolved profile name now, while profile context is
         # reliable. Used in the compression migration block to stamp s.profile
@@ -12785,6 +12986,7 @@ def _run_agent_streaming(
             # detached worker for a NAMED profile paired that profile's endpoint
             # with the DEFAULT profile's API key (finding #3). No-op for the
             # default/root profile.
+            _session_requested_provider = None
             with profiles_api.profile_scope_for_detached_worker(
                 _resolved_profile_name, "model + credential resolution", logger_override=logger
             ):
@@ -13110,6 +13312,15 @@ def _run_agent_streaming(
             # re-instantiated fresh each turn (#855).
             if 'gateway_session_key' in _agent_params:
                 _agent_kwargs['gateway_session_key'] = session_id
+            # OpenRouter provider_routing (sort/ignore/only/order): mirror the
+            # gateway's TurnRunner so browser chat turns respect the profile's
+            # provider_routing block. Per-param guarded for older agent builds.
+            # Captured (not recomputed) so the agent-cache signature below can
+            # include the effective routing: editing sort/only/ignore must mint
+            # a new agent for an already-open session instead of reusing one
+            # built on the old routing.
+            _routing_kwargs = _provider_routing_kwargs_for_agent(_cfg, _agent_params)
+            _agent_kwargs.update(_routing_kwargs)
 
             # ── Agent cache: reuse across messages in the same session ──
             # Mirrors gateway _agent_cache.  Keeps _user_turn_count alive so
@@ -13135,6 +13346,7 @@ def _run_agent_streaming(
                     toolsets=_toolsets,
                     reasoning_config=_reasoning_config,
                     main_request_overrides=_main_request_overrides,
+                    provider_routing_kwargs=_routing_kwargs,
                     prefill_context=_prefill_context,
                     profile_home=_profile_home,
                     safe_profile_runtime_env=_safe_profile_runtime_env,
@@ -14083,6 +14295,7 @@ def _run_agent_streaming(
                                 toolsets=_toolsets,
                                 reasoning_config=_reasoning_config,
                                 main_request_overrides=_main_request_overrides,
+                                provider_routing_kwargs=_routing_kwargs,
                                 prefill_context=_prefill_context,
                                 profile_home=_profile_home,
                                 safe_profile_runtime_env=_safe_profile_runtime_env,
@@ -14523,18 +14736,48 @@ def _run_agent_streaming(
                 _gateway_routing = _extract_gateway_routing_metadata(
                     agent,
                     result,
+                    # The resolved (bare) model, as on master: a qualified
+                    # route hint such as @openrouter:gpt-4o served by gpt-4o
+                    # is not a model switch. The route provider rides along
+                    # separately for the settlement guard.
                     requested_model=resolved_model or model,
                     requested_provider=resolved_provider,
+                    requested_route_provider=_turn_route_provider,
                 )
-                # #6068: the served model must be read AFTER agent.run — the agent
+                # #6068: the served model must be read AFTER agent.run: the agent
                 # mutates agent.model when a fallback fires, so the pre-run
                 # resolved_model would mis-attribute exactly the turns where
                 # attribution matters most.
                 # The configured selection is not proof that it served this turn.
-                _observed_model = getattr(agent, 'model', None)
-                _used_model = _observed_model.strip() if isinstance(_observed_model, str) else None
+                # ponytail: normalize empty/whitespace to None for route equality
+                def _norm_str(v):
+                    val = str(v or '').strip().lower()
+                    return val if val else None
+
+                # ponytail: reuse shared parser for @provider:model tags
+                def _bare_route_model(v):
+                    val = str(v or '').strip()
+                    if val.startswith('@') and ':' in val:
+                        parsed = _parse_provider_qualified_model_id(val)
+                        if parsed:
+                            return parsed[0].strip().lower()
+                        return val.split(':', 1)[1].strip().lower()
+                    return val.lower() if val else None
+
+                _route_matches = True
+                if s is not None:
+                    _cur_m = getattr(s, 'model', None)
+                    _cur_p = getattr(s, 'model_provider', None)
+                    _target_m = _turn_route_model or resolved_model or model
+                    if _bare_route_model(_cur_m) != _bare_route_model(_target_m):
+                        _route_matches = False
+                    if _norm_str(_cur_p) != _norm_str(_turn_route_provider):
+                        _route_matches = False
+
+                _used_model = _capture_turn_served_model(s if _route_matches else None, agent)
                 if _gateway_routing:
-                    s.gateway_routing = _gateway_routing
+                    if _route_matches:
+                        s.gateway_routing = _gateway_routing
                     _history = list(getattr(s, 'gateway_routing_history', None) or [])
                     _history.append(_gateway_routing)
                     s.gateway_routing_history = _history[-50:]
@@ -15452,6 +15695,7 @@ def _run_agent_streaming(
                         toolsets=_toolsets,
                         reasoning_config=_reasoning_config,
                         main_request_overrides=_main_request_overrides,
+                        provider_routing_kwargs=_routing_kwargs,
                         prefill_context=_prefill_context,
                         profile_home=_profile_home,
                         safe_profile_runtime_env=_safe_profile_runtime_env,

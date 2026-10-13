@@ -2658,10 +2658,20 @@ $('btnClearPreview').onclick=handleWorkspaceClose;
 // workspacePath click handler removed -- use topbar workspace chip dropdown instead
 function _applySessionContextMetadataUpdate(data){
   if(!S.session||!data||!data.session)return;
+  if(data.session.session_id && S.session.session_id && String(data.session.session_id) !== String(S.session.session_id)) return;
   S.session.context_length=data.session.context_length||0;
   S.session.threshold_tokens=data.session.threshold_tokens||0;
   S.session.last_prompt_tokens=data.session.last_prompt_tokens||0;
   S.session.post_compression_context_tokens_estimate=data.session.post_compression_context_tokens_estimate||null;
+  if('last_used_model' in data.session){
+    S.session.last_used_model=data.session.last_used_model||null;
+  }
+  if('gateway_routing' in data.session){
+    S.session.gateway_routing=data.session.gateway_routing||null;
+  }
+  if('gateway_routing_history' in data.session){
+    S.session.gateway_routing_history=data.session.gateway_routing_history||[];
+  }
   if(typeof _syncCtxIndicator==='function'){
     const u=S.lastUsage||{};
     const _pick=(latest,stored,dflt=0)=>latest!=null?latest:(stored!=null?stored:dflt);
@@ -2706,6 +2716,12 @@ $('modelSelect').onchange=async()=>{
     return;
   }
   if(typeof _rememberPendingSessionModel==='function') _rememberPendingSessionModel(S.session.session_id,modelState.model,modelState.model_provider);
+  const routeChanged = String(S.session.model || '') !== String(modelState.model || '')
+    || String(S.session.model_provider || '') !== String(modelState.model_provider || '');
+  if(routeChanged){
+    S.session.last_used_model = null;
+    S.session.gateway_routing = null;
+  }
   S.session.model=modelState.model;
   S.session.model_provider=modelState.model_provider||null;
   if(typeof syncModelChip==='function') syncModelChip();
@@ -2715,18 +2731,23 @@ $('modelSelect').onchange=async()=>{
   if(typeof showToast==='function'){
     showToast(t('model_scope_toast')||'Applies to this conversation from your next message.', 3000);
   }
-  const data=await api('/api/session/update',{method:'POST',body:JSON.stringify({
-    session_id:S.session.session_id,
-    workspace:S.session.workspace,
-    model:modelState.model,
-    model_provider:modelState.model_provider||null,
+  S._modelUpdateSeq = (S._modelUpdateSeq || 0) + 1;
+  const updateSeq = S._modelUpdateSeq;
+  const targetSession = S.session;
+  const data = await api('/api/session/update', {method: 'POST', body: JSON.stringify({
+    session_id: S.session.session_id,
+    workspace: S.session.workspace,
+    model: modelState.model,
+    model_provider: modelState.model_provider || null,
   })});
+  if (S.session !== targetSession || S._modelUpdateSeq !== updateSeq) return;
   // NOTE: do NOT clear the pending explicit-pick marker here. It must survive until
   // the NEXT send() consumes it, otherwise the normal "pick → session-update → send"
   // flow loses the explicit-pick signal before /api/chat/start runs and the server
   // re-reverts a cross-family pick (the #3737 bug, Codex catch). send() clears it
   // after reading a matching pending pick. (#3739/#3737)
   _applySessionContextMetadataUpdate(data);
+  if (typeof syncModelChip === 'function') syncModelChip();
   // Warn if selected model belongs to a different provider than what Hermes is configured for
   if(typeof _checkProviderMismatch==='function'){
     const warn=_checkProviderMismatch(selectedModel);

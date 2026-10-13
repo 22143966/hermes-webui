@@ -135,8 +135,104 @@
 
 ### Fixed
 
-- **The sidebar "regenerate title" failure no longer shows the raw internal status code `llm_language_mismatch_aux` to users.** When title generation failed (e.g. the model kept answering in the wrong language), the `/api/session/title/regenerate` 422 body interpolated the internal status string, and the sidebar toast renders that body verbatim — so users saw an unexplained diagnostic like "Could not generate a better title (llm_language_mismatch_aux)". Internal title statuses now map through a human-readable reason (e.g. "the generated title did not match the conversation language"), unknown statuses still pass through for debuggability, and the existing title is preserved unchanged. Completes the second half of the #7693 report (the borrowed-Latin CJK title-guard fix landed earlier as part of #7727). (#7693, closes #7693)
+- **Switching back to a long-running conversation no longer freezes the browser.** Reconnecting to a conversation
+  whose agent has been reasoning for a long time replayed every reasoning chunk with its own render. A 500-chunk replay
+  now paints once per frame instead, cutting the longest main-thread task from about 8-9 s to under 100 ms with the
+  same text. A dropped connection also paints the last words received before it reconnects, without rewinding text in
+  the fade modes. Thanks @UncleLiu-0306. (#8171)
 
+- **The composer model chip and the sidebar now name the model that actually answered after a provider fallback.**
+  When a direct-provider turn fell back to another model, the chip and sidebar kept the configured model. The session
+  now records the served model only when the turn's route still matches the conversation's model/provider, so a mid-turn
+  model pick is never mislabelled. Reopening a session keeps that attribution until you pick a different model in that
+  tab. Thanks @Guts1005. (#7438, fixes #6594)
+
+- **Browser chats now honour a profile's OpenRouter `provider_routing` block** (`sort`, `only`, `ignore`, `order`,
+  `require_parameters`, `data_collection`), as Discord, Telegram and the TUI already did. Both the streaming and the
+  non-streaming chat paths forward it to the agent, editing it takes effect on the next turn, and a `${VAR}` the
+  profile doesn't define is dropped with a warning instead of being sent to OpenRouter as a literal provider name.
+  Thanks @TheDevMoth. (#7812)
+
+- **Chats no longer fail on every message with older Hermes Agent builds.** Each streaming turn re-registers the
+  agent's `cronjob` tool to scope it to the chat's profile, and it copied `ToolEntry.dynamic_schema_overrides`
+  unconditionally; Agent builds from before that field existed raised `AttributeError` before the agent ran, so every
+  chat failed. The field is now forwarded only when both the entry and `register()` support it. Thanks @Yi-111-a.
+  (#8187, fixes #8186)
+
+- **The Memory panel's Project Context section and the sidebar project chips are now translated.** They were
+  hard-coded English in every locale; all 15 locales now carry the strings (English text unchanged), and the residual
+  untranslated Russian values are filled in. Thanks @MuhammadUsamaMX. (#8178, refs #7579)
+
+- **Feishu and DingTalk chats now show up as messaging sessions in the sidebar.** Gateway sessions from those two
+  platforms were classified as "other" with a raw source label, so they missed the messaging filter and the external
+  session handling every other chat platform gets. Both are now in the messaging source set with proper labels, on the
+  server and in the sidebar's fallback tables. Thanks @HenryLoveMiller. (#8174)
+
+- **The model picker no longer trusts a models cache that was only recently touched.** The session-visit freshness
+  check used the cache file's modified time, so anything that touched the file (a copy, a sync, a backup) kept a stale
+  catalog looking fresh. The cache now records when it was actually built (`_built_at`) and the 300 s refresh is measured
+  from that; caches written by older versions, or carrying an invalid or future stamp, fall back to the file time as
+  before. Cache hits still do no writes. Thanks @webtecnica. (#7932, refs #7723)
+
+- **A run that saved memory or a skill just before the WebUI restarted no longer loses that update.** If the server
+  stopped after the run journal recorded a `state_saved` side effect but before the session applied it, reconnecting
+  restored the Worklog rows but silently dropped the saved-state entry. Recovery now replays those side effects from
+  the journal into the turn, exactly once, without touching the journal; very large turns keep their Worklog rows
+  instead of failing the save. Thanks @franksong2702. (#7859)
+
+- **The same mermaid diagram in two replies now renders in both.** Identical replies reuse cached markdown, so both
+  diagrams carried the same render id; drawing the second one silently emptied the first (and a later identical reply
+  could fall back to a plain code block), even after a reload. Each diagram now gets its own id before it is drawn.
+  Thanks @johnDEFI. (#8159)
+
+- **New chats answer faster: the session ID no longer breaks the model's prompt cache.** Every new chat put its own
+  session ID near the end of the system prompt, so no two chats ever shared a cacheable prompt and the model had to
+  re-read it from that line on each time (on a local backend the reporter saw 15-18 s first responses drop to 2-3 s).
+  The ID is now left out by default, matching hermes-agent's own `pass_session_id`. Set `webui.pass_session_id: true`
+  in config.yaml to include it again; it is then added last, so everything before it stays shareable. Thanks @ybai08,
+  and @apakuts for the report. (#8150, fixes #8148)
+
+- **Asking another profile's conversation to change no longer rewrites it before the refusal.** When a request
+  targeted a conversation owned by another profile (such as archive or pin), the ownership check loaded the
+  conversation through the full repair path first, so a refused request could still collapse duplicate partial files
+  and write a shrink backup of the other profile's transcript. The check now reads only who owns the conversation,
+  without repairing, saving or touching the session cache, and refusals answer exactly as before. Thanks @Tivonsico.
+  (#8142, fixes #8094)
+
+- **Long conversations no longer show tool results twice after compression.** When the agent compressed old tool
+  output into a one-line summary, the WebUI kept the full result and also spliced the summary in next to it, so repeated
+  tool cards built up over many compressions. A tool row already on screen is now recognised by its durable row identity
+  and not added again. Thanks @psanger. (#7990)
+
+- **Code blocks no longer flash unhighlighted while you scroll a long conversation.** In virtualized transcripts a
+  newly mounted code block was painted plain for a frame before syntax highlighting and tree views applied; they now
+  render highlighted on first paint, including after switching back to a cached conversation. Thanks @webtecnica.
+  (#7912, #7752)
+- **Starting the WebUI on a port that is already taken explains what to do.** `bootstrap.py` / `start.sh` now check the
+  port before launching: if your own WebUI is already running there it says so (and opens it), otherwise it names the
+  port as busy and suggests a free one instead of failing later with a bind error. Works for IPv4, IPv6 and HTTPS.
+  Thanks @mercael91. (#8112, #8111)
+
+- **A Git "terminal prompts disabled" answer from Git Credential Manager is reported as an authentication failure.**
+  Workspace Git status and fetch now show the sign-in message instead of a generic Git error when GCM refuses to prompt
+  because interactivity is disabled. Thanks @PeterPunk1320. (#8127)
+- **The "Move to project" picker is keyboard-reachable, translated and finger-sized.** Arrow keys, Home, End and Escape work (focus
+  returns to the ⋮ trigger), labels are translated in all 15 locales, and rows are 44px on touch. The picker uses the same placement
+  as the ⋮ menu (below the row, flipping above when that fits, pinned 8px inside the window and scrolling when taller), follows window
+  resizes, and closes when a resize or phone rotation hides the sidebar instead of floating over the composer. Thanks @ybai08. (#8052,
+  fixes #8044)
+
+- **Passkey enrollment works with security keys that send extensions.** Registering a YubiKey or another
+  authenticator that includes CBOR extension data no longer fails with "Trailing CBOR data"; malformed extension bytes
+  are rejected cleanly instead of causing a server error. Existing passkeys keep working. Thanks @Dandandad. (#8093, #8092)
+
+- **Codex sign-in sends an explicit User-Agent on its device-code requests**, so the OAuth endpoint no longer
+  sees a bare library default. Thanks @angelusbr. (#8118)
+
+- **A reply line that legitimately repeats earlier text is no longer hidden while it streams.** Echo suppression used to
+  match on text alone, so two different events with the same words (for example "Processing…" on both sides of a tool
+  call) collapsed into one. Rows are now de-duplicated by their identity, and only a genuinely re-delivered row is
+  dropped. Thanks @webtecnica. (#6293)
 - **A conversation no longer gets stuck on "session already has an active stream".** A tab that went away without a
   clean disconnect (a half-open connection) kept its session channel alive for the life of the server, and a stream left
   behind by a worker that exited without cleaning up blocked every new message in that conversation, sometimes for hours.
@@ -962,6 +1058,9 @@
 
 ### Documentation
 
+- **Troubleshooting no longer sends package-managed installs to the stale in-tree venv.** It resolves the store
+  Python with `hermes --print-runtime-command` at each start (no `jq` needed) and stops the launcher instead of exporting
+  an empty path when that lookup fails. Thanks @smhc. (#8110)
 - **The README's remote-access paragraph now leads with Tailscale Serve.** It sent users straight to a
   `HERMES_WEBUI_HOST=0.0.0.0` bind, which contradicted the guide it links to. It now recommends Serve, which
   keeps WebUI on loopback behind tailnet-only HTTPS, and keeps the authenticated direct-IP bind as the
