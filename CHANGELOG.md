@@ -141,6 +141,11 @@
 
 ### Fixed
 
+- **Insights: the Models card gets three times the width of its neighbours in the usage row.** Long model ids such as
+  `anthropic/claude-...` and `openrouter/...` were cut to an 80 px name column, so several rows read identically. The card
+  now takes a 3x share of the row, and on narrow screens its table stays inside the card instead of spilling past
+  the window. Thanks @aleesposito85. (#8157)
+
 - **Metadata-only session reads no longer rebuild a conversation's regeneration history.** A `GET /api/session?messages=0`
   built the canonical regeneration state even though it returns no messages. It now skips that work, and the browser
   takes regeneration authority from its message load instead, keeping the history it already has loaded, including
