@@ -135,6 +135,12 @@
 
 ### Fixed
 
+- **Switching back to a long-running conversation no longer freezes the browser.** Reconnecting to a conversation
+  whose agent has been reasoning for a long time replayed every reasoning chunk with its own render. A 500-chunk replay
+  now paints once per frame instead, cutting the longest main-thread task from about 8-9 s to under 100 ms with the
+  same text. A dropped connection also paints the last words received before it reconnects, without rewinding text in
+  the fade modes. Thanks @UncleLiu-0306. (#8171)
+
 - **The composer model chip and the sidebar now name the model that actually answered after a provider fallback.**
   When a direct-provider turn fell back to another model, the chip and sidebar kept the configured model. The session
   now records the served model only when the turn's route still matches the conversation's model/provider, so a mid-turn
