@@ -778,7 +778,8 @@ let _currentActivityBurstId=4;
 let renderCount=0;
 function _renderAnchorLiveScene(){{ renderCount+=1; return true; }}
 let flushCount=0;
-function _flushPendingReasoningRender(){{ flushCount+=1; }}
+const appliedAtFlush=[];
+function _flushPendingReasoningRender(){{ flushCount+=1; appliedAtFlush.push(applied.length); }}
 {apply_source}
 const renderOutcome={{}};
 const result=_applyToAnchor(
@@ -788,7 +789,7 @@ const result=_applyToAnchor(
   renderOutcome,
   {{render:false}}
 );
-console.log(JSON.stringify({{result,applied,renderCount,renderOutcome,flushCount}}));
+console.log(JSON.stringify({{result,applied,renderCount,renderOutcome,flushCount,appliedAtFlush}}));
 """
     result = subprocess.run(
         [NODE, "-e", script], text=True, capture_output=True, check=False
@@ -801,6 +802,7 @@ console.log(JSON.stringify({{result,applied,renderCount,renderOutcome,flushCount
     # #8171: a non-reasoning event flushes coalesced reasoning first, so a
     # pending Thinking render can never land after the event it preceded.
     assert data["flushCount"] == 1
+    assert data["appliedAtFlush"] == [0], "pending reasoning must flush BEFORE the event is applied"
     assert data["renderOutcome"] == {"rendered": False}
     assert data["applied"][0]["event"]["source_event_type"] == "state_saved"
     assert data["applied"][0]["event"]["event_id"] == "run-owned-outcome:7"
