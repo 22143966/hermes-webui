@@ -135,6 +135,11 @@
 
 ### Fixed
 
+- **A turn's unanswered tool call no longer passes as answered because a later turn reused its id.** The model context
+  kept any tool call whose id appeared anywhere in the history's tool results, so an earlier interrupted call could pair
+  with a later, unrelated result and send a malformed tool sequence to the provider. Tool calls now pair only with a
+  result immediately after them, in both model-facing projections. Thanks @happy5318. (#8194)
+
 - **Switching back to a long-running conversation no longer freezes the browser.** Reconnecting to a conversation
   whose agent has been reasoning for a long time replayed every reasoning chunk with its own render. A 500-chunk replay
   now paints once per frame instead, cutting the longest main-thread task from about 8-9 s to under 100 ms with the
