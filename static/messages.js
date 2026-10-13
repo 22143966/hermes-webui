@@ -6343,7 +6343,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           // #4720: reset _oldestIdx (full-load symmetry; keeps the #4613 anchor aligned).
           if(typeof _oldestIdx!=='undefined')_oldestIdx=d.session._messages_offset||0;
           // #6112 settle guard.
-          S.messages=_adoptDoneSnapshotMessages(_preSettle, S.messages, _doneFinalAnswer);
+          S.messages=_adoptDoneSnapshotMessages(_preSettle, S.messages, _doneFinalAnswer).messages;
           S.messages=_filterRecoveryControlMessages(S.messages || []);
           if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
           if(typeof clearVisibleMessageRowCache==='function') clearVisibleMessageRowCache();
@@ -7188,6 +7188,32 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   //      it to reconcile, so it would only blank the pane;
   //   2. whatever wins must still contain the streamed final answer — otherwise the answer is
   //      re-attached to the tail so the settled rebuild has something to render.
+  // True when the settled snapshot already ends the current turn with a usable
+  // final assistant row: real text that is not a tool-only row, a compression
+  // marker, a recovery-control row, or a terminal stream-error marker. The Agent
+  // may legitimately rewrite final content before persisting it
+  // (transform_llm_output), so the snapshot's last assistant row can be the
+  // authoritative final reply even when its text differs from the streamed
+  // answer. In that case the streamed copy must NOT be re-appended as a second
+  // assistant row (#6112).
+  function _snapshotHasUsableFinalAssistantRow(messages){
+    const list=Array.isArray(messages)?messages:[];
+    for(let i=list.length-1;i>=0;i--){
+      const m=list[i];
+      if(!m) continue;
+      if(m.role==='user') return false;            // crossed into the prior turn: no assistant row this turn
+      if(m.role!=='assistant') continue;            // skip tool / other rows
+      // m is the last assistant row of the current turn — decide usability.
+      if(_streamRecoveryControlMessage(m)) return false;
+      if(_isMarkerOnlyAssistantMessage(m)) return false;
+      if(typeof _isTerminalStreamErrorMarkerMessage==='function'&&_isTerminalStreamErrorMarkerMessage(m)) return false;
+      let c=m.content;
+      if(Array.isArray(c)) c=c.map(p=>(p&&typeof p==='object')?((p.text||p.input_text||'')||''):(p||'')).join('');
+      c=String(c||'').trim();
+      return !!c;                                  // usable iff it carries real text
+    }
+    return false;
+  }
   function _adoptDoneSnapshotMessages(preSettleMessages, settledMessages, finalAnswer){
     const pre=Array.isArray(preSettleMessages)?preSettleMessages:[];
     const settled=Array.isArray(settledMessages)?settledMessages:[];
@@ -7196,11 +7222,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const answer=String(finalAnswer||'').trim();
     if(!answer) return {adopted:adopted,messages:messages};
     if(_finalAnswerIsInTranscript(messages,answer)) return {adopted:adopted,messages:messages};
+    // #6112: if the snapshot already ends this turn in a usable final assistant
+    // row (e.g. the Agent rewrote the answer before persisting), keep the
+    // snapshot and do not append the streamed copy — re-attach only when that
+    // row is absent.
+    if(_snapshotHasUsableFinalAssistantRow(messages)) return {adopted:adopted,messages:messages};
     if(!messages.length) return {adopted:adopted,messages:messages};
     return {adopted:true,messages:messages.concat([{role:'assistant',content:String(finalAnswer)}])};
   }
   if(typeof window!=='undefined'){
     window._adoptDoneSnapshotMessages=_adoptDoneSnapshotMessages;
+    window._snapshotHasUsableFinalAssistantRow=_snapshotHasUsableFinalAssistantRow;
   }
 
   async function _restoreSettledSession(source, options=null){

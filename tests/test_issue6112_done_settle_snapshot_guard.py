@@ -123,8 +123,14 @@ def _harness(extra: str = "") -> dict:
         _extract_function(MESSAGES_JS, "_carryForwardEphemeralTurnFields"),
         _extract_function(MESSAGES_JS, "_adoptDoneSnapshotMessages"),
         _extract_function(MESSAGES_JS, "_finalAnswerIsInTranscript"),
+        _extract_function(MESSAGES_JS, "_snapshotHasUsableFinalAssistantRow"),
+        _extract_function(MESSAGES_JS, "_streamRecoveryControlMessageText"),
+        _extract_function(MESSAGES_JS, "_streamRecoveryControlMessage"),
+        _extract_function(MESSAGES_JS, "_isMarkerOnlyAssistantMessage"),
         "const _EPHEMERAL_TURN_FIELDS=['_turnUsage','_turnDuration','_turnTps','_gatewayRouting','_statusCard','_anchor_stream_id','_anchor_activity_scene'];",
         _extract_function(MESSAGES_JS, "_isHistoricalAnchorActivityScene"),
+        "function msgContent(m){return (m && m.content)||'';}",
+        "function _isPreservedCompressionTaskListMarkerOnlyText(t){return /active task list was preserved/i.test(String(t||''));}",
         textwrap.dedent(extra),
     ]
     script = "\n".join(pieces)
@@ -351,3 +357,146 @@ def test_no_streamed_answer_leaves_a_populated_snapshot_alone():
     )
     assert result["length"] == 2
     assert result["answers"] == ["partial text that was persisted"]
+
+
+# --------------------------------------------------------------------------- #
+# The REAL `done`-listener wiring must keep the settled transcript non-empty.
+# The prior tests exercised the helper directly; the blanking bug was in the
+# listener assigning the helper's whole {adopted,messages} return object to
+# S.messages, which _filterRecoveryControlMessages then turned into [].
+# --------------------------------------------------------------------------- #
+
+
+def _listener_settle_harness(prev_messages: str, done_session: str, final_answer: str) -> dict:
+    """Execute the real done-listener settle statements in Node.
+
+    Extracts the exact carry-forward / settle-guard / recovery-filter statements
+    from the listener source so the `.messages` wiring is what is under test —
+    not a re-implementation.
+    """
+    assert NODE, "node is required for behavioural #6112 tests"
+    done = _done_listener_src()
+
+    def _grab(stmt_start: str, end_marker: str) -> str:
+        i = done.find(stmt_start)
+        assert i != -1, f"statement not found in done listener: {stmt_start[:40]}"
+        j = done.find(end_marker, i)
+        assert j != -1, f"statement end not found: {end_marker[:40]}"
+        return done[i:j]
+
+    carry = _grab(
+        "S.session=d.session;S.messages=_carryForwardEphemeralTurnFields",
+        "if(typeof _hydrateTodosFromSession",
+    )
+    # Extract the REAL settle-guard + recovery-filter statements (with the
+    # intermediate `_oldestIdx` reset) so the `.messages` wiring is under test.
+    guard = _grab(
+        "// #6112 settle guard.",
+        "if(typeof _hydrateTodosFromSession",
+    )
+    pieces = [
+        _extract_function(MESSAGES_JS, "_messageIdentityKey"),
+        _extract_function(MESSAGES_JS, "_carryForwardEphemeralTurnFields"),
+        _extract_function(MESSAGES_JS, "_adoptDoneSnapshotMessages"),
+        _extract_function(MESSAGES_JS, "_finalAnswerIsInTranscript"),
+        _extract_function(MESSAGES_JS, "_snapshotHasUsableFinalAssistantRow"),
+        _extract_function(MESSAGES_JS, "_streamRecoveryControlMessageText"),
+        _extract_function(MESSAGES_JS, "_streamRecoveryControlMessage"),
+        _extract_function(MESSAGES_JS, "_isMarkerOnlyAssistantMessage"),
+        _extract_function(MESSAGES_JS, "_filterRecoveryControlMessages"),
+        "const _EPHEMERAL_TURN_FIELDS=['_turnUsage','_turnDuration','_turnTps','_gatewayRouting','_statusCard','_anchor_stream_id','_anchor_activity_scene'];",
+        _extract_function(MESSAGES_JS, "_isHistoricalAnchorActivityScene"),
+        # A minimal msgContent so _isMarkerOnlyAssistantMessage/_streamRecoveryControlMessage run.
+        "function msgContent(m){return (m && m.content)||'';}",
+        "function _isPreservedCompressionTaskListMarkerOnlyText(t){return /active task list was preserved/i.test(String(t||''));}",
+        textwrap.dedent(f"""
+            const S = {{ messages: {prev_messages} }};
+            const d = {{ session: {done_session} }};
+            let _doneFinalAnswer = {json.dumps(final_answer)};
+            let _oldestIdx = 0;
+            const _preSettle=Array.isArray(S.messages)?S.messages:[];
+            {carry}
+            {guard}
+            const msgs = Array.isArray(S.messages) ? S.messages : [];
+            console.log(JSON.stringify({{
+                isArray: Array.isArray(S.messages),
+                length: msgs.length,
+                answers: msgs.filter(m => m && m.role === 'assistant').map(m => String(m.content || '')),
+            }}));
+        """),
+    ]
+    script = "\n".join(pieces)
+    res = subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, f"node listener harness failed:\n{res.stderr}"
+    return json.loads(res.stdout.strip())
+
+
+@pytest.mark.skipif(NODE is None, reason="node required for behavioural test")
+def test_done_listener_settle_keeps_transcript_non_empty():
+    """The real listener wiring must produce a non-array-free, non-empty transcript.
+
+    Ordinary `done` payload (user + streamed assistant answer, snapshot carries
+    the same). Before the fix the listener assigned the helper's return OBJECT to
+    S.messages, so `_filterRecoveryControlMessages` saw a non-array and returned
+    `[]` — blanking the pane after every normal turn.
+    """
+    result = _listener_settle_harness(
+        json.dumps([
+            {"role": "user", "content": "the prompt", "_ts": 1},
+            {"role": "assistant", "content": ANSWER, "_ts": 2},
+        ]),
+        json.dumps({
+            "session_id": "s1",
+            "messages": [
+                {"role": "user", "content": "the prompt", "_ts": 1},
+                {"role": "assistant", "content": ANSWER, "_ts": 2},
+            ],
+        }),
+        ANSWER,
+    )
+    assert result["isArray"] is True, "S.messages must be an array after the settle guard"
+    assert result["length"] == 2, "the settled transcript must stay non-empty"
+    assert result["answers"].count(ANSWER) == 1
+
+
+@pytest.mark.skipif(NODE is None, reason="node required for behavioural test")
+def test_rewritten_final_reply_is_not_appended_twice():
+    """The Agent may rewrite the final content before persisting it.
+
+    When the snapshot already ends the turn in a usable final assistant row whose
+    text differs from the streamed copy (transform_llm_output), the streamed copy
+    must NOT be appended as a second assistant row.
+    """
+    rewritten = "The final answer, rewritten by transform_llm_output before persisting."
+    result = _run(
+        json.dumps([{"role": "user", "content": "the prompt", "_ts": 1}]),
+        json.dumps({
+            "session_id": "s1",
+            "messages": [
+                {"role": "user", "content": "the prompt", "_ts": 1},
+                {"role": "assistant", "content": rewritten, "_ts": 2},
+            ],
+        }),
+        final_answer=ANSWER,
+    )
+    assert result["length"] == 2, "the rewritten snapshot answer must not be duplicated"
+    assert result["answers"] == [rewritten], "the snapshot's authoritative row must stand"
+    assert ANSWER not in result["answers"], "the streamed copy must not be re-appended"
+
+
+@pytest.mark.skipif(NODE is None, reason="node required for behavioural test")
+def test_reattach_still_happens_when_turn_has_no_usable_assistant_row():
+    """A tool-only / no-text final row still triggers the re-attach fallback."""
+    result = _run(
+        json.dumps([{"role": "user", "content": "the prompt", "_ts": 1}]),
+        json.dumps({
+            "session_id": "s1",
+            "messages": [
+                {"role": "user", "content": "the prompt", "_ts": 1},
+                {"role": "assistant", "content": "", "_ts": 2, "tool_calls": [{"id": "t1"}]},
+            ],
+        }),
+        final_answer=ANSWER,
+    )
+    assert result["length"] == 3, "with no usable final row the answer must be re-attached"
+    assert result["answers"][-1] == ANSWER
