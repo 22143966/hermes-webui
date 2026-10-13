@@ -4650,6 +4650,13 @@ async function _ensureAllMessagesLoaded() {
         S.session._visibleBaselineServer=(typeof data.session.visible_message_count==='number'&&data.session.visible_message_count>=0)
           ?data.session.visible_message_count
           :S.session._visibleBaselineLocal;
+        // #7882 (gate round-7 SILENT): keep the cached display scalar in sync
+        // with the validated response — the pair re-baselines but the label
+        // reads visible_message_count directly, so leaving the old value
+        // reports a stale total after a full transcript reload.
+        if(typeof data.session.visible_message_count==='number'&&data.session.visible_message_count>=0){
+          S.session.visible_message_count=data.session.visible_message_count;
+        }
       }else{
         // #7882 (greptile round-6 P2): a send is in flight — the replace only
         // added server-known rows, so advance the send's local baseline by
@@ -7321,6 +7328,13 @@ function _applyGatewayCliImportRefresh(activeSid,res){
     S.session._visibleBaselineServer=(typeof res.session.visible_message_count==='number'&&res.session.visible_message_count>=0)
       ?res.session.visible_message_count
       :S.session._visibleBaselineLocal;
+    // #7882 (gate round-7 SILENT): the cached scalar must follow the response
+    // too — the baselines reset but the display count is read directly by the
+    // sidebar/status label, so leaving it at the pre-refresh value reports a
+    // stale visible total (e.g. "2 of 4" after the transcript grew to 4).
+    if(typeof res.session.visible_message_count==='number'&&res.session.visible_message_count>=0){
+      S.session.visible_message_count=res.session.visible_message_count;
+    }
     const newest = next.length ? next[next.length - 1] : null;
     const newestTs = Number((newest && (newest.timestamp || newest._ts)) || 0);
     if(newestTs){
