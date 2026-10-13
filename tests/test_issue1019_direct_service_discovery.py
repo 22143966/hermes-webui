@@ -8,6 +8,8 @@ import subprocess
 import sys
 import textwrap
 import venv
+
+import pytest
 from pathlib import Path
 
 
@@ -205,3 +207,105 @@ def test_discovery_checks_hermes_home_without_explicit_override(monkeypatch, tmp
         launcher_finder=lambda: None,
         python_finder=lambda _python: None,
     ) == agent_root.resolve()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows launcher regression")
+@pytest.mark.parametrize("runtime", ["fallback", "interpreter", "launcher"])
+def test_windows_launcher_defers_stale_marker_root_until_working_runtime(tmp_path, runtime):
+    import shutil
+
+    pwsh = shutil.which("pwsh")
+    if not pwsh:
+        pytest.skip("PowerShell is unavailable")
+    stale = tmp_path / "home" / "hermes-agent"
+    working = (tmp_path / "programs" / "hermes" / "hermes-agent" if runtime == "fallback" else tmp_path / "runtime-agent")
+    (stale / "hermes_cli").mkdir(parents=True)
+    (stale / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    (stale / "venv" / "Scripts").mkdir(parents=True)
+    (stale / "venv" / "Scripts" / "python.exe").write_text("", encoding="utf-8")
+    working.mkdir(parents=True)
+    (working / "run_agent.py").write_text("", encoding="utf-8")
+    source = (REPO_ROOT / "start.ps1").read_text(encoding="utf-8")
+    start = source.index("$AgentDir = $env:HERMES_WEBUI_AGENT_DIR")
+    end = source.index("[Environment]::SetEnvironmentVariable('HERMES_WEBUI_AGENT_DIR', $AgentDir)", start)
+    end = source.index("\n", end)
+    script = tmp_path / "discover.ps1"
+    script.write_text(
+        "$ErrorActionPreference='Stop'\n"
+        "$RepoRoot=$env:TEST_REPO_ROOT\n$Python=$env:TEST_PYTHON\n"
+        "$serverPlatformDefaultHome=$env:HERMES_HOME\n$newHermesHome=$env:HERMES_HOME\n"
+        + source[start:end] + "\nWrite-Output $env:HERMES_WEBUI_AGENT_DIR\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(tmp_path / "user"), "USERPROFILE": str(tmp_path / "user"),
+        "HERMES_HOME": str(tmp_path / "home"), "LOCALAPPDATA": str(tmp_path / "local"),
+        "ProgramFiles": str(tmp_path / "programs"), "ProgramW6432": str(tmp_path / "programs"),
+        "ProgramFiles(x86)": str(tmp_path / "programs"), "HERMES_WEBUI_AGENT_DIR": "",
+        "TEST_REPO_ROOT": str(tmp_path / "repo"), "TEST_PYTHON": sys.executable,
+        "PYTHONPATH": str(REPO_ROOT), "PATH": str(tmp_path / "empty-path"),
+    })
+    if runtime == "interpreter":
+        env["PYTHONPATH"] = str(working) + os.pathsep + str(REPO_ROOT)
+    elif runtime == "launcher":
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "hermes.cmd").write_text("#!" + str(working / "python.exe") + "\n", encoding="utf-8")
+        env["PATH"] = str(bin_dir)
+    result = _run_hidden([pwsh, "-NoProfile", "-File", str(script)], cwd=tmp_path, env=env)
+    assert result.returncode == 0, result.stderr
+    assert Path(result.stdout.strip()) == working
+
+
+def test_direct_service_does_not_install_into_stale_marker_root(monkeypatch, tmp_path):
+    from api import auth, config, models, session_recovery, startup
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_WEBUI_AUTO_INSTALL", "1")
+    monkeypatch.delenv("HERMES_WEBUI_AGENT_DIR", raising=False)
+    stale = tmp_path / "home" / "hermes-agent"
+    (stale / "hermes_cli").mkdir(parents=True)
+    (stale / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    (stale / "cron").mkdir()
+    (stale / "cron" / "jobs.py").write_text("", encoding="utf-8")
+    (stale / "requirements.txt").write_text("stale-package\n", encoding="utf-8")
+    working = tmp_path / "working-agent"
+    working.mkdir()
+    (working / "run_agent.py").write_text("", encoding="utf-8")
+    selected = startup.discover_agent_dir(
+        repo_root=tmp_path / "repo", hermes_home=tmp_path / "home",
+        default_hermes_home=tmp_path / "default", user_home=tmp_path / "user",
+        launcher_finder=lambda: working, python_finder=lambda _python: None,
+    )
+    assert selected == working.resolve()
+    monkeypatch.setattr(config, "_AGENT_DIR", selected)
+    monkeypatch.setattr(config, "_HERMES_FOUND", True)
+    monkeypatch.setattr(config, "print_startup_config", lambda: None)
+    monkeypatch.setattr(config, "verify_hermes_imports", lambda: (False, ["run_agent"], {}))
+    import server
+
+    class StartupChecked(Exception):
+        pass
+
+    def stop_before_state_writes(**_kwargs):
+        raise StartupChecked
+
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(server, "STATE_DIR", SimpleNamespace(mkdir=stop_before_state_writes))
+    monkeypatch.setattr(server, "SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(server, "_ignore_sigpipe", lambda: None)
+    monkeypatch.setattr(server, "install_crash_visibility", lambda: None)
+    monkeypatch.setattr(server, "fix_credential_permissions", lambda: None)
+    monkeypatch.setattr(server, "_raise_fd_soft_limit", lambda: {})
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: None)
+    monkeypatch.setattr(session_recovery, "recover_all_sessions_on_startup", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(auth, "is_auth_enabled", lambda: True)
+    monkeypatch.setattr(auth, "get_oidc_startup_warning", lambda: "")
+    monkeypatch.setattr(startup, "_trusted_agent_dir", lambda _root: True)
+    installs = []
+    monkeypatch.setattr(startup.subprocess, "run", lambda args, **_kwargs: installs.append(args) or subprocess.CompletedProcess(args, 0))
+    with pytest.raises(StartupChecked):
+        server.main()
+    assert installs == []

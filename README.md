@@ -419,6 +419,8 @@ export HERMES_WEBUI_AUTO_INSTALL=1  # enable auto-install of agent deps (disable
 ./start.sh
 ```
 
+Auto-install requires the selected Agent to match `HERMES_WEBUI_AGENT_DIR` or the Agent under `HERMES_HOME`, and still checks ownership and permissions.
+
 Or inline:
 
 ```bash

@@ -282,7 +282,7 @@ def _trusted_agent_dir(agent_dir: Path) -> bool:
         return False
 
 
-def auto_install_agent_deps() -> bool:
+def auto_install_agent_deps(expected_agent_dir: Path | None = None) -> bool:
     enabled = os.environ.get('HERMES_WEBUI_AUTO_INSTALL', '').strip().lower() in ('1', 'true', 'yes')
     if not enabled:
         print('[!!] Auto-install disabled. Set HERMES_WEBUI_AUTO_INSTALL=1 to enable.', flush=True)
@@ -290,6 +290,9 @@ def auto_install_agent_deps() -> bool:
     agent_dir = _agent_dir()
     if agent_dir is None:
         print('[!!] Auto-install skipped: agent directory not found.', flush=True)
+        return False
+    if expected_agent_dir is None or agent_dir != Path(expected_agent_dir).resolve():
+        print('[!!] Auto-install skipped: authorized directory does not match the selected Agent.', flush=True)
         return False
     if not _trusted_agent_dir(agent_dir):
         print('[!!] Auto-install skipped: agent directory failed trust check (check ownership/permissions).', flush=True)
