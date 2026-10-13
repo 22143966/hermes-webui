@@ -1027,7 +1027,7 @@ $('attachChoicePopup')?.addEventListener('click',e=>{
 });
 $('attachChoicePopup')?.addEventListener('focusout',e=>{
   if(!e.currentTarget.contains(e.relatedTarget)){
-    if(_attachChoicePointerDown&&e.relatedTarget===$('btnAttach'))return;
+    if(_attachChoicePointerDown&&(!e.relatedTarget||e.relatedTarget===$('btnAttach')))return;
     _dismissAttachChoice();
   }
 });
