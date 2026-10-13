@@ -5780,7 +5780,12 @@ document.addEventListener('click',e=>{
 });
 window.addEventListener('resize',()=>{
   const dd=$('composerModelDropdown');
-  if(dd&&dd.classList.contains('open')) _positionModelDropdown();
+  if(dd&&dd.classList.contains('open')){
+    _positionModelDropdown();
+    // The scope note re-wraps at a new width, so its measured height (and the
+    // search row's sticky offset) must be recomputed on every resize.
+    if(typeof _syncModelDropdownStickyInsets==='function') _syncModelDropdownStickyInsets(dd);
+  }
   // Keep the reasoning dropdown aligned under its chip when the window
   // resizes while open — same pattern as the model dropdown above.
   const rdd=$('composerReasoningDropdown');
@@ -5801,7 +5806,12 @@ function _repositionOpenModelDropdown(){
   requestAnimationFrame(()=>{
     _modelDropdownRepositionScheduled=false;
     const openDd=$('composerModelDropdown');
-    if(openDd&&openDd.classList.contains('open')) _positionModelDropdown();
+    if(openDd&&openDd.classList.contains('open')){
+      _positionModelDropdown();
+      // A rotation / keyboard-open can also re-wrap the scope note, so refresh
+      // the sticky inset here too (same reason as the resize handler above).
+      if(typeof _syncModelDropdownStickyInsets==='function') _syncModelDropdownStickyInsets(openDd);
+    }
   });
 }
 if(window.visualViewport){
