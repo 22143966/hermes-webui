@@ -414,6 +414,12 @@ def _listener_settle_harness(prev_messages: str, done_session: str, final_answer
             const d = {{ session: {done_session} }};
             let _doneFinalAnswer = {json.dumps(final_answer)};
             let _oldestIdx = 0;
+            // Master's done listener applies a pending title update between the
+            // carry-forward and the settle guard; stub it (not under test here).
+            const completedSid = 'sid-done';
+            const _pendingTitleUpdates = new Map();
+            const _pendingTitleExpectedCurrent = new Map();
+            function applySessionTitleUpdate(){{}}
             const _preSettle=Array.isArray(S.messages)?S.messages:[];
             {carry}
             {guard}
