@@ -7745,6 +7745,22 @@ def _api_safe_message_positions(messages):
             and not str(_repaired.get('content') or '').strip()
         )
     ]
+    # Recompute ownership from the repaired call rows (mirrors
+    # _sanitize_messages_for_api): a tool result linked only to a now-removed
+    # non-adjacent call must leave this projection too, or the two projections
+    # disagree by one row and positional metadata carry-forward misaligns.
+    _surviving_ids = {
+        _tc.get('id') or _tc.get('call_id')
+        for _i, _msg in out
+        if _msg.get('role') == 'assistant'
+        for _tc in (_msg.get('tool_calls') or [])
+        if isinstance(_tc, dict) and (_tc.get('id') or _tc.get('call_id'))
+    }
+    out = [
+        (_i, _msg) for _i, _msg in out
+        if _msg.get('role') != 'tool'
+        or (_msg.get('tool_call_id') or '') in _surviving_ids
+    ]
     # Third pass: strip orphaned tool_calls from assistant messages (mirrors
     # _sanitize_messages_for_api pass 3).
     answered_ids: set = set()
@@ -7926,7 +7942,9 @@ def _strip_orphan_tool_calls(messages):
         else:
             repaired_msg.pop("tool_calls", None)
         repaired[idx] = repaired_msg
-        logger.warning(
+        # debug, not warning: this runs on every projection of every turn, so an
+        # abandoned call would otherwise log several warnings per turn forever.
+        logger.debug(
             "Dropped %d orphan tool_call id(s) at context index %d (no tool_result "
             "immediately after); would have caused an upstream 400: %s",
             len(dropped),
