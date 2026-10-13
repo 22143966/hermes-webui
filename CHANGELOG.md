@@ -141,6 +141,11 @@
 
 ### Fixed
 
+- **Signing in works when another app on the same host sets a malformed cookie.** A cookie with illegal characters
+  from a different service on the same host or domain made the WebUI ignore every cookie after it, so a correct password
+  bounced back to the login page and a switched profile fell back to `default`. Cookies are now read one pair at a time,
+  for both the session and the profile cookie. Thanks @pcsokonay. (#8124, #8123)
+
 - **Insights: the Models card gets three times the width of its neighbours in the usage row.** Long model ids such as
   `anthropic/claude-...` and `openrouter/...` were cut to an 80 px name column, so several rows read identically. The card
   now takes a 3x share of the row, and on narrow screens its table stays inside the card instead of spilling past
