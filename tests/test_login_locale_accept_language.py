@@ -17,8 +17,12 @@ These tests pin the fix:
    never launders an unknown tag into "en".
 2. `/login` uses it while `settings.language` is unset, and still defers to an
    explicit stored choice.
-3. `settings.language` accepts "" so a user can clear the choice and return to
-   automatic browser-language selection.
+
+The tests arrange the unset state by writing ``settings.json`` directly rather
+than through the settings API: an empty-string "reset" is deliberately out of
+scope for this PR (it needs shared client-resolver handling to be correct), so
+the server-side settings endpoint ignores ``{"language": ""}`` and cannot be
+used to clear a prior choice.
 """
 
 import json
@@ -70,7 +74,7 @@ def test_accept_language_returns_none_for_absent_or_unknown():
     assert _login_locale_from_accept_language("fr;q=0, en") == "en"
 
 
-# ── 2 & 3. End-to-end against the live test server ──────────────────────────
+# ── 2. End-to-end against the live test server ──────────────────────────────
 
 
 def _get_settings():
@@ -88,6 +92,32 @@ def _post_settings(body):
         return json.loads(r.read()), r.status
 
 
+def _set_language_on_disk(value):
+    """Arrange the stored ``language`` directly in ``settings.json``.
+
+    ``load_settings()`` re-reads the file on every request (no in-memory
+    cache), so a direct write is picked up by the next ``/login`` GET. This is
+    how the tests establish (and restore) the unset / prior-choice state — the
+    settings API intentionally does not accept an empty-string reset.
+    """
+    from api.config import SETTINGS_FILE
+
+    data = {}
+    if SETTINGS_FILE.exists():
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    if value is None:
+        data.pop("language", None)
+    else:
+        data["language"] = value
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
 def _get_login(accept_language=None):
     headers = {}
     if accept_language is not None:
@@ -103,15 +133,14 @@ def test_fresh_install_login_page_follows_the_browser_language():
     prev = settings.get("language")
     try:
         # Fresh-install state: nothing chosen yet.
-        saved, status = _post_settings({"language": ""})
-        assert status == 200
+        _set_language_on_disk(None)
 
         html, status = _get_login("fr-CA,fr;q=0.9,en;q=0.8")
         assert status == 200
         assert 'lang="fr-FR"' in html
         assert "Se connecter" in html
     finally:
-        _post_settings({"language": prev or ""})
+        _set_language_on_disk(prev)
 
 
 def test_unsupported_browser_language_still_falls_back_to_english():
@@ -119,12 +148,12 @@ def test_unsupported_browser_language_still_falls_back_to_english():
     assert status == 200
     prev = settings.get("language")
     try:
-        _post_settings({"language": ""})
+        _set_language_on_disk(None)
         html, status = _get_login("xx-YY")
         assert status == 200
         assert 'lang="en"' in html
     finally:
-        _post_settings({"language": prev or ""})
+        _set_language_on_disk(prev)
 
 
 def test_login_without_accept_language_header_is_english():
@@ -132,12 +161,12 @@ def test_login_without_accept_language_header_is_english():
     assert status == 200
     prev = settings.get("language")
     try:
-        _post_settings({"language": ""})
+        _set_language_on_disk(None)
         html, status = _get_login(None)
         assert status == 200
         assert 'lang="en"' in html
     finally:
-        _post_settings({"language": prev or ""})
+        _set_language_on_disk(prev)
 
 
 def test_explicit_language_setting_still_overrides_accept_language():
@@ -150,17 +179,4 @@ def test_explicit_language_setting_still_overrides_accept_language():
         assert status == 200
         assert 'lang="ja-JP"' in html
     finally:
-        _post_settings({"language": prev or ""})
-
-
-def test_language_setting_round_trips_empty_string():
-    settings, status = _get_settings()
-    assert status == 200
-    prev = settings.get("language")
-    try:
-        _post_settings({"language": ""})
-        reread, status = _get_settings()
-        assert status == 200
-        assert reread.get("language") in ("", None)
-    finally:
-        _post_settings({"language": prev or ""})
+        _set_language_on_disk(prev)

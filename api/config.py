@@ -13688,10 +13688,8 @@ def save_settings(settings: dict) -> dict:
             if k == "tts_voice":
                 if not isinstance(v, str) or len(v) > 200 or "\x00" in v:
                     continue
-            # Validate language codes (BCP-47-like: 'en', 'zh', 'fr', 'zh-CN').
-            # "" is also accepted: it clears the stored choice so the UI reverts
-            # to browser-language detection instead of pinning a locale (#7622).
-            if k == "language" and v != "" and (
+            # Validate language codes (BCP-47-like: 'en', 'zh', 'fr', 'zh-CN')
+            if k == "language" and (
                 not isinstance(v, str) or not _SETTINGS_LANG_RE.match(v)
             ):
                 continue
