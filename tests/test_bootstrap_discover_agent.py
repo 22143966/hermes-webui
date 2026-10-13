@@ -1,10 +1,4 @@
-"""Tests for `discover_agent_dir` launcher and interpreter fallbacks.
-
-When the standard candidate paths (`~/.hermes/hermes-agent`, `~/hermes-agent`,
-`<webui-parent>/hermes-agent`, `HERMES_WEBUI_AGENT_DIR`) don't match, bootstrap
-bootstrap checks the `hermes` launcher, then asks the configured Python for the
-installed `run_agent` module without importing it.
-"""
+"""Runtime provenance precedes automatic source-path fallbacks during discovery."""
 
 from __future__ import annotations
 
@@ -216,7 +210,7 @@ def test_root_fhs_layout_is_in_candidate_list(monkeypatch, tmp_path):
     )
 
 
-def test_legacy_fhs_root_precedes_launcher(monkeypatch, tmp_path):
+def test_working_launcher_precedes_unproved_legacy_fhs_root(monkeypatch, tmp_path):
     fhs_root = bootstrap.Path("/usr/local/lib/hermes-agent")
     install, venv_python = _make_agent_install(tmp_path)
     hermes = _make_hermes_cli(tmp_path, str(venv_python))
@@ -229,11 +223,7 @@ def test_legacy_fhs_root_precedes_launcher(monkeypatch, tmp_path):
         return real_exists(path)
 
     monkeypatch.setattr(bootstrap.Path, "exists", isolated_exists)
-    monkeypatch.setattr(
-        bootstrap, "_agent_dir_from_hermes_cli", lambda: pytest.fail("launcher must remain later")
-    )
-
-    assert bootstrap.discover_agent_dir() == fhs_root.resolve()
+    assert bootstrap.discover_agent_dir() == install.resolve()
 
 
 def test_launcher_precedes_new_system_fallback(monkeypatch, tmp_path):
@@ -435,7 +425,9 @@ def test_hermes_cli_takes_precedence_over_configured_python(monkeypatch, tmp_pat
     assert bootstrap.discover_agent_dir() == install.resolve()
 
 
-def test_stale_marker_root_does_not_hide_working_launcher(monkeypatch, tmp_path):
+@pytest.mark.parametrize("stale_source", [False, True])
+@pytest.mark.parametrize("runtime", ["launcher", "interpreter"])
+def test_stale_root_does_not_hide_working_runtime(monkeypatch, tmp_path, stale_source, runtime):
     install, venv_python = _make_agent_install(tmp_path)
     (install / "run_agent.py").write_text("class AIAgent: pass\n", encoding="utf-8")
     hermes = _make_hermes_cli(tmp_path, str(venv_python))
@@ -445,5 +437,10 @@ def test_stale_marker_root_does_not_hide_working_launcher(monkeypatch, tmp_path)
     (stale / "cron" / "jobs.py").write_text("", encoding="utf-8")
     (stale / "hermes_cli").mkdir()
     (stale / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    if stale_source:
+        (stale / "run_agent.py").write_text("raise ImportError('stale checkout')\n", encoding="utf-8")
+    if runtime == "interpreter":
+        monkeypatch.setattr(bootstrap, "_agent_dir_from_hermes_cli", lambda: None)
+        monkeypatch.setattr(bootstrap, "_agent_dir_from_python", lambda _python: install)
     assert bootstrap.discover_agent_dir() == install.resolve()
     assert bootstrap._python_can_run_webui_and_agent(sys.executable, install)

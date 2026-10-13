@@ -221,6 +221,8 @@ def test_windows_launcher_defers_stale_marker_root_until_working_runtime(tmp_pat
     working = (tmp_path / "programs" / "hermes" / "hermes-agent" if runtime in ("fallback", "bare-fallback") else tmp_path / "runtime-agent")
     (stale / "hermes_cli").mkdir(parents=True)
     (stale / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    if runtime in ("interpreter", "launcher"):
+        (stale / "run_agent.py").write_text("raise ImportError('stale checkout')\n", encoding="utf-8")
     (stale / "venv" / "Scripts").mkdir(parents=True)
     (stale / "venv" / "Scripts" / "python.exe").write_text("", encoding="utf-8")
     working.mkdir(parents=True)
@@ -269,7 +271,8 @@ def test_windows_launcher_defers_stale_marker_root_until_working_runtime(tmp_pat
     assert Path(selected_python) == (working / "venv" / "Scripts" / "python.exe" if runtime == "bare-fallback" else Path(sys.executable))
 
 
-def test_direct_service_does_not_install_into_stale_marker_root(monkeypatch, tmp_path):
+@pytest.mark.parametrize("runtime", ["launcher", "interpreter"])
+def test_direct_service_does_not_install_into_stale_source_root(monkeypatch, tmp_path, runtime):
     from api import auth, config, models, session_recovery, startup
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -281,13 +284,15 @@ def test_direct_service_does_not_install_into_stale_marker_root(monkeypatch, tmp
     (stale / "cron").mkdir()
     (stale / "cron" / "jobs.py").write_text("", encoding="utf-8")
     (stale / "requirements.txt").write_text("stale-package\n", encoding="utf-8")
+    (stale / "run_agent.py").write_text("raise ImportError('stale checkout')\n", encoding="utf-8")
     working = tmp_path / "working-agent"
     working.mkdir()
     (working / "run_agent.py").write_text("", encoding="utf-8")
     selected = startup.discover_agent_dir(
         repo_root=tmp_path / "repo", hermes_home=tmp_path / "home",
         default_hermes_home=tmp_path / "default", user_home=tmp_path / "user",
-        launcher_finder=lambda: working, python_finder=lambda _python: None,
+        launcher_finder=lambda: working if runtime == "launcher" else None,
+        python_finder=lambda _python: working if runtime == "interpreter" else None,
     )
     assert selected == working.resolve()
     monkeypatch.setattr(config, "_AGENT_DIR", selected)

@@ -190,10 +190,6 @@ if (-not $AgentDir) {
     $serverCandidates += (Join-Path $env:USERPROFILE 'hermes-agent')
     # De-dup server-equivalent list (HERMES_HOME may coincide with platform default).
     $serverCandidates = $serverCandidates | Select-Object -Unique
-    # Authoritative source roots precede launcher and interpreter discovery.
-    foreach ($c in $serverCandidates) {
-        if (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf -ErrorAction SilentlyContinue) { $AgentDir = $c; break }
-    }
     if (-not $AgentDir) {
         try {
             $runtimeCandidates = @(& $Python -c 'import sys; sys.path.insert(0, sys.argv[1]); from api.startup import _agent_dir_from_hermes_cli, _agent_dir_from_python; root = _agent_dir_from_hermes_cli() or _agent_dir_from_python(sys.executable); print(root or "")' $RepoRoot 2>$null)
@@ -203,6 +199,12 @@ if (-not $AgentDir) {
                 }
             }
         } catch { }
+    }
+    if (-not $AgentDir) {
+        # Source roots remain a fallback when no runtime is proved.
+        foreach ($c in $serverCandidates) {
+            if (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf -ErrorAction SilentlyContinue) { $AgentDir = $c; break }
+        }
     }
     $launcherOnlyCandidates = @()
     $launcherOnlyCandidates += (Join-Path $env:USERPROFILE '.hermes\hermes-agent')

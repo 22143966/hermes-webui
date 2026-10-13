@@ -268,7 +268,7 @@ def test_source_and_runtime_discovery_precede_marker_only_roots():
     runtime = block.index("$runtimeCandidates =")
     fallback_run = block.index("foreach ($c in $launcherOnlyCandidates)")
     marker_pass = block.index("foreach ($c in @($serverCandidates) + @($launcherOnlyCandidates))")
-    assert server_run < runtime < fallback_run < marker_pass
+    assert runtime < server_run < fallback_run < marker_pass
     assert "_agent_dir_from_hermes_cli() or _agent_dir_from_python(sys.executable)" in block
     assert "Test-Path (Join-Path $c 'run_agent.py')" in block[fallback_run:marker_pass]
     assert "Test-Path (Join-Path $c 'hermes_cli')" in block[marker_pass:]

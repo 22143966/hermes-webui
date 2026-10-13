@@ -397,7 +397,7 @@ before the session's named-profile Gateway ownership is known.
 
 | Thing | How it finds it |
 |---|---|
-| Hermes agent dir | `HERMES_WEBUI_AGENT_DIR`, then authoritative `run_agent.py` checkouts, the `hermes` launcher, the selected Python, fallback `run_agent.py` checkouts, and finally marker-only roots |
+| Hermes agent dir | `HERMES_WEBUI_AGENT_DIR`, then the `hermes` launcher, the selected Python, authoritative and fallback `run_agent.py` checkouts, and finally marker-only roots |
 | Python executable | Agent venv first, then `.venv` in this repo, then system `python3` |
 | State directory | `HERMES_WEBUI_STATE_DIR` env, then `$HERMES_HOME/webui` (Windows default `%LOCALAPPDATA%\hermes\webui`, POSIX default `~/.hermes/webui`) |
 | Default workspace | `HERMES_WEBUI_DEFAULT_WORKSPACE` env, then `~/workspace`, then state dir |
