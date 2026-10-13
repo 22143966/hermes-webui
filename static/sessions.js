@@ -2495,6 +2495,13 @@ async function loadSession(sid){
     const _msgInner = $('msgInner');
     if (_msgInner && currentSid !== sid) _msgInner.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;padding:40px;text-align:center;">Loading conversation...</div>';
   }
+  // A superseded navigation can return here with this session's transcript
+  // still cached. Snapshot its width before metadata replaces S.session and
+  // drops the old message count and regeneration revision. If an interrupted
+  // forced refresh already cleared the rows, retain its saved width instead.
+  if(currentSid === sid && !forceReload && Array.isArray(S.messages) && S.messages.length > 0){
+    _captureSameSessionForceReloadHint(sid);
+  }
   // Phase 1: Load metadata only (~1KB) for fast session switching. Keep model
   // resolution out of the first-paint path; old provider-shaped model IDs are
   // repaired by the deferred resolver after S.session is assigned.
@@ -3834,8 +3841,10 @@ async function _ensureMessagesLoaded(sid, opts) {
   const _loadGeneration = Number.isFinite(opts.loadGeneration) ? Number(opts.loadGeneration) : null;
   const _ownsLoad = () => _loadingSessionId === sid && (_loadGeneration === null || _loadSessionGeneration === _loadGeneration);
   if (!_ownsLoad()) return;
-  // Already have messages? (e.g. from INFLIGHT restore path, already set)
-  if (!opts.force && S.messages && S.messages.length > 0 && S.messages[0] && S.messages[0].role) {
+  // Metadata-only reads omit regeneration authority. Cached rows alone do
+  // not prove that the current session payload can authorize regeneration.
+  if (!opts.force && S.messages && S.messages.length > 0 && S.messages[0] && S.messages[0].role &&
+      S.session && S.session.session_id === sid && S.session.regeneration_revision) {
     _clearSameSessionForceReloadHint(sid);
     return;
   }
