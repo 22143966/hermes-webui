@@ -7927,54 +7927,6 @@ def _read_profile_config_cached(profile_name: str, cfg_path: str) -> dict | None
     return parsed
 
 
-_ROUTING_ENV_REF_RE = re.compile(r"\$\{[^}]+\}")
-
-
-def _drop_unresolved_routing_refs(block):
-    """Drop ``provider_routing`` values that still carry an unexpanded
-    ``${...}`` reference after env expansion.
-
-    The sync seam expands under the fail-closed profile scope
-    (``block_process_env_fallback``), so a ``${VAR}`` the profile's ``.env``
-    does not define (e.g. a variable only the server process env holds)
-    survives expansion as its literal text. Forwarding that literal would
-    make OpenRouter restrict the request to a provider that does not exist
-    and fail the turn, where master (which forwards no routing on the sync
-    path at all) succeeds. Dropping the affected value restores master's
-    outcome for it, with a warning, without widening what a profile may
-    read from the server environment.
-
-    A list item is dropped individually; a field is dropped when its scalar
-    value is unresolved or its list empties. Non-string values are kept as
-    is. Never mutates ``block``; returns ``(clean_block, dropped)`` where
-    ``dropped`` maps field name to the number of dropped values.
-    """
-    if not isinstance(block, dict):
-        return {}, {}
-    clean = {}
-    dropped = {}
-    for key, value in block.items():
-        if isinstance(value, str):
-            if _ROUTING_ENV_REF_RE.search(value):
-                dropped[key] = 1
-            else:
-                clean[key] = value
-        elif isinstance(value, list):
-            kept = [
-                item for item in value
-                if not (isinstance(item, str)
-                        and _ROUTING_ENV_REF_RE.search(item))
-            ]
-            lost = len(value) - len(kept)
-            if lost:
-                dropped[key] = lost
-            if kept:
-                clean[key] = kept
-        else:
-            clean[key] = value
-    return clean, dropped
-
-
 def _sync_routing_kwargs(profile_cfg: dict | None, agent_params: set) -> dict:
     """Build the sync POST /api/chat provider_routing kwargs from a profile config.
 
@@ -7993,7 +7945,8 @@ def _sync_routing_kwargs(profile_cfg: dict | None, agent_params: set) -> dict:
     (``profile_env_for_thread_readonly``), so a ``${VAR}`` only the server
     process env defines is NOT expanded here. Any routing value that still
     contains ``${...}`` after expansion is dropped (with a warning) via
-    ``_drop_unresolved_routing_refs()`` instead of being forwarded literally:
+    ``api.streaming._drop_unresolved_routing_refs()`` (inside the shared
+    ``_provider_routing_kwargs_for_agent``) instead of being forwarded literally:
     a literal would make OpenRouter target a nonexistent provider and fail a
     turn master (no routing on this path) completes, and re-enabling the
     process-env fallback to avoid the drop would widen what a profile can
@@ -8008,23 +7961,8 @@ def _sync_routing_kwargs(profile_cfg: dict | None, agent_params: set) -> dict:
         cfg = _expand_env_vars(profile_cfg)
     else:
         cfg = get_config()
-    pr = (cfg or {}).get("provider_routing")
-    if isinstance(pr, dict):
-        cleaned, dropped = _drop_unresolved_routing_refs(pr)
-        # Fresh shallow view: cfg may be the shared get_config() cache, and
-        # the cleaned block is a new dict, so nothing shared is mutated.
-        cfg = dict(cfg)
-        cfg["provider_routing"] = cleaned
-    else:
-        dropped = {}
-    for key, count in dropped.items():
-        logger.warning(
-            "provider_routing.%s references an environment variable this "
-            "profile does not define; dropping %d value(s) for the sync "
-            "turn instead of forwarding the literal ${...} text",
-            key,
-            count,
-        )
+    # The shared helper drops (with a warning) any routing value that still
+    # carries an unresolved ${...} after expansion, on both chat paths.
     return _provider_routing_kwargs_for_agent(cfg, agent_params)
 
 
@@ -11700,6 +11638,7 @@ from api.upload import (
     handle_workspace_upload,
 )
 from api.streaming import (
+    _drop_unresolved_routing_refs,
     _sse,
     _sse_write,
     _sse_keepalive,

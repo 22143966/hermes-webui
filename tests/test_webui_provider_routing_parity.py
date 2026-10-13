@@ -139,6 +139,38 @@ def test_helper_malformed_block_equals_absent_block():
     assert h({"provider_routing": ["a", "b"]}, ROUTING_KWARGS) == absent
 
 
+def test_helper_drops_unresolved_env_refs_for_both_paths(caplog):
+    """The shared mapper (used by streaming AND sync) never forwards ``${...}``.
+
+    A routing value whose ``${VAR}`` stayed unresolved after expansion must be
+    dropped with a warning, keeping resolved list items; forwarding the literal
+    makes OpenRouter target a provider that does not exist (#7812 round 6).
+    """
+    import logging
+
+    params = {
+        "providers_allowed",
+        "providers_ignored",
+        "provider_sort",
+        "provider_require_parameters",
+    }
+    cfg = {
+        "provider_routing": {
+            "only": ["${MISSING_ROUTE}", "anthropic"],
+            "ignore": ["${ALSO_MISSING}"],
+            "sort": "${SORT_UNSET}",
+        }
+    }
+    with caplog.at_level(logging.WARNING):
+        kwargs = _helper()(cfg, params)
+    assert kwargs["providers_allowed"] == ["anthropic"]
+    assert kwargs["providers_ignored"] is None
+    assert kwargs["provider_sort"] is None
+    assert "${" not in repr(kwargs)
+    assert cfg["provider_routing"]["only"] == ["${MISSING_ROUTE}", "anthropic"], "input must not be mutated"
+    assert "dropping" in caplog.text
+
+
 def test_helper_require_parameters_defaults_false():
     h = _helper()
     out = h({"provider_routing": {}}, {"provider_require_parameters"})

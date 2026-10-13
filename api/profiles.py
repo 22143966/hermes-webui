@@ -1392,7 +1392,7 @@ def profile_env_for_thread_readonly(
     profile isolation). Callers that feed the expanded result to an
     outbound request must treat any value that still contains ``${...}``
     after expansion as absent (see
-    ``api.routes._drop_unresolved_routing_refs``) instead of forwarding
+    ``api.streaming._drop_unresolved_routing_refs``) instead of forwarding
     the literal.
 
     Accepts a session-like object with ``.profile`` or a profile name.
