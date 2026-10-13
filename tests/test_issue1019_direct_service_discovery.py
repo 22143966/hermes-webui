@@ -172,7 +172,9 @@ def test_direct_service_uses_active_agent_venv_identity(tmp_path, monkeypatch):
     assert observed["handoff"]["config_python"] == str(venv_python)
     assert observed["handoff"]["agent_dir"] == observed["bootstrap"]
     assert Path(observed["handoff"]["python"]).parent == venv_python.parent
-    assert Path(observed["handoff"]["python"]).name in {"python.exe", "pythonw.exe"}
+    assert Path(observed["handoff"]["python"]).name in (
+        {"python.exe", "pythonw.exe"} if os.name == "nt" else {"python"}
+    )
     assert observed["local_python_visible"] is True
     assert observed["found"] is True
     assert observed["imports"][0] is True
@@ -259,6 +261,31 @@ def test_authoritative_source_precedes_launcher_and_interpreter(monkeypatch, tmp
         launcher_finder=lambda: runtime_root if runtime == "launcher" else None,
         python_finder=lambda _python: runtime_root if runtime == "interpreter" else None,
     ) == source_root.resolve()
+
+
+def test_legacy_home_source_follows_proven_runtime(monkeypatch, tmp_path):
+    from api import startup
+
+    legacy_root = tmp_path / "user" / ".hermes" / "hermes-agent"
+    legacy_root.mkdir(parents=True)
+    (legacy_root / "run_agent.py").write_text("", encoding="utf-8")
+    runtime_root = tmp_path / "runtime-agent"
+    runtime_root.mkdir()
+    (runtime_root / "run_agent.py").write_text("", encoding="utf-8")
+
+    monkeypatch.delenv("HERMES_WEBUI_AGENT_DIR", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_PYTHON", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "configured-home"))
+
+    assert startup.discover_agent_dir(
+        repo_root=tmp_path / "webui",
+        hermes_home=tmp_path / "configured-home",
+        default_hermes_home=tmp_path / "default-home",
+        user_home=tmp_path / "user",
+        python_exe=str(tmp_path / "agent-python"),
+        launcher_finder=lambda: runtime_root,
+        python_finder=lambda _python: None,
+    ) == runtime_root.resolve()
 
 
 def test_direct_service_prefers_xdg_source_to_authoritative_marker_root(

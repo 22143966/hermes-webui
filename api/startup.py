@@ -155,7 +155,6 @@ def _discover_agent_identity(
         repo_root.parent / "hermes-agent",
         repo_root.parent if _looks_like_agent_source_root(repo_root.parent) else None,
         default_hermes_home / "hermes-agent",
-        user_home / ".hermes" / "hermes-agent",
         user_home / "hermes-agent",
         Path("/usr/local/lib/hermes-agent"),
     ]
@@ -177,6 +176,7 @@ def _discover_agent_identity(
             return _AgentDiscovery(found, candidate)
 
     fallback_candidates = [
+        user_home / ".hermes" / "hermes-agent",
         Path(os.getenv("XDG_DATA_HOME", str(user_home / ".local" / "share"))).expanduser()
         / "hermes-agent",
         Path("/opt/hermes-agent"),
