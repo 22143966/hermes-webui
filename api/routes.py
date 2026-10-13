@@ -8808,6 +8808,57 @@ def _session_model_state_from_request(
     return model_value, provider
 
 
+def _invalidate_session_route_state_if_changed(
+    session,
+    *,
+    model: str | None,
+    provider: str | None = None,
+    provider_specified: bool = True,
+    already_resolved: bool = False,
+) -> bool:
+    """Normalize and update requested route, clearing route-derived state if changed.
+
+    Preserves gateway_routing_history. When the normalized model or provider
+    differs from the session's existing route, clears last_used_model,
+    gateway_routing, context_length, threshold_tokens, and last_prompt_tokens.
+    Returns True if a real route change occurred, False otherwise.
+    """
+    old_model = getattr(session, "model", None)
+    old_provider = getattr(session, "model_provider", None)
+
+    if already_resolved:
+        norm_model = model
+        norm_provider = provider
+    else:
+        norm_model, norm_provider = _session_model_state_from_request(
+            model,
+            provider if provider_specified else None,
+            current_provider=old_provider,
+        )
+    if norm_model is not None:
+        session.model = norm_model
+    session.model_provider = norm_provider
+
+    # Compare normalized values to avoid spurious invalidation on whitespace/case drift
+    old_norm_model = str(old_model or "").strip()
+    new_norm_model = str(session.model or "").strip()
+    old_norm_provider = _clean_session_model_provider(old_provider) or ""
+    new_norm_provider = _clean_session_model_provider(session.model_provider) or ""
+
+    changed = (old_norm_model != new_norm_model) or (old_norm_provider != new_norm_provider)
+    if changed:
+        session.last_used_model = None
+        session.gateway_routing = None
+        session.context_length = _resolve_context_length_for_session_model(
+            session.model,
+            session.model_provider,
+        )
+        session.threshold_tokens = 0
+        session.last_prompt_tokens = 0
+
+    return changed
+
+
 def _lookup_gateway_session_identity(session_id: str) -> dict:
     if not session_id:
         return {}
@@ -11783,6 +11834,7 @@ def _session_attention_summary(session_id: str) -> dict | None:
 _SIDEBAR_SESSION_RESPONSE_FIELDS = (
     _route_session_list_cache._SIDEBAR_SESSION_RESPONSE_FIELDS
 )
+
 
 
 def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None = None) -> dict:
@@ -16764,6 +16816,7 @@ def handle_post(handler, parsed) -> bool:
                 # the duplicate should behave identically.
                 gateway_routing=copy.deepcopy(getattr(session, "gateway_routing", None)),
                 gateway_routing_history=copy.deepcopy(getattr(session, "gateway_routing_history", None) or []),
+                last_used_model=getattr(session, "last_used_model", None),
                 # Preserve LLM-generated title flag so we don't regenerate title on duplicate.
                 llm_title_generated=getattr(session, "llm_title_generated", False),
                 manual_title=getattr(session, "manual_title", False),
@@ -17202,8 +17255,6 @@ def handle_post(handler, parsed) -> bool:
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be updated from WebUI", 403)
         old_ws = getattr(s, "workspace", "")
-        old_model = getattr(s, "model", None)
-        old_provider = getattr(s, "model_provider", None)
         try:
             new_ws = str(resolve_trusted_workspace(body.get("workspace", s.workspace), profile=getattr(s, "profile", None)))
         except ValueError as e:
@@ -17211,24 +17262,13 @@ def handle_post(handler, parsed) -> bool:
         with _get_session_agent_lock(body["session_id"]):
             s.workspace = new_ws
             if "model" in body or "model_provider" in body:
-                model, provider = _session_model_state_from_request(
-                    body.get("model", s.model),
-                    body.get("model_provider") if "model_provider" in body else None,
-                    getattr(s, "model_provider", None),
+                changed = _invalidate_session_route_state_if_changed(
+                    s,
+                    model=body.get("model", s.model),
+                    provider=body.get("model_provider") if "model_provider" in body else None,
+                    provider_specified="model_provider" in body,
                 )
-                if model is not None:
-                    s.model = model
-                s.model_provider = provider
-                if (
-                    str(old_model or "") != str(getattr(s, "model", "") or "")
-                    or str(old_provider or "") != str(getattr(s, "model_provider", "") or "")
-                ):
-                    s.context_length = _resolve_context_length_for_session_model(
-                        getattr(s, "model", None),
-                        getattr(s, "model_provider", None),
-                    )
-                    s.threshold_tokens = 0
-                    s.last_prompt_tokens = 0
+                if changed:
                     from api.config import _evict_session_agent
 
                     _evict_session_agent(body["session_id"])
@@ -17679,6 +17719,7 @@ def handle_post(handler, parsed) -> bool:
             context_messages=copy.deepcopy(forked_context),
             # Gateway routing — inherit from source
             gateway_routing=copy.deepcopy(getattr(source, "gateway_routing", None)),
+            last_used_model=getattr(source, "last_used_model", None),
             # Context engine — inherit state so branch's context engine starts correctly
             context_engine=getattr(source, "context_engine", None),
             context_engine_state=copy.deepcopy(getattr(source, "context_engine_state", None) or {}),
@@ -24509,8 +24550,13 @@ def _prepare_chat_start_session_for_stream(
         else source
     )
     s.workspace = workspace
-    s.model = model
-    s.model_provider = model_provider
+    _invalidate_session_route_state_if_changed(
+        s,
+        model=model,
+        provider=model_provider,
+        provider_specified=True,
+        already_resolved=True,
+    )
     s.active_stream_id = stream_id
     register_session_writeback_owner(s.session_id, stream_id)
     s.post_compression_context_tokens_estimate = None
@@ -26279,6 +26325,7 @@ def _handle_session_compression_recovery_start(handler, body):
                 threshold_tokens=getattr(source, "threshold_tokens", None),
                 gateway_routing=copy.deepcopy(getattr(source, "gateway_routing", None)),
                 gateway_routing_history=copy.deepcopy(getattr(source, "gateway_routing_history", None) or []),
+                last_used_model=getattr(source, "last_used_model", None),
                 parent_session_id=getattr(source, "session_id", sid),
                 worktree_path=getattr(source, "worktree_path", None),
                 worktree_branch=getattr(source, "worktree_branch", None),
