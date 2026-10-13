@@ -534,7 +534,7 @@ def _install_streaming_cronjob_profile_wrapper() -> None:
 
     _profile_scoped_cronjob_handler.__dict__["_webui_streaming_profile_wrapper"] = True
     _profile_scoped_cronjob_handler.__dict__["_webui_original_handler"] = original_handler
-    registry.register(
+    register_kwargs = dict(
         name=entry.name,
         toolset=entry.toolset,
         schema=entry.schema,
@@ -545,8 +545,15 @@ def _install_streaming_cronjob_profile_wrapper() -> None:
         description=entry.description,
         emoji=entry.emoji,
         max_result_size_chars=entry.max_result_size_chars,
-        dynamic_schema_overrides=entry.dynamic_schema_overrides,
     )
+    # Older hermes-agent builds predate ``ToolEntry.dynamic_schema_overrides``
+    # (and the matching ``register()`` kwarg). Forward it only when both sides
+    # know it, otherwise every chat stream fails with AttributeError (#8186).
+    if hasattr(entry, "dynamic_schema_overrides") and _supports_kwarg(
+        registry.register, "dynamic_schema_overrides"
+    ):
+        register_kwargs["dynamic_schema_overrides"] = entry.dynamic_schema_overrides
+    registry.register(**register_kwargs)
     _STREAMING_CRONJOB_WRAPPER_INSTALLED = True
 
 
