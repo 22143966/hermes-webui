@@ -71,6 +71,7 @@ class Element {{
   removeAttribute(k) {{ delete this.attrs[k]; }}
   getAttribute(k) {{ return this.attrs[k] ?? null; }}
   addEventListener(k,fn) {{ this.listeners[k]=fn; }}
+  removeEventListener(k,fn) {{ if(this.listeners[k]===fn) delete this.listeners[k]; }}
   focus() {{ this.focused=true; }}
   click() {{ this.clicks++; }}
   querySelector() {{ return choice; }}
@@ -107,6 +108,7 @@ Object.defineProperty(globalThis,'navigator',{{value:{{userAgent:''}},configurab
 globalThis.S={{ pendingFiles:[] }};
 globalThis.addFiles=(items)=>{{ S.pendingFiles.push(...items); globalThis.admitted=items; }};
 globalThis.console={{ log(){{}} }};
+const frames=[]; globalThis.requestAnimationFrame=fn=>frames.push(fn);
 eval({block!r});
 assert.equal(attach.getAttribute('aria-haspopup'),'menu');
 attach.onclick({{preventDefault(){{}}}});
@@ -125,7 +127,12 @@ popup.listeners.focusout({{currentTarget:popup,relatedTarget:choice}}); assert.e
 popup.listeners.focusout({{currentTarget:popup,relatedTarget:files}}); assert.equal(popup.hidden,true);
 state.width=844; window.listeners.resize(); attach.onclick({{preventDefault(){{}}}}); assert.equal(popup.hidden,false);
 popup.listeners.click({{target:choice}});
-assert.equal(attach.focused,true); assert.equal(camera.clicks,1); assert.equal(popup.hidden,true); assert.equal(attach.getAttribute('aria-expanded'),'false');
+assert.equal(attach.focused,false); assert.equal(camera.clicks,1);
+camera.listeners.change(); assert.equal(attach.focused,false); frames.shift()(); assert.equal(attach.focused,true);
+assert.equal(camera.listeners.cancel,undefined);
+attach.focused=false; attach.onclick({{preventDefault(){{}}}}); popup.listeners.click({{target:choice}});
+camera.listeners.cancel(); assert.equal(attach.focused,false); frames.shift()(); assert.equal(attach.focused,true);
+assert.equal(camera.listeners.change,undefined); assert.equal(popup.hidden,true); assert.equal(attach.getAttribute('aria-expanded'),'false');
 state.width=1280; state.coarse=false; state.fine=true; window.listeners.resize();
 assert.equal(attach.getAttribute('aria-haspopup'),null);
 assert.equal(attach.getAttribute('aria-expanded'),null);

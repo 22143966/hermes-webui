@@ -1,3 +1,4 @@
+import base64
 import os
 import socket
 import subprocess
@@ -98,12 +99,22 @@ def test_attachment_choice_is_visible_across_mobile_render_matrix(tmp_path):
                     page.keyboard.press("Tab")
                     assert popup.is_hidden()
                     playwright.expect(page.locator("#btnAttach")).to_have_attribute("aria-expanded", "false")
-                    page.locator("#btnAttach").click()
-                    with page.expect_file_chooser() as chooser:
-                        photo.click()
-                    chooser.value.set_files([])
-                    playwright.expect(page.locator("#btnAttach")).to_be_focused()
-                    assert popup.is_hidden()
+                    for choice, input_id in ((photo, "cameraFileInput"), (files, "fileInput")):
+                        for outcome in ("select", "cancel"):
+                            page.locator("#btnAttach").click()
+                            with page.expect_file_chooser() as chooser:
+                                choice.click()
+                            page.locator("#btnAttach").evaluate("button => button.blur()")
+                            if outcome == "select":
+                                chooser.value.set_files({"name": "photo.png", "mimeType": "image/png", "buffer": base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")})
+                            else:
+                                # Playwright emits change for empty files; native cancellation emits cancel.
+                                page.locator(f"#{input_id}").evaluate("input => input.addEventListener('change', event => event.stopImmediatePropagation(), {capture:true, once:true})")
+                                chooser.value.set_files([])
+                                page.locator(f"#{input_id}").dispatch_event("cancel")
+                            page.bring_to_front()
+                            playwright.expect(page.locator("#btnAttach")).to_be_focused()
+                            assert popup.is_hidden()
                     context.close()
             context = browser.new_context(viewport={"width": 1280, "height": 720})
             page = context.new_page()

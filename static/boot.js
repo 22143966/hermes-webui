@@ -977,8 +977,15 @@ function _dismissAttachChoice(restoreFocus){
 }
 window._dismissAttachChoice=_dismissAttachChoice;
 function _openAttachInput(input){
-  _dismissAttachChoice(true);
+  _dismissAttachChoice();
   if(!input)return;
+  const restoreFocus=()=>{
+    input.removeEventListener('change',restoreFocus);
+    input.removeEventListener('cancel',restoreFocus);
+    requestAnimationFrame(()=>$('btnAttach')?.focus());
+  };
+  input.addEventListener('change',restoreFocus);
+  input.addEventListener('cancel',restoreFocus);
   input.value='';
   input.click();
 }
