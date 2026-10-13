@@ -11638,7 +11638,6 @@ from api.upload import (
     handle_workspace_upload,
 )
 from api.streaming import (
-    _drop_unresolved_routing_refs,
     _sse,
     _sse_write,
     _sse_keepalive,
