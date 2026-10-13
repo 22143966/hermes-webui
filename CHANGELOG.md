@@ -135,6 +135,12 @@
 
 ### Fixed
 
+- **Browser chats now honour a profile's OpenRouter `provider_routing` block** (`sort`, `only`, `ignore`, `order`,
+  `require_parameters`, `data_collection`), as Discord, Telegram and the TUI already did. Both the streaming and the
+  non-streaming chat paths forward it to the agent, editing it takes effect on the next turn, and a `${VAR}` the
+  profile doesn't define is dropped with a warning instead of being sent to OpenRouter as a literal provider name.
+  Thanks @TheDevMoth. (#7812)
+
 - **Chats no longer fail on every message with older Hermes Agent builds.** Each streaming turn re-registers the
   agent's `cronjob` tool to scope it to the chat's profile, and it copied `ToolEntry.dynamic_schema_overrides`
   unconditionally; Agent builds from before that field existed raised `AttributeError` before the agent ran, so every
