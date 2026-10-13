@@ -15,6 +15,8 @@ def test_mobile_camera_choice_is_new_and_routes_through_existing_intake():
     boot = read("static/boot.js")
     assert 'id="attachChoicePopup"' in html
     assert 'id="cameraFileInput"' in html
+    assert 'id="cameraFileInput" tabindex="-1"' in html
+    assert 'id="cameraFileInput" tabindex="-1" aria-hidden="true"' in html
     assert 'accept="image/*" capture="environment"' in html
     assert "_shouldOfferCameraChoice" in boot
     assert "fine:matchMedia('(any-pointer:fine)')" in boot
@@ -42,10 +44,12 @@ def test_choice_accessibility_layout_and_locale_parity():
 
     assert 'role="menu"' in html
     assert 'role="menuitem"' in html
+    assert html.count('role="menuitem" tabindex="-1"') == 2
     assert 'aria-expanded="false"' in html
     assert "aria-hidden" in read("static/boot.js")
     assert "min-height:44px" in css
     assert ".attach-choice-popup[hidden]{display:none;}" in css
+    assert ".attach-choice-popup button:focus-visible{background:var(--hover-bg);outline:2px solid var(--accent);outline-offset:1px;}" in css
     assert ".composer-left{display:flex" in css and "overflow-y:hidden" in css
     left_start = html.index('class="composer-left"')
     assert 'id="attachChoicePopup"' not in html[left_start:html.index('</div>', left_start)]
@@ -72,10 +76,11 @@ class Element {{
   getAttribute(k) {{ return this.attrs[k] ?? null; }}
   addEventListener(k,fn) {{ this.listeners[k]=fn; }}
   removeEventListener(k,fn) {{ if(this.listeners[k]===fn) delete this.listeners[k]; }}
-  focus() {{ this.focused=true; }}
+  focus() {{ this.focused=true; document.activeElement=this; }}
   click() {{ this.clicks++; }}
   querySelector() {{ return choice; }}
-  contains(target) {{ return target===choice; }}
+  querySelectorAll(selector) {{ return selector.includes('[data-attach-choice]') ? [choice,files].filter(item=>item.dataset.attachChoice&&!item.getAttribute('disabled')) : []; }}
+  contains(target) {{ return target===choice||target===files; }}
   closest(selector) {{
     if (this.id === 'choice' && selector.includes('[data-attach-choice]')) return this;
     if (this.id === 'popup' && selector.includes('#attachChoicePopup')) return this;
@@ -86,10 +91,10 @@ class Element {{
 const attach = new Element('attach');
 const popup = new Element('popup');
 const choice = new Element('choice'); choice.dataset.attachChoice='camera';
-const files = new Element('files');
+const files = new Element('files'); files.dataset.attachChoice='files';
 const camera = new Element('camera');
 const elements = {{ btnAttach:attach, attachChoicePopup:popup, fileInput:files, cameraFileInput:camera }};
-const document = {{ listeners:{{}}, addEventListener(k,fn){{this.listeners[k]=fn;}} }};
+const document = {{ listeners:{{}}, activeElement:null, addEventListener(k,fn){{this.listeners[k]=fn;}} }};
 const mediaQueries = {{}};
 const window = {{ listeners:{{}}, addEventListener(k,fn){{this.listeners[k]=fn;}}, matchMedia(q){{
   if(mediaQueries[q]) return mediaQueries[q];
@@ -108,24 +113,40 @@ Object.defineProperty(globalThis,'navigator',{{value:{{userAgent:''}},configurab
 globalThis.S={{ pendingFiles:[] }};
 globalThis.addFiles=(items)=>{{ S.pendingFiles.push(...items); globalThis.admitted=items; }};
 globalThis.console={{ log(){{}} }};
-const frames=[]; globalThis.requestAnimationFrame=fn=>frames.push(fn);
+const frames=[]; globalThis.setTimeout=fn=>frames.push(fn);
+const notifyCapabilityChange=()=>Object.values(mediaQueries).forEach(query=>query.listeners.forEach(fn=>fn()));
 eval({block!r});
 assert.equal(attach.getAttribute('aria-haspopup'),'menu');
 attach.onclick({{preventDefault(){{}}}});
 assert.equal(popup.hidden,false); assert.equal(attach.getAttribute('aria-expanded'),'true');
-state.width=1280; state.coarse=false; state.fine=true; window.listeners.resize();
+_handleAttachChoiceKeydown({{key:'ArrowDown',preventDefault(){{}}}});
+assert.equal(document.activeElement,files);
+_handleAttachChoiceKeydown({{key:'ArrowUp',preventDefault(){{}}}});
+assert.equal(document.activeElement,choice);
+_handleAttachChoiceKeydown({{key:'ArrowDown',preventDefault(){{}}}});
+assert.equal(document.activeElement,files);
+_handleAttachChoiceKeydown({{key:'Home',preventDefault(){{}}}});
+assert.equal(document.activeElement,choice);
+_handleAttachChoiceKeydown({{key:'End',preventDefault(){{}}}});
+assert.equal(document.activeElement,files);
+state.width=1280; state.coarse=false; state.fine=true; notifyCapabilityChange();
 assert.equal(popup.hidden,true); assert.equal(attach.getAttribute('aria-expanded'),null);
 assert.equal(attach.getAttribute('aria-controls'),null);
-state.width=400; state.coarse=true; state.fine=false; window.listeners.resize();
+assert.equal(attach.focused,true);
+state.width=400; state.coarse=true; state.fine=false; notifyCapabilityChange();
 attach.onclick({{preventDefault(){{}}}});
 assert.equal(popup.hidden,false); assert.equal(attach.getAttribute('aria-expanded'),'true');
 state.fine=true; mediaQueries['(any-pointer:fine)'].listeners.forEach(fn=>fn());
 assert.equal(popup.hidden,true); assert.equal(attach.getAttribute('aria-expanded'),null);
-state.fine=false; window.listeners.resize();
+state.fine=false; notifyCapabilityChange();
+attach.focused=false;
 attach.onclick({{preventDefault(){{}}}});
 popup.listeners.focusout({{currentTarget:popup,relatedTarget:choice}}); assert.equal(popup.hidden,false);
-popup.listeners.focusout({{currentTarget:popup,relatedTarget:files}}); assert.equal(popup.hidden,true);
-state.width=844; window.listeners.resize(); attach.onclick({{preventDefault(){{}}}}); assert.equal(popup.hidden,false);
+popup.listeners.focusout({{currentTarget:popup,relatedTarget:files}}); assert.equal(popup.hidden,false);
+popup.listeners.focusout({{currentTarget:popup,relatedTarget:attach}}); assert.equal(popup.hidden,true);
+attach.onclick({{preventDefault(){{}}}});
+popup.listeners.focusout({{currentTarget:popup,relatedTarget:new Element('outside')}}); assert.equal(popup.hidden,true);
+state.width=844; notifyCapabilityChange(); attach.onclick({{preventDefault(){{}}}}); assert.equal(popup.hidden,false);
 popup.listeners.click({{target:choice}});
 assert.equal(attach.focused,false); assert.equal(camera.clicks,1);
 camera.listeners.change(); assert.equal(attach.focused,false); frames.shift()(); assert.equal(attach.focused,true);
@@ -133,12 +154,12 @@ assert.equal(camera.listeners.cancel,undefined);
 attach.focused=false; attach.onclick({{preventDefault(){{}}}}); popup.listeners.click({{target:choice}});
 camera.listeners.cancel(); assert.equal(attach.focused,false); frames.shift()(); assert.equal(attach.focused,true);
 assert.equal(camera.listeners.change,undefined); assert.equal(popup.hidden,true); assert.equal(attach.getAttribute('aria-expanded'),'false');
-state.width=1280; state.coarse=false; state.fine=true; window.listeners.resize();
+state.width=1280; state.coarse=false; state.fine=true; notifyCapabilityChange();
 assert.equal(attach.getAttribute('aria-haspopup'),null);
 assert.equal(attach.getAttribute('aria-expanded'),null);
 assert.equal(attach.getAttribute('aria-controls'),null);
 attach.onclick({{preventDefault(){{}}}}); assert.equal(files.clicks,1);
-state.width=844; state.coarse=true; state.fine=true; navigator.userAgent='iPhone'; window.listeners.resize();
+state.width=844; state.coarse=true; state.fine=true; navigator.userAgent='iPhone'; notifyCapabilityChange();
 attach.onclick({{preventDefault(){{}}}}); assert.equal(popup.hidden,false);
 assert.equal(attach.getAttribute('aria-haspopup'),'menu');
 const first=new File(['x'],'image.jpg',{{type:'image/jpeg'}});
@@ -169,7 +190,7 @@ def test_popup_dismissal_has_one_owner_across_lifecycle_boundaries():
 
     assert "window._dismissAttachChoice=_dismissAttachChoice" in boot
     capability = boot[boot.index("function _handleAttachChoiceCapabilityChange"):boot.index("function _setAttachChoiceOpen")]
-    assert "_dismissAttachChoice();" in capability
+    assert "_dismissAttachChoice(!!(popup&&popup.contains(document.activeElement)))" in capability
     visibility = boot[boot.index("function _applyComposerFooterVisibilitySettings"):boot.index("window._applyComposerFooterVisibilitySettings")]
     assert "hidden.hide_composer_attach" in visibility
     assert "_dismissAttachChoice()" in visibility

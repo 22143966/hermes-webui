@@ -73,7 +73,14 @@ def test_attachment_choice_is_visible_across_mobile_render_matrix(tmp_path):
                     )
                     page = context.new_page()
                     page.add_init_script(f"localStorage.setItem('hermes-lang', {locale!r});")
-                    page.goto(f"http://127.0.0.1:{port}/", wait_until="domcontentloaded")
+                    with page.expect_response(
+                        lambda response: response.url.endswith("/api/onboarding/status")
+                    ) as onboarding_response:
+                        page.goto(f"http://127.0.0.1:{port}/", wait_until="domcontentloaded")
+                    assert onboarding_response.value.json()["completed"] is True
+                    page.wait_for_function(
+                        "document.getElementById('onboardingOverlay').style.display !== 'flex'"
+                    )
                     page.wait_for_selector("#btnAttach", timeout=10000)
                     page.locator("#btnAttach").click()
                     popup = page.locator("#attachChoicePopup")
@@ -94,7 +101,7 @@ def test_attachment_choice_is_visible_across_mobile_render_matrix(tmp_path):
                     assert box["x"] + box["width"] <= width
                     assert box["y"] + box["height"] <= 320
                     assert popup.locator(".ws-opt-icon svg").count() == 2
-                    page.keyboard.press("Tab")
+                    page.keyboard.press("ArrowDown")
                     assert popup.is_visible()
                     page.keyboard.press("Tab")
                     assert popup.is_hidden()

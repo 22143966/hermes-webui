@@ -958,7 +958,10 @@ function _syncAttachChoiceSemantics(){
   }
 }
 function _handleAttachChoiceCapabilityChange(){
-  if(!_shouldOfferCameraChoice())_dismissAttachChoice();
+  if(!_shouldOfferCameraChoice()){
+    const popup=$('attachChoicePopup');
+    _dismissAttachChoice(!!(popup&&popup.contains(document.activeElement)));
+  }
   _syncAttachChoiceSemantics();
 }
 function _setAttachChoiceOpen(open,restoreFocus){
@@ -982,7 +985,7 @@ function _openAttachInput(input){
   const restoreFocus=()=>{
     input.removeEventListener('change',restoreFocus);
     input.removeEventListener('cancel',restoreFocus);
-    requestAnimationFrame(()=>$('btnAttach')?.focus());
+    setTimeout(()=>$('btnAttach')?.focus(),0);
   };
   input.addEventListener('change',restoreFocus);
   input.addEventListener('cancel',restoreFocus);
@@ -1019,21 +1022,34 @@ $('attachChoicePopup')?.addEventListener('click',e=>{
   if(choice==='files')_openAttachInput($('fileInput'));
 });
 $('attachChoicePopup')?.addEventListener('focusout',e=>{
-  if(!e.currentTarget.contains(e.relatedTarget)&&e.relatedTarget!==$('btnAttach'))_dismissAttachChoice();
+  if(!e.currentTarget.contains(e.relatedTarget))_dismissAttachChoice();
 });
 document.addEventListener('pointerdown',e=>{
   if(_attachChoiceOpen&&!e.target.closest('#attachChoicePopup,#btnAttach'))_dismissAttachChoice();
 });
 function _handleAttachChoiceKeydown(e){
-  if(_attachChoiceOpen&&e.key==='Escape'){
+  if(!_attachChoiceOpen)return false;
+  if(e.key==='Escape'){
     e.preventDefault();
     _dismissAttachChoice(true);
     return true;
   }
-  return false;
+  const popup=$('attachChoicePopup');
+  if(!popup||!popup.contains(document.activeElement))return false;
+  const choices=[...popup.querySelectorAll('[data-attach-choice]:not([disabled])')];
+  if(!choices.length)return false;
+  const current=choices.indexOf(document.activeElement);
+  let next=current;
+  if(e.key==='ArrowDown')next=current<0?0:(current+1)%choices.length;
+  else if(e.key==='ArrowUp')next=current<0?choices.length-1:(current-1+choices.length)%choices.length;
+  else if(e.key==='Home')next=0;
+  else if(e.key==='End')next=choices.length-1;
+  else return false;
+  e.preventDefault();
+  choices[next].focus();
+  return true;
 }
 _syncAttachChoiceSemantics();
-window.addEventListener('resize',_handleAttachChoiceCapabilityChange);
 Object.values(_attachChoiceCapabilityQueries).forEach(query=>{
   if(typeof query.addEventListener==='function')query.addEventListener('change',_handleAttachChoiceCapabilityChange);
   else if(typeof query.addListener==='function')query.addListener(_handleAttachChoiceCapabilityChange);
