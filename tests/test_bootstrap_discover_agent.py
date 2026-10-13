@@ -16,6 +16,19 @@ import pytest
 import bootstrap
 
 
+@pytest.fixture(autouse=True)
+def _isolated_runtime(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    monkeypatch.delenv("HERMES_WEBUI_AGENT_DIR", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_PYTHON", raising=False)
+    monkeypatch.setattr(bootstrap.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    monkeypatch.setattr(bootstrap, "REPO_ROOT", tmp_path / "webui")
+    monkeypatch.setattr(bootstrap._startup, "_platform_default_hermes_home", lambda: tmp_path / "default")
+    monkeypatch.setattr(bootstrap, "_agent_dir_from_hermes_cli", lambda: None)
+
+
 def _make_agent_install(tmp_path, *, with_run_agent: bool = True):
     """Build a fake hermes-agent install with venv/bin/python3 + run_agent.py."""
     install = tmp_path / "agent"
@@ -74,6 +87,7 @@ def _make_hermes_bash_wrapper(tmp_path, exec_target: str):
 
 def _isolate_discover_agent_dir(monkeypatch, tmp_path, hermes_path):
     """Point `which("hermes")` at our fake CLI and clear all standard candidates."""
+    monkeypatch.setattr(bootstrap, "_agent_dir_from_hermes_cli", bootstrap._startup._agent_dir_from_hermes_cli)
     monkeypatch.setattr(bootstrap.shutil, "which", lambda name: str(hermes_path) if name == "hermes" else None)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "no-such-hermes-home"))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "isolated-localappdata"))
@@ -192,6 +206,7 @@ def test_root_fhs_layout_is_in_candidate_list(monkeypatch, tmp_path):
 
     monkeypatch.setattr(bootstrap.Path, "exists", recording_exists)
 
+    monkeypatch.setattr(bootstrap, "_agent_dir_from_python", lambda _python: None)
     bootstrap.discover_agent_dir()
 
     assert any(
@@ -418,3 +433,17 @@ def test_hermes_cli_takes_precedence_over_configured_python(monkeypatch, tmp_pat
     )
 
     assert bootstrap.discover_agent_dir() == install.resolve()
+
+
+def test_stale_marker_root_does_not_hide_working_launcher(monkeypatch, tmp_path):
+    install, venv_python = _make_agent_install(tmp_path)
+    (install / "run_agent.py").write_text("class AIAgent: pass\n", encoding="utf-8")
+    hermes = _make_hermes_cli(tmp_path, str(venv_python))
+    _isolate_discover_agent_dir(monkeypatch, tmp_path, hermes)
+    stale = bootstrap.Path(bootstrap.os.environ["HERMES_HOME"]) / "hermes-agent"
+    (stale / "cron").mkdir(parents=True)
+    (stale / "cron" / "jobs.py").write_text("", encoding="utf-8")
+    (stale / "hermes_cli").mkdir()
+    (stale / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    assert bootstrap.discover_agent_dir() == install.resolve()
+    assert bootstrap._python_can_run_webui_and_agent(sys.executable, install)

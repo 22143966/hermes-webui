@@ -100,15 +100,16 @@ def _looks_like_agent_source_root(path: Path) -> bool:
     return (path / "run_agent.py").exists() or _looks_like_pip_style_agent_source_root(path)
 
 
-def _first_valid_agent_candidate(candidates: list[Path | None]) -> Path | None:
-    for marker in ("run_agent.py", "pip"):
-        for candidate in candidates:
-            if candidate is None:
-                continue
-            if marker == "run_agent.py" and (candidate / marker).exists():
-                return candidate.resolve()
-            if marker == "pip" and _looks_like_pip_style_agent_source_root(candidate):
-                return candidate.resolve()
+def _first_valid_agent_candidate(candidates: list[Path | None], *, marker_only=False) -> Path | None:
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        valid = (
+            _looks_like_pip_style_agent_source_root(candidate)
+            if marker_only else (candidate / "run_agent.py").exists()
+        )
+        if valid:
+            return candidate.resolve()
     return None
 
 
@@ -176,7 +177,12 @@ def _discover_agent_identity(
         Path("/usr/local/hermes-agent"),
         Path("/usr/local/share/hermes-agent"),
     ]
-    return _AgentDiscovery(_first_valid_agent_candidate(fallback_candidates))
+    found = _first_valid_agent_candidate(fallback_candidates)
+    if found:
+        return _AgentDiscovery(found)
+    return _AgentDiscovery(_first_valid_agent_candidate(
+        authoritative_candidates + fallback_candidates, marker_only=True,
+    ))
 
 
 def discover_agent_dir(
