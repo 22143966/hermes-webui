@@ -363,6 +363,14 @@ def test_insights_usage_grid_desktop_split_favors_models():
     cq_block = STYLE_CSS[cq_start:cq_end + 1]
     assert 'minmax(160px,1fr) minmax(0,3fr)' in cq_block, \
         f'container-gated rule must split 25/75 with a 160px floor, got: {cq_block}'
+    # Both ends of the container query must stay connected (release review of #8157, Greptile P2): the content
+    # column must NAME the container the query targets, and the gated rule must target the usage grid. Without
+    # these, renaming the container or the selector would silently drop the desktop split while this test passed.
+    content_rule = [line for line in STYLE_CSS.splitlines() if line.startswith('#insightsContent{')]
+    assert content_rule and 'container-name:insights' in content_rule[0], \
+        f'#insightsContent must declare container-name:insights, got: {content_rule}'
+    assert '.insights-usage-grid{' in cq_block, \
+        f'the @container insights rule must target .insights-usage-grid, got: {cq_block}'
     # Default (outside the query): stacked single column, so narrow columns
     # never split the row below the Models table's minimum width.
     default_rules = [line for line in STYLE_CSS.splitlines()
