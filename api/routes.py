@@ -3009,6 +3009,7 @@ from api.config import (
     retire_pre_admission_claim_if_owned,
     is_orphaned_stream,
     get_config,
+    _expand_env_vars,
     get_webui_session_save_mode,
     get_config_snapshot,
     STREAM_GOAL_RELATED,
@@ -3540,6 +3541,88 @@ def _run_journal_snapshot_event_id_for_run(
     return f"{run_id}:{event_seq}" if event_seq else None
 
 
+_RUN_JOURNAL_STATE_SAVED_MAX_EVENTS = 128
+_RUN_JOURNAL_STATE_SAVED_MAX_BYTES = 64_000
+
+
+def _run_journal_state_saved_side_effect(
+    event: dict,
+    *,
+    session_id: str,
+    run_id: str,
+    stream_id: str,
+) -> dict | None:
+    """Return one canonical server-owned ``state_saved`` Anchor outcome.
+
+    Run-journal envelopes are durable server evidence. Recovery must not infer
+    ownership from payload text or a transport fallback: session id, run id,
+    event id, and sequence must all agree before the side effect can enter the
+    Anchor scene. Only the bounded public state metadata is projected; any
+    additional producer payload stays in the journal.
+    """
+    if not isinstance(event, dict):
+        return None
+    if str(event.get("event") or event.get("type") or "").strip() != "state_saved":
+        return None
+    if not isinstance(event.get("session_id"), str) or event.get("session_id").strip() != session_id:
+        return None
+    event_run_id, malformed_run_id = _run_journal_envelope_run_id_result(event)
+    if malformed_run_id or event_run_id != run_id:
+        return None
+    seq = event.get("seq")
+    if type(seq) is not int or seq <= 0:
+        return None
+    raw_event_id = event.get("event_id")
+    if not isinstance(raw_event_id, str) or not raw_event_id.strip():
+        return None
+    event_id = raw_event_id.strip()
+    event_id_run, event_id_seq = _shared_parse_run_journal_event_id(event_id)
+    if event_id_run != run_id or event_id_seq != seq:
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    payload_session_id = payload.get("session_id")
+    if not isinstance(payload_session_id, str) or payload_session_id.strip() != session_id:
+        return None
+    kind = payload.get("kind")
+    action = payload.get("action")
+    if not isinstance(kind, str) or not kind.strip() or len(kind.strip()) > 128:
+        return None
+    if not isinstance(action, str) or not action.strip() or len(action.strip()) > 128:
+        return None
+    canonical_payload = {
+        "session_id": session_id,
+        "kind": kind.strip(),
+        "action": action.strip(),
+    }
+    if "name" in payload:
+        name = payload.get("name")
+        if not isinstance(name, str) or len(name) > 512:
+            return None
+        if name.strip():
+            canonical_payload["name"] = name.strip()
+    created_at = event.get("created_at")
+    if isinstance(created_at, bool) or not isinstance(created_at, (int, float)):
+        return None
+    try:
+        created_at = float(created_at)
+    except OverflowError:
+        return None
+    if created_at != created_at or created_at in (float("inf"), float("-inf")):
+        return None
+    return {
+        "source_event_type": "state_saved",
+        "event_id": event_id,
+        "session_id": session_id,
+        "run_id": run_id,
+        "stream_id": stream_id,
+        "seq": seq,
+        "created_at": created_at,
+        "payload": canonical_payload,
+    }
+
+
 def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict | None:
     stream_id = str(stream_id or "").strip()
     if not stream_id:
@@ -3608,6 +3691,10 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
     reasoning_index = _CompactEchoIndex()
     messages: list[dict] = []
     tool_calls: list[dict] = []
+    side_effects: list[dict] = []
+    seen_side_effect_event_ids: set[str] = set()
+    side_effect_bytes = 0
+    side_effects_truncated = False
     activity_burst_anchors: list[dict] = []
     current_activity_burst_id = 0
     fresh_segment = True
@@ -3720,6 +3807,39 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             # their per-row work while preserving the last_ts watermark they
             # carry.
             last_ts = event.get("created_at", last_ts)
+            continue
+        if event_name == "state_saved":
+            last_ts = event.get("created_at", last_ts)
+            side_effect = _run_journal_state_saved_side_effect(
+                event,
+                session_id=session_id,
+                run_id=run_id,
+                stream_id=stream_id,
+            )
+            if (
+                side_effect is not None
+                and side_effect["event_id"] not in seen_side_effect_event_ids
+            ):
+                if side_effects_truncated:
+                    continue
+                try:
+                    encoded_side_effect = json.dumps(
+                        side_effect,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                except UnicodeEncodeError:
+                    continue
+                if (
+                    len(side_effects) >= _RUN_JOURNAL_STATE_SAVED_MAX_EVENTS
+                    or side_effect_bytes + len(encoded_side_effect)
+                    > _RUN_JOURNAL_STATE_SAVED_MAX_BYTES
+                ):
+                    side_effects_truncated = True
+                    continue
+                seen_side_effect_event_ids.add(side_effect["event_id"])
+                side_effects.append(side_effect)
+                side_effect_bytes += len(encoded_side_effect)
             continue
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         last_ts = event.get("created_at", last_ts)
@@ -4153,6 +4273,8 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "final_message_ref": None,
             "terminal_state": None,
             "activity_rows": anchor_activity_rows,
+            "side_effects": side_effects,
+            "side_effects_truncated": side_effects_truncated,
         },
     }
 
@@ -4305,6 +4427,11 @@ def _sanitize_anchor_activity_scene(scene):
         raise ValueError("scene.activity_rows is too large")
     scene_copy = copy.deepcopy(scene)
     encoded = json.dumps(scene_copy, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    if len(encoded) > _ANCHOR_ACTIVITY_SCENE_MAX_BYTES and "side_effects" in scene_copy:
+        # Recovered outcomes must not displace a rows-only Worklog that fits.
+        # Keep the original rows and the same UTF-8 persistence budget.
+        scene_copy.pop("side_effects")
+        encoded = json.dumps(scene_copy, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
     if len(encoded) > _ANCHOR_ACTIVITY_SCENE_MAX_BYTES:
         raise ValueError("scene payload is too large")
     return json.loads(encoded.decode("utf-8"))
@@ -7800,6 +7927,45 @@ def _read_profile_config_cached(profile_name: str, cfg_path: str) -> dict | None
     return parsed
 
 
+def _sync_routing_kwargs(profile_cfg: dict | None, agent_params: set) -> dict:
+    """Build the sync POST /api/chat provider_routing kwargs from a profile config.
+
+    ``profile_cfg`` is the raw dict returned by ``_read_profile_model_config()``:
+    a plain ``yaml.safe_load`` of the profile's ``config.yaml`` with NO env
+    expansion (that only runs in the main ``get_config()`` loader, which caches
+    the expanded view). Expanding with the same ``_expand_env_vars()`` the
+    loader uses keeps a ``provider_routing`` reference such as
+    ``only: [${ROUTE_PROVIDER}]`` from reaching the Agent as the literal
+    ``${ROUTE_PROVIDER}`` string (and hence into OpenRouter's request body).
+    The streaming path reads its routing from an already-expanded config, so
+    both paths agree. ``_expand_env_vars()`` returns a fresh structure, so the
+    cached raw dict is never mutated.
+
+    The seam runs under the thread-only fail-closed profile scope
+    (``profile_env_for_thread_readonly``), so a ``${VAR}`` only the server
+    process env defines is NOT expanded here. Any routing value that still
+    contains ``${...}`` after expansion is dropped (with a warning) via
+    ``api.streaming._drop_unresolved_routing_refs()`` (inside the shared
+    ``_provider_routing_kwargs_for_agent``) instead of being forwarded literally:
+    a literal would make OpenRouter target a nonexistent provider and fail a
+    turn master (no routing on this path) completes, and re-enabling the
+    process-env fallback to avoid the drop would widen what a profile can
+    read from the server environment.
+
+    Falls back to ``get_config()`` (already env-expanded) when the session has
+    no usable profile config, matching the previous ``_pp_cfg or get_config()``
+    semantics at the sync site. Mapping to AIAgent kwargs stays in the shared
+    signature-gated helper ``_provider_routing_kwargs_for_agent``.
+    """
+    if isinstance(profile_cfg, dict) and profile_cfg:
+        cfg = _expand_env_vars(profile_cfg)
+    else:
+        cfg = get_config()
+    # The shared helper drops (with a warning) any routing value that still
+    # carries an unresolved ${...} after expansion, on both chat paths.
+    return _provider_routing_kwargs_for_agent(cfg, agent_params)
+
+
 def _load_profile_config_dict(session) -> dict | None:
     """Load the session profile's config.yaml as a dict, or None."""
     if not getattr(session, "profile", None):
@@ -8640,6 +8806,57 @@ def _session_model_state_from_request(
             provider,
         )
     return model_value, provider
+
+
+def _invalidate_session_route_state_if_changed(
+    session,
+    *,
+    model: str | None,
+    provider: str | None = None,
+    provider_specified: bool = True,
+    already_resolved: bool = False,
+) -> bool:
+    """Normalize and update requested route, clearing route-derived state if changed.
+
+    Preserves gateway_routing_history. When the normalized model or provider
+    differs from the session's existing route, clears last_used_model,
+    gateway_routing, context_length, threshold_tokens, and last_prompt_tokens.
+    Returns True if a real route change occurred, False otherwise.
+    """
+    old_model = getattr(session, "model", None)
+    old_provider = getattr(session, "model_provider", None)
+
+    if already_resolved:
+        norm_model = model
+        norm_provider = provider
+    else:
+        norm_model, norm_provider = _session_model_state_from_request(
+            model,
+            provider if provider_specified else None,
+            current_provider=old_provider,
+        )
+    if norm_model is not None:
+        session.model = norm_model
+    session.model_provider = norm_provider
+
+    # Compare normalized values to avoid spurious invalidation on whitespace/case drift
+    old_norm_model = str(old_model or "").strip()
+    new_norm_model = str(session.model or "").strip()
+    old_norm_provider = _clean_session_model_provider(old_provider) or ""
+    new_norm_provider = _clean_session_model_provider(session.model_provider) or ""
+
+    changed = (old_norm_model != new_norm_model) or (old_norm_provider != new_norm_provider)
+    if changed:
+        session.last_used_model = None
+        session.gateway_routing = None
+        session.context_length = _resolve_context_length_for_session_model(
+            session.model,
+            session.model_provider,
+        )
+        session.threshold_tokens = 0
+        session.last_prompt_tokens = 0
+
+    return changed
 
 
 def _lookup_gateway_session_identity(session_id: str) -> dict:
@@ -11477,6 +11694,7 @@ from api.streaming import (
     _sse_keepalive,
     _sse_set_write_deadline,
     _run_agent_streaming,
+    _provider_routing_kwargs_for_agent,
     cancel_stream,
     _materialize_pending_user_turn_before_error,
     generate_session_title_for_session,
@@ -11616,6 +11834,7 @@ def _session_attention_summary(session_id: str) -> dict | None:
 _SIDEBAR_SESSION_RESPONSE_FIELDS = (
     _route_session_list_cache._SIDEBAR_SESSION_RESPONSE_FIELDS
 )
+
 
 
 def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None = None) -> dict:
@@ -14260,7 +14479,8 @@ def _handle_session_get(handler, parsed) -> bool:
             for row in _all_msgs
         )
         if (
-            not raw.get("read_only")
+            load_messages
+            and not raw.get("read_only")
             and not _truncated
             and (not raw.get("is_cli_session") or imported_turn_marker)
         ):
@@ -16597,6 +16817,7 @@ def handle_post(handler, parsed) -> bool:
                 # the duplicate should behave identically.
                 gateway_routing=copy.deepcopy(getattr(session, "gateway_routing", None)),
                 gateway_routing_history=copy.deepcopy(getattr(session, "gateway_routing_history", None) or []),
+                last_used_model=getattr(session, "last_used_model", None),
                 # Preserve LLM-generated title flag so we don't regenerate title on duplicate.
                 llm_title_generated=getattr(session, "llm_title_generated", False),
                 manual_title=getattr(session, "manual_title", False),
@@ -17035,8 +17256,6 @@ def handle_post(handler, parsed) -> bool:
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be updated from WebUI", 403)
         old_ws = getattr(s, "workspace", "")
-        old_model = getattr(s, "model", None)
-        old_provider = getattr(s, "model_provider", None)
         try:
             new_ws = str(resolve_trusted_workspace(body.get("workspace", s.workspace), profile=getattr(s, "profile", None)))
         except ValueError as e:
@@ -17044,24 +17263,13 @@ def handle_post(handler, parsed) -> bool:
         with _get_session_agent_lock(body["session_id"]):
             s.workspace = new_ws
             if "model" in body or "model_provider" in body:
-                model, provider = _session_model_state_from_request(
-                    body.get("model", s.model),
-                    body.get("model_provider") if "model_provider" in body else None,
-                    getattr(s, "model_provider", None),
+                changed = _invalidate_session_route_state_if_changed(
+                    s,
+                    model=body.get("model", s.model),
+                    provider=body.get("model_provider") if "model_provider" in body else None,
+                    provider_specified="model_provider" in body,
                 )
-                if model is not None:
-                    s.model = model
-                s.model_provider = provider
-                if (
-                    str(old_model or "") != str(getattr(s, "model", "") or "")
-                    or str(old_provider or "") != str(getattr(s, "model_provider", "") or "")
-                ):
-                    s.context_length = _resolve_context_length_for_session_model(
-                        getattr(s, "model", None),
-                        getattr(s, "model_provider", None),
-                    )
-                    s.threshold_tokens = 0
-                    s.last_prompt_tokens = 0
+                if changed:
                     from api.config import _evict_session_agent
 
                     _evict_session_agent(body["session_id"])
@@ -17512,6 +17720,7 @@ def handle_post(handler, parsed) -> bool:
             context_messages=copy.deepcopy(forked_context),
             # Gateway routing — inherit from source
             gateway_routing=copy.deepcopy(getattr(source, "gateway_routing", None)),
+            last_used_model=getattr(source, "last_used_model", None),
             # Context engine — inherit state so branch's context engine starts correctly
             context_engine=getattr(source, "context_engine", None),
             context_engine_state=copy.deepcopy(getattr(source, "context_engine_state", None) or {}),
@@ -24342,8 +24551,13 @@ def _prepare_chat_start_session_for_stream(
         else source
     )
     s.workspace = workspace
-    s.model = model
-    s.model_provider = model_provider
+    _invalidate_session_route_state_if_changed(
+        s,
+        model=model,
+        provider=model_provider,
+        provider_specified=True,
+        already_resolved=True,
+    )
     s.active_stream_id = stream_id
     register_session_writeback_owner(s.session_id, stream_id)
     s.post_compression_context_tokens_estimate = None
@@ -26112,6 +26326,7 @@ def _handle_session_compression_recovery_start(handler, body):
                 threshold_tokens=getattr(source, "threshold_tokens", None),
                 gateway_routing=copy.deepcopy(getattr(source, "gateway_routing", None)),
                 gateway_routing_history=copy.deepcopy(getattr(source, "gateway_routing_history", None) or []),
+                last_used_model=getattr(source, "last_used_model", None),
                 parent_session_id=getattr(source, "session_id", sid),
                 worktree_path=getattr(source, "worktree_path", None),
                 worktree_branch=getattr(source, "worktree_branch", None),
@@ -27023,6 +27238,50 @@ def _handle_chat_sync(handler, body):
             _provider = _bundle["provider"]
             _api_key = _bundle["api_key"]
             _base_url = _bundle["base_url"]
+            # OpenRouter provider_routing prefs (parity with tui_gateway and the
+            # gateway's TurnRunner). _pp_cfg is this session's profile config,
+            # already parsed above: a RAW yaml.safe_load with no env expansion
+            # (only the get_config() loader expands). _sync_routing_kwargs
+            # expands ${VAR} references with the same _expand_env_vars() that
+            # loader uses, then maps the block through the shared
+            # signature-gated helper the streaming path uses, so (a) an older
+            # hermes-agent build lacking any of the six params does not
+            # TypeError this endpoint, (b) a malformed provider_routing block
+            # (string/list) is treated as empty instead of 500ing the request,
+            # and (c) a value like only: [${ROUTE_PROVIDER}] reaches the Agent
+            # resolved, never as a literal ${...} string in OpenRouter's
+            # request body. Falls back to the active profile's config for
+            # profile-less sessions.
+            # The expansion must run with this session's profile env bound:
+            # the HTTP handler thread for POST /api/chat has no profile-
+            # scoped thread-local env, so an unbound _expand_env_vars() would
+            # resolve ${VAR} against the server process env (the process-
+            # wide profile's .env). A different process value would apply the
+            # wrong provider routing, while the streaming path (which binds
+            # the profile env in its worker) does not.
+            # The binding is THREAD-ONLY (profile_env_for_thread_readonly):
+            # the seam does a pure in-memory expansion and reads nothing from
+            # os.environ, so mirroring the profile env into the process env
+            # (as profile_env_for_background_worker does for agent bodies)
+            # would only let this request's setup/restore clobber a
+            # concurrent streaming turn's mirrored env, and vice versa. The
+            # thread-only scope also sets the fail-closed
+            # block_process_env_fallback boundary: a ${VAR} only the server
+            # process env defines does not expand here, and
+            # _sync_routing_kwargs drops any routing value that still carries
+            # ${...} after expansion (with a warning) instead of forwarding
+            # the literal, which would make OpenRouter target a nonexistent
+            # provider. The scope is a no-op for default-profile sessions, so
+            # profile-less behavior is unchanged.
+            try:
+                _sync_routing_params = set(inspect.signature(AIAgent.__init__).parameters)
+            except (TypeError, ValueError):
+                _sync_routing_params = set()
+            from api.profiles import profile_env_for_thread_readonly
+            with profile_env_for_thread_readonly(
+                s, "sync provider routing", logger_override=logger,
+            ):
+                _routing_kwargs = _sync_routing_kwargs(_pp_cfg, _sync_routing_params)
             agent = AIAgent(
                 model=_model,
                 provider=_provider,
@@ -27034,6 +27293,7 @@ def _handle_chat_sync(handler, body):
                 quiet_mode=True,
                 enabled_toolsets=_resolve_cli_toolsets(),
                 session_id=s.session_id,
+                **_routing_kwargs,
                 **_agent_bundle_kwargs(AIAgent, _bundle),
             )
             from api.streaming import (
