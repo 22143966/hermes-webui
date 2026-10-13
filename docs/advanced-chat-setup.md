@@ -258,11 +258,13 @@ browser UI.
 
 ### Several profiles behind one Gateway
 
-A turn uses the gateway URL and key of the **session's own profile**, not those of whichever profile the WebUI process loaded. A named profile reaches its own route (for example `/p/<profile>`) only when that profile sets its URL itself, in its `.env` (`HERMES_WEBUI_GATEWAY_BASE_URL`) or in its `config.yaml` (`webui_gateway_base_url`). With only the global `HERMES_WEBUI_GATEWAY_BASE_URL` exported, named-profile turns still go to the default route.
+A turn uses the gateway URL and key of the **session's own profile**, not those of whichever profile the WebUI process loaded. Globally exported values stay available, though, and `HERMES_WEBUI_GATEWAY_BASE_URL` in the environment always wins over `webui_gateway_base_url` in `config.yaml`. So with the global export from the examples above still in place, a named profile keeps going to the global route.
+
+To give a named profile its own route (for example `/p/<profile>`), set `HERMES_WEBUI_GATEWAY_BASE_URL` in that profile's `.env`, or remove the global export and set `webui_gateway_base_url` in that profile's `config.yaml`.
 
 The key follows the same rule: put `HERMES_WEBUI_GATEWAY_API_KEY` (or `API_SERVER_KEY`) in each profile's `.env`. A global `HERMES_WEBUI_GATEWAY_API_KEY` combined with per-profile `API_SERVER_KEY` values makes named profiles send the wrong key and the Gateway answers HTTP 401.
 
-A `${VAR}` in a profile's `webui_gateway_base_url` is expanded from that profile's environment only, never from the WebUI process environment, so the URL and the key always come from the same profile. If the variable is not set there, the turn ends with an error naming the unresolved variable and no request is sent.
+A `${VAR}` in a profile's `webui_gateway_base_url` is expanded from the same environment the key is read from: the profile's own `.env` first, then any global variable that did not itself come from another profile's `.env`. Variables loaded from the active profile's `.env` are not visible to other profiles, so each profile that uses `${VAR}` should define it in its own `.env`. If the variable is not set anywhere, the turn ends with an error naming the unresolved variable and no request is sent.
 
 The bridge is best used by operators who already run Hermes Gateway/API Server
 locally and want browser-originated chat to use the same runtime/tool path as
