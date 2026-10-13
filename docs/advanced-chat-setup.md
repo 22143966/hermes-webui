@@ -256,6 +256,14 @@ exposing the key value. That `gateway_chat` field is an operator diagnostic
 payload only; it is not currently rendered as a user-facing health banner in the
 browser UI.
 
+### Several profiles behind one Gateway
+
+A turn uses the gateway URL and key of the **session's own profile**, not those of whichever profile the WebUI process loaded. A named profile reaches its own route (for example `/p/<profile>`) only when that profile sets its URL itself, in its `.env` (`HERMES_WEBUI_GATEWAY_BASE_URL`) or in its `config.yaml` (`webui_gateway_base_url`). With only the global `HERMES_WEBUI_GATEWAY_BASE_URL` exported, named-profile turns still go to the default route.
+
+The key follows the same rule: put `HERMES_WEBUI_GATEWAY_API_KEY` (or `API_SERVER_KEY`) in each profile's `.env`. A global `HERMES_WEBUI_GATEWAY_API_KEY` combined with per-profile `API_SERVER_KEY` values makes named profiles send the wrong key and the Gateway answers HTTP 401.
+
+A `${VAR}` in a profile's `webui_gateway_base_url` is expanded from that profile's environment only, never from the WebUI process environment, so the URL and the key always come from the same profile. If the variable is not set there, the turn ends with an error naming the unresolved variable and no request is sent.
+
 The bridge is best used by operators who already run Hermes Gateway/API Server
 locally and want browser-originated chat to use the same runtime/tool path as
 messaging surfaces. Attachments, cancellation, approvals, and clarify prompts
