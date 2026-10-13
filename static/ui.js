@@ -1483,7 +1483,7 @@ function _applyUserRowIntrinsicHeight(row, rawText){
   const h=Math.max(remembered, estimate);
   if(h>0) row.style.containIntrinsicSize='auto '+Math.round(h)+'px';
 }
-function _measureMessageVirtualRow(inner, entry){
+function _measureMessageVirtualRow(inner, entry, deferredWrites){
   if(!inner||!entry) return 0;
   const primary=inner.querySelector(`[data-msg-idx="${entry.rawIdx}"]`);
   if(!primary) return 0;
@@ -1504,8 +1504,18 @@ function _measureMessageVirtualRow(inner, entry){
   // extract it without this helper (they stub every collaborator by name).
   if(totalHeight>0 && primary.dataset && primary.dataset.role==='user'
      && typeof _rememberUserRowIntrinsicHeight==='function'){
+    // _rememberUserRowIntrinsicHeight below is a plain JS map write; only the
+    // contain-intrinsic-size assignment invalidates layout. Callers that measure a
+    // whole row set pass a pending buffer (#7677) so every style write lands AFTER
+    // every geometry read — the read/write interleaving this used to do made row N's
+    // getBoundingClientRect() force a fresh full-document layout after row N-1's
+    // write, i.e. N rows cost N layouts on a transcript that can be hundreds of
+    // thousands of pixels tall. No buffer (direct/legacy callers) keeps the
+    // immediate inline write.
     _rememberUserRowIntrinsicHeight(primary.dataset.sessionMsgIdx, totalHeight);
-    primary.style.containIntrinsicSize='auto '+Math.round(totalHeight)+'px';
+    const intrinsic='auto '+Math.round(totalHeight)+'px';
+    if(Array.isArray(deferredWrites)) deferredWrites.push({row:primary,intrinsic:intrinsic});
+    else primary.style.containIntrinsicSize=intrinsic;
   }
   return totalHeight;
 }
@@ -1515,10 +1525,15 @@ function _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, 
   let changed=false;
   let measuredCount=0;
   let measuredTotal=0;
+  // #7677 read/write separation: the whole measurement pass is READS FIRST
+  // (every row's getBoundingClientRect()), then one WRITE phase that flushes the
+  // deferred contain-intrinsic-size values. All the reads therefore share a
+  // single layout instead of forcing one per row.
+  const deferredWrites=[];
   for(let vi=0;vi<renderVisWithIdx.length;vi++){
     const entry=renderVisWithIdx[vi];
     if(!entry) continue;
-    const totalHeight=_measureMessageVirtualRow(inner, entry);
+    const totalHeight=_measureMessageVirtualRow(inner, entry, deferredWrites);
     if(totalHeight<=0) continue;
     const visibleIdx=Number(renderVisibleIdxs&&renderVisibleIdxs[vi]);
     if(!Number.isFinite(visibleIdx)) continue;
@@ -1528,6 +1543,10 @@ function _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, 
     }
     measuredTotal+=totalHeight;
     measuredCount++;
+  }
+  for(let wi=0;wi<deferredWrites.length;wi++){
+    const pending=deferredWrites[wi];
+    if(pending&&pending.row) pending.row.style.containIntrinsicSize=pending.intrinsic;
   }
   if(measuredCount>0){
     _messageVirtualEstimatedRowHeight=Math.max(60, Math.round(measuredTotal/measuredCount));
@@ -15967,6 +15986,58 @@ function _assistantTurnHasVisibleRenderedSegment(turn){
   }
   return false;
 }
+// #7677 (terminal settlement). STREAM_DONE renders the just-settled turn with the
+// keep-open token armed, disarms, then collapses that turn in place — or falls back
+// to a SECOND full transcript rebuild. The in-place collapse below keys off the
+// settled-scene OWNER group, which only the NON-transparent settled renderer stamps
+// (_renderSettledAnchorSceneForMessage), so transparent streams never matched a
+// group and ALWAYS paid the second rebuild: the "~11 s of every turn" of this issue,
+// on top of an already multi-second first render.
+//
+// The only armed-keep-open effect the TRANSPARENT settled renderer honors is the
+// per-turn row-cap exemption (`justSettled` in
+// _renderSettledAnchorSceneTransparentForMessage): while the token is armed the
+// just-settled turn renders its activity rows in FULL, and the unarmed rebuild's
+// only job is to re-cap that one turn behind a "Show earlier steps" affordance. So
+// whenever the armed render left the turn within the cap slack — including the
+// common plain reply whose scene has no activity rows at all — the unarmed rebuild
+// would produce exactly the same DOM and there is nothing left to collapse.
+//
+// Fail closed in every other case: non-transparent stream, a worklog-worthy scene
+// whose rows are not in the rendered transcript (windowing / cache divergence), or
+// a turn over the cap that an unarmed rebuild WOULD re-cap. Cost is never traded
+// for correctness — the second render stays the fallback.
+function _transparentSettledTurnSecondRenderIsRedundant(streamId){
+  if(!streamId) return false;
+  if(typeof isTransparentStream!=='function'||!isTransparentStream()) return false;
+  const inner=$('msgInner');
+  if(!inner||typeof inner.querySelectorAll!=='function') return false;
+  const messages=(typeof S!=='undefined'&&S&&Array.isArray(S.messages))?S.messages:[];
+  const ownerIdxs=[];
+  let ownerScene=null;
+  for(let i=0;i<messages.length;i++){
+    const m=messages[i];
+    if(!m||String(m._anchor_stream_id||'')!==String(streamId)) continue;
+    ownerIdxs.push(String(i));
+    ownerScene=m._anchor_activity_scene||ownerScene;
+  }
+  if(!ownerIdxs.length) return false;
+  // The transparent settled renderer stamps each row node with the owner message's
+  // RAW index (data-anchor-owner-idx); count only this stream's settled rows.
+  let renderedRows=0;
+  const nodes=inner.querySelectorAll('[data-anchor-owner-idx][data-anchor-settled-scene-row="1"]');
+  for(let i=0;i<nodes.length;i++){
+    if(ownerIdxs.indexOf(String(nodes[i]&&nodes[i].getAttribute('data-anchor-owner-idx')))>=0) renderedRows++;
+  }
+  if(!renderedRows){
+    // No settled rows rendered for this turn: a rebuild is a no-op unless the scene
+    // is worklog-worthy (its rows would appear — but then they would be here).
+    if(!ownerScene) return true;
+    if(typeof _anchorSceneSceneHasWorklogWorthyRows!=='function') return false;
+    return !_anchorSceneSceneHasWorklogWorthyRows(ownerScene);
+  }
+  return renderedRows<=(_TRANSPARENT_SETTLED_ROW_CAP+_TRANSPARENT_SETTLED_ROW_CAP_SLACK);
+}
 function _collapseJustSettledWorklogInPlace(streamId){
   // #6414: STREAM_DONE used to render the settled turn once with its Worklog
   // forced open, then immediately run a second full render only to collapse it.
@@ -15980,7 +16051,14 @@ function _collapseJustSettledWorklogInPlace(streamId){
   const group=Array.from(inner.querySelectorAll('[data-anchor-settled-scene-owner="1"]'))
     .filter(candidate=>candidate.getAttribute('data-anchor-stream-id')===String(streamId))
     .pop();
-  if(!group) return false;
+  if(!group){
+    // #7677: no settled-scene owner group means either a non-transparent miss
+    // (keep the old fail-closed fallback) or a TRANSPARENT stream, which never
+    // stamps that group at all — in which case the second STREAM_DONE render is
+    // redundant exactly when the armed settle render already matches the unarmed
+    // one. Non-transparent callers still get false from the helper below.
+    return _transparentSettledTurnSecondRenderIsRedundant(streamId);
+  }
   const ownerTurn=typeof group.closest==='function'?group.closest('.assistant-turn'):null;
   const ownerHasVisibleSegment=_assistantTurnHasVisibleRenderedSegment(ownerTurn);
   if(ownerHasVisibleSegment===null) return false;
