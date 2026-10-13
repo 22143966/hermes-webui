@@ -3009,6 +3009,7 @@ from api.config import (
     retire_pre_admission_claim_if_owned,
     is_orphaned_stream,
     get_config,
+    _expand_env_vars,
     get_webui_session_save_mode,
     get_config_snapshot,
     STREAM_GOAL_RELATED,
@@ -7926,6 +7927,45 @@ def _read_profile_config_cached(profile_name: str, cfg_path: str) -> dict | None
     return parsed
 
 
+def _sync_routing_kwargs(profile_cfg: dict | None, agent_params: set) -> dict:
+    """Build the sync POST /api/chat provider_routing kwargs from a profile config.
+
+    ``profile_cfg`` is the raw dict returned by ``_read_profile_model_config()``:
+    a plain ``yaml.safe_load`` of the profile's ``config.yaml`` with NO env
+    expansion (that only runs in the main ``get_config()`` loader, which caches
+    the expanded view). Expanding with the same ``_expand_env_vars()`` the
+    loader uses keeps a ``provider_routing`` reference such as
+    ``only: [${ROUTE_PROVIDER}]`` from reaching the Agent as the literal
+    ``${ROUTE_PROVIDER}`` string (and hence into OpenRouter's request body).
+    The streaming path reads its routing from an already-expanded config, so
+    both paths agree. ``_expand_env_vars()`` returns a fresh structure, so the
+    cached raw dict is never mutated.
+
+    The seam runs under the thread-only fail-closed profile scope
+    (``profile_env_for_thread_readonly``), so a ``${VAR}`` only the server
+    process env defines is NOT expanded here. Any routing value that still
+    contains ``${...}`` after expansion is dropped (with a warning) via
+    ``api.streaming._drop_unresolved_routing_refs()`` (inside the shared
+    ``_provider_routing_kwargs_for_agent``) instead of being forwarded literally:
+    a literal would make OpenRouter target a nonexistent provider and fail a
+    turn master (no routing on this path) completes, and re-enabling the
+    process-env fallback to avoid the drop would widen what a profile can
+    read from the server environment.
+
+    Falls back to ``get_config()`` (already env-expanded) when the session has
+    no usable profile config, matching the previous ``_pp_cfg or get_config()``
+    semantics at the sync site. Mapping to AIAgent kwargs stays in the shared
+    signature-gated helper ``_provider_routing_kwargs_for_agent``.
+    """
+    if isinstance(profile_cfg, dict) and profile_cfg:
+        cfg = _expand_env_vars(profile_cfg)
+    else:
+        cfg = get_config()
+    # The shared helper drops (with a warning) any routing value that still
+    # carries an unresolved ${...} after expansion, on both chat paths.
+    return _provider_routing_kwargs_for_agent(cfg, agent_params)
+
+
 def _load_profile_config_dict(session) -> dict | None:
     """Load the session profile's config.yaml as a dict, or None."""
     if not getattr(session, "profile", None):
@@ -11603,6 +11643,7 @@ from api.streaming import (
     _sse_keepalive,
     _sse_set_write_deadline,
     _run_agent_streaming,
+    _provider_routing_kwargs_for_agent,
     cancel_stream,
     _materialize_pending_user_turn_before_error,
     generate_session_title_for_session,
@@ -27149,6 +27190,50 @@ def _handle_chat_sync(handler, body):
             _provider = _bundle["provider"]
             _api_key = _bundle["api_key"]
             _base_url = _bundle["base_url"]
+            # OpenRouter provider_routing prefs (parity with tui_gateway and the
+            # gateway's TurnRunner). _pp_cfg is this session's profile config,
+            # already parsed above: a RAW yaml.safe_load with no env expansion
+            # (only the get_config() loader expands). _sync_routing_kwargs
+            # expands ${VAR} references with the same _expand_env_vars() that
+            # loader uses, then maps the block through the shared
+            # signature-gated helper the streaming path uses, so (a) an older
+            # hermes-agent build lacking any of the six params does not
+            # TypeError this endpoint, (b) a malformed provider_routing block
+            # (string/list) is treated as empty instead of 500ing the request,
+            # and (c) a value like only: [${ROUTE_PROVIDER}] reaches the Agent
+            # resolved, never as a literal ${...} string in OpenRouter's
+            # request body. Falls back to the active profile's config for
+            # profile-less sessions.
+            # The expansion must run with this session's profile env bound:
+            # the HTTP handler thread for POST /api/chat has no profile-
+            # scoped thread-local env, so an unbound _expand_env_vars() would
+            # resolve ${VAR} against the server process env (the process-
+            # wide profile's .env). A different process value would apply the
+            # wrong provider routing, while the streaming path (which binds
+            # the profile env in its worker) does not.
+            # The binding is THREAD-ONLY (profile_env_for_thread_readonly):
+            # the seam does a pure in-memory expansion and reads nothing from
+            # os.environ, so mirroring the profile env into the process env
+            # (as profile_env_for_background_worker does for agent bodies)
+            # would only let this request's setup/restore clobber a
+            # concurrent streaming turn's mirrored env, and vice versa. The
+            # thread-only scope also sets the fail-closed
+            # block_process_env_fallback boundary: a ${VAR} only the server
+            # process env defines does not expand here, and
+            # _sync_routing_kwargs drops any routing value that still carries
+            # ${...} after expansion (with a warning) instead of forwarding
+            # the literal, which would make OpenRouter target a nonexistent
+            # provider. The scope is a no-op for default-profile sessions, so
+            # profile-less behavior is unchanged.
+            try:
+                _sync_routing_params = set(inspect.signature(AIAgent.__init__).parameters)
+            except (TypeError, ValueError):
+                _sync_routing_params = set()
+            from api.profiles import profile_env_for_thread_readonly
+            with profile_env_for_thread_readonly(
+                s, "sync provider routing", logger_override=logger,
+            ):
+                _routing_kwargs = _sync_routing_kwargs(_pp_cfg, _sync_routing_params)
             agent = AIAgent(
                 model=_model,
                 provider=_provider,
@@ -27160,6 +27245,7 @@ def _handle_chat_sync(handler, body):
                 quiet_mode=True,
                 enabled_toolsets=_resolve_cli_toolsets(),
                 session_id=s.session_id,
+                **_routing_kwargs,
                 **_agent_bundle_kwargs(AIAgent, _bundle),
             )
             from api.streaming import (
