@@ -137,7 +137,7 @@ jobs:
           exit 0
 
   # Selection probes for layouts from PR #7948 review:
-  # 1) LOCALAPPDATA pip Agent must beat stale Program Files source
+  # 1) Program Files source lookup must precede marker-only Agent roots
   # 2) explicit HERMES_WEBUI_STATE_DIR must keep LOCALAPPDATA HERMES_HOME
   #    despite leftover %USERPROFILE%\.hermes\webui
   # 3) legacy-only Agent in %USERPROFILE%\.hermes\hermes-agent (no WebUI state)
@@ -221,7 +221,7 @@ jobs:
             return $out
           }
 
-          # Probe 1: LOCALAPPDATA pip beats Program Files source
+          # Probe 1: run_agent.py fallback roots precede marker-only Agent roots
           $local = Join-Path $root 'local'
           $user = Join-Path $root 'user1'
           $pf = Join-Path $root 'pf'
@@ -237,13 +237,13 @@ jobs:
             ProgramFiles = $pf
             'ProgramFiles(x86)' = $pf
           }
-          if ($out1 -notmatch [regex]::Escape("PROBE_AGENT_DIR=$localAgent")) {
-            throw "two-install: expected Agent dir $localAgent"
+          if ($out1 -notmatch [regex]::Escape("PROBE_AGENT_DIR=$pfAgent")) {
+            throw "two-install: expected fallback Agent dir $pfAgent"
           }
-          if ($out1 -match [regex]::Escape("PROBE_AGENT_DIR=$pfAgent")) {
-            throw "two-install: Program Files source incorrectly won"
+          if ($out1 -match [regex]::Escape("PROBE_AGENT_DIR=$localAgent")) {
+            throw "two-install: marker-only Agent incorrectly beat fallback source"
           }
-          Write-Host "OK probe1: LOCALAPPDATA pip beat Program Files source"
+          Write-Host "OK probe1: fallback source beat marker-only Agent root"
 
           # Probe 2: explicit STATE_DIR keeps LOCALAPPDATA HERMES_HOME
           $local2 = Join-Path $root 'local2'
