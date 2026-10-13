@@ -135,6 +135,12 @@
 
 ### Fixed
 
+- **Chats no longer fail on every message with older Hermes Agent builds.** Each streaming turn re-registers the
+  agent's `cronjob` tool to scope it to the chat's profile, and it copied `ToolEntry.dynamic_schema_overrides`
+  unconditionally; Agent builds from before that field existed raised `AttributeError` before the agent ran, so every
+  chat failed. The field is now forwarded only when both the entry and `register()` support it. Thanks @Yi-111-a.
+  (#8187, fixes #8186)
+
 - **The Memory panel's Project Context section and the sidebar project chips are now translated.** They were
   hard-coded English in every locale; all 15 locales now carry the strings (English text unchanged), and the residual
   untranslated Russian values are filled in. Thanks @MuhammadUsamaMX. (#8178, refs #7579)
