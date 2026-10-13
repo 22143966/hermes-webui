@@ -265,6 +265,22 @@ def test_sse_error_with_first_reasoning_pending_keeps_one_reasoning_event():
     assert result["settled"] is True
 
 
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("activity_mode", ["transparent_stream", "compact_worklog"])
+def test_transport_recovery_paints_pending_token_before_retry(activity_mode):
+    result = _run_reasoning_scene(
+        activity_mode=activity_mode,
+        reasoning_burst=True,
+        lifecycle_case="token_reconnect",
+    )
+    assert "LAST WORDS BEFORE DROP" not in result["before_error"]
+    assert "LAST WORDS BEFORE DROP" in result["during_reconnect"]
+    assert result["pending_frames"] == 0
+    assert result["old_source_closed"] is True
+    assert result["inflight_text"] == "LAST WORDS BEFORE DROP NEW connection"
+    assert "LAST WORDS BEFORE DROP NEW connection" in result["after_reconnect"]
+
+
 _NODE_SCENE = r"""
 const fs = require('fs');
 const uiSrc = fs.readFileSync(process.env.ISSUE5720_UI_JS, 'utf8');
@@ -597,7 +613,7 @@ global.resetTurnWorkspaceMutations=()=>{};
 global._resetStreamScrollFollow=()=>{};
 global._suspendSessionStreamForLiveChat=()=>{};
 global.ensureLiveWorklogShell=()=>null;
-global._extractInlineThinkingFromContent=(content,reasoning)=>({content:String(content||''),reasoning:String(reasoning||'')});
+global._extractInlineThinkingFromContent=(content,reasoning)=>({content:String(content||''),displayText:String(content||''),reasoning:String(reasoning||'')});
 
 class FakeEventSource {
   static instances=[];
@@ -655,6 +671,22 @@ if(deferredFrames){
   const lifecycle=process.env.ISSUE5720_LIFECYCLE_CASE;
   if(lifecycle){
     (async()=>{
+      if(lifecycle==='token_reconnect'){
+        global.renderMd=text=>String(text);
+        await source.emit('token',{text:'LAST WORDS BEFORE DROP'});
+        const beforeError=turn.textContent;
+        await source.emit('error',{});
+        const duringReconnect=turn.textContent;
+        const pendingFrames=frames.size;
+        const [id,probe]=Array.from(timers).at(-1);
+        timers.delete(id);await probe();
+        await FakeEventSource.instances.at(-1).emit('token',{text:' NEW connection'});
+        drainFrames();
+        process.stdout.write(JSON.stringify({before_error:beforeError,during_reconnect:duringReconnect,
+          pending_frames:pendingFrames,old_source_closed:source.readyState===2,
+          inflight_text:INFLIGHT['sid-1'].lastAssistantText,after_reconnect:turn.textContent}));
+        return;
+      }
       const initial=lifecycle==='echo'?'Visible echo answer with enough text':'OLD reasoning';
       await source.emit('reasoning',{text:initial});
       const oldFrames=Array.from(frames.values());

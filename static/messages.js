@@ -6047,7 +6047,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       try{if(existingLive.source.readyState!==2)existingLive.source.close();}catch(_){ }
     }
     LIVE_STREAMS[activeSid]={streamId,source,dispose:(reconnecting=false)=>{
-      if(!reconnecting) _streamFinalized=true;
+      if(reconnecting) _flushPendingSegmentRender();
+      else _streamFinalized=true;
       _cancelAnimationFramePendingStreamRender();
     }};
     _bindSidebarIdleRecovery(LIVE_STREAMS[activeSid]);
