@@ -1218,6 +1218,65 @@ console.log(JSON.stringify({drained, repaintsAfterNoop: repaints,
     assert data["keptForPicker"] is True
 
 
+def test_closing_the_action_menu_replays_an_explicit_completion_with_a_newer_picker_open():
+    """A non-background repaint skipped by the action-menu guard is not lost.
+
+    Rename can finish while another row's action menu is open.  That menu may
+    open a newer project picker before its close tick runs; the completion must
+    still repaint through the keep-picker lane instead of waiting for Escape.
+    """
+    assert NODE is not None
+    script = r"""
+const timers = [];
+const setTimeout = fn => { timers.push(fn); return timers.length; };
+let keptRepaints = 0;
+function _repaintSidebarKeepingProjectPicker() { keptRepaints += 1; }
+function renderSessionListFromCache() { throw new Error('plain repaint used'); }
+function _focusSessionActionMenuRestoreTarget() { return true; }
+let _sessionActionMenu = {remove(){}};
+let _sessionActionAnchor = null;
+let _sessionActionSessionId = 's1';
+let _sessionActionPreviousFocus = null;
+let _projectPickerTeardown = () => {}; // newer picker opened by the menu action
+let _sessionListRepaintDeferredByPicker = false;
+let _sessionListRepaintDeferredByActionMenu = true;
+""" + _close_session_action_menu_source() + r"""
+closeSessionActionMenu();
+timers.splice(0).forEach(fn => fn());
+console.log(JSON.stringify({
+  keptRepaints,
+  flagCleared: _sessionListRepaintDeferredByActionMenu === false,
+  pickerKept: _projectPickerTeardown !== null,
+}));
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "keptRepaints": 1,
+        "flagCleared": True,
+        "pickerKept": True,
+    }
+
+
+def test_project_mutation_completions_use_the_immediate_keep_picker_contract():
+    """Every project mutation completion paints beneath a newer picker."""
+    picker = _show_project_picker_source()
+
+    context_start = SESSIONS_JS.find("function _showProjectContextMenu(")
+    delete_start = SESSIONS_JS.find("async function _confirmDeleteProject(", context_start)
+    delete_end = SESSIONS_JS.find("// Global Escape handler", delete_start)
+    assert context_start >= 0 and delete_start > context_start and delete_end > delete_start
+    context_menu = SESSIONS_JS[context_start:delete_start]
+    delete_project = SESSIONS_JS[delete_start:delete_end]
+
+    contract = "await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});"
+    assert picker.count(contract) == 2, "picker project-create success and move-failure must both repaint"
+    assert context_menu.count(contract) == 1, "project colour completion must repaint"
+    assert delete_project.count(contract) == 1, "project deletion completion must repaint"
+    assert "await renderSessionList();" not in context_menu
+    assert "await renderSessionList();" not in delete_project
+
+
 def test_explicit_repaint_retires_the_open_picker_and_folds_its_deferral():
     # An explicit control (child-count toggle, tag filter, inline project
     # create) retires the picker first so its repaint is not swallowed by the

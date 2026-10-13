@@ -5348,6 +5348,21 @@ function closeSessionActionMenu({restoreFocus=false}={}){
   _sessionActionSessionId = null;
   _sessionActionPreviousFocus = null;
   if(!_focusSessionActionMenuRestoreTarget(focusTarget)) _focusSessionActionMenuRestoreTarget(fallbackFocusTarget);
+  // A mutation completion is durable user-visible state, not background churn.
+  // Replay it even when this menu action opened a newer project picker; the
+  // keep-picker path re-anchors that overlay after rebuilding the sidebar.
+  if(typeof _sessionListRepaintDeferredByActionMenu!=='undefined'&&_sessionListRepaintDeferredByActionMenu){
+    setTimeout(()=>{
+      if(!_sessionListRepaintDeferredByActionMenu||_sessionActionMenu) return;
+      _sessionListRepaintDeferredByActionMenu=false;
+      try{
+        if(typeof _repaintSidebarKeepingProjectPicker==='function') _repaintSidebarKeepingProjectPicker();
+        else if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
+      }catch(_){
+        _sessionListRepaintDeferredByActionMenu=true;
+      }
+    },0);
+  }
   // Drain a sidebar repaint the project picker deferred while this menu was
   // blocking renders (picker dismissed by opening another row's ⋮ menu). Next
   // tick, so a menu action that opens the picker re-arms the guard first.
@@ -8953,6 +8968,11 @@ function renderSessionListFromCache(){
   // click it. Sidebar syncs, stream/unread updates, and panel-resync repairs can
   // all call this while the fixed-position menu is open; rebuilding the row DOM
   // here removes the anchor and makes the menu feel unclickable.
+  if(_sessionActionMenu
+    &&!_sidebarRepaintBackgroundChurn
+    &&typeof _sessionListRepaintDeferredByActionMenu!=='undefined'){
+    _sessionListRepaintDeferredByActionMenu=true;
+  }
   if(_sessionActionMenu) return;
   // Same for the "Move to project" picker opened from that menu: rebuilding the
   // rows removes its anchor, and the picker closes itself when its row goes away.
@@ -10616,6 +10636,10 @@ const PROJECT_COLORS=['#7cb9ff','#f5c542','#e94560','#50c878','#c084fc','#fb923c
 // any later viewport change — can retire the previous one's listeners instead
 // of leaking a handler that repositions a detached element.
 let _projectPickerTeardown=null;
+// Set when an explicit mutation completion could not repaint because the session
+// action menu was still open. Menu teardown replays this through the keep-picker
+// contract so a newer picker cannot swallow the completed state change.
+let _sessionListRepaintDeferredByActionMenu=false;
 // Set when a sidebar repaint was skipped because the project picker was open, so the
 // picker's teardown can replay it (same contract as the ⋮ menu guard, minus the lost repaint).
 let _sessionListRepaintDeferredByPicker=false;
@@ -10921,10 +10945,10 @@ function _showProjectPicker(session, anchorEl){
       try{
         await api('/api/session/move',{method:'POST',body:JSON.stringify({session_id:session.session_id,project_id:res.project.project_id})});
         session.project_id=res.project.project_id;
-        await renderSessionList();
+        await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
         showToast('Created "'+res.project.name+'" and moved session');
       }catch(e){
-        await renderSessionList();
+        await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
         showToast('Created "'+res.project.name+'" but move failed: '+(e&&e.message||'try again'));
       }
     }
@@ -11519,7 +11543,7 @@ function _showProjectContextMenu(e, proj, chip){
       menu.remove();
       try {
         await api('/api/projects/rename',{method:'POST',body:JSON.stringify({project_id:proj.project_id,name:proj.name,color:hex})});
-        await renderSessionList();
+        await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
         showToast('Color updated');
       } catch(e) {
         showToast('Color update failed: '+(e.message||e));
@@ -11556,7 +11580,7 @@ async function _confirmDeleteProject(proj){
   try {
     await api('/api/projects/delete',{method:'POST',body:JSON.stringify({project_id:proj.project_id})});
     if(_activeProject===proj.project_id) _activeProject=null;
-    await renderSessionList();
+    await renderSessionList({deferWhileInteracting:false,keepProjectPicker:true});
     showToast('Project deleted');
   } catch(e) {
     showToast('Delete failed: '+(e.message||e));

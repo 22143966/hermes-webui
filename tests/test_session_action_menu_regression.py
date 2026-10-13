@@ -28,6 +28,9 @@ def test_session_list_refresh_does_not_close_open_conversation_actions():
 
     assert "if(_renamingSid) return;" in body
     assert "if(_sessionActionMenu) return;" in body
+    assert "&&!_sidebarRepaintBackgroundChurn" in body
+    assert "_sessionListRepaintDeferredByActionMenu=true;" in body
+    assert body.index("_sessionListRepaintDeferredByActionMenu=true;") < body.index("if(_sessionActionMenu) return;")
     assert body.index("if(_sessionActionMenu) return;") < body.index("closeSessionActionMenu();")
 
 
