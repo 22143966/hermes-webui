@@ -7573,6 +7573,35 @@ def _sanitize_messages_for_api(
         if sanitized.get('role'):
             clean.append(sanitized)
 
+    # #7237 (standalone): repair ADJACENT tool-call/result blocks before the
+    # global pass below. A result belonging to a later, unrelated turn must not
+    # make an earlier orphan call look answered and survive this projection.
+    _repaired_clean = _strip_orphan_tool_calls(clean)
+    clean = [
+        _repaired
+        for _original, _repaired in zip(clean, _repaired_clean, strict=True)
+        if not (
+            _original.get('role') == 'assistant'
+            and _original.get('tool_calls')
+            and not _repaired.get('tool_calls')
+            and not str(_repaired.get('content') or '').strip()
+        )
+    ]
+    # Recompute ownership from the repaired call rows: a tool result linked only
+    # to a now-removed non-adjacent call must be removed too.
+    _surviving_ids = {
+        _tc.get('id') or _tc.get('call_id')
+        for _msg in clean
+        if _msg.get('role') == 'assistant'
+        for _tc in (_msg.get('tool_calls') or [])
+        if isinstance(_tc, dict) and (_tc.get('id') or _tc.get('call_id'))
+    }
+    clean = [
+        _msg for _msg in clean
+        if _msg.get('role') != 'tool'
+        or (_msg.get('tool_call_id') or '') in _surviving_ids
+    ]
+
     # Third pass: strip orphaned tool_calls from assistant messages — calls whose id
     # has no matching tool-role response in the clean list.  Strict providers (DeepSeek,
     # newer OpenAI) reject with 400 when an assistant message references a tool call that
@@ -7701,6 +7730,37 @@ def _api_safe_message_positions(messages):
         if sanitized.get('role'):
             out.append((idx, sanitized))
 
+    # #7237 (standalone): mirror the adjacent-pair repair from
+    # _sanitize_messages_for_api so a non-adjacent later result cannot mask an
+    # early orphan call on this projection either.
+    _original_out = out
+    _repaired_rows = _strip_orphan_tool_calls([_m for _i, _m in _original_out])
+    out = [
+        (_i, _repaired)
+        for (_i, _original), _repaired in zip(_original_out, _repaired_rows, strict=True)
+        if not (
+            _original.get('role') == 'assistant'
+            and _original.get('tool_calls')
+            and not _repaired.get('tool_calls')
+            and not str(_repaired.get('content') or '').strip()
+        )
+    ]
+    # Recompute ownership from the repaired call rows (mirrors
+    # _sanitize_messages_for_api): a tool result linked only to a now-removed
+    # non-adjacent call must leave this projection too, or the two projections
+    # disagree by one row and positional metadata carry-forward misaligns.
+    _surviving_ids = {
+        _tc.get('id') or _tc.get('call_id')
+        for _i, _msg in out
+        if _msg.get('role') == 'assistant'
+        for _tc in (_msg.get('tool_calls') or [])
+        if isinstance(_tc, dict) and (_tc.get('id') or _tc.get('call_id'))
+    }
+    out = [
+        (_i, _msg) for _i, _msg in out
+        if _msg.get('role') != 'tool'
+        or (_msg.get('tool_call_id') or '') in _surviving_ids
+    ]
     # Third pass: strip orphaned tool_calls from assistant messages (mirrors
     # _sanitize_messages_for_api pass 3).
     answered_ids: set = set()
@@ -7807,6 +7867,91 @@ def _deduplicate_context_messages(messages):
             seen.add(key)
         deduped.append(msg)
     return deduped
+
+
+def _strip_orphan_tool_calls(messages):
+    """Return a context-only repair without mutating any input message rows.
+
+    Strict providers reject an assistant ``tool_calls`` entry when no matching
+    ``tool`` result follows in the same context. The repair belongs to the
+    model-facing context projection, not the display transcript, so the input
+    list and every input dictionary must remain unchanged. Clone only rows whose
+    ``tool_calls`` field is actually removed or filtered.
+    """
+    if not isinstance(messages, list):
+        return messages
+    repaired = list(messages)
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        calls = msg.get("tool_calls")
+        if isinstance(calls, str):
+            try:
+                calls = json.loads(calls)
+            except (ValueError, TypeError):
+                continue
+        if not isinstance(calls, list) or not calls:
+            continue
+        # The repair is called at completed-turn writeback sinks. A final row
+        # is not automatically in flight; preserving it solely because it is
+        # last lets settled orphan calls survive into the next request.
+        covered = set()
+        probe = idx + 1
+        while probe < len(messages):
+            following = messages[probe]
+            if not isinstance(following, dict):
+                break
+            # A temporary ``_recovered`` user row is materialized by the #1543
+            # stale-stream recovery path between an assistant's ``tool_calls``
+            # and their ``tool`` results. A later pass in
+            # ``_sanitize_messages_for_api`` / ``_api_safe_message_positions``
+            # drops that row from the final projection, so treat it as
+            # transparent here — otherwise a valid, completed tool pair is
+            # misclassified as an orphan and silently lost on exactly the
+            # recovery path this repair is meant to harden.
+            if following.get("role") == "user" and following.get("_recovered"):
+                probe += 1
+                continue
+            # Consecutive assistant rows merge in the Agent's repair, so an
+            # intermediate progress row between a call and its result is
+            # transparent here too (else a valid pair reads as an orphan).
+            if following.get("role") == "assistant":
+                probe += 1
+                continue
+            if following.get("role") != "tool":
+                break
+            covered.add(str(following.get("tool_call_id") or ""))
+            probe += 1
+        kept = []
+        dropped = []
+        for call in calls:
+            call_id = (
+                str(call.get("id") or call.get("call_id") or "")
+                if isinstance(call, dict)
+                else ""
+            )
+            if call_id and call_id in covered:
+                kept.append(call)
+            else:
+                dropped.append(call_id)
+        if not dropped:
+            continue
+        repaired_msg = copy.deepcopy(msg)
+        if kept:
+            repaired_msg["tool_calls"] = copy.deepcopy(kept)
+        else:
+            repaired_msg.pop("tool_calls", None)
+        repaired[idx] = repaired_msg
+        # debug, not warning: this runs on every projection of every turn, so an
+        # abandoned call would otherwise log several warnings per turn forever.
+        logger.debug(
+            "Dropped %d orphan tool_call id(s) at context index %d (no tool_result "
+            "immediately after); would have caused an upstream 400: %s",
+            len(dropped),
+            idx,
+            ", ".join(d for d in dropped if d) or "<missing id>",
+        )
+    return repaired
 
 
 def _assign_stable_message_ids(result_messages, *existing_arrays):

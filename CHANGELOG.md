@@ -101,6 +101,18 @@
 
 ### Security
 
+- **Pressing Enter on the approval card's Deny button denies.** While a tool approval was pending, Enter on any focused
+  control outside a text field ran "Allow once": Enter on **Deny**, **Allow session** or **Always allow** approved the
+  command once, and Enter on the ⋮ menu, a menu row, the project picker or a control that closes itself on Enter approved
+  the pending action instead of doing its own job. Enter now approves only when it isn't pressed on a control, so each
+  button does what it says. Enter with nothing focused still means Allow once. (#8131, #8130)
+
+- **A malformed passkey response is refused with 400/401, never a server error.** Registering or signing in with a
+  crafted passkey response, for example one whose declared credential ID is longer than the real one, could make the
+  CBOR reader raise an unexpected error and answer `500 Internal server error`. Every malformed registration or login
+  response now gets a clean 400/401 with nothing stored and no session issued, and valid passkeys register and sign in
+  exactly as before. Thanks @ybai08. (#8138, fixes #8126)
+
 - **Remote images in chat no longer load until you click them (zero-click exfiltration fix).** Any assistant-rendered
   `![x](https://host/?d=…)` used to fetch the moment it rendered, which let a prompt-injected reply beacon chat data to
   an outside server. The default CSP `img-src` no longer allows arbitrary `https:` images, and a non-allowlisted remote
@@ -134,6 +146,27 @@
   @laitekin. (#7297, fixes #7294)
 
 ### Fixed
+
+- **Signing in works when another app on the same host sets a malformed cookie.** A cookie with illegal characters
+  from a different service on the same host or domain made the WebUI ignore every cookie after it, so a correct password
+  bounced back to the login page and a switched profile fell back to `default`. Cookies are now read one pair at a time,
+  for both the session and the profile cookie. Thanks @pcsokonay. (#8124, #8123)
+
+- **Insights: the Models card gets three times the width of its neighbours in the usage row.** Long model ids such as
+  `anthropic/claude-...` and `openrouter/...` were cut to an 80 px name column, so several rows read identically. The card
+  now takes a 3x share of the row, and on narrow screens its table stays inside the card instead of spilling past
+  the window. Thanks @aleesposito85. (#8157)
+
+- **Metadata-only session reads no longer rebuild a conversation's regeneration history.** A `GET /api/session?messages=0`
+  built the canonical regeneration state even though it returns no messages. It now skips that work, and the browser
+  takes regeneration authority from its message load instead, keeping the history it already has loaded, including
+  after you switch away and back while a refresh is in flight. Metadata-only responses no longer carry
+  `regeneration_revision`. Thanks @tobenot. (#8173)
+
+- **A turn's unanswered tool call no longer passes as answered because a later turn reused its id.** The model context
+  kept any tool call whose id appeared anywhere in the history's tool results, so an earlier interrupted call could pair
+  with a later, unrelated result and send a malformed tool sequence to the provider. Tool calls now pair only with a
+  result immediately after them, in both model-facing projections. Thanks @happy5318. (#8194)
 
 - **Switching back to a long-running conversation no longer freezes the browser.** Reconnecting to a conversation
   whose agent has been reasoning for a long time replayed every reasoning chunk with its own render. A 500-chunk replay
