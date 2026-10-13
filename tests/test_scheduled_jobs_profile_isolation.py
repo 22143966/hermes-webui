@@ -373,8 +373,7 @@ def test_streaming_cronjob_wrapper_uses_profile_context_only_for_tool_call(tmp_p
 
     class Registry:
         def get_entry(self, name):
-            assert name == "cronjob"
-            return entry
+            return entry if name == entry.name else None
 
         def register(self, **kwargs):
             events.append(("register", kwargs["name"]))
@@ -508,8 +507,7 @@ def test_streaming_cronjob_wrapper_context_survives_threadpool_context_copy(tmp_
 
     class Registry:
         def get_entry(self, name):
-            assert name == "cronjob"
-            return entry
+            return entry if name == entry.name else None
 
         def register(self, **kwargs):
             events.append(("register", kwargs["name"]))
@@ -569,8 +567,7 @@ def test_streaming_cronjob_wrapper_leaves_calls_unwrapped_without_streaming_prof
 
     class Registry:
         def get_entry(self, name):
-            assert name == "cronjob"
-            return entry
+            return entry if name == entry.name else None
 
         def register(self, **kwargs):
             entry.handler = kwargs["handler"]
@@ -584,6 +581,199 @@ def test_streaming_cronjob_wrapper_leaves_calls_unwrapped_without_streaming_prof
 
     assert entry.handler({"action": "list"}) == "ok"
     assert events == [("handler", "list")]
+
+
+def test_streaming_cronjob_wrapper_wraps_the_renamed_cronjob_manage_tool(tmp_path, monkeypatch):
+    """Current hermes-agent registers ``cronjob_manage``, not ``cronjob`` (#8189).
+
+    Looking up the old name alone made the wrapper return at its debug log, so a
+    cron tool call made from a chat ran against the default profile.
+    """
+    import types
+
+    from api import profiles as p
+    from api import streaming as st
+
+    profile_home = tmp_path / "home" / "profiles" / "ops"
+    events = []
+
+    class Ctx:
+        def __init__(self, home):
+            self.home = str(home)
+
+        def __enter__(self):
+            events.append(("enter", self.home))
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append(("exit", self.home))
+            return False
+
+    def original_handler(args, **kwargs):
+        events.append(("handler", st._STREAMING_CRON_PROFILE_HOME.get()))
+        return "ok"
+
+    class Entry:
+        name = "cronjob_manage"
+        toolset = "cronjob"
+        schema = {"name": "cronjob_manage"}
+        handler = staticmethod(original_handler)
+        check_fn = None
+        requires_env = []
+        is_async = False
+        description = ""
+        emoji = "⏰"
+        max_result_size_chars = None
+        dynamic_schema_overrides = None
+
+    entry = Entry()
+
+    class Registry:
+        def get_entry(self, name):
+            return entry if name == entry.name else None
+
+        def register(self, **kwargs):
+            events.append(("register", kwargs["name"]))
+            entry.handler = kwargs["handler"]
+
+    registry_mod = types.ModuleType("tools.registry")
+    registry_mod.__dict__["registry"] = Registry()
+    monkeypatch.setitem(sys.modules, "tools.registry", registry_mod)
+    monkeypatch.setattr(st, "_STREAMING_CRONJOB_WRAPPER_INSTALLED", False)
+    monkeypatch.setattr(p, "cron_profile_context_for_home", Ctx)
+
+    st._install_streaming_cronjob_profile_wrapper()
+
+    assert events == [("register", "cronjob_manage")]
+    assert st._STREAMING_CRONJOB_WRAPPER_INSTALLED is True
+
+    token = st._STREAMING_CRON_PROFILE_HOME.set(str(profile_home))
+    try:
+        assert entry.handler({"action": "list"}) == "ok"
+    finally:
+        st._STREAMING_CRON_PROFILE_HOME.reset(token)
+
+    assert events == [
+        ("register", "cronjob_manage"),
+        ("enter", str(profile_home)),
+        ("handler", str(profile_home)),
+        ("exit", str(profile_home)),
+    ]
+
+
+def test_streaming_cronjob_wrapper_wraps_both_names_when_both_are_registered(monkeypatch):
+    """A build that keeps the old name next to the new one must wrap both.
+
+    Each wrapped handler must call its own original: the loop that wraps them
+    would otherwise let the last entry's handler win for all of them.
+    """
+    import types
+
+    from api import streaming as st
+
+    events = []
+
+    def make_entry(name):
+        entry = types.SimpleNamespace(
+            name=name,
+            toolset="cronjob",
+            schema={"name": name},
+            check_fn=None,
+            requires_env=[],
+            is_async=False,
+            description="",
+            emoji="⏰",
+            max_result_size_chars=None,
+            dynamic_schema_overrides=None,
+        )
+        entry.handler = (lambda args, _name=name, **kwargs: "ok:%s" % _name)
+        return entry
+
+    entries = {name: make_entry(name) for name in st._STREAMING_CRONJOB_TOOL_NAMES}
+
+    class Registry:
+        def get_entry(self, name):
+            return entries.get(name)
+
+        def register(self, **kwargs):
+            events.append(("register", kwargs["name"]))
+            entries[kwargs["name"]].handler = kwargs["handler"]
+
+    registry_mod = types.ModuleType("tools.registry")
+    registry_mod.__dict__["registry"] = Registry()
+    monkeypatch.setitem(sys.modules, "tools.registry", registry_mod)
+    monkeypatch.setattr(st, "_STREAMING_CRONJOB_WRAPPER_INSTALLED", False)
+
+    st._install_streaming_cronjob_profile_wrapper()
+
+    assert events == [("register", "cronjob_manage"), ("register", "cronjob")]
+    # No streaming profile is set, so each wrapper must call its own original.
+    assert entries["cronjob_manage"].handler({}) == "ok:cronjob_manage"
+    assert entries["cronjob"].handler({}) == "ok:cronjob"
+
+
+def test_streaming_cronjob_wrapper_never_propagates_a_registration_failure(monkeypatch):
+    """A future agent shape change must not abort the chat stream (#8186)."""
+    import types
+
+    from api import streaming as st
+
+    entry = types.SimpleNamespace(
+        name="cronjob_manage",
+        toolset="cronjob",
+        schema={"name": "cronjob_manage"},
+        handler=lambda args, **kwargs: "ok",
+        check_fn=None,
+        requires_env=[],
+        is_async=False,
+        description="",
+        emoji="⏰",
+        max_result_size_chars=None,
+        dynamic_schema_overrides=None,
+    )
+    calls = []
+
+    class Registry:
+        def get_entry(self, name):
+            return entry if name == entry.name else None
+
+        def register(self, **kwargs):
+            calls.append(kwargs["name"])
+            raise AttributeError("unexpected agent shape")
+
+    registry_mod = types.ModuleType("tools.registry")
+    registry_mod.__dict__["registry"] = Registry()
+    monkeypatch.setitem(sys.modules, "tools.registry", registry_mod)
+    monkeypatch.setattr(st, "_STREAMING_CRONJOB_WRAPPER_INSTALLED", False)
+
+    st._install_streaming_cronjob_profile_wrapper()
+
+    assert calls == ["cronjob_manage"]
+    # Warn once: a broken agent build is not retried on every chat stream.
+    assert st._STREAMING_CRONJOB_WRAPPER_INSTALLED is True
+
+
+def test_streaming_cronjob_wrapper_names_cover_the_installed_agent_tool():
+    """The lookup names must cover what the installed hermes-agent registers.
+
+    Skips when hermes-agent is not importable, which is the case in the WebUI
+    venv; on a machine that has it, this fails if the tool is renamed again.
+    """
+    pytest.importorskip("tools.registry")
+
+    from api import streaming as st
+
+    try:
+        import tools.cronjob_tools  # noqa: F401  (registers the tool on import)
+    except Exception:  # pragma: no cover - depends on the installed agent
+        pytest.skip("hermes-agent cronjob tool module unavailable")
+
+    from tools.registry import registry
+
+    assert any(
+        registry.get_entry(name) is not None
+        for name in st._STREAMING_CRONJOB_TOOL_NAMES
+    ), "the wrapper would never install for the installed agent"
 
 
 def test_streaming_profile_home_mutation_avoids_long_lived_cron_cache_patch():
