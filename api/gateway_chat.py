@@ -993,12 +993,29 @@ def _sidecars_with_active_stream(session_dir) -> list[str]:
 def _gateway_endpoint_for_profile(profile_name) -> tuple[str, str]:
     """URL and key of the session's own profile, root included, never the process-active profile."""
     from api import profiles as _profiles
-    from api.config import get_config_for_profile_home
+    from api.config import _thread_ctx, get_config_for_profile_home
 
     home = _profiles.get_hermes_home_for_profile(str(profile_name or "").strip())
     environ = {k: v for k, v in os.environ.items() if k not in _profiles._loaded_profile_env_keys}
     environ.update(_profiles.filter_runtime_env_for_gateway_parity(_profiles.get_profile_runtime_env(home)))
-    return _gateway_base_url(get_config_for_profile_home(home), environ), _gateway_api_key(environ)
+    # ${VAR} in the profile's config.yaml must expand from the same environment the key comes from,
+    # never from the process environment, or the URL and key end up belonging to different profiles.
+    previous_env = getattr(_thread_ctx, "env", {})
+    previous_block = bool(getattr(_thread_ctx, "block_process_env_fallback", False))
+    _thread_ctx.env = dict(environ)
+    _thread_ctx.block_process_env_fallback = True
+    try:
+        config_data = get_config_for_profile_home(home)
+    finally:
+        _thread_ctx.env = previous_env
+        _thread_ctx.block_process_env_fallback = previous_block
+    base_url = _gateway_base_url(config_data, environ)
+    if "${" in base_url:
+        raise RuntimeError(
+            f"gateway URL for profile {profile_name or 'default'!r} still contains an unresolved variable "
+            f"({base_url}); set it in that profile's .env"
+        )
+    return base_url, _gateway_api_key(environ)
 
 
 def _resume_gateway_run_for_session(session) -> bool:

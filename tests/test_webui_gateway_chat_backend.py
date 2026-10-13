@@ -8,6 +8,8 @@ import threading
 import time
 import urllib.error
 
+import pytest
+
 import api.gateway_chat as gateway_chat
 import api.models as models
 import api.streaming as streaming
@@ -1910,3 +1912,56 @@ def test_gateway_chat_401_hint_reports_the_session_profile_key_not_the_process_k
     # The profile DID send a key, so the hint is the "check it matches" one, never "Set ...".
     assert "Check that HERMES_WEBUI_GATEWAY_API_KEY matches" in blob
     assert "Set HERMES_WEBUI_GATEWAY_API_KEY to the same value" not in blob
+
+
+def _profile_homes(tmp_path, monkeypatch, envs, config_url="${GW_ROUTE}"):
+    """Throwaway profile homes whose config.yaml names the gateway URL by variable; the real resolver runs."""
+    import api.profiles as profiles
+
+    homes = {}
+    for name in envs:
+        home = tmp_path / name
+        home.mkdir()
+        (home / "config.yaml").write_text('webui_gateway_base_url: "%s"\n' % config_url, encoding="utf-8")
+        homes[name] = home
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda n: homes[str(n)])
+    monkeypatch.setattr(profiles, "get_profile_runtime_env", lambda home: dict(envs[Path(home).name]))
+    monkeypatch.delenv("HERMES_WEBUI_GATEWAY_BASE_URL", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_GATEWAY_API_KEY", raising=False)
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    # GW_ROUTE reaches the process env only by way of the active profile's .env, which is what this set records.
+    monkeypatch.setattr(profiles, "_loaded_profile_env_keys", set(getattr(profiles, "_loaded_profile_env_keys", ())) | {"GW_ROUTE"})
+    return homes
+
+
+def test_gateway_endpoint_expands_url_variable_from_the_session_profile_env(tmp_path, monkeypatch):
+    envs = {
+        "alpha": {"GW_ROUTE": "http://gw.local/p/alpha", "API_SERVER_KEY": "alpha-key"},
+        "beta": {"GW_ROUTE": "http://gw.local/p/beta", "API_SERVER_KEY": "beta-key"},
+    }
+    _profile_homes(tmp_path, monkeypatch, envs)
+    monkeypatch.setenv("GW_ROUTE", "http://gw.local/p/PROCESS")        # the process-active profile's value
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/p/beta", "beta-key")
+    assert gateway_chat._gateway_endpoint_for_profile("alpha") == ("http://gw.local/p/alpha", "alpha-key")
+
+
+def test_gateway_endpoint_never_uses_the_process_env_for_the_url_variable(tmp_path, monkeypatch):
+    envs = {"beta": {"API_SERVER_KEY": "beta-key"}}                    # beta defines no GW_ROUTE
+    _profile_homes(tmp_path, monkeypatch, envs)
+    monkeypatch.setenv("GW_ROUTE", "http://gw.local/p/PROCESS")
+
+    with pytest.raises(RuntimeError, match="unresolved variable"):
+        gateway_chat._gateway_endpoint_for_profile("beta")
+
+
+def test_gateway_endpoint_restores_the_thread_env_state(tmp_path, monkeypatch):
+    from api.config import _thread_ctx
+
+    envs = {"beta": {"GW_ROUTE": "http://gw.local/p/beta", "API_SERVER_KEY": "k"}}
+    _profile_homes(tmp_path, monkeypatch, envs)
+    before_env = getattr(_thread_ctx, "env", {})
+    before_block = getattr(_thread_ctx, "block_process_env_fallback", False)
+    gateway_chat._gateway_endpoint_for_profile("beta")
+    assert getattr(_thread_ctx, "env", {}) == before_env
+    assert getattr(_thread_ctx, "block_process_env_fallback", False) == before_block
