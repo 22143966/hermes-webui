@@ -9341,9 +9341,6 @@ function renderSessionListFromCache(){
       title.onkeydown=(e)=>{
         if(e.key!=='Enter'||e.ctrlKey||e.metaKey||e.altKey||e.shiftKey) return;
         e.preventDefault();
-        // Keep this Enter from the document-level shortcuts: with a tool
-        // approval card visible, a bare Enter there means "Allow once".
-        e.stopPropagation();
         if(!e.repeat) title.click();
       };
     }
