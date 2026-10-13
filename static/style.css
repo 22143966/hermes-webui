@@ -3344,7 +3344,7 @@
    box + 9px padding + 1px border = 34.4px, rounded down so the row's
    background covers the note's bottom border instead of leaving a sliver.
    z-index stays below the note's 2 so the note always wins the overlap. */
-.model-dropdown .model-search-row{position:sticky;top:34px;background:var(--surface);z-index:1;}
+.model-dropdown .model-search-row{position:sticky;top:var(--model-scope-note-h,34px);background:var(--surface);z-index:1;}
 .model-group{padding:8px 14px 4px;font-size:10px;font-weight:700;letter-spacing:.04em;color:var(--muted);text-transform:uppercase;border-top:1px solid var(--border2);margin-top:2px;}.model-group.collapsible{cursor:pointer;user-select:none}.model-group.collapsible:before{content:'\25b6';display:inline-block;font-size:8px;margin-right:5px;transition:transform .15s ease}.model-group.collapsible.open:before{transform:rotate(90deg)}.model-group-body:empty{display:none}
 .model-group.sub{padding:4px 14px 2px 22px;font-size:9px;border-top:none;margin-top:0;letter-spacing:.03em;color:var(--muted);background:transparent;}.model-group.sub.collapsible:before{content:'\25b6';display:inline-block;font-size:7px;margin-right:4px;transition:transform .15s ease}.model-group.sub.collapsible.open:before{transform:rotate(90deg)}.model-group-body.sub{padding-left:8px;border-left:1px solid var(--border);}
 .model-opt{padding:10px 14px;cursor:pointer;transition:background .12s;display:flex;flex-direction:column;gap:3px;align-items:flex-start;}

@@ -23,7 +23,7 @@ def test_composer_picker_search_row_pins_under_the_scope_note():
     # the list; the composer picker must pin its search row under the sticky
     # scope note or the search box scrolls out of view. Same idiom as the
     # Settings picker (.settings-model-dropdown .model-search-row).
-    assert ".model-dropdown .model-search-row{position:sticky;top:34px;background:var(--surface);z-index:1;}" in STYLE_CSS
+    assert ".model-dropdown .model-search-row{position:sticky;top:var(--model-scope-note-h,34px);background:var(--surface);z-index:1;}" in STYLE_CSS
 
 
 def test_toggle_model_dropdown_scrolls_active_row_after_open():

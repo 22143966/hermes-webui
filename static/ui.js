@@ -5555,6 +5555,7 @@ function renderModelDropdown(){
     const row=rows[idx];
     row.classList.add('is-highlighted');
     if(typeof row.scrollIntoView==='function') row.scrollIntoView({block:'nearest'});
+    if(typeof _nudgeModelRowBelowStickyStack==='function') _nudgeModelRowBelowStickyStack(dd,row);
   };
   _si.addEventListener('keydown',e=>{
     if(e.key==='Escape'){closeDropdown();return;}
@@ -5608,6 +5609,26 @@ async function selectModelFromDropdown(value){
   if(typeof sel.onchange==='function') await sel.onchange();
 }
 
+// The scope note and the search row are both sticky. Measure the live note
+// height (it wraps to two lines in longer locales / narrow sheets) so the
+// search row pins exactly under the note instead of a hard-coded 34px.
+function _syncModelDropdownStickyInsets(dd){
+  if(!dd||typeof dd.querySelector!=='function'||!dd.style) return;
+  const note=dd.querySelector('.model-scope-note');
+  const noteH=(note&&typeof note.getBoundingClientRect==='function')?Math.floor(note.getBoundingClientRect().height):0;
+  if(typeof dd.style.setProperty==='function') dd.style.setProperty('--model-scope-note-h',noteH+'px');
+}
+// scrollIntoView does not know about the pinned note + search stack, so a
+// nearest-scroll (arrow keys) or a clamped centre-scroll (open) can park the
+// row underneath it. Nudge the list so the row's top clears the stack; no-op
+// when it already does.
+function _nudgeModelRowBelowStickyStack(dd,row){
+  if(!dd||!row||typeof row.getBoundingClientRect!=='function'||typeof dd.querySelector!=='function') return;
+  const bottomOf=(el)=>(el&&typeof el.getBoundingClientRect==='function')?el.getBoundingClientRect().bottom:0;
+  const stack=Math.max(bottomOf(dd.querySelector('.model-scope-note')),bottomOf(dd.querySelector('.model-search-row')));
+  const top=row.getBoundingClientRect().top;
+  if(top<stack) dd.scrollTop-=Math.ceil(stack-top);
+}
 async function toggleModelDropdown(){
   const dd=$('composerModelDropdown');
   const chip=$('composerModelChip');
@@ -5627,8 +5648,10 @@ async function toggleModelDropdown(){
   renderModelDropdown();
   dd.classList.add('open');
   _positionModelDropdown();
+  _syncModelDropdownStickyInsets(dd);
   const activeRow=dd.querySelector('.model-opt.active');
   if(activeRow&&typeof activeRow.scrollIntoView==='function') activeRow.scrollIntoView({block:'center'});
+  _nudgeModelRowBelowStickyStack(dd,activeRow);
   chip.classList.add('active');
   const mobileAction=$('composerMobileModelAction');
   if(mobileAction) mobileAction.classList.add('active');
