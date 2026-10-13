@@ -191,8 +191,9 @@ a closed drawer (#8044). Run it locally with
 write the open picker at 390x844, 820x1180, 844x390 and 1440x900.
 
 Last, it runs `tests/browser_session_row_activation.py`, which imports two
-conversations and opens them from the sidebar without a pointer press. Every
-row title must be a focusable link, with `aria-current="page"` on the open
+conversations and opens them from the sidebar without a pointer press. Tab
+from the conversation filter must reach a conversation title, every row title
+must be a focusable link, with `aria-current="page"` on the open
 conversation's title. Mouse events without pointer events (how Firefox performs
 a screen reader's activate command, e.g. NVDA in browse mode), a bare
 `element.click()`, and Enter on the focused title must each open the
@@ -203,8 +204,10 @@ approval card (the document-level "Enter = Allow once" shortcut), and a
 right-click on a row must not swallow the next keyboard activation. A real
 mouse click and a touch tap must still open it exactly once; Enter on the row's
 ⋮ trigger must open its menu, not the conversation; and in selection mode the
-title must not be a link. The checks run in Chromium, and in Firefox as well
-when Playwright's Firefox is installed (`python -m playwright install firefox`).
+title must not be a link. The checks run in Chromium, and also in Firefox and
+WebKit when their Playwright builds are installed and launch
+(`python -m playwright install --with-deps firefox webkit`); a missing or
+unlaunchable engine is reported as skipped.
 Run it locally with `python tests/browser_session_row_activation.py`.
 
 ## Public conversation lifecycle gate

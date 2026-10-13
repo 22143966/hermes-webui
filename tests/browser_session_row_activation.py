@@ -13,7 +13,9 @@ WHY THIS EXISTS
   conversation; VoiceOver in Safari happened to work because it synthesizes
   pointer events as well.
 
-WHAT IT CHECKS (Chromium, and Firefox when its Playwright build is installed)
+WHAT IT CHECKS (Chromium, plus Firefox and WebKit when their Playwright
+builds are installed and launch; WebKit needs its system libraries)
+  - Tab from the conversation filter reaches a conversation title;
   - every row title is a focusable link; the open conversation's title carries
     aria-current="page", the others do not;
   - mouse events without pointer events (how Firefox performs an assistive
@@ -178,6 +180,23 @@ def _check_desktop(page, seed, name):
 
     _open(page, alpha)
     page.evaluate(COUNT_OPENS_JS)
+
+    # A keyboard user with no screen reader: Tab from the conversation filter
+    # must reach a conversation title. Let the sidebar show the open
+    # conversation first: while focus is inside the list, deferred list
+    # refreshes wait until it leaves (by design), so blur afterwards too.
+    _wait_until(page, """(sid) => Array.from(document.querySelectorAll('#sessionList .session-item[data-sid]'))
+      .some(row => row.dataset.sid === sid && row.querySelector('.session-title[aria-current="page"]'))""", alpha)
+    page.focus("#sessionSearch")
+    reached = None
+    for _ in range(25):
+        page.keyboard.press("Tab")
+        reached = page.evaluate(FOCUSED_SID_JS)
+        if reached:
+            break
+    if not reached:
+        fail("Tab from the conversation filter never reached a conversation title (25 presses)")
+    page.evaluate("() => document.activeElement && document.activeElement.blur()")
 
     titles = {t["sid"]: t for t in page.evaluate(TITLES_JS)}
     for sid in (alpha, beta):
@@ -425,12 +444,19 @@ def main():
         seed = None
         with sync_playwright() as pw:
             engines = [("chromium", pw.chromium, {"args": ["--no-sandbox", "--disable-dev-shm-usage"]})]
-            if os.path.exists(pw.firefox.executable_path):
-                engines.append(("firefox", pw.firefox, {}))
-            else:
-                print("NOTE firefox: Playwright's Firefox is not installed; checking Chromium only")
+            for name, engine in (("firefox", pw.firefox), ("webkit", pw.webkit)):
+                if os.path.exists(engine.executable_path):
+                    engines.append((name, engine, {}))
+                else:
+                    print(f"NOTE {name}: Playwright's {name} build is not installed; skipped")
             for name, engine, launch_args in engines:
-                browser = engine.launch(headless=True, **launch_args)
+                try:
+                    browser = engine.launch(headless=True, **launch_args)
+                except Exception as exc:  # e.g. WebKit without its system libraries
+                    if name == "chromium":
+                        raise
+                    print(f"NOTE {name}: could not launch ({str(exc).strip().splitlines()[0]}); skipped")
+                    continue
                 ctx, page, errors = _new_page(browser, viewport={"width": 1440, "height": 900})
                 if page is None:
                     failures.append(f"  [{name}] {errors}")
