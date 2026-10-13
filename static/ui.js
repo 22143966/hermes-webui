@@ -4514,10 +4514,37 @@ function syncModelChip(){
   const text=opt?opt.textContent:getModelLabel(sel.value||'');
   const compactText=_compactComposerModelChipLabel(sel.value||'', text);
   const gatewayRouting=_latestGatewayRoutingForSession(S.session);
-  const displayText=_formatGatewayModelLabel(sel.value||'',compactText,gatewayRouting)||compactText;
+  const pickerState=(typeof _modelStateForSelect==='function')
+    ? _modelStateForSelect(sel, sel.value)
+    : { model: sel.value||'', model_provider: null };
+  const pickerModel=pickerState.model||sel.value||'';
+  const _bareRouteModel=(v)=>{
+    const s=String(v||'').trim();
+    const p=(typeof _providerFromModelValue==='function')?String(_providerFromModelValue(s)||''):'';
+    const pre=p?`@${p}:`:'';
+    return (pre&&s.toLowerCase().startsWith(pre.toLowerCase()))?s.slice(pre.length):s;
+  };
+  const _pickerProv=String(pickerState.model_provider||'').trim().toLowerCase();
+  const _sessProv=String((S.session&&S.session.model_provider)||'').trim().toLowerCase();
+  // Only an explicit picker pick (the user chose a model in this tab) can make
+  // the session's served-model attribution stale. A dropdown that restored a
+  // fallback option on its own is not a user choice, so keep the attribution.
+  const _explicitPick=(S.session&&typeof _readExplicitPickerPick==='function')
+    ? _readExplicitPickerPick(S.session.session_id)
+    : null;
+  const routeMatches=!S.session||!S.session.model||!_explicitPick||(
+    _bareRouteModel(pickerModel).toLowerCase()===_bareRouteModel(S.session.model).toLowerCase()
+    &&(!_pickerProv||!_sessProv||_pickerProv===_sessProv)
+  );
+  const activeRouting=routeMatches?gatewayRouting:null;
+  const fallbackModel=(routeMatches&&S.session&&S.session.last_used_model)?S.session.last_used_model:(sel.value||'');
+  const fallbackText=(routeMatches&&S.session&&S.session.last_used_model)
+    ? _compactComposerModelChipLabel(S.session.last_used_model, getModelLabel(S.session.last_used_model))
+    : compactText;
+  const displayText=_formatGatewayModelLabel(fallbackModel,fallbackText,activeRouting)||fallbackText;
   label.textContent=displayText;
   if(mobileLabel) mobileLabel.textContent=displayText;
-  chip.title=gatewayRouting?`${sel.value||'Conversation model'} ${_gatewayRoutingLabel(gatewayRouting)}`:(sel.value||'Conversation model');
+  chip.title=activeRouting?`${fallbackModel||'Conversation model'} ${_gatewayRoutingLabel(activeRouting)}`:(fallbackModel||'Conversation model');
   chip.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
   if(mobileAction) mobileAction.classList.toggle('active',!!(dd&&dd.classList.contains('open')));
 }
@@ -5407,6 +5434,14 @@ async function selectModelFromDropdown(value){
   const sameModel=String(currentState.model||'')===String(value||'');
   const sameProvider=String(currentState.model_provider||'')===String(provider||'');
   if(sameModel&&sameProvider){ closeModelDropdown(); return; }
+  if(S.session){
+    const sessionModelChanged = String(S.session.model || '') !== String(value || '')
+      || String(S.session.model_provider || '') !== String(provider || '');
+    if(sessionModelChanged){
+      S.session.last_used_model = null;
+      S.session.gateway_routing = null;
+    }
+  }
   // Resolve the provider-specific option so duplicate bare IDs (e.g. gpt-5.5
   // under OpenAI Codex vs OpenRouter) update session model_provider correctly.
   if(typeof _ensureModelOptionInDropdown==='function'){
@@ -8235,11 +8270,51 @@ function _gatewayModelWarningText(routing){
   const used=getModelLabel(routing.used_model||'served model');
   return`Model switched: ${requested} → ${used}`;
 }
+function _canonicalModelForCompare(val){
+  if(!val) return '';
+  let str=String(val).trim().toLowerCase();
+  const colonIdx=str.lastIndexOf(':');
+  if(colonIdx!==-1) str=str.slice(colonIdx+1);
+  const slashIdx=str.lastIndexOf('/');
+  if(slashIdx!==-1) str=str.slice(slashIdx+1);
+  return str;
+}
+
 function _latestGatewayRoutingForSession(session){
   if(!session)return null;
-  if(session.gateway_routing)return session.gateway_routing;
-  const history=Array.isArray(session.gateway_routing_history)?session.gateway_routing_history:[];
-  return history.length?history[history.length-1]:null;
+  const fromHistory=!session.gateway_routing;
+  const routing=session.gateway_routing||(Array.isArray(session.gateway_routing_history)&&session.gateway_routing_history.length?session.gateway_routing_history[session.gateway_routing_history.length-1]:null);
+  if(!routing)return null;
+  const _canonical=(typeof _canonicalModelForCompare==='function')
+    ? _canonicalModelForCompare
+    : (val)=>{
+        if(!val) return '';
+        let str=String(val).trim().toLowerCase();
+        const colonIdx=str.lastIndexOf(':');
+        if(colonIdx!==-1) str=str.slice(colonIdx+1);
+        const slashIdx=str.lastIndexOf('/');
+        if(slashIdx!==-1) str=str.slice(slashIdx+1);
+        return str;
+      };
+  if(routing.requested_model&&session.model){
+    const reqModel=_canonical(routing.requested_model);
+    const sessModel=_canonical(session.model);
+    if(reqModel&&sessModel&&reqModel!==sessModel){
+      return null;
+    }
+  }
+  // Canonical provider identity matching: case-insensitive, preserves legacy/empty
+  const hasExplicitRoute=routing.requested_route_provider!==undefined&&routing.requested_route_provider!==null&&String(routing.requested_route_provider).trim()!=='';
+  const sessProvider=String(session.model_provider||'').trim().toLowerCase();
+  if(hasExplicitRoute){
+    const routeProvider=String(routing.requested_route_provider).trim().toLowerCase();
+    if(sessProvider && routeProvider && routeProvider !== sessProvider) return null;
+  } else if(fromHistory){
+    const reqProvider=String(routing.requested_provider||'').trim().toLowerCase();
+    // Fail closed on provider-less history candidate when active route has an explicit provider
+    if(sessProvider && (!reqProvider || reqProvider !== sessProvider)) return null;
+  }
+  return routing;
 }
 
 function _stripXmlToolCallsDisplay(s){
@@ -11181,6 +11256,11 @@ function restoreLiveTurnHtmlForSession(sid){
   const liveGroup=restored.querySelector('.tool-call-group[data-live-tool-call-group="1"]');
   if(liveGroup&&typeof _startActivityElapsedTimer==='function') _startActivityElapsedTimer(liveGroup);
   if(typeof placeLiveToolCardsHost==='function') placeLiveToolCardsHost();
+  try{
+  if(typeof highlightCode==='function') highlightCode(restored);
+  if(typeof addCopyButtons==='function') addCopyButtons(restored);
+  if(typeof initTreeViews==='function') initTreeViews(restored);
+  }catch(_){ /* fail-safe: a bad block (e.g. _buildTreeDOM overflow) must not abort scroll restore, cache or the caller; the deferred pass keeps the old contained failure */ }
   requestAnimationFrame(()=>_postProcessWithAnchorSuppression(restored));
   return true;
 }
@@ -13870,7 +13950,9 @@ function _applyTransparentRowFading(turn){
   const rows=Array.from(blocks.querySelectorAll(':scope > .transparent-event-row'));
   const isLive=turn.id==='liveAssistantTurn'||turn.getAttribute('data-live-assistant-turn')==='1';
   if(!isLive){
-    rows.forEach(row=>row.removeAttribute('data-transparent-fade'));
+    rows.forEach(row=>{
+      if(row.hasAttribute('data-transparent-fade')) row.removeAttribute('data-transparent-fade');
+    });
     return;
   }
   const total=rows.length;
@@ -13878,9 +13960,15 @@ function _applyTransparentRowFading(turn){
     const row=rows[i];
     // Newest = full opacity; each step back drops by 1 (floors at 5).
     const stepsFromEnd=total-1-i;
-    if(stepsFromEnd<=0){row.removeAttribute('data-transparent-fade');continue;}
+    if(stepsFromEnd<=0){
+      if(row.hasAttribute('data-transparent-fade')) row.removeAttribute('data-transparent-fade');
+      continue;
+    }
     const step=Math.min(5,stepsFromEnd);
-    row.setAttribute('data-transparent-fade',String(step));
+    const stepStr=String(step);
+    if(row.getAttribute('data-transparent-fade')!==stepStr){
+      row.setAttribute('data-transparent-fade',stepStr);
+    }
   }
 }
 // Resolve the assistant message that carries a transparent turn's settled
@@ -13958,7 +14046,10 @@ function _renderTransparentTurnFooter(turn, opts){
       turn.appendChild(footer);
     }
   }
-  footer.innerHTML=html.replace(/^<div class="transparent-turn-footer">|<\/div>$/g,'');
+  const targetHtml=html.replace(/^<div class="transparent-turn-footer">|<\/div>$/g,'');
+  if(footer.innerHTML!==targetHtml){
+    footer.innerHTML=targetHtml;
+  }
 }
 // ── Activity-group user expand intent (#1298) ──────────────────────────────
 // When the user manually expands the live "Activity" dropdown during streaming,
@@ -18399,6 +18490,11 @@ function renderMessages(options){
       if(typeof _syncExtensionMessageActionSlots==='function') _syncExtensionMessageActionSlots(inner);
       _wireMessageWindowLoadEarlierButton();
       if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
+      try{
+      if(typeof highlightCode==='function') highlightCode(inner);
+      if(typeof addCopyButtons==='function') addCopyButtons(inner);
+      if(typeof initTreeViews==='function') initTreeViews(inner);
+      }catch(_){ /* fail-safe: a bad block (e.g. _buildTreeDOM overflow) must not abort scroll restore, cache or the caller; the deferred pass keeps the old contained failure */ }
       _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
       if(_maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualWindow)) return;
       _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
@@ -19757,7 +19853,15 @@ function renderMessages(options){
         failover.textContent=failoverText;
         fragments.push(failover);
       }
-      if(gatewayText){
+      // The transparent turn footer owns the model label (.lf-model) whenever
+      // the turn has transparent event rows; skip the generic chip and gateway
+      // label there so exactly one model label renders per turn. Model sits after
+      // duration to match the transparent footer order (elapsed, model, ...).
+      const _transparentFooterOwnsModel=(usedModelText||gatewayText)&&isTransparentStream()&&row&&(()=>{
+        const blocks=_assistantTurnBlocks(row);
+        return !!(blocks&&blocks.querySelector(':scope > .transparent-event-row'));
+      })();
+      if(gatewayText&&!_transparentFooterOwnsModel){
         const gateway=document.createElement('span');
         gateway.className='msg-gateway-inline';
         gateway.textContent=gatewayText;
@@ -19769,14 +19873,6 @@ function renderMessages(options){
         duration.textContent=`Done in ${durationText}`;
         fragments.push(duration);
       }
-      // The transparent turn footer owns the model label (.lf-model) whenever
-      // the turn has transparent event rows — skip the generic chip there so
-      // exactly one model label renders per turn. Model sits after duration to
-      // match the transparent footer order (elapsed · model · …).
-      const _transparentFooterOwnsModel=usedModelText&&isTransparentStream()&&row&&(()=>{
-        const blocks=_assistantTurnBlocks(row);
-        return !!(blocks&&blocks.querySelector(':scope > .transparent-event-row'));
-      })();
       if(usedModelText&&!_transparentFooterOwnsModel){
         const usedModel=document.createElement('span');
         usedModel.className='msg-used-model-inline';
@@ -19834,9 +19930,8 @@ function renderMessages(options){
       _applyTransparentRowFading(turn);
       if(hasTransparentRows){
         // Read turn metadata from the final metadata-bearing assistant segment,
-        // not querySelector's first match — a tool turn's activity segment
-        // precedes the answer, and the metadata lives on the last message
-        // (#6068 gate round 2: multi-segment turns lost the model label).
+        // not querySelector's first match: a tool turn's activity segment
+        // precedes the answer, and the metadata lives on the last message.
         const msg=_transparentTurnMetaMessage(turn);
         let durationText='';
         let modelText='';
@@ -19846,6 +19941,10 @@ function renderMessages(options){
         if(msg){
           if(msg._turnDuration!=null) durationText=_formatTurnDuration(msg._turnDuration);
           modelText=_usedModelTurnChipLabel(msg);
+          const routing=msg._gatewayRouting;
+          if(routing&&typeof _formatGatewayModelLabel==='function'){
+            modelText=_formatGatewayModelLabel(String(msg._usedModel||'').trim()||(S.session&&S.session.model)||'', '', routing)||modelText;
+          }
           if(modelText) modelTitle=String(msg._usedModel||'').trim();
           if(msg._firstTokenMs!=null) ttftText=_formatFirstToken(msg._firstTokenMs);
           if(msg._turnUsage){
@@ -20054,6 +20153,21 @@ function renderMessages(options){
   // (tool completion, session switch) must not override the user's scroll position.
   // scrollIfPinned() respects _scrollPinned, so it's a no-op if user scrolled up.
   if(typeof _syncLiveRunStatusAfterRender==='function') _syncLiveRunStatusAfterRender();
+  // Reconcile extension message-action slots BEFORE the cache snapshot so the cached
+  // HTML carries the reconciled attribute-bound buttons (same contract as before #7752).
+  if(typeof _syncExtensionMessageActionSlots==='function') _syncExtensionMessageActionSlots(inner);
+  // Snapshot only when this render can be cached (same gate as the .set below): mid-stream
+  // and transient-card renders must not pay a whole-transcript serialization they discard.
+  let cacheHtml='';
+  if(sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi){ cacheHtml=inner.innerHTML; }
+  // Synchronously highlight code blocks, initialize structured tree views, and attach
+  // copy buttons BEFORE the frame is painted so virtualized transcripts do not paint
+  // unhighlighted raw text for one frame when scrolled into view (#7752).
+  try{
+  if(typeof highlightCode==='function') highlightCode(inner);
+  if(typeof addCopyButtons==='function') addCopyButtons(inner);
+  if(typeof initTreeViews==='function') initTreeViews(inner);
+  }catch(_){ /* fail-safe: a bad block (e.g. _buildTreeDOM overflow) must not abort scroll restore, cache or the caller; the deferred pass keeps the old contained failure */ }
   _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
   if(_maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualWindow)) return;
   // Apply syntax highlighting after DOM is built
@@ -20064,7 +20178,6 @@ function renderMessages(options){
   }
   // Apply persisted playback speed after media nodes are rendered.
   if(typeof _applyMediaPlaybackPreferences==='function') _applyMediaPlaybackPreferences(inner);
-  if(typeof _syncExtensionMessageActionSlots==='function') _syncExtensionMessageActionSlots(inner);
   // Populate session cache so switching back here skips a full rebuild.
   _sessionHtmlCacheSid=sid;
   // Skip caching while the just-settled keep-open token is armed: that render
@@ -20076,9 +20189,9 @@ function renderMessages(options){
   // the helper) working — absent helper == not armed == cache normally.
   const _keepOpenArmed=(typeof _isKeepSettledWorklogOpenArmed==='function')&&_isKeepSettledWorklogOpenArmed();
   if(sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi&&!_keepOpenArmed){
-    const _html=inner.innerHTML;
+    const _html=cacheHtml;
     // Only cache sessions with <300KB rendered HTML; evict oldest beyond 8 sessions.
-    if(_html.length<300_000){
+    if(_html&&_html.length<300_000){
       const renderSignature=cachedRenderSignature===null?_messageRenderCacheSignature():cachedRenderSignature;
       _sessionHtmlCache.set(sid,{html:_html,msgCount,renderWindowKey,signature:renderSignature});
       if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
@@ -21892,6 +22005,19 @@ function loadHtmlInline(container){
   });
 }
 
+// Identical replies reuse cached markdown HTML and therefore the same
+// data-mermaid-id; mermaid.render() then fails for every block after the
+// first because the id is already taken. Hand such a block a fresh id.
+function _uniqueMermaidRenderId(block){
+  let id=block.dataset.mermaidId||('m-'+Math.random().toString(36).slice(2));
+  const sel=(typeof CSS!=='undefined'&&CSS.escape)?CSS.escape(id):id;
+  if(document.getElementById(id)||document.querySelectorAll('[data-mermaid-id="'+sel+'"]').length>1){
+    id=id+'-'+Math.random().toString(36).slice(2,8);
+    block.dataset.mermaidId=id;
+  }
+  return id;
+}
+
 function renderMermaidBlocks(container){
   const root=container||document;
   const blocks=root.querySelectorAll('.mermaid-block:not([data-rendered])');
@@ -21921,7 +22047,7 @@ function renderMermaidBlocks(container){
   blocks.forEach(async(block)=>{
     block.dataset.rendered='true';
     const code=block.textContent;
-    const id=block.dataset.mermaidId||('m-'+Math.random().toString(36).slice(2));
+    const id=_uniqueMermaidRenderId(block);
     try{
       const {svg}=await mermaid.render(id,code);
       const tmp=document.getElementById('d'+id);
