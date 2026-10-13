@@ -156,7 +156,7 @@ $AgentDir = $env:HERMES_WEBUI_AGENT_DIR
 # Set by discovery below. Stays $false for an explicit override, which is the
 # caller's choice and is never second-guessed.
 $selectedIsBareSourceCheckout = $false
-$selectedFromRuntimeOrFallback = $false
+$selectedFromProvenRuntime = $false
 if ($AgentDir -and -not (Test-Path (Join-Path $AgentDir 'hermes_cli') -PathType Container)) {
     Write-Error "HERMES_WEBUI_AGENT_DIR is set to '$AgentDir' but no hermes_cli/ folder exists there. Unset the variable to fall back to auto-discovery, or fix the path."
     exit 1
@@ -199,7 +199,7 @@ if (-not $AgentDir) {
             $runtimeCandidates = @(& $Python -c 'import sys; sys.path.insert(0, sys.argv[1]); from api.startup import _agent_dir_from_hermes_cli, _agent_dir_from_python; root = _agent_dir_from_hermes_cli() or _agent_dir_from_python(sys.executable); print(root or "")' $RepoRoot 2>$null)
             if ($LASTEXITCODE -eq 0) {
                 foreach ($c in $runtimeCandidates) {
-                    if ($c -and (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf -ErrorAction SilentlyContinue)) { $AgentDir = $c; $selectedFromRuntimeOrFallback = $true; break }
+                    if ($c -and (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf -ErrorAction SilentlyContinue)) { $AgentDir = $c; $selectedFromProvenRuntime = $true; break }
                 }
             }
         } catch { }
@@ -214,7 +214,7 @@ if (-not $AgentDir) {
     $launcherOnlyCandidates = $launcherOnlyCandidates | Select-Object -Unique
     if (-not $AgentDir) {
         foreach ($c in $launcherOnlyCandidates) {
-            if (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf -ErrorAction SilentlyContinue) { $AgentDir = $c; $selectedFromRuntimeOrFallback = $true; break }
+            if (Test-Path (Join-Path $c 'run_agent.py') -PathType Leaf -ErrorAction SilentlyContinue) { $AgentDir = $c; break }
         }
     }
     if (-not $AgentDir) {
@@ -274,7 +274,7 @@ if (-not $AgentDir) {
         $AgentDir -and
         ($AgentDir -eq $repoParent -or
          $AgentDir -eq (Join-Path $env:USERPROFILE 'hermes-agent')))
-    if ($AgentDir -and -not $selectedFromRuntimeOrFallback -and
+    if ($AgentDir -and -not $selectedFromProvenRuntime -and
         -not (Test-Path (Join-Path $AgentDir 'venv\Scripts\python.exe')) -and
         (
             -not (Test-Path (Join-Path $AgentDir 'hermes_cli') -PathType Container) -or
@@ -348,7 +348,7 @@ if (-not $AgentDir) {
 # means the venv override is unnecessary: its own venv, or the managed
 # bootstrap that activate_managed_agent() imports (hermes_bootstrap.py).
 $agentVenvPython = Join-Path $AgentDir 'venv\Scripts\python.exe'
-if ($selectedIsBareSourceCheckout -and -not $selectedFromRuntimeOrFallback -and
+if ($selectedIsBareSourceCheckout -and -not $selectedFromProvenRuntime -and
     -not (Test-Path $agentVenvPython) -and
     -not (Test-Path (Join-Path $AgentDir 'hermes_bootstrap.py'))) {
     # Neither, and the selected root is a bare source checkout. Discovery has

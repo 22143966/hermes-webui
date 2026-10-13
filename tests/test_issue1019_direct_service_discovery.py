@@ -210,7 +210,7 @@ def test_discovery_checks_hermes_home_without_explicit_override(monkeypatch, tmp
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows launcher regression")
-@pytest.mark.parametrize("runtime", ["fallback", "interpreter", "launcher"])
+@pytest.mark.parametrize("runtime", ["fallback", "interpreter", "launcher", "bare-fallback"])
 def test_windows_launcher_defers_stale_marker_root_until_working_runtime(tmp_path, runtime):
     import shutil
 
@@ -218,23 +218,32 @@ def test_windows_launcher_defers_stale_marker_root_until_working_runtime(tmp_pat
     if not pwsh:
         pytest.skip("PowerShell is unavailable")
     stale = tmp_path / "home" / "hermes-agent"
-    working = (tmp_path / "programs" / "hermes" / "hermes-agent" if runtime == "fallback" else tmp_path / "runtime-agent")
+    working = (tmp_path / "programs" / "hermes" / "hermes-agent" if runtime in ("fallback", "bare-fallback") else tmp_path / "runtime-agent")
     (stale / "hermes_cli").mkdir(parents=True)
     (stale / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
     (stale / "venv" / "Scripts").mkdir(parents=True)
     (stale / "venv" / "Scripts" / "python.exe").write_text("", encoding="utf-8")
     working.mkdir(parents=True)
-    (working / "run_agent.py").write_text("", encoding="utf-8")
+    if runtime == "bare-fallback":
+        bare = tmp_path / "user" / ".hermes" / "hermes-agent"
+        bare.mkdir(parents=True)
+        (bare / "run_agent.py").write_text("", encoding="utf-8")
+        (working / "hermes_cli").mkdir()
+        (working / "venv" / "Scripts").mkdir(parents=True)
+        (working / "venv" / "Scripts" / "python.exe").write_text("", encoding="utf-8")
+    else:
+        (working / "run_agent.py").write_text("", encoding="utf-8")
+        if runtime == "fallback":
+            (working / "hermes_bootstrap.py").write_text("", encoding="utf-8")
     source = (REPO_ROOT / "start.ps1").read_text(encoding="utf-8")
     start = source.index("$AgentDir = $env:HERMES_WEBUI_AGENT_DIR")
-    end = source.index("[Environment]::SetEnvironmentVariable('HERMES_WEBUI_AGENT_DIR', $AgentDir)", start)
-    end = source.index("\n", end)
+    end = source.index("# === Resolve bind + state defaults", start)
     script = tmp_path / "discover.ps1"
     script.write_text(
-        "$ErrorActionPreference='Stop'\n"
+        "$ErrorActionPreference='Stop'\n$WarningPreference='SilentlyContinue'\n"
         "$RepoRoot=$env:TEST_REPO_ROOT\n$Python=$env:TEST_PYTHON\n"
         "$serverPlatformDefaultHome=$env:HERMES_HOME\n$newHermesHome=$env:HERMES_HOME\n"
-        + source[start:end] + "\nWrite-Output $env:HERMES_WEBUI_AGENT_DIR\n",
+        + source[start:end] + "\nWrite-Output $env:HERMES_WEBUI_AGENT_DIR\nWrite-Output $Python\n",
         encoding="utf-8",
     )
     env = os.environ.copy()
@@ -255,7 +264,9 @@ def test_windows_launcher_defers_stale_marker_root_until_working_runtime(tmp_pat
         env["PATH"] = str(bin_dir)
     result = _run_hidden([pwsh, "-NoProfile", "-File", str(script)], cwd=tmp_path, env=env)
     assert result.returncode == 0, result.stderr
-    assert Path(result.stdout.strip()) == working
+    selected_root, selected_python = result.stdout.strip().splitlines()
+    assert Path(selected_root) == working
+    assert Path(selected_python) == (working / "venv" / "Scripts" / "python.exe" if runtime == "bare-fallback" else Path(sys.executable))
 
 
 def test_direct_service_does_not_install_into_stale_marker_root(monkeypatch, tmp_path):
