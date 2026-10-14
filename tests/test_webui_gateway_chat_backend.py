@@ -2035,3 +2035,47 @@ def test_gateway_endpoint_does_not_let_a_divergent_profile_inherit_the_active_cu
 
     assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/own", "beta-key")
     assert gateway_chat._gateway_endpoint_for_profile("alpha") == ("http://gw.local/authoritative", "alpha-key")
+
+
+def _shared_gateway(monkeypatch, url="http://gw.local:8642", key="shared-root-key", launcher_key=None):
+    """The process pair: the URL from the launcher, the key from the default profile's .env (so the loader recorded it)."""
+    import api.profiles as profiles
+
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", url)
+    monkeypatch.setenv("API_SERVER_KEY", key)
+    if launcher_key:
+        monkeypatch.setenv("HERMES_WEBUI_GATEWAY_API_KEY", launcher_key)
+    monkeypatch.setattr(profiles, "_loaded_profile_env_keys", {"API_SERVER_KEY", "GW_ROUTE"})
+
+
+def test_gateway_endpoint_a_profile_with_the_same_url_and_no_key_keeps_the_shared_key(tmp_path, monkeypatch):
+    _profile_homes(tmp_path, monkeypatch, {"beta": {"HERMES_WEBUI_GATEWAY_BASE_URL": "http://gw.local:8642"}}, config_url=None)
+    _shared_gateway(monkeypatch)
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local:8642", "shared-root-key")
+
+
+def test_gateway_endpoint_a_key_only_profile_keeps_the_shared_url(tmp_path, monkeypatch):
+    import api.profiles as profiles
+
+    _profile_homes(tmp_path, monkeypatch, {"beta": {"API_SERVER_KEY": "beta-key"}}, config_url=None)
+    _shared_gateway(monkeypatch)
+    # the shared URL comes from the default profile's .env too, so the loader recorded it and a profile copy strips it
+    monkeypatch.setattr(profiles, "_loaded_profile_env_keys", {"API_SERVER_KEY", "GW_ROUTE", "HERMES_WEBUI_GATEWAY_BASE_URL"})
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local:8642", "beta-key")
+
+
+def test_gateway_endpoint_the_launcher_alias_never_outranks_the_profiles_own_key(tmp_path, monkeypatch):
+    envs = {"beta": {"HERMES_WEBUI_GATEWAY_BASE_URL": "http://gw.local/p/beta", "API_SERVER_KEY": "beta-key"}}
+    _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    _shared_gateway(monkeypatch, launcher_key="launcher-key")
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/p/beta", "beta-key")
+
+
+def test_gateway_endpoint_the_shared_key_is_never_sent_to_a_different_gateway(tmp_path, monkeypatch):
+    _profile_homes(tmp_path, monkeypatch, {"beta": {"HERMES_WEBUI_GATEWAY_BASE_URL": "http://gw.local/p/beta"}}, config_url=None)
+    _shared_gateway(monkeypatch, launcher_key="launcher-key")
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/p/beta", "")

@@ -1017,44 +1017,55 @@ def _profile_config_path(home):
 def _gateway_endpoint_for_profile(profile_name) -> tuple[str, str]:
     """URL and key for a session's profile, never those of the process-active profile.
 
-    A profile with no gateway URL or key of its own (neither in its .env nor in its config.yaml) uses the
-    endpoint the WebUI process was given, an explicitly shared one: exactly the pair a single-profile deployment
-    sends. A profile that sets its own gets its own, URL and key from the same environment: ${VAR} in its
-    config.yaml is expanded from that profile's .env, read fresh from the file, never from the process
-    environment and never from the cached (already expanded) ambient config.
+    The shared pair is what the WebUI process was given (launcher environment, default profile's .env, ambient
+    config): exactly what a single-profile deployment sends. A profile may override each half on its own:
+
+    - URL: its own HERMES_WEBUI_GATEWAY_BASE_URL in its .env, or webui_gateway_base_url in its config.yaml
+      (${VAR} expanded from that profile's .env, read fresh from the file, never from the process environment or
+      the cached ambient config); without one it keeps the shared URL.
+    - Key: its own HERMES_WEBUI_GATEWAY_API_KEY or API_SERVER_KEY (either alias, its own first, so the
+      launcher's alias is never sent to a Gateway the profile points at itself); without one it keeps the
+      shared key, but only while the resolved URL is the shared URL, so the shared key is never sent to a
+      different Gateway.
     """
     from api import profiles as _profiles
     from api.config import _expand_env_vars, _load_yaml_config_file_raw, _thread_ctx, get_config
+
+    shared_url, shared_key = _gateway_base_url(get_config(), os.environ), _gateway_api_key(os.environ)
 
     home = Path(_profiles.get_hermes_home_for_profile(str(profile_name or "").strip()))
     own_env = _profiles.filter_runtime_env_for_gateway_parity(_profiles.get_profile_runtime_env(home))
     raw_cfg = _load_yaml_config_file_raw(_profile_config_path(home), _copy=False)
     own_url_cfg = raw_cfg.get("webui_gateway_base_url") if isinstance(raw_cfg, dict) else None
-    has_own = bool(
-        own_env.get(_WEBUI_GATEWAY_BASE_URL_ENV) or own_env.get(_WEBUI_GATEWAY_API_KEY_ENV)
-        or own_env.get("API_SERVER_KEY") or own_url_cfg
-    )
-    if not has_own:
-        return _gateway_base_url(get_config(), os.environ), _gateway_api_key(os.environ)
+    own_url_env = str(own_env.get(_WEBUI_GATEWAY_BASE_URL_ENV) or "").strip()
+    own_key = str(own_env.get(_WEBUI_GATEWAY_API_KEY_ENV) or own_env.get("API_SERVER_KEY") or "").strip()
 
-    environ = {k: v for k, v in os.environ.items() if k not in _profiles._loaded_profile_env_keys}
-    environ.update(own_env)
-    previous_env = getattr(_thread_ctx, "env", {})
-    previous_block = bool(getattr(_thread_ctx, "block_process_env_fallback", False))
-    _thread_ctx.env = dict(environ)
-    _thread_ctx.block_process_env_fallback = True
-    try:
-        expanded_url = _expand_env_vars(own_url_cfg)
-    finally:
-        _thread_ctx.env = previous_env
-        _thread_ctx.block_process_env_fallback = previous_block
-    base_url = _gateway_base_url({"webui_gateway_base_url": expanded_url} if expanded_url else {}, environ)
-    if "${" in base_url:
-        raise RuntimeError(
-            f"gateway URL for profile {profile_name or 'default'!r} still contains an unresolved variable "
-            f"({base_url}); set it in that profile's .env"
-        )
-    return base_url, _gateway_api_key(environ)
+    if not (own_url_env or own_url_cfg or own_key):
+        return shared_url, shared_key
+
+    url = shared_url
+    if own_url_env or own_url_cfg:
+        environ = {k: v for k, v in os.environ.items() if k not in _profiles._loaded_profile_env_keys}
+        environ.update(own_env)
+        previous_env = getattr(_thread_ctx, "env", {})
+        previous_block = bool(getattr(_thread_ctx, "block_process_env_fallback", False))
+        _thread_ctx.env = dict(environ)
+        _thread_ctx.block_process_env_fallback = True
+        try:
+            expanded_url = _expand_env_vars(own_url_cfg)
+        finally:
+            _thread_ctx.env = previous_env
+            _thread_ctx.block_process_env_fallback = previous_block
+        # a launcher-exported URL still outranks config.yaml, as everywhere else
+        url_env = own_url_env or str(environ.get(_WEBUI_GATEWAY_BASE_URL_ENV) or "").strip()
+        url = _gateway_base_url({"webui_gateway_base_url": expanded_url} if expanded_url else {},
+                                {_WEBUI_GATEWAY_BASE_URL_ENV: url_env} if url_env else {})
+        if "${" in url:
+            raise RuntimeError(
+                f"gateway URL for profile {profile_name or 'default'!r} still contains an unresolved variable "
+                f"({url}); set it in that profile's .env"
+            )
+    return url, (own_key or (shared_key if url == shared_url else ""))
 
 
 def _resume_gateway_run_for_session(session) -> bool:
