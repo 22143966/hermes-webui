@@ -399,8 +399,8 @@ before the session's named-profile Gateway ownership is known.
 
 | Thing | How it finds it |
 |---|---|
-| Hermes agent dir | `HERMES_WEBUI_AGENT_DIR`, then known checkout paths, the `hermes` launcher on `PATH`, and finally the installed `run_agent` module exposed by `HERMES_WEBUI_PYTHON` |
-| Python executable | Agent venv first, then `.venv` in this repo, then system `python3` |
+| Hermes agent dir | `HERMES_WEBUI_AGENT_DIR`, then valid authoritative `run_agent.py` checkouts, the `hermes` launcher, the selected Python, valid fallback checkouts, and finally marker-only roots |
+| Python executable | `HERMES_WEBUI_PYTHON`, Agent venv, interpreter that proved the Agent root, `.venv` in this repo, then system Python |
 | State directory | `HERMES_WEBUI_STATE_DIR` env, then `$HERMES_HOME/webui` (Windows default `%LOCALAPPDATA%\hermes\webui`, POSIX default `~/.hermes/webui`) |
 | Default workspace | `HERMES_WEBUI_DEFAULT_WORKSPACE` env, then `~/workspace`, then state dir |
 | Port | `HERMES_WEBUI_PORT` env or first argument, default `8787` |
@@ -420,6 +420,8 @@ export HERMES_WEBUI_PORT=9000
 export HERMES_WEBUI_AUTO_INSTALL=1  # enable auto-install of agent deps (disabled by default)
 ./start.sh
 ```
+
+Auto-install requires the selected Agent to match `HERMES_WEBUI_AGENT_DIR` or the Agent under `HERMES_HOME`, and still checks ownership and permissions.
 
 Or inline:
 
