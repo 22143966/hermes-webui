@@ -1078,6 +1078,8 @@ async function loadCrons(animate, options) {
       _showAllCronProfiles = false;
       _cronOtherProfileCount = 0;
     }
+    // Capture after the await: the reader may have scrolled during the request.
+    const listScrollTop = background ? box.scrollTop : 0;
     box.innerHTML = '';
     // Partition active vs paused so paused jobs don't drown the list (#4026).
     // _cronList stays the single source of truth — only the render is split,
@@ -1122,7 +1124,7 @@ async function loadCrons(animate, options) {
         : (t('cron_no_jobs') || 'No jobs yet');
       box.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:12px">${esc(emptyText)}</div>`;
       _appendCronProfileToggle(box);
-      if ((!background || _cronDetailRefreshKey === _currentCronDetailKey) && _cronMode !== 'create' && _cronMode !== 'edit') _clearCronDetail();
+      if (_cronMode !== 'create' && _cronMode !== 'edit') _clearCronDetail();
       _cronDetailRefreshKey = null;
       return data;
     }
@@ -1153,7 +1155,7 @@ async function loadCrons(animate, options) {
     // or collapsing a run the user is reading.
     if (_currentCronDetail && _cronMode !== 'create' && _cronMode !== 'edit') {
       const refreshed = _cronList.find(j => _cronJobKey(j) === _currentCronDetailKey);
-      if (background && _cronDetailRefreshKey !== _currentCronDetailKey) {
+      if (background && refreshed && _cronDetailRefreshKey !== _currentCronDetailKey) {
         const runs = $('cronDetailRuns');
         if (runs) runs.classList.toggle('has-new-run', !!(refreshed && !refreshed.read_only && _cronNewJobIds.has(String(refreshed.id))));
       }
@@ -1161,9 +1163,17 @@ async function loadCrons(animate, options) {
       else _clearCronDetail();
     }
     _cronDetailRefreshKey = null;
+    if (background) box.scrollTop = listScrollTop;
     return data;
   } catch(e) {
     if (_cronLoadSeq !== _cronLoadGeneration) return;
+    // Retry one foreground read when a poll displaced an explicit refresh.
+    // Foreground failures do not recurse, and cancelled/hidden views do not retry.
+    if (background && _currentPanel === 'tasks' && _currentCronDetail &&
+        _cronDetailRefreshKey === _currentCronDetailKey &&
+        _cronMode !== 'create' && _cronMode !== 'edit') {
+      return await loadCrons(false);
+    }
     box.innerHTML = `<div style="padding:12px;color:var(--accent);font-size:12px">${esc(t('error_prefix'))}${esc(e.message)}</div>`;
   }
   finally {
@@ -1529,6 +1539,7 @@ async function _loadRunContent(jobId, filename, runId){
 function openCronDetail(jobOrId, el){
   const job = _findCronJob(jobOrId);
   if (!job) return;
+  const refreshPending = !!_cronDetailRefreshKey;
   const detailKey = _cronJobKey(job);
   document.querySelectorAll('.cron-item').forEach(e => e.classList.remove('active'));
   const target = el || $(_cronItemId(job));
@@ -1541,6 +1552,9 @@ function openCronDetail(jobOrId, el){
   _editingCronId = null;
   _stopCronWatch();
   _renderCronDetail(job);
+  // Navigation cancels the old selection intent, but cached rows may predate
+  // the action. Give the newly selected detail its own authoritative refresh.
+  if (refreshPending) loadCrons();
   if (!job.read_only) _checkCronWatchOnDetail(job.id, detailKey);
   _closeMobileSidebarAfterPanelSelection();
 }

@@ -95,3 +95,50 @@ Related automated verification: 56 tests passed across
 The refresh-button static signature test now accepts the optional `options`
 parameter while retaining `animate` as the first parameter and preserving all
 existing button restoration/accessibility checks.
+
+## Review 5522230057 follow-up
+
+The earlier captures and totals above are historical. `review_fixes.py` and
+`review_fixes_results.json` qualify this follow-up, comparing the exact reviewed
+panels source `448539d4793e5267fec06079ade04d0335cfa4c7` against the current checkout
+in the same updated HTML shell. Eight Chromium runs cover both revisions at
+1440×1000 and 390×1000, default skin, actual dark and light theme application.
+
+Each run holds the successful Pause/Resume action's list response, injects a
+completion, fails the newer list refresh with HTTP 503, then releases the action
+response. The reviewed version retains the old status and wrong inverse control;
+the fixed version performs a bounded foreground retry and shows the correct
+status and control. Both actions are checked. An away-and-back selection race is
+also reproduced before and passes after. Empty and nonempty lists that remove
+the selected job retain its controls before; after, selection clears and Run/Edit
+are hidden. There are no uncaught page errors in these eight runs.
+
+| View | Reviewed version after successful Pause | Fixed version |
+| --- | --- | --- |
+| Desktop dark | [stale active](review-before-503-1440-dark.png) | [paused with Resume](review-fixed-503-1440-dark.png) |
+| Desktop light | [stale active](review-before-503-1440-light.png) | [paused with Resume](review-fixed-503-1440-light.png) |
+| Phone dark | [stale active](review-before-503-390-dark.png) | [paused with Resume](review-fixed-503-390-dark.png) |
+| Phone light | [stale active](review-before-503-390-light.png) | [paused with Resume](review-fixed-503-390-light.png) |
+
+The list-scroll concern was inferred in the review, not measured. Chromium
+retained scrollTop=250 in both versions in this fixture; it did not reproduce a
+browser scroll reset. The implementation now explicitly captures scroll after
+the response arrives and restores it after a background rebuild. A Node harness
+that resets scroll when innerHTML is cleared fails before and passes after;
+this is defensive coverage, not proof of a reproduced Chromium defect.
+
+Verification for this follow-up: the eight affected/neighbouring files pass
+101 tests; the broader cron, scheduled-job isolation and master/detail selection
+sweep passes 330 tests with 8 skips (Agent-dependent/platform coverage).
+Collection confirms all 38 refresh-race cases. The previously failing master
+selection test is unchanged and passes. New regressions reproduce removal,
+missing retry, away-and-back and simulated scroll-reset failures before fixing.
+Node syntax, Ruff on changed Python and git diff whitespace checks pass.
+
+Reproduce with the repository test environment plus Playwright/Chromium:
+`python docs/pr-media/6767/review_fixes.py`. Use a local filesystem for disposable
+pytest state; SQLite fixture creation on a CIFS mount encountered locking errors.
+The browser script starts only its own loopback server and stops it in finally;
+all cron responses and actions are controlled fixtures with an inert Agent root.
+No live scheduling, production restart or maintainer visual approval is claimed.
+The full-suite and GitHub CI status are reported separately in the PR update.

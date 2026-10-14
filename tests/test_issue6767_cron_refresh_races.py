@@ -30,6 +30,7 @@ let _currentCronDetail='existing',_currentCronDetailKey='existing',_cronMode='de
 let renders=0,clears=0,opened=null,writes=[],renderedJob=null;const pending=[];
 let _cronDetailRefreshKey = null;
 const localStorage = {getItem(){return null;},setItem(){}};
+let _currentPanel = 'tasks';
 function api(url,opts){if(opts){writes.push(url);return Promise.resolve({id:'saved'});}return new Promise((resolve,reject)=>pending.push({resolve,reject}));}
 async function loadCronProfiles(){} function loadCronGatewayNotice(){}
 function esc(s){return String(s);} function t(s){return s;} function showToast(){}
@@ -72,10 +73,15 @@ def test_current_load_failure_displays_error():
     run_js("const p=loadCrons(true);await waitRequests(1);pending[0].reject(new Error('current timeout'));await p;assert(box.innerHTML.includes('current timeout'));assert.equal(button.disabled,false);")
 
 
-@pytest.mark.parametrize("empty", [False, True])
-def test_background_refresh_keeps_output_open_and_marks_list(empty):
-    jobs = [] if empty else [{"id": "newer", "name": "Newer"}]
-    run_js("const p=loadCrons(false,{background:true});await waitRequests(1);pending[0].resolve({jobs:" + json.dumps(jobs) + "});const data=await p;assert.equal(renders,0);assert.equal(clears,0);assert.equal(output.innerHTML,'Loaded output');assert.equal(output.open,true);assert.deepEqual(_cronList,data.jobs);if(data.jobs.length)assert(box.children[0].innerHTML.includes('cron-new-dot'));")
+def test_background_refresh_keeps_existing_output_open_and_marks_list():
+    jobs = [{"id": "existing", "name": "Existing"}, {"id": "newer", "name": "Newer"}]
+    run_js("const p=loadCrons(false,{background:true});await waitRequests(1);pending[0].resolve({jobs:" + json.dumps(jobs) + "});const data=await p;assert.equal(renders,0);assert.equal(clears,0);assert.equal(output.innerHTML,'Loaded output');assert.equal(output.open,true);assert.deepEqual(_cronList,data.jobs);assert(box.children[1].innerHTML.includes('cron-new-dot'));")
+
+
+@pytest.mark.parametrize("jobs", [[], [{"id": "other", "name": "Other"}]])
+@pytest.mark.parametrize("mode", ["detail", "create", "edit"])
+def test_background_refresh_clears_removed_selection_but_preserves_forms(jobs, mode):
+    run_js("_cronMode=" + json.dumps(mode) + ";const p=loadCrons(false,{background:true});await waitRequests(1);pending[0].resolve({jobs:" + json.dumps(jobs) + "});await p;assert.equal(clears," + ("1" if mode == "detail" else "0") + ");")
 
 
 @pytest.mark.parametrize("action,state", [("cronPause", "paused"), ("cronResume", "active")])
@@ -108,16 +114,37 @@ assert.equal(renders,0);assert.equal(_cronDetailRefreshKey,null);
 """)
 
 
-def test_failed_latest_refresh_retains_intent_until_successful_retry():
+def test_failed_latest_refresh_retries_once_without_another_completion():
     run_js("""
 const old=cronPause('existing');await waitRequests(1);
 const poll=loadCrons(false,{background:true});await waitRequests(2);
-pending[1].reject(new Error('temporary'));await poll;
+pending[1].reject(new Error('temporary'));await waitRequests(3);
 pending[0].resolve({jobs:[{id:'existing',name:'Old'}]});await old;
 assert.equal(renders,0);assert.equal(_cronDetailRefreshKey,'existing');
-const retry=loadCrons(false,{background:true});await waitRequests(3);
-pending[2].resolve({jobs:[{id:'existing',name:'Current',state:'paused'}]});await retry;
+pending[2].resolve({jobs:[{id:'existing',name:'Current',state:'paused'}]});await poll;
 assert.equal(renders,1);assert.equal(renderedJob.state,'paused');assert.equal(_cronDetailRefreshKey,null);
+""")
+
+
+def test_failed_foreground_retry_is_bounded():
+    run_js("""
+const old=cronPause('existing');await waitRequests(1);
+const poll=loadCrons(false,{background:true});await waitRequests(2);
+pending[1].reject(new Error('503'));await waitRequests(3);
+pending[2].reject(new Error('retry failed'));await poll;
+pending[0].resolve({jobs:[{id:'existing',name:'Old'}]});await old;
+assert.equal(pending.length,3);assert(box.innerHTML.includes('retry failed'));
+""")
+
+
+@pytest.mark.parametrize("cancel", ["_currentPanel='chat';", "_cronMode='edit';", "_cronDetailRefreshKey=null;"])
+def test_background_failure_does_not_retry_cancelled_or_hidden_intent(cancel):
+    run_js("""
+const old=loadCrons();await waitRequests(1);
+const poll=loadCrons(false,{background:true});await waitRequests(2);
+""" + cancel + """
+pending[1].reject(new Error('503'));await poll;assert.equal(pending.length,2);
+pending[0].resolve({jobs:[{id:'existing'}]});await old;
 """)
 
 
@@ -134,10 +161,14 @@ function _cronProfileName(p){return p||'default';}
 function _isCronNeedsAttention(job){return job.state==='needs_attention';}
 function _isCronScheduleError(job){return job.state==='schedule_error';}
 function _loadCronDetailRuns(){} function _stopCronWatch(){}
+function _findCronJob(job){return typeof job==='object'?job:_cronList.find(j=>j.id===job);}
+function _clearCronUnreadForJob(){} function _checkCronWatchOnDetail(){}
+function _closeMobileSidebarAfterPanelSelection(){}
+document.querySelectorAll=()=>[];
 eval(['_renderCronDetail','toggleCronPromptExpanded','_setCronHeaderButtons',
  '_cronPanelExpandKey','_cronExpansionGet','_cronExpansionSet','_cronStatusMeta',
  '_isCronScriptJob','_cronModeLabel','_cronOutputTitle','_cronAgentPromptCardHtml',
- '_clearCronDetail'].map(extract).join('\n'));
+ '_clearCronDetail','openCronDetail'].map(extract).join('\n'));
 function assertControls(state){
  assert.equal(_currentCronDetail.state,state);
  assert(fields.taskDetailBody.innerHTML.includes('cron_status_'+state));
@@ -175,6 +206,32 @@ def test_real_detail_cancellation_clears_pending_intent(cancel):
 
 def test_user_requested_refresh_still_updates_detail():
     run_js("const p=loadCrons();await waitRequests(1);pending[0].resolve({jobs:[{id:'existing',name:'Updated'}]});await p;assert.equal(renders,1);")
+
+
+@pytest.mark.parametrize("action,state,initial", [("cronPause", "paused", "active"), ("cronResume", "active", "paused")])
+def test_action_refresh_survives_away_and_back(action, state, initial):
+    job = {"id": "existing", "name": "Existing", "state": initial}
+    other = {"id": "other", "name": "Other", "state": "active"}
+    fresh = dict(job, state=state)
+    run_js("_cronList=" + json.dumps([job, other]) + ";openCronDetail('existing');" +
+           "const action=" + action + "('existing');await waitRequests(1);" +
+           "openCronDetail('other');openCronDetail('existing');" +
+           "const poll=loadCrons(false,{background:true});" +
+           "for(let i=0;i<50;i++)await Promise.resolve();" +
+           "const latest=pending[pending.length-1];latest.resolve({jobs:" + json.dumps([fresh, other]) + "});await poll;" +
+           "assertControls(" + json.dumps(state) + ");" +
+           "for(const req of pending)req.resolve({jobs:" + json.dumps([fresh, other]) + "});await action;", setup=REAL_DETAIL)
+
+
+def test_background_refresh_preserves_list_scroll_at_response_time():
+    run_js("""
+let html='';box.scrollTop=40;
+Object.defineProperty(box,'innerHTML',{get(){return html;},set(value){html=value;box.scrollTop=0;}});
+const poll=loadCrons(false,{background:true});await waitRequests(1);
+box.scrollTop=160; // reader scrolled while the request was in flight
+pending[0].resolve({jobs:[{id:'existing',name:'Existing'}]});await poll;
+assert.equal(box.scrollTop,160);
+""")
 
 
 @pytest.mark.parametrize("editing", [False, True])
