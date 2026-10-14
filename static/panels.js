@@ -1048,6 +1048,8 @@ let _cronDetailRefreshKey = null;  // explicit refresh intent survives a superse
 
 async function loadCrons(animate, options) {
   const background = !!(options && options.background);
+  const hasDetailRefreshKey = !!(options && Object.prototype.hasOwnProperty.call(options, 'detailRefreshKey'));
+  const requestedDetailRefreshKey = hasDetailRefreshKey ? options.detailRefreshKey : null;
   const box = $('cronList');
   const refreshBtn = $('cronRefreshBtn');
   loadCronGatewayNotice();
@@ -1060,8 +1062,10 @@ async function loadCrons(animate, options) {
   // latest, so only the newest render wins.
   const _cronLoadSeq = ++_cronLoadGeneration;
   if (!background) {
-    _cronDetailRefreshKey = _currentCronDetail && _cronMode !== 'create' && _cronMode !== 'edit'
-      ? _currentCronDetailKey : null;
+    _cronDetailRefreshKey = hasDetailRefreshKey
+      ? (requestedDetailRefreshKey || null)
+      : (_currentCronDetail && _cronMode !== 'create' && _cronMode !== 'edit'
+          ? _currentCronDetailKey : null);
   }
   if (animate && refreshBtn) {
     refreshBtn.style.opacity = '0.5';
@@ -1155,7 +1159,9 @@ async function loadCrons(animate, options) {
     // or collapsing a run the user is reading.
     if (_currentCronDetail && _cronMode !== 'create' && _cronMode !== 'edit') {
       const refreshed = _cronList.find(j => _cronJobKey(j) === _currentCronDetailKey);
-      if (background && refreshed && _cronDetailRefreshKey !== _currentCronDetailKey) {
+      const differentDetailSelected = hasDetailRefreshKey && _currentCronDetailKey !== requestedDetailRefreshKey;
+      if (refreshed && (differentDetailSelected ||
+          (background && _cronDetailRefreshKey !== _currentCronDetailKey))) {
         const runs = $('cronDetailRuns');
         if (runs) runs.classList.toggle('has-new-run', !!(refreshed && !refreshed.read_only && _cronNewJobIds.has(String(refreshed.id))));
       }
@@ -2084,7 +2090,7 @@ async function saveCronForm(){
     // A completion poll can supersede this save's list request. If its accepted
     // response has not landed yet, take one foreground read so the still-current
     // form completes from the authoritative list rather than remaining saveable.
-    if (!data || data.jobs !== _cronList) data = await loadCrons();
+    if (!data || data.jobs !== _cronList) data = await loadCrons(false, {detailRefreshKey: formDetailKey});
     if (!formStillCurrent() || !data || data.jobs !== _cronList) return null;
     return _cronList;
   };
@@ -2122,7 +2128,10 @@ async function saveCronForm(){
       // detail must receive the successful write; other navigation stays quiet.
       const editedDetailShown = !saveViewCurrent && _cronMode === 'read' &&
         !!_currentCronDetail && _currentCronDetailKey === formDetailKey;
-      const data = await loadCrons(false, {background: !saveViewCurrent && !editedDetailShown});
+      const data = await loadCrons(false, {
+        background: !saveViewCurrent && !editedDetailShown,
+        detailRefreshKey: formDetailKey,
+      });
       // A background refresh keeps a newer selection/output untouched. Only the
       // still-current form may auto-open its saved job from the accepted list.
       if (!saveViewCurrent) return;
@@ -2152,7 +2161,10 @@ async function saveCronForm(){
     showToast(t('cron_job_created'));
     const saveViewCurrent = formStillCurrent();
     if (!saveViewCurrent && _currentPanel !== 'tasks') return;
-    const data = await loadCrons(false, {background: !saveViewCurrent});
+    const data = await loadCrons(false, {
+      background: !saveViewCurrent,
+      detailRefreshKey: formDetailKey,
+    });
     if (!saveViewCurrent) return;
     const jobs = await acceptedJobsForCurrentForm(data);
     if (!jobs) return;

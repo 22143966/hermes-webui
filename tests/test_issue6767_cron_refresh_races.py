@@ -50,7 +50,9 @@ async function waitRequests(n){for(let i=0;i<50&&pending.length<n;i++)await Prom
 def run_js(body, setup=""):
     script = HARNESS.replace("PANELS_PATH", json.dumps(str(PANELS)))
     script += setup
-    script += "\n(async()=>{" + body + "})().catch(e=>{console.error(e);process.exit(1);});"
+    script += """
+const testTimeout=setTimeout(()=>{console.error('unfinished test body');process.exit(1);},5000);
+(async()=>{""" + body + """})().then(()=>clearTimeout(testTimeout)).catch(e=>{clearTimeout(testTimeout);console.error(e);process.exit(1);});"""
     result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
 
@@ -237,7 +239,7 @@ assert.equal(box.scrollTop,160);
 @pytest.mark.parametrize("editing", [False, True])
 def test_save_does_not_select_job_from_superseded_response(editing):
     prefix = "_cronMode=" + json.dumps("edit" if editing else "create") + ";" + ("_editingCronId='saved';" if editing else "")
-    run_js(prefix + "const save=saveCronForm();await waitRequests(1);const poll=loadCrons(false,{background:true});await waitRequests(2);pending[1].resolve({jobs:[{id:'existing',name:'Existing'}]});await poll;pending[0].resolve({jobs:[{id:'existing',name:'Existing'},{id:'saved',name:'Saved'}]});await save;assert.equal(opened,null);assert.equal(writes.length,1);")
+    run_js(prefix + "const save=saveCronForm();await waitRequests(1);const poll=loadCrons(false,{background:true});await waitRequests(2);pending[1].resolve({jobs:[{id:'existing',name:'Existing'}]});await poll;pending[0].resolve({jobs:[{id:'existing',name:'Existing'},{id:'saved',name:'Saved'}]});await waitRequests(3);pending[2].resolve({jobs:[{id:'existing',name:'Existing'}]});await save;assert.equal(opened,null);assert.equal(writes.length,1);")
 
 
 @pytest.mark.parametrize("editing", [False, True])
@@ -248,7 +250,8 @@ def test_current_save_opens_job_from_superseding_accepted_list(editing, accepted
     stale_jobs = "[{id:'existing',name:'Existing'},{id:'saved',name:'Stale saved'}]"
     ordering = (
         f"pending[1].resolve({{jobs:{accepted_jobs}}});await poll;"
-        f"pending[0].resolve({{jobs:{stale_jobs}}});"
+        f"pending[0].resolve({{jobs:{stale_jobs}}});await waitRequests(3);"
+        f"pending[2].resolve({{jobs:{accepted_jobs}}});"
         if accepted_first
         else
         f"pending[0].resolve({{jobs:{stale_jobs}}});await waitRequests(3);"
@@ -341,4 +344,34 @@ assert.equal(!!(loadOptions&&loadOptions.background),false);
 assert.equal(_currentCronDetail.name,'Renamed');
 assert(fields.taskDetailBody.innerHTML.includes('New prompt'));
 assert.equal(fields.btnPauseTaskDetail.style.display,'');
+""", setup=REAL_DETAIL)
+
+
+def test_edit_cancel_refresh_preserves_another_task_selected_during_read():
+    run_js("""
+const saved={id:'saved',name:'Existing',state:'active',prompt:'Old prompt'};
+const other={id:'other',name:'Other',state:'active',prompt:'Other prompt'};
+_cronList=[saved,other];
+let renderCalls=0;
+const productionRender=_renderCronDetail;
+_renderCronDetail=(job)=>{renderCalls++;return productionRender(job);};
+_renderCronDetail(saved);
+_cronMode='edit';_editingCronId='saved';_cronPreFormDetail=saved;
+let settleWrite;
+const originalApi=api;
+api=function(url,opts){if(opts)return new Promise(resolve=>{settleWrite=resolve;});return originalApi(url,opts);};
+const save=saveCronForm();
+cancelCronForm();
+settleWrite({id:'saved'});await waitRequests(1);
+openCronDetail(other);
+output.innerHTML='Other loaded output';output.open=true;
+const detailBefore=fields.taskDetailBody.innerHTML;
+const rendersBefore=renderCalls;
+pending[0].resolve({jobs:[{...saved,name:'Renamed',prompt:'New prompt'},other]});
+await save;
+assert.equal(_currentCronDetail.id,'other');
+assert.equal(fields.taskDetailBody.innerHTML,detailBefore);
+assert.equal(renderCalls,rendersBefore);
+assert.equal(output.innerHTML,'Other loaded output');
+assert.equal(output.open,true);
 """, setup=REAL_DETAIL)
