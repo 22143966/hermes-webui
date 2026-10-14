@@ -156,6 +156,11 @@
 
 ### Fixed
 
+- **Background-subagent wakeups no longer appear as messages you typed.** When delegated background work finishes, the
+  wakeup the Agent needs is still delivered, but the transcript no longer shows it as a user bubble, and it no longer
+  counts toward message totals, provisional titles, forks or exports. That holds across reloads, session switches and
+  streaming. Thanks @CharlesMcquade. (#7882)
+
 - **Settings search shows results right away.** Typing in the Settings search box now lists matches from the
   already-loaded panes immediately, instead of waiting for every pane to finish loading, and a result you've clicked
   no longer reappears when the slower panes arrive. Thanks @yugui923. (#6370)
