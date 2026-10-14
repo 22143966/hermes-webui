@@ -11024,7 +11024,14 @@ function _reanchorProjectPickerAfterRepaint(){
   if(typeof open.refreshChoices==='function') open.refreshChoices();
   if(typeof _syncProjectPickerSelection==='function') _syncProjectPickerSelection(open);
   const current=open.anchorEl;
-  if(current&&current.isConnected!==false) return false;
+  if(current&&current.isConnected!==false){
+    // Refreshed choices can make the picker taller than when it was placed (a
+    // pending create, rename or delete completing). Re-run placement for a
+    // still-connected anchor too, so a below-anchor picker that no longer fits
+    // flips or caps instead of growing past the viewport. Focus is untouched.
+    if(typeof _positionProjectPicker==='function') _positionProjectPicker(open.picker,current);
+    return false;
+  }
   let next=(typeof _findSessionRenameRow==='function')?_findSessionRenameRow(open.sessionId):null;
   const contextPoint=current&&current._projectPickerContextPoint;
   const currentClasses=current&&current.classList;

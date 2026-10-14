@@ -1639,7 +1639,8 @@ def _sync_project_picker_selection_source() -> str:
 
 
 def test_kept_same_owner_picker_refreshes_selected_project_without_moving_focus():
-    """A held Move completion updates the reopened picker's radio state in place."""
+    """A held Move completion updates the reopened picker's radio state in place,
+    re-places it against its live anchor, and keeps keyboard focus."""
     assert NODE is not None
     script = r"""
 let _allSessions=[{session_id:'s',project_id:'project-b'}];
@@ -1674,7 +1675,7 @@ console.log(JSON.stringify({result,a:a.state(),b:b.state(),focused,positioned,re
         "a": {"active": False, "checked": "false"},
         "b": {"active": True, "checked": "true"},
         "focused": "project-a",
-        "positioned": 0,
+        "positioned": 1,
         "refreshed": 1,
     }
 
