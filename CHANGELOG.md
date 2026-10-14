@@ -156,6 +156,10 @@
 
 ### Fixed
 
+- **Faster secret redaction on long values.** The redactor no longer runs its environment-assignment and code-key
+  matchers on strings that contain no `=`, which those patterns need to match, so long URL-bearing values in API
+  responses are masked with less CPU. Every other masking rule is unchanged. Thanks @tobenot. (#8192)
+
 - **A finished reply no longer vanishes when the final update arrives empty.** If the stream's closing event carried an
   empty message list, the done handler replaced the visible transcript with nothing, so the reply you just watched stream
   disappeared until a reload. The settle now keeps the streamed transcript when the payload is empty. Thanks
