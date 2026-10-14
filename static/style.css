@@ -2109,6 +2109,9 @@
   .has-tooltip{position:relative;}
   .has-tooltip::after{content:attr(data-tooltip);position:absolute;left:calc(100% + 8px);top:50%;transform:translateY(-50%);background:var(--surface);border:1px solid var(--accent-bg-strong);color:var(--text);font-size:11.5px;font-weight:600;letter-spacing:.02em;padding:5px 10px;border-radius:6px;white-space:nowrap;pointer-events:none;z-index:1500;box-shadow:0 8px 24px rgba(0,0,0,.65),0 0 0 1px rgba(0,0,0,.35),0 1px 0 rgba(255,255,255,.04) inset;opacity:0;transition:opacity .14s ease;transition-delay:0s;}
   .has-tooltip:hover::after,.has-tooltip:focus-visible::after{opacity:1;transition-delay:.15s;}
+  /* A popup trigger's own menu supersedes its tooltip (iPad sticky hover showed both, #7069). Scoped to
+     aria-haspopup so plain toggles with aria-expanded (e.g. the workspace edge toggle) keep theirs. */
+  .has-tooltip[aria-haspopup][aria-expanded="true"]::after{content:none;}
   /* For bottom-positioned tooltips (panel header buttons, non-rail elements) */
   .has-tooltip--bottom::after{left:50%;top:auto;bottom:auto;transform:translateX(-50%);top:calc(100% + 8px);}
   /* For bottom-positioned tooltips on a trigger that sits flush with its
