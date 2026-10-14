@@ -163,6 +163,12 @@
   conversation outline loads older messages without re-rendering, which left on-screen rows with indexes relative to
   the old window. These actions now resolve each row's current index. Thanks @dss539. (#8218)
 
+- **Updates recover from a renamed remote branch instead of failing to fetch.** When a branch on the remote was renamed
+  so its old name now blocks the new one (`'refs/remotes/origin/x' exists; cannot create ...`, or on git 2.51+ only
+  "some local refs could not be updated; try running 'git remote prune origin'"), the updater prunes just the stale
+  remote-tracking ref and retries once. Local branches, local tags and working-tree changes are never touched. Thanks
+  @UncleLiu-0306. (#8227)
+
 - **WebUI finds the same Agent whether it starts as a service or through bootstrap, and recovers from a half-finished
   Agent install.** Direct service startup and `bootstrap.py` now share one Agent discovery path, keep the interpreter
   that actually proved the Agent install for later Agent subprocesses, and retry an incomplete install instead of
