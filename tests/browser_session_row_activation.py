@@ -40,6 +40,7 @@ builds are installed and launch; WebKit needs its system libraries)
   lands.
 """
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -164,6 +165,15 @@ FOCUSED_SID_JS = """() => {
 }"""
 
 
+ACTIONS_TRIGGER_JS = """(sid) => {
+  const row = Array.from(document.querySelectorAll('#sessionList .session-item[data-sid]'))
+    .find(node => node.dataset.sid === sid);
+  return row ? row.querySelector('.session-actions-trigger') : null;
+}"""
+
+FOCUS_IN_LIST_JS = "() => !!document.querySelector('#sessionList:focus-within')"
+
+
 def _title(page, sid):
     handle = page.evaluate_handle(TITLE_SELECTOR_JS, sid)
     return handle.as_element()
@@ -279,6 +289,13 @@ def _check_desktop(page, seed, name):
     current = {t["sid"]: t["current"] for t in page.evaluate(TITLES_JS)}
     if current.get(beta) != "page" or current.get(alpha) is not None:
         fail(f"aria-current did not follow the open conversation: {current}")
+    # Opening rebuilds the list; keyboard focus must land on the opened row's
+    # rebuilt title (not <body>), so the next Tab continues from that row.
+    if page.evaluate(FOCUSED_SID_JS) != beta:
+        fail("after Enter opened a conversation, focus was not on its title in the sidebar")
+    page.keyboard.press("Tab")
+    if not page.evaluate("(sid) => document.activeElement === (" + ACTIONS_TRIGGER_JS + ")(sid)", beta):
+        fail("Tab after Enter did not continue to the opened row's actions button")
 
     # A held Enter auto-repeats; only the first keydown may open.
     page.evaluate(COUNT_OPENS_JS)
@@ -387,6 +404,48 @@ def _check_desktop(page, seed, name):
     if _opens(page) or not page.evaluate(ACTIVE_JS, alpha):
         fail(f"a mouse drag along a row opened {_opens(page)}")
 
+    # Press a title, drag onto the same row's actions button, release: the
+    # button stops pointerup from bubbling, and the browser's click then
+    # targets the row. Nothing may open (master keeps the current one).
+    _open(page, alpha)
+    page.evaluate("() => document.activeElement && document.activeElement.blur()")
+    page.evaluate(COUNT_OPENS_JS)
+    box = _title(page, beta).bounding_box()
+    x, y = box["x"] + min(20, box["width"] / 3), box["y"] + box["height"] / 2
+    page.mouse.move(x, y)
+    trigger = page.evaluate_handle(ACTIONS_TRIGGER_JS, beta).as_element()
+    tbox = trigger.bounding_box() if trigger else None
+    if not tbox or not tbox["width"]:
+        fail("the beta row's actions button has no box while the row is hovered")
+    else:
+        page.mouse.down()
+        page.mouse.move(tbox["x"] + tbox["width"] / 2, tbox["y"] + tbox["height"] / 2, steps=8)
+        page.mouse.up()
+        page.wait_for_timeout(SETTLE_MS)
+        if _opens(page) or not page.evaluate(ACTIVE_JS, alpha):
+            fail(f"dragging from a title onto its actions button opened {_opens(page)}")
+    page.evaluate("() => typeof closeSessionActionMenu === 'function' && closeSessionActionMenu()")
+
+    # A mouse press must not park focus on a title: the list would stay
+    # :focus-within, and refreshes deferred while the user interacts would
+    # never apply after the mouse leaves. Jittery 8 px press, no open.
+    _open(page, alpha)
+    page.evaluate("() => document.activeElement && document.activeElement.blur()")
+    page.evaluate(COUNT_OPENS_JS)
+    box = _title(page, beta).bounding_box()
+    x, y = box["x"] + min(20, box["width"] / 3), box["y"] + box["height"] / 2
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x + 8, y, steps=4)
+    page.mouse.up()
+    page.mouse.move(0, 0)
+    page.wait_for_timeout(SETTLE_MS)
+    if page.evaluate(FOCUS_IN_LIST_JS):
+        fail("a mouse press on a title left keyboard focus inside the conversation list")
+    page.evaluate("() => renderSessionList({deferWhileInteracting: true})")
+    if not _wait_until(page, "() => !_isSessionListUserInteracting() && !_pendingSessionListPayload", timeout_ms=2500):
+        fail("a deferred sidebar refresh was still pending 2.5 s after a mouse press on a title")
+
     _open(page, alpha)
     page.evaluate(COUNT_OPENS_JS)
     trigger = page.evaluate_handle("""(sid) => {
@@ -406,6 +465,14 @@ def _check_desktop(page, seed, name):
             fail(f"Enter on the actions trigger opened a conversation: {_opens(page)}")
     page.keyboard.press("Escape")
     page.evaluate("() => typeof closeSessionActionMenu === 'function' && closeSessionActionMenu()")
+    page.wait_for_timeout(300)
+
+    # Double-click still renames (the title drops mouse focus, not the press).
+    _open(page, alpha)
+    _title(page, beta).dblclick()
+    if not _wait_until(page, "() => !!document.querySelector('#sessionList .session-title-input')", timeout_ms=2000):
+        fail("double-clicking a title no longer starts a rename")
+    page.keyboard.press("Escape")
     page.wait_for_timeout(300)
 
     page.evaluate("() => toggleSessionSelectMode()")
@@ -499,6 +566,11 @@ def _check_touch(page, ctx, seed, label, phone):
     page.wait_for_timeout(SETTLE_MS)
     if _opens(page) != [gamma]:
         fail(f"short swipe then Enter opened {_opens(page)}, expected exactly [gamma]")
+    in_sidebar = page.evaluate("() => !!(document.activeElement && document.activeElement.closest('.sidebar'))")
+    if phone and in_sidebar:
+        fail("after Enter opened a conversation, focus stayed inside the closed drawer")
+    if not phone and page.evaluate(FOCUSED_SID_JS) != gamma:
+        fail("after Enter opened a conversation, focus was not on its title in the sidebar")
 
     # The same with a screen reader's activate command (mouse events, no
     # pointer events) instead of Enter.
@@ -619,7 +691,7 @@ def main():
                 found = _check_desktop(page, seed, name)
                 failures.extend(found)
                 if not found:
-                    print(f"OK  {name} — rows open from assistive activation, click(), Enter and the mouse; repaints never steal focus")
+                    print(f"OK  {name} — rows open from assistive activation, click(), Enter and the mouse; Enter keeps focus on the opened row; drags and presses neither open nor park focus; repaints never steal focus")
                 failures.extend(f"  [{name}] pageerror: {err}" for err in errors)
                 ctx.close()
 
@@ -662,6 +734,10 @@ def main():
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait()
+        log.close()
+        # The state dir holds the server's caches; /tmp is often RAM-backed.
+        shutil.rmtree(state_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -254,8 +254,13 @@ conversation's title. Mouse events without pointer events (how Firefox performs
 a screen reader's activate command, e.g. NVDA in browse mode), a bare
 `element.click()`, and Enter on the focused title must each open the
 conversation, and a sidebar repaint must never move focus to a title (a screen
-reader would pull its reading cursor back to the list). A held (auto-repeated)
-Enter must not open it again, Enter on a title must not answer a visible tool
+reader would pull its reading cursor back to the list). After Enter opens a
+conversation, focus must be on that row's rebuilt title, so the next Tab reaches
+its ⋮ trigger; on a phone, focus must not stay inside the closed drawer. A mouse
+press on a title must not park focus there (a refresh deferred while the user
+interacts must apply once the mouse leaves), and double-click must still rename.
+Dragging from a title onto the row's ⋮ trigger must not open the conversation.
+A held (auto-repeated) Enter must not open it again, Enter on a title must not answer a visible tool
 approval card (the document-level "Enter = Allow once" shortcut), and a
 right-click on a row must not swallow the next keyboard activation. A real
 mouse click and a touch tap must still open it exactly once, and a mouse drag

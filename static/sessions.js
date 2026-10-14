@@ -9657,6 +9657,10 @@ function renderSessionListFromCache(){
         // path, never through a click a gesture could be mistaken for.
         if(!e.repeat) _activateRowWithoutPointer(title);
       };
+      // Keyboard focus only: a mouse press must not park focus on the title,
+      // or the list stays :focus-within and deferred refreshes never apply.
+      // Click, double-click rename and assistive activation are unaffected.
+      title.onmousedown=(e)=>{if(e.button===0) e.preventDefault();};
     }
     const tsMs=_sessionTimestampMs(s);
     const ts=document.createElement('span');
@@ -10463,15 +10467,32 @@ function renderSessionListFromCache(){
       if(_sessionActionMenu){closeSessionActionMenu();return;}
       if(_sessionSelectMode){if(!readOnly)toggleSessionSelect(s.session_id);return;}
       clearTimeout(_tapTimer);_tapTimer=null;_lastTapTime=0;
-      void _openRowSession();
+      void _openRowSession().then(_refocusOpenedRowTitle);
+    };
+    // Opening rebuilds the list and detaches the focused title, dropping focus
+    // to <body>. Hand it to the opened row's rebuilt title so the next Tab
+    // continues from there. Focus that went somewhere real is left alone, and
+    // focus() is a no-op inside the closed (inert) phone drawer.
+    const _refocusOpenedRowTitle=()=>{
+      const current=document.activeElement;
+      if(current&&current!==document.body&&current.isConnected) return;
+      const list=$('sessionList');
+      const row=list&&list.querySelector('.session-item[data-sid="'+CSS.escape(s.session_id)+'"]');
+      const rowTitle=row&&row.querySelector('.session-title[tabindex]');
+      if(rowTitle) _focusSessionActionMenuRestoreTarget(rowTitle);
     };
     // A bare click is assistive-technology activation. The gesture's own
     // clicks never get here as one: a mouse/pen release flags the click the
     // browser dispatches in the same task (cleared once that task ends, so it
     // cannot outlive the gesture, and is list-wide so a row rebuilt in between
     // still matches), and a handled touch tap cancels its compatibility click
-    // at touchend. Capture phase so inner controls that stop propagation still
-    // consume the flag.
+    // at touchend. Both listeners use the capture phase so inner controls that
+    // stop propagation (the actions button) still publish and consume the flag.
+    el.addEventListener('pointerup',(e)=>{
+      if(e.pointerType==='touch'||e.button!==0) return;
+      _sessionRowPointerReleasePending=true;
+      setTimeout(()=>{_sessionRowPointerReleasePending=false;},0);
+    },true);
     el.addEventListener('click',(e)=>{
       if(_sessionRowPointerReleasePending){
         _sessionRowPointerReleasePending=false;
@@ -10503,10 +10524,6 @@ function renderSessionListFromCache(){
       if(_gesturePointerType==='mouse'&&_gestureState!=='idle') _clearPointerDragState();
     };
     el.onpointerup=(e)=>{
-      if(e.pointerType!=='touch'&&e.button===0){
-        _sessionRowPointerReleasePending=true;
-        setTimeout(()=>{_sessionRowPointerReleasePending=false;},0);
-      }
       if(e.pointerType==='touch') return;
       if(e.pointerType==='mouse' && e.button!==0) return;  // ignore right/middle click
       if((e.ctrlKey||e.metaKey) && !_sessionSelectMode && !_renamingSid && _gestureState!=='idle' && !_longPressMenuOpened && (typeof _newTabOpenSupported!=='function'||_newTabOpenSupported())){
