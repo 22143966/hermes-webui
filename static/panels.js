@@ -2079,6 +2079,15 @@ async function saveCronForm(){
   const formDetailKey = _currentCronDetailKey;
   const formStillCurrent = () => $('cronFormError') === errEl &&
     _currentPanel === formPanel && _cronMode === formMode && _currentCronDetailKey === formDetailKey;
+  const acceptedJobsForCurrentForm = async (data) => {
+    if (!formStillCurrent()) return null;
+    // A completion poll can supersede this save's list request. If its accepted
+    // response has not landed yet, take one foreground read so the still-current
+    // form completes from the authoritative list rather than remaining saveable.
+    if (!data || data.jobs !== _cronList) data = await loadCrons();
+    if (!formStillCurrent() || !data || data.jobs !== _cronList) return null;
+    return _cronList;
+  };
   try{
     const modelEl = $('cronFormModel');
     const modelLoaded = !!(modelEl && modelEl.dataset.loaded === '1');
@@ -2109,11 +2118,17 @@ async function saveCronForm(){
       showToast(t('cron_job_updated'));
       const saveViewCurrent = formStillCurrent();
       if (!saveViewCurrent && _currentPanel !== 'tasks') return;
-      const data = await loadCrons(false, {background: !saveViewCurrent});
+      // Cancel returns an edit form to the same job's read view. That visible
+      // detail must receive the successful write; other navigation stays quiet.
+      const editedDetailShown = !saveViewCurrent && _cronMode === 'read' &&
+        !!_currentCronDetail && _currentCronDetailKey === formDetailKey;
+      const data = await loadCrons(false, {background: !saveViewCurrent && !editedDetailShown});
       // A background refresh keeps a newer selection/output untouched. Only the
       // still-current form may auto-open its saved job from the accepted list.
-      if (!saveViewCurrent || !formStillCurrent() || !data || data.jobs !== _cronList) return;
-      const job = _cronList.find(j => j.id === editedId);
+      if (!saveViewCurrent) return;
+      const jobs = await acceptedJobsForCurrentForm(data);
+      if (!jobs) return;
+      const job = jobs.find(j => j.id === editedId);
       if (job) openCronDetail(job);
       return;
     }
@@ -2138,9 +2153,10 @@ async function saveCronForm(){
     const saveViewCurrent = formStillCurrent();
     if (!saveViewCurrent && _currentPanel !== 'tasks') return;
     const data = await loadCrons(false, {background: !saveViewCurrent});
-    if (!saveViewCurrent || !formStillCurrent() || !data || data.jobs !== _cronList) return;
+    if (!saveViewCurrent) return;
+    const jobs = await acceptedJobsForCurrentForm(data);
+    if (!jobs) return;
     const newId = res && (res.id || (res.job && res.job.id));
-    const jobs = _cronList;
     const job = jobs && (newId ? jobs.find(j => j.id === newId) : jobs[jobs.length - 1]);
     if (job) {
       _cronIsDuplicate = false;
