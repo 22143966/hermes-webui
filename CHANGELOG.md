@@ -58,6 +58,11 @@
 
 ### Fixed
 
+- **Stopping a Gateway chat now carries the interrupted turn into the model's next context.** The cancelled prompt and its
+  partial answer are reconciled into context exactly once (also for empty-context sessions, eager-save mode, forks,
+  same-second interrupts and cleared sessions), and display-only recovered rows are never resurrected into context.
+  Thanks @Ejmathewp. (#8166)
+
 - **API paths are case-insensitive under `/api/`.** `/API/Settings` and `/Api/...` now route like `/api/...`, and the
   folded path is what the auth check sees, while dynamic segments (share tokens, MCP server names, session ids) keep
   their original case. Thanks @webtecnica. (#6589, fixes #3943)

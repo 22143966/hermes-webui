@@ -25221,6 +25221,8 @@ def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, st
         str(getattr(s, "session_source", None) or "").strip().lower() == "fork"
     )
     existing = list(getattr(s, "messages", None) or [])
+    from api.process_event_utils import build_active_turn_token, stamp_message_source
+
     if existing:
         latest = existing[-1]
         if isinstance(latest, dict) and latest.get("role") == "user":
@@ -25228,11 +25230,25 @@ def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, st
             msg_text = " ".join(str(msg or "").split())
             if latest_text == msg_text:
                 if _checkpoint_source == "fork" or _fork_owned_wakeup:
+                    # Fork turns keep the copied-row identity: the branch
+                    # route copies transcript rows up to the fork point and
+                    # the re-sent prompt rides the copied row; the
+                    # `_fork_child_turn` marker stamps it (unchanged).
                     latest["_fork_child_turn"] = s.session_id
-                return
+                    return
+                # Text alone is not turn ownership (re-gate 2026-10-06 item
+                # 3): a second interrupt of the same prompt inside one second
+                # carries a DIFFERENT stream token and must checkpoint its
+                # own row instead of collapsing into the previous turn's.
+                # Token-less rows (legacy data) keep the established
+                # content check.
+                current_token = build_active_turn_token(
+                    getattr(s, "active_stream_id", None), started_at,
+                )
+                latest_token = latest.get("_active_turn_token")
+                if not (latest_token and current_token and latest_token != current_token):
+                    return
     user_msg = {"role": "user", "content": msg}
-    from api.process_event_utils import build_active_turn_token, stamp_message_source
-
     stamp_message_source(
         user_msg,
         source,
