@@ -5,6 +5,11 @@
 
 ### Added
 
+- **Project bindings: pin workspaces and a model to a sidebar project.** Right-click a project chip and choose
+  **Project settings…** to bind one or more workspaces (one marked default) and a model, so the project's quick-create
+  (+) button opens a new session already set up for that project. Thanks @silent-reader-cn.
+  (#6836)
+
 - **English multilingual Edge TTS voices.** The English multilingual Edge text-to-speech voices are allowed and listed in
   Settings alongside the existing voices; the server still accepts only allowlisted voice IDs. Thanks
   @judah-hermes-agent. (#8210)
