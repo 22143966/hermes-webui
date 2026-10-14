@@ -156,6 +156,10 @@
 
 ### Fixed
 
+- **Long virtualized transcripts measure rows before writing, and settle without a redundant second rebuild.** Row
+  heights are read before layout is invalidated, and the transparent settle skips a rebuild that only repeated the
+  first, so scrolling a long session does less work and keeps its place. Thanks @MuhammadUsamaMX. (#8232, fixes #7677)
+
 - **Outline jumps land on the message right after a long session opens.** Load-time bottom settling no longer pulls
   the reader back, and the jump reuses already-loaded history instead of fetching it again. Thanks @dss539. (#8219)
 
