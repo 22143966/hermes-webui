@@ -2370,7 +2370,7 @@ class TestUpdateBannerUx:
         """
         ui_src = read('static/ui.js')
         panels_src = read('static/panels.js')
-        format_fn = extract_js_function(ui_src, '_formatUpdateTargetStatus')
+        format_fn = extract_js_function(ui_src, '_formatUpdateTargetStatus') + '\n' + extract_js_function(ui_src, '_updateTargetArrowNamesTag')
         instruction_fn = extract_js_function(ui_src, '_formatManualUpdateInstruction')
         error_fn = extract_js_function(ui_src, '_formatUpdateCheckError')
         check_fn = extract_js_function(panels_src, 'checkUpdatesNow')
@@ -2428,6 +2428,19 @@ function _showUpdateBanner() {{}}
   state.checkUpdatesStatus.textContent = '';
   await checkUpdatesNow();
   if(state.checkUpdatesStatus.textContent.indexOf('Up to date · Latest tag: v0.51.913') === -1) throw new Error('up-to-date branch must show spaced tag suffix: '+state.checkUpdatesStatus.textContent);
+  // #6859 fold r3: the suffix is dropped ONLY when the tag's own target arrow names it.
+  apiData = {{ webui: {{ latest_tag: 'v0.52.1', behind: 0 }}, agent: {{ behind: 1, branch: 'origin/fix-v0.52.1' }} }};
+  state.checkUpdatesStatus.textContent = '';
+  await checkUpdatesNow();
+  if(state.checkUpdatesStatus.textContent.indexOf(' · Latest tag: v0.52.1') === -1) throw new Error('agent branch containing the tag must not hide it: '+state.checkUpdatesStatus.textContent);
+  apiData = {{ webui: {{ latest_tag: 'v0.52.1', behind: 0 }}, agent: {{ behind: 1, release_based: true, current_version: 'v0.52.9', latest_version: 'v0.52.10', latest_tag: 'v0.52.10' }} }};
+  state.checkUpdatesStatus.textContent = '';
+  await checkUpdatesNow();
+  if(state.checkUpdatesStatus.textContent.indexOf(' · Latest tag: v0.52.1') === -1) throw new Error('agent v0.52.10 must not hide webui v0.52.1: '+state.checkUpdatesStatus.textContent);
+  apiData = {{ webui: {{ latest_tag: 'v0.52.1', behind: 1, release_based: true, current_version: 'v0.52.0', latest_version: 'v0.52.1' }}, agent: null }};
+  state.checkUpdatesStatus.textContent = '';
+  await checkUpdatesNow();
+  if(state.checkUpdatesStatus.textContent.indexOf('Latest tag') !== -1) throw new Error('arrow already names the tag; suffix must be skipped: '+state.checkUpdatesStatus.textContent);
   // No tag fields anywhere → no suffix.
   apiData = {{ webui: {{ behind: 1 }}, agent: null }};
   state.checkUpdatesStatus.textContent = '';
@@ -2486,7 +2499,7 @@ function _showUpdateBanner() {{}}
 
         ui_src = read('static/ui.js')
         panels_src = read('static/panels.js')
-        format_fn = extract_js_function(ui_src, '_formatUpdateTargetStatus')
+        format_fn = extract_js_function(ui_src, '_formatUpdateTargetStatus') + '\n' + extract_js_function(ui_src, '_updateTargetArrowNamesTag')
         instruction_fn = extract_js_function(ui_src, '_formatManualUpdateInstruction')
         error_fn = extract_js_function(ui_src, '_formatUpdateCheckError')
         check_fn = extract_js_function(panels_src, 'checkUpdatesNow')
@@ -2698,7 +2711,7 @@ if(state.btnClearUpdateLock.style.display !== 'inline-block' || state.btnClearUp
     def test_settings_manual_webui_update_includes_pull_guidance(self):
         ui_src = read('static/ui.js')
         panels_src = read('static/panels.js')
-        format_fn = extract_js_function(ui_src, '_formatUpdateTargetStatus')
+        format_fn = extract_js_function(ui_src, '_formatUpdateTargetStatus') + '\n' + extract_js_function(ui_src, '_updateTargetArrowNamesTag')
         instruction_fn = extract_js_function(ui_src, '_formatManualUpdateInstruction')
         error_fn = extract_js_function(ui_src, '_formatUpdateCheckError')
         check_fn = extract_js_function(panels_src, 'checkUpdatesNow')
