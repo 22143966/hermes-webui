@@ -29,19 +29,22 @@ global._scrollPinned=true;global._messageUserUnpinned=false;
 global._messageRenderWindowSize=30;
 let exists=!!scenario.row,settling=true;
 const container={scrollTop:900};
-const row={dataset:{sessionMsgIdx:scenario.stale?900:0},scrollIntoView:()=>{events.push('scroll');container.scrollTop=100;},classList:{remove(){},add(){}},offsetWidth:1};
+const row={dataset:{sessionMsgIdx:scenario.stale?900:0},scrollIntoView:()=>{events.push(owned?'scroll':'scroll-unowned');container.scrollTop=100;},classList:{remove(){},add(){}},offsetWidth:1};
 global.document={getElementById:id=>id==='messages'?container:(exists?row:null)};
 global.requestAnimationFrame=f=>frames.push(f);
 window.setTimeout=f=>timers.push(f);
 // A load-time bottom-settle timer armed before the click writes the bottom unless cancelled.
 timers.push(()=>{if(settling){container.scrollTop=900;events.push('settle-bottom');}});
 global._cancelBottomSettle=()=>{settling=false;events.push('cancel');};
-global._beginMessageJumpScroll=()=>{_scrollPinned=false;_messageUserUnpinned=true;events.push('begin');};
+// Scroll ownership lapses when its settle timer fires (300 ms in ui.js); a long
+// render outlasts it, so the jump must take ownership again before scrolling.
+let owned=false;
+global._beginMessageJumpScroll=()=>{owned=true;_scrollPinned=false;_messageUserUnpinned=true;events.push('begin');};
 global._currentMessageRenderWindowSize=()=>_messageRenderWindowSize;
 global._messageRenderableMessageCount=()=>130;
 global._messageSessionIndexForRawIdx=n=>n;
 // While bottom settling is armed, a render pulls the viewport back to the end.
-global.renderMessages=()=>{events.push('render',_messageUserUnpinned?'unpinned':'pinned');exists=true;row.dataset.sessionMsgIdx=0;if(settling)frames.push(()=>{container.scrollTop=900;events.push('bottom-retry');});};
+global.renderMessages=()=>{events.push('render',_messageUserUnpinned?'unpinned':'pinned');exists=true;row.dataset.sessionMsgIdx=0;owned=false;if(settling)frames.push(()=>{container.scrollTop=900;events.push('bottom-retry');});};
 global._flashRow=()=>{};
 global._currentSid=()=>S.session.session_id;
 global._ensureAllMessagesLoaded=async()=>{
@@ -75,6 +78,9 @@ def test_jump_lands_despite_pending_bottom_settle(row):
     assert "pinned" not in result["events"]
     assert "bottom-retry" not in result["events"]
     assert "settle-bottom" not in result["events"]
+    # The scroll happens while the jump owns scrolling (re-taken after a render).
+    assert "scroll" in result["events"]
+    assert "scroll-unowned" not in result["events"]
 
 
 def test_loaded_history_is_not_downloaded_again():
