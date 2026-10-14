@@ -296,7 +296,10 @@ def _run_git(args, cwd, timeout=10):
         raw = getattr(exc, 'stderr', None) or getattr(exc, 'stdout', None) or ''
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode('utf-8', 'replace')
-        detail = raw.strip()
+        # The partial output is user-facing git text: a pull that died on a
+        # credentialed remote can echo the URL (with its token) before timing
+        # out, so run it through the same credential scrub the fetch path uses.
+        detail = _sanitize_git_diagnostic(raw, limit=len(raw))
         return detail or f"git {' '.join(args)} timed out after {timeout}s", False
     except FileNotFoundError:
         return 'git executable not found', False
