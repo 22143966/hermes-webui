@@ -258,13 +258,12 @@ browser UI.
 
 ### Several profiles behind one Gateway
 
-A turn uses the gateway URL and key of the **session's own profile**, not those of whichever profile the WebUI process loaded. Globally exported values stay available, though, and `HERMES_WEBUI_GATEWAY_BASE_URL` in the environment always wins over `webui_gateway_base_url` in `config.yaml`. So with the global export from the examples above still in place, a named profile keeps going to the global route.
+A turn uses the gateway URL and key of the **session's own profile**, not those of whichever profile the WebUI process loaded.
 
-To give a named profile its own route (for example `/p/<profile>`), set `HERMES_WEBUI_GATEWAY_BASE_URL` in that profile's `.env`, or remove the global export and set `webui_gateway_base_url` in that profile's `config.yaml`.
-
-The key follows the same rule: put `HERMES_WEBUI_GATEWAY_API_KEY` (or `API_SERVER_KEY`) in each profile's `.env`. A global `HERMES_WEBUI_GATEWAY_API_KEY` combined with per-profile `API_SERVER_KEY` values makes named profiles send the wrong key and the Gateway answers HTTP 401.
-
-A `${VAR}` in a profile's `webui_gateway_base_url` is expanded from the same environment the key is read from: the profile's own `.env` first, then any global variable that did not itself come from another profile's `.env`. Variables loaded from the active profile's `.env` are not visible to other profiles, so each profile that uses `${VAR}` should define it in its own `.env`. If the variable is not set anywhere, the turn ends with an error naming the unresolved variable and no request is sent.
+- **A profile that sets nothing of its own** (no `HERMES_WEBUI_GATEWAY_BASE_URL`, `HERMES_WEBUI_GATEWAY_API_KEY` or `API_SERVER_KEY` in its own `.env`, no `webui_gateway_base_url` in its `config.yaml`) uses the shared endpoint the WebUI process was given, URL and key together. That includes values exported by the launcher and values the default profile's `~/.hermes/.env` put into the process environment. This is what a single-profile setup sends, so named profiles on a shared Gateway keep working unchanged.
+- **A profile that sets its own** URL or key gets its own, resolved together from that profile's `.env` and `config.yaml`. To give a named profile its own route (for example `/p/<profile>`), set `HERMES_WEBUI_GATEWAY_BASE_URL` in that profile's `.env`, or set `webui_gateway_base_url` in its `config.yaml` and leave `HERMES_WEBUI_GATEWAY_BASE_URL` out of the launcher environment (an exported `HERMES_WEBUI_GATEWAY_BASE_URL` takes precedence over `config.yaml`).
+- Put `HERMES_WEBUI_GATEWAY_API_KEY` (or `API_SERVER_KEY`) in each such profile's `.env`. Values loaded from the default profile's `.env` are not inherited by a profile that sets its own URL or key. A global `HERMES_WEBUI_GATEWAY_API_KEY` combined with per-profile `API_SERVER_KEY` values makes those profiles send the wrong key and the Gateway answers HTTP 401.
+- A `${VAR}` in a profile's `webui_gateway_base_url` is expanded from that profile's `.env`, read fresh from the file on every turn, plus any launcher export that did not come from another profile's `.env`. If the variable is not set anywhere, the turn ends with an error naming the unresolved variable and no request is sent.
 
 The bridge is best used by operators who already run Hermes Gateway/API Server
 locally and want browser-originated chat to use the same runtime/tool path as

@@ -1922,7 +1922,8 @@ def _profile_homes(tmp_path, monkeypatch, envs, config_url="${GW_ROUTE}"):
     for name in envs:
         home = tmp_path / name
         home.mkdir()
-        (home / "config.yaml").write_text('webui_gateway_base_url: "%s"\n' % config_url, encoding="utf-8")
+        (home / "config.yaml").write_text(
+            ('webui_gateway_base_url: "%s"\n' % config_url) if config_url else "{}\n", encoding="utf-8")
         homes[name] = home
     monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda n: homes[str(n)])
     monkeypatch.setattr(profiles, "get_profile_runtime_env", lambda home: dict(envs[Path(home).name]))
@@ -1965,3 +1966,30 @@ def test_gateway_endpoint_restores_the_thread_env_state(tmp_path, monkeypatch):
     gateway_chat._gateway_endpoint_for_profile("beta")
     assert getattr(_thread_ctx, "env", {}) == before_env
     assert getattr(_thread_ctx, "block_process_env_fallback", False) == before_block
+
+
+def test_gateway_endpoint_keeps_the_shared_pair_for_a_profile_with_no_transport_overrides(tmp_path, monkeypatch):
+    """A globally exported URL plus API_SERVER_KEY only in the default profile's .env (so the loader recorded and
+    would strip it) must still authenticate a named profile that sets nothing of its own: the pair master sends."""
+    import api.profiles as profiles
+
+    _profile_homes(tmp_path, monkeypatch, {"beta": {"TERMINAL_CWD": "/work"}}, config_url=None)
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gw.local:8642")
+    monkeypatch.setenv("API_SERVER_KEY", "shared-root-key")
+    monkeypatch.setattr(profiles, "_loaded_profile_env_keys", {"API_SERVER_KEY"})
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local:8642", "shared-root-key")
+
+
+def test_gateway_endpoint_reads_the_active_profiles_env_fresh_not_the_cached_config(tmp_path, monkeypatch):
+    """Changing the active profile's .env from route A to route B must change the URL with the key, even though
+    the ambient config cache was expanded earlier."""
+    import api.profiles as profiles
+
+    envs = {"alpha": {"GW_ROUTE": "http://gw.local/p/A", "API_SERVER_KEY": "key-A"}}
+    homes = _profile_homes(tmp_path, monkeypatch, envs)
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: homes["alpha"])   # alpha is the ambient profile
+
+    assert gateway_chat._gateway_endpoint_for_profile("alpha") == ("http://gw.local/p/A", "key-A")
+    envs["alpha"] = {"GW_ROUTE": "http://gw.local/p/B", "API_SERVER_KEY": "key-B"}
+    assert gateway_chat._gateway_endpoint_for_profile("alpha") == ("http://gw.local/p/B", "key-B")
