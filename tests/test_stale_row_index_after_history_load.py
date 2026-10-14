@@ -85,3 +85,73 @@ def test_fork_rereads_index_from_its_row():
     reread = body.index("_rowCurrentRawIdx(forkRow,msgIdx-1)+1")
     # Must happen before the absolute keep_count is captured (#2184 ordering).
     assert reread < body.index("const absoluteKeepCount = _oldestIdx + msgIdx;")
+
+
+# Run the real edit / regenerate / fork actions on a 40-message session whose
+# tail rows (window starting at message 10) were rendered before the full
+# history loaded. Network and DOM are stubs; the request bodies are recorded.
+ACTIONS = r"""
+const assert = require('node:assert/strict');
+const calls = [];
+let sendBtn = null;
+const S = {session: {session_id: 's1', regeneration_revision: 'r1'}, busy: false, messages: []};
+// Each action starts from the full 40-message session (an edit truncates it).
+const reset = () => { S.messages = Array.from({length: 40}, (_, i) => ({role: i % 2 ? 'assistant' : 'user', content: String(i)})); };
+let _oldestIdx = 0, _submitEditInFlight = false;
+const window = {};
+const document = {createElement: (type) => type === 'textarea'
+  ? {value: '', className: '', addEventListener() {}, after() {}, focus() {}, setSelectionRange() {}}
+  : {className: '', innerHTML: '', querySelector: (sel) => sel.includes('send') ? (sendBtn = sendBtn || {}) : {}}};
+function requestAnimationFrame() {}
+function autoResizeTextarea() {}
+function _deliberateSessionModelPick() { return null; }
+function _reArmRecoveryPick() {}
+function renderMessages() {}
+function $() { return {value: ''}; }
+async function send() { calls.push({send: true}); }
+function setStatus(message) { calls.push({status: message}); }
+function showToast(message) { calls.push({toast: message}); }
+function t(key) { return key; }
+async function startRegeneration(sid, revision) { calls.push({regenerate: sid, revision}); }
+async function loadSession() {}
+async function renderSessionList() {}
+async function _ensureAllMessagesLoaded() { _oldestIdx = 0; }
+async function api(path, options) { calls.push({path, body: JSON.parse(options.body)}); return {}; }
+FUNCTIONS
+// A tail row rendered while the window started at absolute message 10.
+const staleRow = (rawIdx) => ({
+  dataset: {msgIdx: String(rawIdx), sessionMsgIdx: String(rawIdx + 10), rawText: 'old'},
+  querySelector: () => ({replaceWith() {}}),
+  closest() { return this; },
+});
+(async () => {
+  const out = {};
+  // Edit opened before history loads, sent after it loaded (outline opened meanwhile).
+  reset(); _oldestIdx = 10; sendBtn = null; calls.length = 0;
+  editMessage(staleRow(28)); _oldestIdx = 0;
+  await sendBtn.onclick();
+  out.editOpenedBefore = calls.find((c) => c.path === '/api/session/truncate').body.keep_count;
+  // History already loaded without a re-render, then edit, fork, regenerate.
+  reset(); _oldestIdx = 0; sendBtn = null; calls.length = 0;
+  editMessage(staleRow(28)); await sendBtn.onclick();
+  out.editAfterLoad = calls.find((c) => c.path === '/api/session/truncate').body.keep_count;
+  reset(); calls.length = 0;
+  const forkRow = staleRow(3);
+  await forkFromMessage(4, {closest: () => forkRow});
+  out.fork = calls.find((c) => c.path === '/api/session/branch').body.keep_count;
+  reset(); calls.length = 0;
+  await regenerateResponse(staleRow(29));
+  out.regenerate = calls.filter((c) => c.regenerate || c.status);
+  console.log(JSON.stringify(out));
+})().catch((e) => { console.error(e); process.exitCode = 1; });
+"""
+
+
+def test_actions_send_the_shown_message_after_history_loads():
+    functions = "\n".join([_helpers(), _function(UI_JS, "editMessage"), _function(UI_JS, "submitEdit"),
+                           _function(UI_JS, "regenerateResponse"), _function(COMMANDS_JS, "forkFromMessage")])
+    out = _run(ACTIONS.replace("FUNCTIONS", functions))
+    assert out["editOpenedBefore"] == 38   # last user message is absolute 38
+    assert out["editAfterLoad"] == 38
+    assert out["fork"] == 14               # fork keeps messages 0..13
+    assert out["regenerate"] == [{"regenerate": "s1", "revision": "r1"}]
