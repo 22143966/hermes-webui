@@ -242,6 +242,12 @@ bootstrap probe accepts either backend.
 
 ---
 
+## Browser becomes unresponsive while switching running conversations
+
+If `/health` is healthy and `active_runs` still contains the tasks, a frozen browser does not mean the backend workers have crashed. Reconnecting to a long reasoning stream can replay many chunks at once; repainting the activity scene for every chunk can block the browser main thread.
+
+Reasoning deltas remain in each conversation's `INFLIGHT` state. Display updates share the answer's coalesced render scheduler, with synchronous tail flushes at interim-answer, tool, and terminal boundaries. Queued renders check the current conversation and stream ownership before updating the pane. Transport recovery paints pending assistant prose before cancelling the queued frame, so already received text stays visible while reconnecting. Reloading the page reconnects to existing tasks; the backend does not need to restart just because the browser froze.
+
 ## "Response interrupted." marker keeps saying "no agent output was recovered"
 
 **Symptom.** After a live response stream stops before a turn completes (manual restart, OOM, crash, browser/SSE disconnect, lost worker bookkeeping, …), the affected chat shows an `**Response interrupted.**` marker. If the run-journal for that turn is already visible on disk, the marker says the partial output was recovered; if not, it preserves the user turn and says no agent output was recovered yet.
