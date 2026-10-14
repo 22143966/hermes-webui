@@ -5,6 +5,11 @@
 
 ### Added
 
+- **Project bindings: pin workspaces and a model to a sidebar project.** Right-click a project chip and choose
+  **Project settings…** to bind one or more workspaces (one marked default) and a model, so the project's quick-create
+  (+) button opens a new session already set up for that project. Thanks @silent-reader-cn.
+  (#6836)
+
 - **Middle-click or Ctrl/Cmd-click a conversation in the sidebar to open it in a new tab.** Works for top-level rows
   and for nested sub-conversations (a child of a compressed conversation opens the child itself, also after a refresh),
   keeps each tab on its own profile, and leaves plain clicks, the action menu and touch gestures unchanged. Thanks
