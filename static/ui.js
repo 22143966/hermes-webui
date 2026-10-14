@@ -3073,10 +3073,19 @@ function _inlineMediaHtmlForRef(ref, sessionId, altText){
   if(/^file:\/\//i.test(ref)){
     try{
       const u=new URL(ref);
+      // #8033: file:///C:/Users/me/x parses to pathname '/C:/Users/me/x' —
+      // the file-URI grammar keeps the leading separator. Strip exactly that
+      // ONE separator before the drive letter; never a generic leading-slash
+      // removal (POSIX and UNC semantics differ). Non-local file authorities
+      // (UNC: file://server/share/...) are explicitly rejected here — never
+      // silently rewired to a local path.
+      if(u.hostname&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(u.hostname)) return '';
       ref=decodeURIComponent(u.pathname||ref.replace(/^file:\/\//i,''));
+      ref=ref.replace(/^[\\/]([A-Za-z]:[\\/])/,'$1');
     }catch(_){
       try{ref=decodeURIComponent(ref.replace(/^file:\/\//i,''));}
       catch(__){ref=ref.replace(/^file:\/\//i,'');}
+      ref=ref.replace(/^[\\/]([A-Za-z]:[\\/])/,'$1');
     }
   }
   if(/^https?:\/\//i.test(ref)){

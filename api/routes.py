@@ -22944,6 +22944,30 @@ def _media_deny_reason(target: Path) -> str | None:
     return None
 
 
+# #8033: Windows drive-letter file:/// URIs arrive here as '/C:/Users/me/x' —
+# URL.pathname keeps the file-URI grammar's leading separator before the drive
+# letter, and Path('/C:/x') is root-relative on Windows (resolves to the wrong
+# location). Strip exactly that ONE URI-style separator when it sits
+# immediately before a drive letter. Never a generic leading-slash removal:
+# POSIX ('/home/me/x') and UNC ('\\server\share\...') semantics differ and
+# must stay untouched.
+_WINDOWS_DRIVE_URI_LEAD_RE = re.compile(r"^[\\/]([A-Za-z]:[\\/])")
+
+
+def _normalize_media_request_path(raw_path: str) -> str:
+    """Return ``raw_path`` with the file-URI leading separator before a drive
+    letter removed (Windows drive-letter file:/// URIs), otherwise unchanged.
+
+    Only a leading ``[\\/]`` immediately followed by ``[A-Za-z]:[\\/]``
+    matches; every other path (POSIX absolute, UNC, drive-relative ``C:foo``,
+    already-clean ``C:/x``) passes through untouched. Shape-only: no
+    percent-decoding, no existence checks.
+    """
+    if _WINDOWS_DRIVE_URI_LEAD_RE.match(raw_path):
+        return raw_path[1:]
+    return raw_path
+
+
 def _handle_media(handler, parsed):
     """Serve a local file by absolute path for inline display in the chat.
 
@@ -22980,7 +23004,11 @@ def _handle_media(handler, parsed):
 
     # Resolve the path and check it is within an allowed root
     try:
-        target = Path(raw_path).resolve()
+        # #8033: Windows drive-letter file:/// URIs carry a URI-style leading
+        # separator ('/C:/Users/...'); strip exactly that one separator so
+        # Path() does not treat the drive path as root-relative on Windows.
+        # POSIX and UNC paths are returned unchanged by the normalizer.
+        target = Path(_normalize_media_request_path(raw_path)).resolve()
     except Exception:
         return bad(handler, "Invalid path", 400)
 

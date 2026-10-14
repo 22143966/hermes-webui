@@ -4791,10 +4791,18 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     if(!/^file:\/\//i.test(href)) return href;
     try{
-      const path=decodeURIComponent(href.replace(/^file:\/\//i,''));
-      return 'api/media?path='+encodeURIComponent(path)+'&inline=1';
+      const u=new URL(href);
+      // #8033 (policy shared with ui.js): non-local file authorities (UNC:
+      // file://server/share/...) are explicitly rejected — never silently
+      // rewired to a local path.
+      if(u.hostname&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(u.hostname)) return href;
+      const path=decodeURIComponent(u.pathname||href.replace(/^file:\/\//i,''));
+      // #8033: file:///C:/Users/me/x parses to '/C:/Users/me/x' — strip
+      // exactly the URI-style separator before the drive letter (never a
+      // generic leading-slash removal: POSIX/UNC semantics differ).
+      return 'api/media?path='+encodeURIComponent(path.replace(/^[\\/]([A-Za-z]:[\\/])/,'$1'))+'&inline=1';
     }catch(_){
-      return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,''))+'&inline=1';
+      return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,'').replace(/^[\\/]([A-Za-z]:[\\/])/,'$1'))+'&inline=1';
     }
   }
   function _smdFileHref(raw){
