@@ -15940,6 +15940,15 @@ function _computeTransparentHiddenPrefixCount(rows){
 // renderMessages({preserveScroll:true}) call and cleared after the settled-scene
 // render pass; null at all other times.
 let _keepSettledWorklogOpenForStreamId=null;
+// #7677: PRE-INIT snapshot taken by the keep-open settle render (renderMessages
+// computes `cacheHtml` before highlightCode/addCopyButtons/initTreeViews and
+// deliberately does NOT cache the forced-open DOM, #5260). When the settle chain
+// then skips the unarmed rebuild, _cacheSettledTranscriptHtml() publishes this
+// stash so the session still lands in _sessionHtmlCache. Capturing it here —
+// rather than from the live DOM afterwards — is what keeps restored controls
+// working: innerHTML cannot save onclick handlers, and addCopyButtons() /
+// initTreeViews() skip already-initialized markup on restore.
+let _settleKeepOpenCacheStash=null;
 function _shouldKeepSettledWorklogOpenForStreamSettle(streamId){
   // Round 6 scroll-jump guard: collapsing the JUST-settled live worklog into a
   // compact summary at STREAM_DONE shrinks the transcript by hundreds of px. The
@@ -16035,18 +16044,23 @@ function _transparentSettledTurnWouldBeCapped(inner, scene, rawIdx){
   }
   return true;
 }
-// #7677 (review P2). STREAM_DONE's unarmed second render was also the pass that
-// wrote the settled transcript into _sessionHtmlCache (the keep-open ARMED
-// render is deliberately uncached, #5260). Skipping that rebuild therefore used
-// to leave the session uncached, so switching away and back paid a full rebuild.
-// Snapshot the ALREADY-SETTLED DOM here instead — no rebuild — under exactly the
-// gates renderMessages() applies to its own cache write: a live session id, no
-// in-flight stream, no transient compression/handoff card, and <300 KB of HTML.
+// #7677 (review P2 / r2 P1). STREAM_DONE's unarmed second render was also the
+// pass that wrote the settled transcript into _sessionHtmlCache (the keep-open
+// ARMED render is deliberately uncached, #5260). Skipping that rebuild therefore
+// used to leave the session uncached, so switching away and back paid a full
+// rebuild. Publish the PRE-INIT snapshot the armed render stashed — no rebuild —
+// under exactly the gates renderMessages() applies to its own cache write: the
+// stash must belong to the live session, no in-flight stream, no transient
+// compression/handoff card, and <300 KB of HTML. Reading the LIVE DOM here would
+// be wrong: by settle time it is post-init, and innerHTML cannot carry the copy
+// buttons' / tree views' onclick handlers, so restored controls would be dead.
 function _cacheSettledTranscriptHtml(){
   try{
-    const sid=(typeof S!=='undefined'&&S&&S.session)?S.session.session_id:null;
-    const inner=(typeof $==='function')?$('msgInner'):null;
-    if(!sid||!inner) return false;
+    if(typeof _settleKeepOpenCacheStash==='undefined'||!_settleKeepOpenCacheStash) return false;
+    const stash=_settleKeepOpenCacheStash;
+    const sid=stash.sid;
+    const currentSid=(typeof S!=='undefined'&&S&&S.session)?S.session.session_id:null;
+    if(!sid||sid!==currentSid) return false;
     if(typeof INFLIGHT!=='undefined'&&INFLIGHT&&INFLIGHT[sid]) return false;
     const w=(typeof window!=='undefined')?window:null;
     const hasTransient=!!(w&&(
@@ -16054,23 +16068,17 @@ function _cacheSettledTranscriptHtml(){
       (w._handoffUi&&(!w._handoffUi.sessionId||w._handoffUi.sessionId===sid))
     ));
     if(hasTransient) return false;
-    const html=inner.innerHTML||'';
-    if(!html||html.length>=300000) return false;
+    if(!stash.html||stash.html.length>=300000) return false;
     if(typeof _sessionHtmlCache==='undefined'||!_sessionHtmlCache||typeof _sessionHtmlCache.set!=='function') return false;
-    const msgCount=(typeof S!=='undefined'&&S&&Array.isArray(S.messages))?S.messages.length:0;
-    let renderWindowKey='';
-    if(typeof _messageVirtualWindowKeyFor==='function'
-       &&typeof _currentMessageVirtualWindow==='function'
-       &&typeof _getVisibleMessagesWithIdx==='function'
-       &&typeof _messageVirtualKeepTailCount==='function'){
-      renderWindowKey=_messageVirtualWindowKeyFor(
-        _currentMessageVirtualWindow(_getVisibleMessagesWithIdx(), _messageVirtualKeepTailCount())
-      );
-    }
-    const signature=(typeof _messageRenderCacheSignature==='function')?_messageRenderCacheSignature():'';
     if(typeof _sessionHtmlCacheSid!=='undefined') _sessionHtmlCacheSid=sid;
-    _sessionHtmlCache.set(sid,{html:html,msgCount,renderWindowKey,signature});
+    _sessionHtmlCache.set(sid,{
+      html:stash.html,
+      msgCount:stash.msgCount,
+      renderWindowKey:stash.renderWindowKey,
+      signature:stash.signature,
+    });
     if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
+    _settleKeepOpenCacheStash=null;
     return true;
   }catch(_e){ return false; }
 }
@@ -17307,6 +17315,7 @@ function clearMessageRenderCache(){
   _clearRenderCache();
   _sessionHtmlCache.clear();
   _sessionHtmlCacheSid=null;
+  _settleKeepOpenCacheStash=null;
   clearVisibleMessageRowCache();
   _clearMessageVirtualHeightCache();
 }
@@ -20485,6 +20494,26 @@ function renderMessages(options){
       _sessionHtmlCache.set(sid,{html:_html,msgCount,renderWindowKey,signature:renderSignature});
       if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
     }
+    // #7677: an unarmed render supersedes any pending settle stash.
+    _settleKeepOpenCacheStash=null;
+  }else if(sid&&_keepOpenArmed){
+    // #7677: still no cache WRITE here (#5260 — the forced-open DOM must never be
+    // persisted), but stash the pre-init snapshot this render already computed.
+    // `cacheHtml` is taken BEFORE highlightCode/addCopyButtons/initTreeViews run,
+    // so it is exactly what the normal cache path would have stored. When the
+    // settle chain then skips the unarmed rebuild, _cacheSettledTranscriptHtml()
+    // publishes this stash — reading it back from the live DOM instead would save
+    // copy buttons and JSON/YAML trees WITHOUT their onclick handlers, leaving
+    // dead controls after a session switch (#7677 review r2 P1).
+    _settleKeepOpenCacheStash=(cacheHtml&&cacheHtml.length<300_000)
+      ? {
+        sid,
+        msgCount,
+        renderWindowKey,
+        html:cacheHtml,
+        signature:cachedRenderSignature===null?_messageRenderCacheSignature():cachedRenderSignature,
+      }
+      : null;
   }
   _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
   // Kill the pinned/tail-follower mid-stream jitter. Schedule the re-anchor in a MICROTASK,

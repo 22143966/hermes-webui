@@ -307,7 +307,7 @@ const ownerNodes=Array.from({length:__ROWCOUNT__},()=>({
     return null;
   },
 }));
-const inner={innerHTML:'<div class="assistant-turn">settled</div>'};
+const inner={innerHTML:'<button onclick="liveCopy()">copy</button><div data-tree-init="1">tree</div>'};
 inner.querySelectorAll=function(sel){
   if(sel.indexOf('data-anchor-settled-scene-owner')!==-1) return [];   // transparent: no group
   if(sel.indexOf('data-anchor-owner-idx')!==-1) return ownerNodes;
@@ -327,6 +327,10 @@ function _transparentRevealKey(sessionId,ownerIdx){ return String(sessionId)+':'
 // _sessionHtmlCache snapshot collaborators (mirrors renderMessages' own gates).
 const _sessionHtmlCache=new Map();
 var _sessionHtmlCacheSid=null;
+// The keep-open settle render's PRE-INIT snapshot, exactly as renderMessages
+// stashes it (cacheHtml is taken before highlightCode/addCopyButtons/
+// initTreeViews, so it carries no onclick handlers and no data-tree-init flags).
+var _settleKeepOpenCacheStash=__STASH__;
 const INFLIGHT={};
 const window={};
 function _getVisibleMessagesWithIdx(){ return []; }
@@ -355,10 +359,24 @@ console.log(JSON.stringify({
         .replace("__OWNERSCENE__", owner_scene)
         .replace("__QUERIED__", json.dumps(queried))
         .replace("__REVEALED__", str(revealed).lower())
+        .replace("__STASH__", _keep_open_stash_js(session_id, owner_idx + 1))
         .replace(
             "__SESSION__",
             f", session:{{ session_id:{json.dumps(session_id)} }}" if session_id else "",
         )
+    )
+
+
+def _keep_open_stash_js(session_id: str | None, msg_count: int) -> str:
+    """The PRE-INIT snapshot renderMessages stashes while the keep-open token is
+    armed — the only HTML the settle skip is allowed to publish (#7677 review
+    r2 P1: a post-init innerHTML snapshot keeps the copy buttons / tree views but
+    not their onclick handlers, so restored controls would be dead)."""
+    if not session_id:
+        return "null"
+    return (
+        "{ sid:%s, msgCount:%d, renderWindowKey:'wk', signature:'sig1', "
+        "html:'<div>pre-init</div>' }" % (json.dumps(session_id), msg_count)
     )
 
 
@@ -510,6 +528,10 @@ def test_transparent_settle_skip_still_writes_the_session_html_cache():
     assert entry["msgCount"] == 6
     assert entry["renderWindowKey"] == "wk"
     assert entry["signature"] == "sig1"
+    assert entry["html"] == "<div>pre-init</div>", (
+        "the published entry must carry the stashed PRE-INIT snapshot, not the "
+        f"live post-init DOM; got {entry['html'][:60]!r}"
+    )
     assert m["cacheSid"] == "sess-1"
 
 
@@ -522,7 +544,10 @@ const _sessionHtmlCache=new Map();
 var _sessionHtmlCacheSid=null;
 const INFLIGHT = __INFLIGHT__;
 const window = { _compressionUi:null, _handoffUi:null };
-const inner = { html:'x'.repeat(__HTMLLEN__) };
+// The LIVE DOM at settle time is POST-init: addCopyButtons()/initTreeViews()
+// already ran, and innerHTML cannot carry their onclick handlers — so a live
+// snapshot would restore dead controls (#7677 review r2 P1).
+const inner = { html:'<button onclick="liveCopy()">copy</button><div data-tree-init="1">tree</div>' };
 Object.defineProperty(inner,'innerHTML',{ get(){ return this.html; } });
 function $(id){ return id==='msgInner'?inner:null; }
 function _getVisibleMessagesWithIdx(){ return []; }
@@ -530,6 +555,11 @@ function _messageVirtualKeepTailCount(){ return 0; }
 function _currentMessageVirtualWindow(vis,keep){ return {start:0,end:0}; }
 function _messageVirtualWindowKeyFor(m){ return 'wk'; }
 function _messageRenderCacheSignature(){ return 'sig1'; }
+// The PRE-INIT snapshot the keep-open settle render stashed in renderMessages().
+var _settleKeepOpenCacheStash = {
+  sid:'sess-1', msgCount:3, renderWindowKey:'wk', signature:'sig1',
+  html:'x'.repeat(__HTMLLEN__),
+};
 const S = { session:{session_id:'sess-1'}, messages:[1,2,3] };
 if(src.search(/function\s+_cacheSettledTranscriptHtml\s*\(/)>=0){
   eval(extractFunc('_cacheSettledTranscriptHtml'));
@@ -541,6 +571,7 @@ if(typeof _cacheSettledTranscriptHtml==='function'){
 console.log(JSON.stringify({
   ok, err,
   entry:_sessionHtmlCache.has('sess-1')?_sessionHtmlCache.get('sess-1'):null,
+  stashHtml:_settleKeepOpenCacheStash?_settleKeepOpenCacheStash.html.length:null,
 }));
 """
     return template.replace(
@@ -552,11 +583,16 @@ def test_cache_snapshot_writes_a_cacheable_entry():
     m = json.loads(_run_node(_cache_snapshot_harness(inflight=False, html_len=64)))
     assert m["err"] is None, m["err"]
     assert m["ok"] is True, (
-        "the settle-skip path must snapshot the settled DOM into _sessionHtmlCache "
-        f"when the session is cacheable; got ok={m['ok']}"
+        "the settle-skip path must publish the keep-open render's PRE-INIT "
+        f"snapshot into _sessionHtmlCache; got ok={m['ok']}"
     )
     assert m["entry"] is not None
     assert m["entry"]["msgCount"] == 3
+    assert m["entry"]["html"] == "x" * 64, (
+        "the cached HTML must be the stashed PRE-INIT snapshot, never the live "
+        f"post-init DOM; got {m['entry']['html'][:40]!r}"
+    )
+    assert m["stashHtml"] is None, "the stash must be consumed once published"
 
 
 def test_cache_snapshot_respects_the_inflight_and_size_gates():
