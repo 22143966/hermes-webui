@@ -19,12 +19,32 @@ def _root_init_section() -> str:
 
 
 def _chown_helper_script() -> str:
-    """The inline `sh -c` body that chown_home_hermeswebui runs per batch."""
-    fn_start = INIT_SCRIPT.index("chown_home_hermeswebui()")
-    fn_end = INIT_SCRIPT.index("\n}\n", fn_start)
-    match = re.search(r"-exec sh -c '(.*?)' chown_home_hermeswebui", INIT_SCRIPT[fn_start:fn_end], re.S)
-    assert match, "chown_home_hermeswebui must run chown through the inline sh helper"
+    """The inline `sh -c` body that the ownership walks run per batch."""
+    match = re.search(r"^_chown_tolerating_vanished='(.*?)'$", INIT_SCRIPT, re.S | re.M)
+    assert match, "the ownership walks must run chown through the inline sh helper"
     return match.group(1)
+
+
+def _function(name: str) -> str:
+    start = INIT_SCRIPT.index(f"{name}() {{")
+    end = INIT_SCRIPT.index("\n}\n", start)
+    return INIT_SCRIPT[start : end + 2]
+
+
+def _run_find_wrapper(tmp_path, stub_body: str):
+    """Run find_tolerating_vanished with `find` replaced by a stub."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "find"
+    stub.write_text("#!/bin/sh\n" + stub_body + "\n", encoding="utf-8")
+    stub.chmod(0o755)
+    script = _function("find_tolerating_vanished") + '\nfind_tolerating_vanished /h -print\n'
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+    )
 
 
 def test_usermod_skips_its_implicit_home_walk():
@@ -40,10 +60,53 @@ def test_usermod_skips_its_implicit_home_walk():
     assert 'usermod -o -u "${WANTED_UID}" hermeswebui' not in root
 
 
-def test_explicit_walk_ignores_entries_vanishing_between_readdir_and_stat():
-    fn_start = INIT_SCRIPT.index("chown_home_hermeswebui()")
-    fn_end = INIT_SCRIPT.index("\n}\n", fn_start)
-    assert "find /home/hermeswebui -ignore_readdir_race" in INIT_SCRIPT[fn_start:fn_end]
+def test_explicit_walks_tolerate_vanished_entries():
+    wrapper = _function("find_tolerating_vanished")
+    assert 'find "$root" -ignore_readdir_race' in wrapper
+    for name in ("chown_home_hermeswebui", "migrate_home_old_uid"):
+        body = _function(name)
+        assert "find_tolerating_vanished /home/hermeswebui" in body
+        assert '-exec sh -c "$_chown_tolerating_vanished"' in body
+
+
+def test_find_wrapper_accepts_only_vanished_directory_diagnostics(tmp_path):
+    (tmp_path / "vanished").mkdir()
+    vanished = _run_find_wrapper(
+        tmp_path / "vanished",
+        "echo \"find: '/h/x': No such file or directory\" >&2; exit 1",
+    )
+    assert vanished.returncode == 0, vanished.stderr
+
+    for case, body in {
+        "denied": "echo \"find: '/h/x': Permission denied\" >&2; exit 1",
+        "chown": "echo \"find: '/h/x': No such file or directory\" >&2; "
+        "echo \"chown: changing ownership of '/h/y': Read-only file system\" >&2; exit 1",
+        "silent": "exit 1",
+        "root": "echo \"find: '/h': No such file or directory\" >&2; exit 1",
+        "exec": "echo \"find: 'sh': No such file or directory\" >&2; exit 1",
+    }.items():
+        (tmp_path / case).mkdir()
+        result = _run_find_wrapper(tmp_path / case, body)
+        assert result.returncode != 0, case
+        if case != "silent":
+            assert "find: " in result.stderr or "chown: " in result.stderr, case
+
+
+def test_uid_change_migrates_pruned_subtrees_from_old_uid():
+    """Skipping usermod's walk must not leave .git metadata or a writable
+    agent checkout owned by the previous UID; a read-only agent mount stays
+    untouched."""
+    root = _root_init_section()
+    assert root.index("_old_hermeswebui_uid=$(id -u hermeswebui)") < root.index(
+        'usermod -o -u "${WANTED_UID}"'
+    )
+    assert root.index("chown_home_hermeswebui || error_exit") < root.index(
+        'migrate_home_old_uid "$_old_hermeswebui_uid" || error_exit'
+    )
+    migrate = _function("migrate_home_old_uid")
+    assert '[ -w "$agent" ] || skip_agent=(-path "$agent" -prune -o)' in migrate
+    assert '-uid "$old_uid"' in migrate
+    assert 'migrate_home_old_uid "${WANTED_UID}" {} +' in migrate
 
 
 @pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="needs a non-root POSIX user")

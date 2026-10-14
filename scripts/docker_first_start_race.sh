@@ -2,9 +2,12 @@
 # Disposable Docker proof for first-start ownership alignment (#8106).
 #
 # Two-container compose shares ~/.hermes with an agent that replaces files
-# atomically (temp file + rename) while the WebUI container is still running
-# its root init. The init's ownership walks must survive entries vanishing
-# mid-walk, while still failing on real chown errors.
+# atomically (temp file + rename) and removes directories while the WebUI
+# container is still running its root init. The init's ownership walks must
+# survive entries vanishing mid-walk, while still failing on real chown errors.
+# The image's build-time UID differs from WANTED_UID, so every case is a UID
+# change: files of the old UID, including the subtrees the main walk prunes
+# (.git, a writable hermes-agent checkout), must move to the new UID.
 #
 # Usage: scripts/docker_first_start_race.sh IMAGE [RACE_ROUNDS]
 #
@@ -39,25 +42,30 @@ trap cleanup EXIT
 
 docker volume create "$CACHE_VOL" >/dev/null
 
-# Create a hermes-home volume holding SEED_FILES files owned by the image's
-# build-time UID, so both ownership walks have real work to do.
+# Create a hermes-home volume holding SEED_FILES files and a git repository,
+# all owned by the image's build-time UID, so the ownership walks have real
+# work to do.
 new_home_volume() {
   local vol="$1"
   CREATED_VOLUMES+=("$vol")
   docker volume create "$vol" >/dev/null
   docker container run --rm -v "$vol":/h --entrypoint bash "$IMAGE" -c \
-    "mkdir -p /h/seed /h/churn && cd /h/seed && seq 1 $SEED_FILES | xargs touch && chown -R $OLD_ID:$OLD_ID /h"
+    "mkdir -p /h/seed /h/churn /h/project && cd /h/seed && seq 1 $SEED_FILES | xargs touch \
+     && git init -q /h/project && chown -R $OLD_ID:$OLD_ID /h"
 }
 
 # Keep replacing files in the shared home the way the agent gateway does:
-# write a temp file, then rename it over the final name. Runs as root so the
-# writes keep going after the WebUI init has re-owned the directory.
+# write a temp file, then rename it over the final name. Also create and
+# remove whole directories, which find reports even with
+# -ignore_readdir_race. Runs as root so the writes keep going after the WebUI
+# init has re-owned the directory.
 start_churn() {
   local name="$1" vol="$2"
   CREATED_CONTAINERS+=("$name")
   docker container run -d --name "$name" -v "$vol":/h \
     --entrypoint bash "$IMAGE" -c \
-    'i=0; while :; do i=$(( (i + 1) % 200 )); echo x > /h/churn/.tmp.$i; mv -f /h/churn/.tmp.$i /h/churn/f$i; done' \
+    'i=0; while :; do i=$(( (i + 1) % 200 )); echo x > /h/churn/.tmp.$i; mv -f /h/churn/.tmp.$i /h/churn/f$i;
+       mkdir -p /h/churn/d$i/sub && touch /h/churn/d$i/sub/f; rm -rf /h/churn/d$(( (i + 100) % 200 )); done' \
     >/dev/null
 }
 
@@ -107,6 +115,10 @@ assert_ready() {
   [ "$home" = "/home/hermeswebui" ] || fail "$name has home $home, expected /home/hermeswebui"
   stale="$(docker container exec "$name" find /home/hermeswebui/.hermes/seed ! -uid "$NEW_ID" -print -quit)"
   [ -z "$stale" ] || fail "$name left $stale with the old owner"
+  stale="$(docker container exec "$name" find /home/hermeswebui/.hermes/project -uid "$OLD_ID" -print -quit)"
+  [ -z "$stale" ] || fail "$name left $stale in a git repository with the old UID"
+  docker container exec -u hermeswebui "$name" git -C /home/hermeswebui/.hermes/project status >/dev/null \
+    || fail "$name: git refuses the repository under the home"
   if docker container logs "$name" 2>&1 | grep -E '!! ERROR|!! Exiting script'; then
     fail "$name logged an init error"
   fi
@@ -147,6 +159,21 @@ start_webui "${PREFIX}-ro" -v "${PREFIX}-ro":/home/hermeswebui/.hermes \
   -v "$agent_vol":/home/hermeswebui/.hermes/hermes-agent:ro
 assert_ready "${PREFIX}-ro"
 docker container rm -f "${PREFIX}-ro" >/dev/null
+echo "ok"
+
+echo "== writable agent checkout moves from the old UID"
+new_home_volume "${PREFIX}-rw"
+rw_agent_vol="${PREFIX}-rw-agent"
+CREATED_VOLUMES+=("$rw_agent_vol")
+docker volume create "$rw_agent_vol" >/dev/null
+docker container run --rm -v "$rw_agent_vol":/a --entrypoint bash "$IMAGE" -c \
+  "echo src > /a/README && git init -q /a && chown -R $OLD_ID:$OLD_ID /a"
+start_webui "${PREFIX}-rw" -v "${PREFIX}-rw":/home/hermeswebui/.hermes \
+  -v "$rw_agent_vol":/home/hermeswebui/.hermes/hermes-agent
+assert_ready "${PREFIX}-rw"
+stale="$(docker container exec "${PREFIX}-rw" find /home/hermeswebui/.hermes/hermes-agent -uid "$OLD_ID" -print -quit)"
+[ -z "$stale" ] || fail "writable agent checkout left $stale with the old UID"
+docker container rm -f "${PREFIX}-rw" >/dev/null
 echo "ok"
 
 echo "== a real chown failure still stops startup"
