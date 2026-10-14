@@ -156,6 +156,10 @@
 
 ### Fixed
 
+- **Settings search shows results right away.** Typing in the Settings search box now lists matches from the
+  already-loaded panes immediately, instead of waiting for every pane to finish loading, and a result you've clicked
+  no longer reappears when the slower panes arrive. Thanks @yugui923. (#6370)
+
 - **Faster secret redaction on long values.** The redactor no longer runs its environment-assignment and code-key
   matchers on strings that contain no `=`, which those patterns need to match, so long URL-bearing values in API
   responses are masked with less CPU. Every other masking rule is unchanged. Thanks @tobenot. (#8192)
