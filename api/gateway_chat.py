@@ -2036,6 +2036,11 @@ def _project_transcript_context_rows(messages) -> list:
             continue
         if _is_non_replayable_history_row(entry) or _is_reasoning_only_assistant_message(entry):
             continue
+        # Journal-recovered rows without a proven context owner are display-only:
+        # projecting them would hand the model an answer it never produced in
+        # this context (same exclusion master's cancel path applies).
+        if entry.get("_recovered_display_only") is True:
+            continue
         role = str(entry.get("role") or "").strip().lower()
         if role not in {"user", "assistant"}:
             continue

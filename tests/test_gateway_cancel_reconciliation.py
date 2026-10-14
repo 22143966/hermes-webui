@@ -1708,5 +1708,26 @@ class ReconciliationHarness(unittest.TestCase):
         )
 
 
+def test_projection_skips_recovered_display_only_rows():
+    """RM fold: a journal-recovered answer marked ``_recovered_display_only``
+    must not be projected into the seeded model context on a Gateway cancel.
+
+    The empty-context seed accepted these rows and dropped the marker, so the
+    next admission carried an answer the model never produced in this context.
+    """
+    from api.gateway_chat import _project_transcript_context_rows
+
+    rows = _project_transcript_context_rows([
+        {"role": "user", "content": "u0", "timestamp": 1790000000.0},
+        {"role": "assistant", "content": "unproven recovered answer",
+         "_recovered": True, "_recovered_display_only": True},
+        {"role": "assistant", "content": "a0", "timestamp": 1790000001.0},
+    ])
+    contents = [r.get("content") for r in rows]
+    assert "unproven recovered answer" not in contents
+    assert contents == ["u0", "a0"]
+    assert all("_recovered_display_only" not in r for r in rows)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
