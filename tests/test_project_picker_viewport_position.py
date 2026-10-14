@@ -3470,6 +3470,56 @@ console.log(JSON.stringify({pressedId, refreshResult, listenersBefore, afterUp, 
     assert data["settledTimers"] == 0
 
 
+def test_picker_new_press_retires_prior_gesture_fallback():
+    """A prior gesture's fallback must not refresh beneath a new press."""
+    data = _run_picker_cases("""
+openPicker(260);
+const firstPressed = mountedPicker.children[1];
+(mountedPicker.listeners.pointerdown || [])[0]({button:0,pointerId:9});
+const refreshResult = _openProjectPicker.refreshChoices();
+docEmitter.dispatch('pointercancel',{pointerId:9},true);
+const fallbackTimerKeys = [...timers.keys()];
+const listenersWithFallback = docEmitter.count();
+
+const secondPressed = mountedPicker.children[2];
+const secondPressedId = secondPressed.getAttribute('data-project-id');
+(mountedPicker.listeners.pointerdown || [])[0]({button:0,pointerId:10});
+const afterSecondDown = {
+  timers: timers.size,
+  listeners: docEmitter.count(),
+  sameFirstNode: mountedPicker.children[1] === firstPressed,
+  sameSecondNode: mountedPicker.children[2] === secondPressed,
+};
+// A cleared fallback cannot run while the second choice is held.
+flushTimers();
+const whileSecondHeld = {
+  sameFirstNode: mountedPicker.children[1] === firstPressed,
+  sameSecondNode: mountedPicker.children[2] === secondPressed,
+};
+docEmitter.dispatch('pointerup',{pointerId:10},true);
+docEmitter.dispatch('click',{target:secondPressed},true);
+secondPressed.onclick();
+const moveCall = apiCalls.filter(c => String(c.url).indexOf('/api/session/move') !== -1).pop();
+const movedProjectId = moveCall ? JSON.parse(moveCall.body).project_id : null;
+flushTimers();
+console.log(JSON.stringify({refreshResult, fallbackTimerKeys, listenersWithFallback,
+  afterSecondDown, whileSecondHeld, secondPressedId, movedProjectId,
+  settledTimers:timers.size}));
+""")
+    assert data["refreshResult"] == "deferred"
+    assert len(data["fallbackTimerKeys"]) == 1
+    # Starting the second press cancels both the old grace timer and the old
+    # capture click listener, while keeping the pending refresh queued.
+    assert data["afterSecondDown"]["timers"] == 0
+    assert data["afterSecondDown"]["listeners"] == data["listenersWithFallback"] - 1
+    assert data["afterSecondDown"]["sameFirstNode"] is True
+    assert data["afterSecondDown"]["sameSecondNode"] is True
+    assert data["whileSecondHeld"]["sameFirstNode"] is True
+    assert data["whileSecondHeld"]["sameSecondNode"] is True
+    assert data["movedProjectId"] == data["secondPressedId"]
+    assert data["settledTimers"] == 0
+
+
 def test_picker_refresh_restores_focus_only_when_picker_owned_it():
     body = _show_project_picker_source()
     assert "const ownedFocus=!!(active&&typeof picker.contains==='function'&&picker.contains(active));" in body

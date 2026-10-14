@@ -11294,6 +11294,14 @@ function _showProjectPicker(session, anchorEl){
   };
   const beginPointerGesture=(event)=>{
     if(event&&event.button!=null&&event.button!==0) return;
+    // A prior release/cancel may still be waiting for its synthetic click or
+    // grace timeout. A new press owns the pending refresh now: retire the old
+    // completion so it cannot rebuild or reposition choices under this press.
+    if(choiceRefreshTimer!==null){clearTimeout(choiceRefreshTimer);choiceRefreshTimer=null;}
+    if(gestureClickListener){
+      document.removeEventListener('click',gestureClickListener,true);
+      gestureClickListener=null;
+    }
     pointerGestureId=event&&event.pointerId!=null?event.pointerId:0;
   };
   // Append to body and position using getBoundingClientRect so it isn't clipped
