@@ -7608,6 +7608,7 @@ def _sanitize_messages_for_api(
     effective_provider: str | None = None,
     effective_base_url: str | None = None,
     preserve_api_content: bool = False,
+    preserve_row_clocks: bool = False,
     requested_provider: str = "",
 ):
     """Return a deep copy of messages with only API-safe fields.
@@ -7720,7 +7721,20 @@ def _sanitize_messages_for_api(
         if strip_native_images and 'content' in sanitized:
             sanitized['content'] = _strip_native_image_parts_from_content(sanitized.get('content'))
         if sanitized.get('role'):
-            clean.append(sanitized)
+            # The Agent-replay caller (``preserve_row_clocks``) rides each
+            # row's own clock through the projection under a transient
+            # internal marker so the bare-assistant splice guard can detect
+            # out-of-clock-order late-output rows on the PROJECTED list (a raw
+            # index would misattach after a sanitizer merge/replacement,
+            # round-6 blocker 2). ``_sanitize_messages_for_agent`` strips the
+            # marker before the wire payload is returned; it never reaches the
+            # provider.
+            if preserve_row_clocks and 'timestamp' in msg:
+                _clocked = dict(sanitized)
+                _clocked['_replay_ts'] = msg['timestamp']
+                clean.append(_clocked)
+            else:
+                clean.append(sanitized)
 
     # Merge consecutive assistant rows BEFORE positional orphan pairing, so a
     # legitimate ``assistant(call), assistant(progress), tool(result)`` shape
@@ -7871,6 +7885,7 @@ def _sanitize_messages_for_agent(
         effective_provider=effective_provider,
         effective_base_url=effective_base_url,
         preserve_api_content=True,
+        preserve_row_clocks=normalize_bare_assistant_adjacency,
         requested_provider=requested_provider,
     )
     if normalize_bare_assistant_adjacency:
@@ -7909,7 +7924,27 @@ def _sanitize_messages_for_agent(
         # the installed Agent unconditionally; durable raw-row addressability
         # is proven separately on the settle/persist side, which keeps the
         # raw rows verbatim.
-        sanitized = _merge_agent_replay_bare_assistant_rows(sanitized)
+        #
+        # #7237 round 6 CI (boundary matrix, 2026-10-14): one cancelled-history
+        # shape is still preserved as separate rows in the OUTBOUND snapshot —
+        # an out-of-clock-order splice (a late assistant output whose clock is
+        # NEWER than the row following the pair). The reconcile proves those
+        # rows individually addressable and the boundary matrix pins the
+        # row-level prefix, so the sent projection keeps them separate; the
+        # settle proof compares the UNCONDITIONAL merge of the sent rows (what
+        # the installed Agent returns), computed at the settle call sites.
+        sanitized = _merge_agent_replay_bare_assistant_rows(
+            sanitized, preserve_splices=True
+        )
+        # The clock marker is a transient projection-internal discriminator: it
+        # must not ride the wire payload (the installed Agent clones all keys
+        # and strict providers reject unknown fields).
+        sanitized = [
+            {k: v for k, v in row.items() if k != '_replay_ts'}
+            if isinstance(row, dict)
+            else row
+            for row in sanitized
+        ]
     return sanitized
 
 
@@ -7992,7 +8027,58 @@ def _merge_agent_replay_bare_user_rows(messages):
     return merged
 
 
-def _merge_agent_replay_bare_assistant_rows(messages):
+def _agent_replay_settle_projection(sent_history):
+    """Return the history form the installed Agent will RETURN for the rows
+    this process actually handed it.
+
+    The sent projection keeps out-of-clock-order splice pairs separate so the
+    durable raw rows stay individually addressable in the outbound snapshot
+    (#7237 boundary matrix, late-output shapes). The installed Agent's
+    ``repair_message_sequence`` merges every adjacent bare assistant pair
+    unconditionally, so the settle's strict-prefix proof must compare against
+    the UNCONDITIONAL merge of the sent rows — otherwise a real merging Agent's
+    returned prefix diverges from the snapshot and the settle fails closed,
+    dropping the current turn's output. For every other history the sent form
+    and the unconditional merge are identical, so this is a no-op there.
+    """
+    return _merge_agent_replay_bare_assistant_rows(
+        copy.deepcopy(sent_history), preserve_splices=False
+    )
+
+
+def _replay_pair_is_out_of_clock_order(messages, idx):
+    """Return True when the adjacent assistant pair ending at ``idx`` is an
+    out-of-clock-order splice the reconciliation inserted late.
+
+    #7237 boundary matrix pins the row-level prefix for the ``late-output``
+    shapes: a late assistant row whose clock is NEWER than the row that
+    FOLLOWS the pair in the projected list must stay individually addressable
+    in the outbound snapshot (the round-5 ``_replay_merge_blocked_by_cancelled_history``
+    clause 3, restored WITHOUT the raw-provenance handoff round 6 removed).
+    The guard runs on the PROJECTED rows, which carry their own clocks
+    (``_replay_ts``) through the sanitizer, so a raw index can never misattach
+    after a sanitizer merge/replacement (round-6 blocker 2).
+
+    Pairs in clock order — including the float-clock and
+    supersession-continuation schedules the round-6 durable-preservation
+    tests pin — merge unconditionally, exactly like the installed Agent.
+    """
+    if idx < 1 or idx + 1 >= len(messages):
+        return False
+    msg = messages[idx]
+    nxt = messages[idx + 1]
+    if not isinstance(msg, dict) or not isinstance(nxt, dict):
+        return False
+    later_ts = msg.get('_replay_ts')
+    next_ts = nxt.get('_replay_ts')
+    if not isinstance(later_ts, (int, float)) or isinstance(later_ts, bool):
+        return False
+    if not isinstance(next_ts, (int, float)) or isinstance(next_ts, bool):
+        return False
+    return later_ts > next_ts
+
+
+def _merge_agent_replay_bare_assistant_rows(messages, *, preserve_splices: bool = False):
     """Mirror the installed Agent's merge of adjacent bare assistant rows.
 
     The Agent's ``repair_message_sequence`` merges consecutive assistant turns
@@ -8036,7 +8122,7 @@ def _merge_agent_replay_bare_assistant_rows(messages):
     if not isinstance(messages, list):
         return messages
     merged: list = []
-    for msg in messages:
+    for _idx, msg in enumerate(messages):
         if not isinstance(msg, dict):
             merged.append(msg)
             continue
@@ -8053,6 +8139,10 @@ def _merge_agent_replay_bare_assistant_rows(messages):
             and not _is_reasoning_only_assistant_message(msg)
             and not _is_non_replayable_history_row(prev)
             and not _is_non_replayable_history_row(msg)
+            and not (
+                preserve_splices
+                and _replay_pair_is_out_of_clock_order(messages, _idx)
+            )
         ):
             survivor = copy.deepcopy(prev)
             prev_content = survivor.get("content")
@@ -15296,7 +15386,12 @@ def _run_agent_streaming(
             # owns and sanitizer-rewritten historical rows could be appended
             # beside the authoritative raw history (#7237 review
             # data-regression finding, nesquena-hermes 2026-09-23).
-            _run_conversation_projected_history = copy.deepcopy(
+            #
+            # The settle proof compares the UNCONDITIONAL merge of the sent
+            # rows (the form the installed Agent returns), because the sent
+            # projection itself keeps out-of-clock-order splice pairs separate
+            # (#7237 boundary matrix late-output shapes).
+            _run_conversation_projected_history = _agent_replay_settle_projection(
                 _run_conversation_kwargs.get("conversation_history") or []
             )
             result = agent.run_conversation(**_run_conversation_kwargs)
@@ -15908,7 +16003,11 @@ def _run_agent_streaming(
                                 # thread it so the settle's ownership signal
                                 # matches the run that produced this result
                                 # (#7237 review data-regression finding).
-                                _heal_projected_history = copy.deepcopy(
+                                # The settle proof uses the UNCONDITIONAL merge
+                                # of the sent rows (the form the installed
+                                # Agent returns; splice pairs stay separate in
+                                # the sent projection itself).
+                                _heal_projected_history = _agent_replay_settle_projection(
                                     _heal_kwargs.get("conversation_history") or []
                                 )
                                 _heal_result = agent.run_conversation(**_heal_kwargs)
@@ -17331,8 +17430,11 @@ def _run_agent_streaming(
                         # Terminal-heal retry: thread the projection this
                         # retry sent so the settle can prove which rows the
                         # current turn owns (#7237 review data-regression
-                        # finding).
-                        _heal_projected_history2 = copy.deepcopy(
+                        # finding). The settle proof uses the UNCONDITIONAL
+                        # merge of the sent rows (the form the installed Agent
+                        # returns; splice pairs stay separate in the sent
+                        # projection itself).
+                        _heal_projected_history2 = _agent_replay_settle_projection(
                             _heal_kwargs2.get("conversation_history") or []
                         )
                         _heal_result = _heal_agent.run_conversation(**_heal_kwargs2)

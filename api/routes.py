@@ -28127,6 +28127,7 @@ def _handle_chat_sync(handler, body):
                 _restore_reasoning_metadata_before_boundary,
                 _settle_current_turn_boundary,
                 _sanitize_messages_for_agent,
+                _agent_replay_settle_projection,
                 _compact_session_image_parts_for_persistence,
                 _context_messages_for_new_turn,
                 _workspace_context_prefix,
@@ -28170,20 +28171,26 @@ def _handle_chat_sync(handler, body):
             # Take an INDEPENDENT deep snapshot here: the value handed to the
             # Agent and the value compared at settle time must be two objects,
             # or "what we sent" is a moving target.
-            _run_conversation_projected_history = copy.deepcopy(
-                _sanitize_messages_for_agent(
-                    _previous_context_messages,
-                    cfg=get_config(),
-                    effective_model=_model,
-                    effective_provider=_provider,
-                    effective_base_url=_base_url,
-                    # #7237 review round 3 finding 5 (nesquena-hermes
-                    # 2026-10-06): same Agent-replay adjacency normalization the
-                    # streaming path applies, so the sync settle models the
-                    # Agent's merge of bare assistant rows instead of rejecting
-                    # the changed prefix and dropping the exchange.
-                    normalize_bare_assistant_adjacency=True,
-                )
+            #
+            # The sent projection keeps out-of-clock-order splice pairs
+            # separate (the boundary matrix pins the row-level prefix), so the
+            # settle proof compares the UNCONDITIONAL merge of the sent rows —
+            # the form the installed Agent actually returns.
+            _agent_replay_projection = _sanitize_messages_for_agent(
+                _previous_context_messages,
+                cfg=get_config(),
+                effective_model=_model,
+                effective_provider=_provider,
+                effective_base_url=_base_url,
+                # #7237 review round 3 finding 5 (nesquena-hermes
+                # 2026-10-06): same Agent-replay adjacency normalization the
+                # streaming path applies, so the sync settle models the
+                # Agent's merge of bare assistant rows instead of rejecting
+                # the changed prefix and dropping the exchange.
+                normalize_bare_assistant_adjacency=True,
+            )
+            _run_conversation_projected_history = _agent_replay_settle_projection(
+                _agent_replay_projection
             )
 
             result = agent.run_conversation(
@@ -28201,8 +28208,10 @@ def _handle_chat_sync(handler, body):
                 # makes the prefix proof a moving target — the repair
                 # mutates the dict in place and the settle then rejects the
                 # changed prefix, dropping the follow-up's prompt and reply.
-                # A second deep copy here isolates the Agent's mutation.
-                conversation_history=copy.deepcopy(_run_conversation_projected_history),
+                # A second deep copy here isolates the Agent's mutation. The
+                # Agent receives the SENT projection (splice pairs separate);
+                # only the settle proof uses the unconditional merge.
+                conversation_history=copy.deepcopy(_agent_replay_projection),
                 task_id=s.session_id,
                 persist_user_message=msg,
             )
