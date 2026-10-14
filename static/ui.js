@@ -16007,6 +16007,73 @@ function _assistantTurnHasVisibleRenderedSegment(turn){
 // whose rows are not in the rendered transcript (windowing / cache divergence), or
 // a turn over the cap that an unarmed rebuild WOULD re-cap. Cost is never traded
 // for correctness — the second render stays the fallback.
+// #7677 (review P1). The UNARMED rebuild's decision to re-cap a turn is taken
+// from the SCENE'S ROW LIST (`_anchorSceneRowsForRendering(...,{settled:true})`)
+// and the turn's revealed state — never from what happens to sit in the DOM.
+// Rows that render no node at all (hidden reasoning) are still in that list, so
+// counting the nodes the ARMED render left behind can read cap+slack while the
+// list is longer, and declare the second render redundant while an unarmed
+// rebuild would still re-cap the turn to its last 30 rows + a "Show earlier
+// steps" affordance. Any row source we cannot read fails CLOSED (pay the second
+// render); correctness is never traded for the saved rebuild.
+function _transparentSettledTurnWouldBeCapped(inner, scene, rawIdx){
+  if(!scene) return false;
+  if(typeof _anchorSceneRowsForRendering!=='function') return true;
+  let rows=null;
+  try{ rows=_anchorSceneRowsForRendering(scene,{settled:true}); }catch(_e){ rows=null; }
+  if(!Array.isArray(rows)) return true;
+  if(rows.length<=_TRANSPARENT_SETTLED_ROW_CAP+_TRANSPARENT_SETTLED_ROW_CAP_SLACK) return false;
+  // #5966 Codex F3: the persistent revealed set is authoritative — an already
+  // revealed turn is never re-capped by a rebuild. The DOM flag
+  // (data-transparent-earlier-revealed) is only the renderer's same-render fast
+  // path; ignoring it here fails toward the second render, i.e. the safe side.
+  if(typeof _transparentRevealKey==='function'
+     &&typeof _transparentRevealedTurns!=='undefined'
+     &&_transparentRevealedTurns&&typeof _transparentRevealedTurns.has==='function'){
+    const session=(typeof S!=='undefined'&&S)?S.session:null;
+    if(_transparentRevealedTurns.has(_transparentRevealKey(session&&session.session_id, rawIdx))) return false;
+  }
+  return true;
+}
+// #7677 (review P2). STREAM_DONE's unarmed second render was also the pass that
+// wrote the settled transcript into _sessionHtmlCache (the keep-open ARMED
+// render is deliberately uncached, #5260). Skipping that rebuild therefore used
+// to leave the session uncached, so switching away and back paid a full rebuild.
+// Snapshot the ALREADY-SETTLED DOM here instead — no rebuild — under exactly the
+// gates renderMessages() applies to its own cache write: a live session id, no
+// in-flight stream, no transient compression/handoff card, and <300 KB of HTML.
+function _cacheSettledTranscriptHtml(){
+  try{
+    const sid=(typeof S!=='undefined'&&S&&S.session)?S.session.session_id:null;
+    const inner=(typeof $==='function')?$('msgInner'):null;
+    if(!sid||!inner) return false;
+    if(typeof INFLIGHT!=='undefined'&&INFLIGHT&&INFLIGHT[sid]) return false;
+    const w=(typeof window!=='undefined')?window:null;
+    const hasTransient=!!(w&&(
+      (w._compressionUi&&(!w._compressionUi.sessionId||w._compressionUi.sessionId===sid))||
+      (w._handoffUi&&(!w._handoffUi.sessionId||w._handoffUi.sessionId===sid))
+    ));
+    if(hasTransient) return false;
+    const html=inner.innerHTML||'';
+    if(!html||html.length>=300000) return false;
+    if(typeof _sessionHtmlCache==='undefined'||!_sessionHtmlCache||typeof _sessionHtmlCache.set!=='function') return false;
+    const msgCount=(typeof S!=='undefined'&&S&&Array.isArray(S.messages))?S.messages.length:0;
+    let renderWindowKey='';
+    if(typeof _messageVirtualWindowKeyFor==='function'
+       &&typeof _currentMessageVirtualWindow==='function'
+       &&typeof _getVisibleMessagesWithIdx==='function'
+       &&typeof _messageVirtualKeepTailCount==='function'){
+      renderWindowKey=_messageVirtualWindowKeyFor(
+        _currentMessageVirtualWindow(_getVisibleMessagesWithIdx(), _messageVirtualKeepTailCount())
+      );
+    }
+    const signature=(typeof _messageRenderCacheSignature==='function')?_messageRenderCacheSignature():'';
+    if(typeof _sessionHtmlCacheSid!=='undefined') _sessionHtmlCacheSid=sid;
+    _sessionHtmlCache.set(sid,{html:html,msgCount,renderWindowKey,signature});
+    if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
+    return true;
+  }catch(_e){ return false; }
+}
 function _transparentSettledTurnSecondRenderIsRedundant(streamId){
   if(!streamId) return false;
   if(typeof isTransparentStream!=='function'||!isTransparentStream()) return false;
@@ -16014,16 +16081,30 @@ function _transparentSettledTurnSecondRenderIsRedundant(streamId){
   if(!inner||typeof inner.querySelectorAll!=='function') return false;
   const messages=(typeof S!=='undefined'&&S&&Array.isArray(S.messages))?S.messages:[];
   const ownerIdxs=[];
+  const ownerScenes=[];
   let ownerScene=null;
   for(let i=0;i<messages.length;i++){
     const m=messages[i];
     if(!m||String(m._anchor_stream_id||'')!==String(streamId)) continue;
     ownerIdxs.push(String(i));
+    ownerScenes.push(m._anchor_activity_scene||null);
     ownerScene=m._anchor_activity_scene||ownerScene;
   }
   if(!ownerIdxs.length) return false;
+  // #7677 (review P1): decide with the renderer's own inputs first — if the
+  // unarmed rebuild would re-cap ANY of this stream's owner turns, the second
+  // render is not redundant no matter what the armed render left in the DOM.
+  if(typeof _transparentSettledTurnWouldBeCapped==='function'){
+    for(let k=0;k<ownerScenes.length;k++){
+      if(!ownerScenes[k]) continue;
+      if(_transparentSettledTurnWouldBeCapped(inner, ownerScenes[k], Number(ownerIdxs[k]))) return false;
+    }
+  }
   // The transparent settled renderer stamps each row node with the owner message's
   // RAW index (data-anchor-owner-idx); count only this stream's settled rows.
+  // This stays as the SECOND guard: it catches a turn whose scene rows are not in
+  // the rendered transcript at all (windowing / cache divergence), where the row
+  // list alone cannot prove the two renders match.
   let renderedRows=0;
   const nodes=inner.querySelectorAll('[data-anchor-owner-idx][data-anchor-settled-scene-row="1"]');
   for(let i=0;i<nodes.length;i++){
@@ -16057,7 +16138,13 @@ function _collapseJustSettledWorklogInPlace(streamId){
     // stamps that group at all — in which case the second STREAM_DONE render is
     // redundant exactly when the armed settle render already matches the unarmed
     // one. Non-transparent callers still get false from the helper below.
-    return _transparentSettledTurnSecondRenderIsRedundant(streamId);
+    const redundant=_transparentSettledTurnSecondRenderIsRedundant(streamId);
+    // #7677 (review P2): skipping the unarmed rebuild also skips the cache write
+    // that rebuild used to perform (the armed render is deliberately uncached,
+    // #5260) — snapshot the already-settled DOM so a later switch-away/switch-back
+    // still hits _sessionHtmlCache instead of a full rebuild.
+    if(redundant&&typeof _cacheSettledTranscriptHtml==='function') _cacheSettledTranscriptHtml();
+    return redundant;
   }
   const ownerTurn=typeof group.closest==='function'?group.closest('.assistant-turn'):null;
   const ownerHasVisibleSegment=_assistantTurnHasVisibleRenderedSegment(ownerTurn);

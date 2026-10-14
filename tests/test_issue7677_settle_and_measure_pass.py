@@ -266,15 +266,36 @@ def _transp_settle_harness(
     owner_stream_id: str,
     queried_stream_id: str | None = None,
     owner_has_scene: bool = True,
+    scene_row_count: int | None = None,
+    revealed: bool = False,
+    session_id: str | None = None,
 ) -> str:
     cap, slack = _transparent_cap_consts()
     assert row_count in (0, cap + slack, cap + slack + 1)
     owner_idx = 5
     queried = queried_stream_id or owner_stream_id
-    owner_scene = " _anchor_activity_scene:{ rows:[] }," if owner_has_scene else ""
+    # `row_count` drives the RENDERED NODES left behind by the armed render;
+    # `scene_row_count` drives the scene's own row list
+    # (`_anchorSceneRowsForRendering`) — the two differ whenever a row renders no
+    # node at all (hidden reasoning). The unarmed rebuild caps on the ROW LIST,
+    # never on the node count (#7677 review P1).
+    scen_rows = row_count if scene_row_count is None else scene_row_count
+    owner_scene = (
+        f" _anchor_activity_scene:{{ rows:new Array({scen_rows}) }},"
+        if owner_has_scene
+        else ""
+    )
     template = _extract_func_script(UI_JS) + r"""
 const _TRANSPARENT_SETTLED_ROW_CAP=__CAP__;
 const _TRANSPARENT_SETTLED_ROW_CAP_SLACK=__SLACK__;
+// Review-fix collaborators (#7677): only eval'd once they exist in the source,
+// so the pre-fix RED run keeps the original assertions green.
+if(src.search(/function\s+_transparentSettledTurnWouldBeCapped\s*\(/)>=0){
+  eval(extractFunc('_transparentSettledTurnWouldBeCapped'));
+}
+if(src.search(/function\s+_cacheSettledTranscriptHtml\s*\(/)>=0){
+  eval(extractFunc('_cacheSettledTranscriptHtml'));
+}
 eval(extractFunc('_transparentSettledTurnSecondRenderIsRedundant'));
 eval(extractFunc('_collapseJustSettledWorklogInPlace'));
 // The compact settled-scene OWNER group is a NON-transparent artifact: a
@@ -286,7 +307,7 @@ const ownerNodes=Array.from({length:__ROWCOUNT__},()=>({
     return null;
   },
 }));
-const inner={};
+const inner={innerHTML:'<div class="assistant-turn">settled</div>'};
 inner.querySelectorAll=function(sel){
   if(sel.indexOf('data-anchor-settled-scene-owner')!==-1) return [];   // transparent: no group
   if(sel.indexOf('data-anchor-owner-idx')!==-1) return ownerNodes;
@@ -297,11 +318,31 @@ function isTransparentStream(){ return __TRANSPARENT__; }
 // Stubbable collaborator: a scene that is worklog-worthy must fail closed when
 // none of its rows are in the rendered transcript.
 function _anchorSceneSceneHasWorklogWorthyRows(scene){ return !!(scene&&scene.rows); }
-const S={ messages:new Array(__OWNERIDX__ + 1).fill(null) };
+// The renderer's row source: the UNARMED rebuild caps on this length, so the
+// skip predicate has to read the same list.
+function _anchorSceneRowsForRendering(scene,opts){ return (scene&&Array.isArray(scene.rows))?scene.rows:[]; }
+// Revealed-state (the persistent set is authoritative, per #5966 Codex F3).
+const _transparentRevealedTurns=new Set();
+function _transparentRevealKey(sessionId,ownerIdx){ return String(sessionId)+':'+String(ownerIdx); }
+// _sessionHtmlCache snapshot collaborators (mirrors renderMessages' own gates).
+const _sessionHtmlCache=new Map();
+var _sessionHtmlCacheSid=null;
+const INFLIGHT={};
+const window={};
+function _getVisibleMessagesWithIdx(){ return []; }
+function _messageVirtualKeepTailCount(){ return 0; }
+function _currentMessageVirtualWindow(vis,keep){ return {start:0,end:0,topPad:0,bottomPad:0,total:0}; }
+function _messageVirtualWindowKeyFor(m){ return 'wk'; }
+function _messageRenderCacheSignature(){ return 'sig1'; }
+const S={ messages:new Array(__OWNERIDX__ + 1).fill(null)__SESSION__ };
 S.messages[__OWNERIDX__]={ role:'assistant', _anchor_stream_id:__OWNERSTREAM__,__OWNERSCENE__ };
+// Same key expression the impl and _revealTransparentEarlierSteps use.
+if(__REVEALED__) _transparentRevealedTurns.add(_transparentRevealKey(S&&S.session&&S.session.session_id,__OWNERIDX__));
 console.log(JSON.stringify({
   redundant:_transparentSettledTurnSecondRenderIsRedundant(__QUERIED__),
   collapsed:_collapseJustSettledWorklogInPlace(__QUERIED__),
+  cacheEntry:_sessionHtmlCache.has('sess-1') ? _sessionHtmlCache.get('sess-1') : null,
+  cacheSid:_sessionHtmlCacheSid,
 }));
 """
     return (
@@ -313,6 +354,11 @@ console.log(JSON.stringify({
         .replace("__OWNERSTREAM__", json.dumps(owner_stream_id))
         .replace("__OWNERSCENE__", owner_scene)
         .replace("__QUERIED__", json.dumps(queried))
+        .replace("__REVEALED__", str(revealed).lower())
+        .replace(
+            "__SESSION__",
+            f", session:{{ session_id:{json.dumps(session_id)} }}" if session_id else "",
+        )
     )
 
 
@@ -395,6 +441,133 @@ def test_transparent_settle_fails_closed_when_the_turn_is_unknown():
     )
     assert m["redundant"] is False
     assert m["collapsed"] is False
+
+
+def test_hidden_reasoning_rows_do_not_mask_an_over_cap_turn():
+    """#7677 review P1 — the skip predicate must decide with the SAME inputs the
+    unarmed renderer uses: the scene's row list, not the node count left by the
+    ARMED render. Hidden reasoning rows are in `rows` but never produce a node, so
+    a node count reads `cap+slack` while `rows.length` is `cap+slack+5`: the
+    unarmed rebuild WOULD re-cap that turn to its last `cap` rows plus a
+    "Show earlier steps" affordance, and skipping it would leave a permanently
+    expanded turn."""
+    cap, slack = _transparent_cap_consts()
+    m = json.loads(
+        _run_node(
+            _transp_settle_harness(
+                cap + slack,
+                True,
+                "stream-1",
+                scene_row_count=cap + slack + 5,
+            )
+        )
+    )
+    assert m["redundant"] is False, (
+        "an over-cap scene row list must keep the second render even when the "
+        "armed render left only cap+slack nodes behind (hidden reasoning rows "
+        f"render no node); got redundant={m['redundant']}"
+    )
+    assert m["collapsed"] is False
+
+
+def test_revealed_over_cap_turn_still_skips_the_second_render():
+    """Mirror of P1 in the other direction: a turn the reader already revealed is
+    never re-capped by the unarmed rebuild, so the second render stays redundant
+    even with an over-cap row list."""
+    cap, slack = _transparent_cap_consts()
+    m = json.loads(
+        _run_node(
+            _transp_settle_harness(
+                cap + slack,
+                True,
+                "stream-1",
+                scene_row_count=cap + slack + 5,
+                revealed=True,
+            )
+        )
+    )
+    assert m["redundant"] is True
+    assert m["collapsed"] is True
+
+
+def test_transparent_settle_skip_still_writes_the_session_html_cache():
+    """#7677 review P2 — the unarmed second render was the pass that populated
+    `_sessionHtmlCache` for transparent turns (the armed render is deliberately
+    uncached, #5260). Skipping it must not leave the session uncached, or
+    switching away and back pays a full rebuild."""
+    cap, slack = _transparent_cap_consts()
+    m = json.loads(
+        _run_node(
+            _transp_settle_harness(cap + slack, True, "stream-1", session_id="sess-1")
+        )
+    )
+    assert m["collapsed"] is True
+    entry = m["cacheEntry"]
+    assert entry is not None, (
+        "the skipped second render must be replaced by a direct snapshot of the "
+        "already-settled DOM in _sessionHtmlCache; got no cache entry"
+    )
+    assert entry["msgCount"] == 6
+    assert entry["renderWindowKey"] == "wk"
+    assert entry["signature"] == "sig1"
+    assert m["cacheSid"] == "sess-1"
+
+
+# ── 3. cache snapshot gates (review P2) ─────────────────────────────────────
+
+
+def _cache_snapshot_harness(inflight: bool, html_len: int) -> str:
+    template = _extract_func_script(UI_JS) + r"""
+const _sessionHtmlCache=new Map();
+var _sessionHtmlCacheSid=null;
+const INFLIGHT = __INFLIGHT__;
+const window = { _compressionUi:null, _handoffUi:null };
+const inner = { html:'x'.repeat(__HTMLLEN__) };
+Object.defineProperty(inner,'innerHTML',{ get(){ return this.html; } });
+function $(id){ return id==='msgInner'?inner:null; }
+function _getVisibleMessagesWithIdx(){ return []; }
+function _messageVirtualKeepTailCount(){ return 0; }
+function _currentMessageVirtualWindow(vis,keep){ return {start:0,end:0}; }
+function _messageVirtualWindowKeyFor(m){ return 'wk'; }
+function _messageRenderCacheSignature(){ return 'sig1'; }
+const S = { session:{session_id:'sess-1'}, messages:[1,2,3] };
+if(src.search(/function\s+_cacheSettledTranscriptHtml\s*\(/)>=0){
+  eval(extractFunc('_cacheSettledTranscriptHtml'));
+}
+let ok=null, err=null;
+if(typeof _cacheSettledTranscriptHtml==='function'){
+  try{ ok=_cacheSettledTranscriptHtml(); }catch(e){ err=String(e); }
+}else{ err='missing'; }
+console.log(JSON.stringify({
+  ok, err,
+  entry:_sessionHtmlCache.has('sess-1')?_sessionHtmlCache.get('sess-1'):null,
+}));
+"""
+    return template.replace(
+        "__INFLIGHT__", "{'sess-1':true}" if inflight else "{}"
+    ).replace("__HTMLLEN__", str(html_len))
+
+
+def test_cache_snapshot_writes_a_cacheable_entry():
+    m = json.loads(_run_node(_cache_snapshot_harness(inflight=False, html_len=64)))
+    assert m["err"] is None, m["err"]
+    assert m["ok"] is True, (
+        "the settle-skip path must snapshot the settled DOM into _sessionHtmlCache "
+        f"when the session is cacheable; got ok={m['ok']}"
+    )
+    assert m["entry"] is not None
+    assert m["entry"]["msgCount"] == 3
+
+
+def test_cache_snapshot_respects_the_inflight_and_size_gates():
+    """Same gates as renderMessages' own cache write: an in-flight stream and an
+    oversized transcript must never be cached."""
+    busy = json.loads(_run_node(_cache_snapshot_harness(inflight=True, html_len=64)))
+    assert busy["ok"] is False
+    assert busy["entry"] is None, "an in-flight session must not be cached"
+    huge = json.loads(_run_node(_cache_snapshot_harness(inflight=False, html_len=300_000)))
+    assert huge["ok"] is False
+    assert huge["entry"] is None, "transcripts >=300KB must not be cached"
 
 
 def test_stream_done_handler_wires_the_in_place_collapse_before_the_fallback():
