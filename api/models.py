@@ -1117,43 +1117,37 @@ def _message_role(message):
     return str(message.get('role', '')).strip().lower()
 
 
+# Scan complete strings and structural delimiters in C, rather than visiting
+# every character of large metadata strings in Python. The EOF alternative also
+# consumes an unfinished string (including a dangling backslash), so braces or
+# key-like text inside a truncated string can never be mistaken for structure.
+_JSON_PREFIX_TOKENS = re.compile(r'"((?:[^"\\]+|\\[\s\S])*)("|\\?\Z)|([{}\[\]])')
+_JSON_PREFIX_ESCAPES = re.compile(r'\\([\s\S])')
+
+
 def _find_top_level_json_key(text, key):
-    """Return the byte offset of a top-level JSON object key, if present."""
+    """Return the character offset of a top-level JSON object key, if present."""
     depth = 0
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if ch == '"':
-            start = i
-            i += 1
-            escaped = False
-            chars = []
-            while i < n:
-                c = text[i]
-                if escaped:
-                    chars.append(c)
-                    escaped = False
-                elif c == '\\':
-                    escaped = True
-                elif c == '"':
-                    break
-                else:
-                    chars.append(c)
-                i += 1
-            if i >= n:
-                return None
-            if depth == 1 and ''.join(chars) == key:
-                j = i + 1
-                while j < n and text[j] in ' \t\r\n':
-                    j += 1
-                if j < n and text[j] == ':':
-                    return start
-        elif ch in '{[':
-            depth += 1
-        elif ch in '}]':
-            depth -= 1
-        i += 1
+    for token in _JSON_PREFIX_TOKENS.finditer(text):
+        structural = token.group(3)
+        if structural is not None:
+            depth += 1 if structural in '{[' else -1
+            continue
+        if token.group(2) != '"':
+            return None
+        if depth != 1:
+            continue
+        name = token.group(1)
+        # Match the original scanner's escape handling, not JSON unescaping:
+        # it drops the backslash and keeps the following character literally.
+        if '\\' in name:
+            name = _JSON_PREFIX_ESCAPES.sub(r'\1', name)
+        if name == key:
+            j = token.end()
+            while j < len(text) and text[j] in ' \t\r\n':
+                j += 1
+            if j < len(text) and text[j] == ':':
+                return token.start()
     return None
 
 
