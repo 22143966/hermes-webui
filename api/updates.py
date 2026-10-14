@@ -69,6 +69,7 @@ _FETCH_NETWORK_FAILURE_SIGNATURES = (
     'tls connection was non-properly terminated',
     'ssl certificate problem',
 )
+_REMOTE_REF_COLLISION_RE = re.compile(r"exists; cannot create ['\"]refs/remotes/origin/")
 _RELEASE_TAG_RE = re.compile(r'^v[0-9][0-9A-Za-z.+-]*$')
 _EXPERIMENTAL_RELEASE_TAG_RE = re.compile(r'^exp-v[0-9]+(?:\.[0-9]+)*$')
 _GITHUB_RELEASE_TAGS_URL = 'https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100'
@@ -286,6 +287,16 @@ def _run_git(args, cwd, timeout=10):
         stderr = (r.stderr or '').strip()
         if r.returncode == 0:
             return stdout, True
+        if (args[:2] == ['fetch', 'origin']
+                and all(arg in {'--quiet', '--tags', '--force'} for arg in args[2:])
+                and _REMOTE_REF_COLLISION_RE.search(stderr or stdout)):
+            refspec, refspec_ok = _run_git(['config', '--get-all', 'remote.origin.fetch'], cwd)
+            # Custom destinations may prune local tags or branches; fail closed.
+            if refspec_ok and refspec == '+refs/heads/*:refs/remotes/origin/*':
+                return _run_git([
+                    'fetch', 'origin', '--prune', '--no-prune-tags', '--refmap=',
+                    *args[2:], '+refs/heads/*:refs/remotes/origin/*',
+                ], cwd, timeout=timeout)
         return stderr or stdout or f"git exited with status {r.returncode}", False
     except subprocess.TimeoutExpired as exc:
         # text=True decodes only the *completed* run's pipes; on a timeout
