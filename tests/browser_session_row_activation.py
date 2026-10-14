@@ -40,6 +40,7 @@ builds are installed and launch; WebKit needs its system libraries)
   lands.
 """
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -47,7 +48,24 @@ import time
 import urllib.error
 import urllib.request
 
-PORT = int(os.getenv("SESSION_ROW_ACTIVATION_PORT", "8799"))
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _port_in_use(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return True
+        return False
+
+
+# An ephemeral port by default, so the gate never talks to another server
+# that already holds a fixed one; SESSION_ROW_ACTIVATION_PORT pins it.
+PORT = int(os.getenv("SESSION_ROW_ACTIVATION_PORT") or _free_port())
 BASE = f"http://127.0.0.1:{PORT}"
 WAIT_MS = 5000
 # Opening a conversation repaints the sidebar again shortly after; wait it out
@@ -55,13 +73,18 @@ WAIT_MS = 5000
 SETTLE_MS = 800
 
 
-def _wait_for_health(timeout=30):
+def _wait_for_health(proc, timeout=30):
+    """True once this gate's own server answers /health. A server that exited
+    (for example because the port was taken) fails at once, so a different
+    process answering on the port is never mistaken for it."""
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if proc.poll() is not None:
+            return False
         try:
             with urllib.request.urlopen(BASE + "/health", timeout=2) as r:
                 if r.status == 200:
-                    return True
+                    return proc.poll() is None
         except (urllib.error.URLError, OSError):
             pass
         time.sleep(0.5)
@@ -426,6 +449,10 @@ def main():
         "HERMES_WEBUI_AGENT_DIR": os.path.join(state_dir, "no-agent"),
     })
 
+    if _port_in_use(PORT):
+        print(f"SETUP FAIL: port {PORT} is already in use; refusing to test another server", file=sys.stderr)
+        return 2
+
     log = open(os.path.join(state_dir, "server.log"), "w")
     proc = subprocess.Popen(
         [sys.executable, server_py], cwd=repo_root, env=env,
@@ -433,8 +460,8 @@ def main():
         **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
     )
     try:
-        if not _wait_for_health(timeout=30):
-            print("SETUP FAIL: server did not become healthy in 30s", file=sys.stderr)
+        if not _wait_for_health(proc, timeout=30):
+            print("SETUP FAIL: this gate's server exited or did not become healthy in 30s", file=sys.stderr)
             log.flush()
             with open(os.path.join(state_dir, "server.log")) as f:
                 print(f.read()[-2000:], file=sys.stderr)
