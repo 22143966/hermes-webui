@@ -12728,13 +12728,14 @@ async function checkUpdatesNow(channelOverride){
       // the release-path version field: on the stable up-to-date payload it
       // holds the CURRENT tag, which would mislabel it as "Latest". Both
       // payload shapes carry latest_tag from the backend (#6859 review S1).
+      // Skip the suffix when the line already names the tag (e.g. "-> v0.52.1"): it would only repeat it (#6859 Fable r1).
       const tagInfo=(data.webui&&data.webui.latest_tag)
         ||(data.agent&&data.agent.latest_tag)||'';
       if(parts.length){
         let txt=t('settings_updates_available').replace('{count}',parts.join(', '));
         if(manualInstruction) txt+=' · '+manualInstruction;
         if(noGitParts.length) txt+=' · '+t('settings_update_no_git');
-        if(tagInfo) txt += ' ' + t('settings_latest_tag_suffix').replace('{0}', tagInfo);
+        if(tagInfo&&!txt.includes(tagInfo)) txt += ' ' + t('settings_latest_tag_suffix').replace('{0}', tagInfo);
         if(status){status.textContent=txt;status.style.color='var(--accent)';}
         // Also trigger the update banner
         if(typeof _showUpdateBanner==='function') _showUpdateBanner(data,_recoveryGenerationAtCheck);
