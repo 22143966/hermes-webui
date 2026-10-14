@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import time
 import uuid
+import weakref
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -1697,6 +1698,15 @@ class Session:
         return SESSION_DIR / f'{self.session_id}.json'
 
     def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
+        # #7881: every save of this session id, skip_index=True included,
+        # holds one reentrant persistence lock across the persisted-effort
+        # read, the payload construction and the atomic replacement, so a
+        # save cannot freeze an effort that another save replaces before it
+        # lands. Lock order: persist -> _INDEX_WRITE_LOCK -> LOCK.
+        with _session_persist_lock(self.session_id):
+            return self._save_locked(touch_updated_at=touch_updated_at, skip_index=skip_index)
+
+    def _save_locked(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
         if not is_safe_session_id(self.session_id):
             raise ValueError(f"Unsafe session_id {self.session_id!r}; refusing to write outside session store")
         # ── #1558 P0 guard ──────────────────────────────────────────────
@@ -1728,10 +1738,16 @@ class Session:
         # that pick. If this object has not changed the effort since it last
         # loaded or saved it, keep the value on disk instead of rolling the
         # pick back. This closes the stale-snapshot class for every writer.
+        # The persistence lock held by save() keeps this read current until
+        # the replacement below.
         if self.reasoning_effort == getattr(self, '_reasoning_effort_saved', self.reasoning_effort):
-            on_disk = _prefix_reasoning_effort(self.path)
-            if on_disk is not _NO_PREFIX_VALUE:
+            on_disk = _persisted_reasoning_effort(self.path)
+            if on_disk is not _REASONING_EFFORT_ABSENT:
                 self.reasoning_effort = on_disk
+                # Move the baseline with the adoption, so a refused (early
+                # return) or failed (raise) save below cannot leave the
+                # adopted value looking like this object's own change.
+                self._reasoning_effort_saved = on_disk
         self._webui_pending_user_timestamp_identity = (
             _validated_webui_pending_user_timestamp_identity(
                 self, getattr(self, '_webui_pending_user_timestamp_identity', None)
@@ -1779,6 +1795,7 @@ class Session:
                 self.session_id,
             )
         meta = {k: getattr(self, k, None) for k in METADATA_FIELDS}
+        written_reasoning_effort = meta.get('reasoning_effort')
         # #5854: message_count and a compact anchor-scene fingerprint go in the
         # metadata prefix (BEFORE messages) so load_metadata_only() and the
         # sidebar-poll freshness check never have to parse the full (250-480KB)
@@ -1980,9 +1997,10 @@ class Session:
                 f.flush()
                 os.fsync(f.fileno())
             if skip_index:
-                # Callers that explicitly skip the sidebar projection retain
-                # the existing same-session concurrency contract: their unique
-                # temp files may replace the sidecar independently.
+                # Callers that explicitly skip the sidebar projection do not
+                # take _INDEX_WRITE_LOCK; the per-session persistence lock
+                # held by save() still orders them against every other save
+                # of this session (#7881).
                 _safe_replace(tmp, self.path)
             else:
                 # Publish the sidecar and its sidebar projection as one ordered
@@ -2008,7 +2026,9 @@ class Session:
             except Exception:
                 pass
             raise
-        self._reasoning_effort_saved = self.reasoning_effort
+        # The value this save actually wrote, not one set on the live object
+        # after the payload was built.
+        self._reasoning_effort_saved = written_reasoning_effort
 
         # #4985 belt-and-suspenders self-heal: a successful save with at
         # least one real message on the sidecar is unconditional proof the
@@ -5770,24 +5790,81 @@ def _prefix_message_count(path):
     return _parse_nonnegative_int(parsed.get('message_count'))
 
 
-_NO_PREFIX_VALUE = object()
+#: ``_persisted_reasoning_effort()`` result for a CONFIRMED absence only: no
+#: sidecar yet, or a sidecar whose top-level object has no
+#: ``reasoning_effort`` key (written before #7881). A read miss is not this.
+_REASONING_EFFORT_ABSENT = object()
 
 
-def _prefix_reasoning_effort(path):
-    """The sidecar's persisted ``reasoning_effort``, from the bounded prefix.
+def _normalize_persisted_reasoning_effort(value):
+    return str(value).strip().lower() if value is not None else None
 
-    Returns ``_NO_PREFIX_VALUE`` when there is no file, the prefix is unreadable,
-    or the key is absent (legacy sidecar); the caller then writes its own value.
+
+def _persisted_reasoning_effort(path):
+    """The sidecar's persisted ``reasoning_effort`` (#7881).
+
+    The bounded metadata prefix answers the common case. A prefix MISS --
+    metadata past the 1 MiB budget (a large pending prompt or compression
+    summary), a truncated, corrupt or unreadable prefix, or a prefix without
+    the key -- is not an absence, so the whole sidecar is parsed instead.
+    Only a missing file or a parsed sidecar without the key returns
+    ``_REASONING_EFFORT_ABSENT``; a sidecar whose content is not a JSON object
+    holds no recoverable value and counts as absent too. A sidecar that exists
+    but cannot be read raises OSError, so save() fails closed instead of
+    writing a value it could not compare.
     """
+    parsed = None
     try:
         raw = _read_metadata_json_prefix(path)
         parsed = json.loads(raw) if raw else None
+    except FileNotFoundError:
+        return _REASONING_EFFORT_ABSENT
     except (OSError, ValueError):
-        return _NO_PREFIX_VALUE
-    if not isinstance(parsed, dict) or 'reasoning_effort' not in parsed:
-        return _NO_PREFIX_VALUE
-    value = parsed['reasoning_effort']
-    return str(value).strip().lower() if value is not None else None
+        parsed = None
+    if isinstance(parsed, dict) and 'reasoning_effort' in parsed:
+        return _normalize_persisted_reasoning_effort(parsed['reasoning_effort'])
+    try:
+        text = Path(path).read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return _REASONING_EFFORT_ABSENT
+    except UnicodeDecodeError:
+        text = None
+    data = None
+    if text is not None:
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+    if not isinstance(data, dict):
+        logger.warning(
+            "session sidecar %s is not a JSON object; no persisted reasoning effort to keep", path,
+        )
+        return _REASONING_EFFORT_ABSENT
+    if 'reasoning_effort' not in data:
+        return _REASONING_EFFORT_ABSENT
+    return _normalize_persisted_reasoning_effort(data['reasoning_effort'])
+
+
+# #7881: per-session reentrant persistence locks. Every Session.save() of one
+# session id -- skip_index=True included -- holds the same lock across its
+# persisted-effort read, payload construction and atomic replacement; the
+# /api/reasoning pick holds it across its in-memory change and save. Lock
+# order: persist -> _INDEX_WRITE_LOCK -> LOCK (never take this lock while
+# holding either of those). Weak values, so ids nobody is saving do not
+# accumulate.
+_SESSION_PERSIST_LOCKS = weakref.WeakValueDictionary()
+_SESSION_PERSIST_LOCKS_GUARD = threading.Lock()
+
+
+def _session_persist_lock(sid):
+    """Return the shared reentrant persistence lock for ``sid``."""
+    key = str(sid or '')
+    with _SESSION_PERSIST_LOCKS_GUARD:
+        lock = _SESSION_PERSIST_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _SESSION_PERSIST_LOCKS[key] = lock
+        return lock
 
 
 def _legacy_sidecar_facts_get(sid):

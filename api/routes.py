@@ -4775,7 +4775,40 @@ def _resolve_session_under_lock(sid: str, outside=None):
         ):
             return outside
         return None
-    return _ensure_full_session_before_mutation(sid, latest)
+    latest = _ensure_full_session_before_mutation(sid, latest)
+    _carry_cli_source_identity(latest, outside)
+    return latest
+
+
+# The source-identity fields _apply_cli_source_meta_to_session() stamps.
+_CLI_SOURCE_IDENTITY_FIELDS = (
+    "is_cli_session", "source_tag", "raw_source", "session_source", "source_label",
+    "user_id", "chat_id", "chat_type", "thread_id", "session_key", "platform",
+)
+_CLI_SOURCE_IDENTITY_MARKERS = ("is_cli_session", "source_tag", "raw_source", "session_source", "source_label")
+
+
+def _carry_cli_source_identity(target, outside) -> None:
+    """Restore the source identity a lock-held reload dropped (#7881, #7776).
+
+    CLI materialization saves the sidecar before it stamps the source fields
+    on the cached object, so a reload after that object is evicted reads a
+    WebUI-default identity, and saving it would turn the chat into a
+    WebUI-native session. The outside-resolved object is the same session and
+    still carries the identity, so copy it -- without I/O under the session
+    lock. Only a reload with no identity of its own is filled; one that has
+    any (a fork's ``session_source='fork'`` included) is never overwritten.
+    """
+    if outside is None or target is None or target is outside:
+        return
+    if str(getattr(outside, "session_id", "") or "") != str(getattr(target, "session_id", "") or ""):
+        return
+    if not any(getattr(outside, name, None) for name in _CLI_SOURCE_IDENTITY_MARKERS):
+        return
+    if any(getattr(target, name, None) for name in _CLI_SOURCE_IDENTITY_MARKERS):
+        return
+    for name in _CLI_SOURCE_IDENTITY_FIELDS:
+        setattr(target, name, getattr(outside, name, None))
 
 
 def _publish_saved_session(sid: str, session) -> None:
@@ -11921,6 +11954,7 @@ from api.models import (
     persist_recovered_workspace_binding,
     WorkspaceBindingPersistenceError,
     new_session,
+    _session_persist_lock,
     all_sessions,
     title_from,
     SESSION_INDEX_FILE,
@@ -17602,56 +17636,67 @@ def handle_post(handler, parsed) -> bool:
                 # lock so the lock-held Session.load() cannot drop it on save.
                 _reasoning_cli_meta = _lookup_cli_session_metadata(session_id) or {}
                 with _get_session_agent_lock(session_id):
-                    # #7738: re-resolve the canonical session under the lock.
-                    try:
-                        reasoning_session = _resolve_session_under_lock(session_id, reasoning_session)
-                    except KeyError:
-                        reasoning_session = None
-                    if reasoning_session is None:
-                        return bad(handler, "Session not found", 404)
-                    if getattr(reasoning_session, "read_only", False) or (
-                        (getattr(reasoning_session, "source_tag", "") or getattr(reasoning_session, "raw_source", "") or "").strip().lower() == "subagent"
-                        or _is_subagent_child_session_id(session_id)
-                    ):
-                        reasoning_session = None
-                    else:
-                        # The pre-routing visibility guard ran before this lock,
-                        # and chat start can retag an empty chat to another
-                        # profile under LOCK. Check the owner on this object and
-                        # write only that checked profile's default, so a later
-                        # retag cannot redirect the write.
-                        with LOCK:
-                            reasoning_profile = getattr(reasoning_session, "profile", None)
-                        if not _session_visible_to_active_profile(reasoning_profile, handler):
-                            return _session_profile_mismatch_response(
-                                handler, session_id, reasoning_profile
-                            )
-                        if _reasoning_cli_meta:
-                            _apply_cli_source_meta_to_session(reasoning_session, _reasoning_cli_meta)
-                        previous_effort = getattr(reasoning_session, "reasoning_effort", None)
-                        reasoning_session.reasoning_effort = normalized_effort
+                    # #7881: the resolve, the in-memory change and its save
+                    # hold the persistence lock every Session.save() of this
+                    # id takes. A save without the session lock (share
+                    # create/revoke) then either lands before this resolve
+                    # (and is in the snapshot saved here) or after this save
+                    # (and adopts the pick); it can no longer read the old
+                    # effort and land after the pick, nor can the pick write
+                    # a snapshot older than that save.
+                    with _session_persist_lock(session_id):
+                        # #7738: re-resolve the canonical session under the lock.
                         try:
-                            # A preference change is not conversation activity.
-                            reasoning_session.save(touch_updated_at=False)
-                        except Exception:
-                            # Keep the cached session equal to its sidecar.
-                            reasoning_session.reasoning_effort = previous_effort
-                            raise
+                            reasoning_session = _resolve_session_under_lock(session_id, reasoning_session)
+                        except KeyError:
+                            reasoning_session = None
+                        if reasoning_session is None:
+                            return bad(handler, "Session not found", 404)
+                        if getattr(reasoning_session, "read_only", False) or (
+                            (getattr(reasoning_session, "source_tag", "") or getattr(reasoning_session, "raw_source", "") or "").strip().lower() == "subagent"
+                            or _is_subagent_child_session_id(session_id)
+                        ):
+                            reasoning_session = None
+                        else:
+                            # The pre-routing visibility guard ran before this lock,
+                            # and chat start can retag an empty chat to another
+                            # profile under LOCK. Check the owner on this object and
+                            # write only that checked profile's default, so a later
+                            # retag cannot redirect the write.
+                            with LOCK:
+                                reasoning_profile = getattr(reasoning_session, "profile", None)
+                            if not _session_visible_to_active_profile(reasoning_profile, handler):
+                                return _session_profile_mismatch_response(
+                                    handler, session_id, reasoning_profile
+                                )
+                            if _reasoning_cli_meta:
+                                _apply_cli_source_meta_to_session(reasoning_session, _reasoning_cli_meta)
+                            previous_effort = getattr(reasoning_session, "reasoning_effort", None)
+                            reasoning_session.reasoning_effort = normalized_effort
+                            try:
+                                # A preference change is not conversation activity.
+                                reasoning_session.save(touch_updated_at=False)
+                            except Exception:
+                                # Keep the cached session equal to its sidecar.
+                                reasoning_session.reasoning_effort = previous_effort
+                                raise
+                    if reasoning_session is not None:
                         # A retag after the check could have been persisted with
                         # this pick. Recheck the owner of what was just saved; if
                         # the request no longer owns the chat, undo and refuse.
                         with LOCK:
                             saved_profile = getattr(reasoning_session, "profile", None)
                         if not _session_visible_to_active_profile(saved_profile, handler):
-                            reasoning_session.reasoning_effort = previous_effort
-                            try:
-                                reasoning_session.save(touch_updated_at=False)
-                            except Exception:
-                                reasoning_session.reasoning_effort = normalized_effort
-                                logger.warning(
-                                    "reasoning effort rollback save failed for %s",
-                                    session_id, exc_info=True,
-                                )
+                            with _session_persist_lock(session_id):
+                                reasoning_session.reasoning_effort = previous_effort
+                                try:
+                                    reasoning_session.save(touch_updated_at=False)
+                                except Exception:
+                                    reasoning_session.reasoning_effort = normalized_effort
+                                    logger.warning(
+                                        "reasoning effort rollback save failed for %s",
+                                        session_id, exc_info=True,
+                                    )
                             return _session_profile_mismatch_response(
                                 handler, session_id, saved_profile
                             )
@@ -17662,17 +17707,18 @@ def handle_post(handler, parsed) -> bool:
                                 effort, get_hermes_home_for_profile(reasoning_profile)
                             )
                         except Exception:
-                            reasoning_session.reasoning_effort = previous_effort
-                            try:
-                                reasoning_session.save(touch_updated_at=False)
-                            except Exception:
-                                # The sidecar kept the new value; match it in memory
-                                # and surface the original profile-write error.
-                                reasoning_session.reasoning_effort = normalized_effort
-                                logger.warning(
-                                    "reasoning effort rollback save failed for %s",
-                                    session_id, exc_info=True,
-                                )
+                            with _session_persist_lock(session_id):
+                                reasoning_session.reasoning_effort = previous_effort
+                                try:
+                                    reasoning_session.save(touch_updated_at=False)
+                                except Exception:
+                                    # The sidecar kept the new value; match it in memory
+                                    # and surface the original profile-write error.
+                                    reasoning_session.reasoning_effort = normalized_effort
+                                    logger.warning(
+                                        "reasoning effort rollback save failed for %s",
+                                        session_id, exc_info=True,
+                                    )
                             raise
                         _publish_saved_session(session_id, reasoning_session)
                 if reasoning_session is None:
