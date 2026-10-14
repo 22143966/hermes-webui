@@ -147,6 +147,11 @@
 
 ### Fixed
 
+- **A finished reply no longer vanishes when the final update arrives empty.** If the stream's closing event carried an
+  empty message list, the done handler replaced the visible transcript with nothing, so the reply you just watched stream
+  disappeared until a reload. The settle now keeps the streamed transcript when the payload is empty. Thanks
+  @MuhammadUsamaMX. (#7836, fixes #6112)
+
 - **Signing in works when another app on the same host sets a malformed cookie.** A cookie with illegal characters
   from a different service on the same host or domain made the WebUI ignore every cookie after it, so a correct password
   bounced back to the login page and a switched profile fell back to `default`. Cookies are now read one pair at a time,
