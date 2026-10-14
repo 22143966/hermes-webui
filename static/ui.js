@@ -5727,6 +5727,11 @@ function _fitComposerFooter(){
     footer.style.visibility='hidden';
   }
   let next='';
+  // Buttons carry `transition:all`; measured mid-transition they still report
+  // their icon-stage width, so a footer that collapsed to icons could never
+  // re-expand once its labels fit again (#8253 Fable r1). Freeze transitions
+  // for the synchronous strip-and-measure.
+  footer.classList.add('cf-measuring');
   try{
     footer.classList.remove('cf-icons','cf-burger');
     if(overflows()){
@@ -5742,6 +5747,7 @@ function _fitComposerFooter(){
     // task so no intermediate geometry is ever committed to the screen.
     footer.classList.toggle('cf-icons',next.includes('cf-icons'));
     footer.classList.toggle('cf-burger',next.includes('cf-burger'));
+    footer.classList.remove('cf-measuring');
     if(frozenHeight>0){
       footer.style.height=prevHeight;
       footer.style.visibility=prevVisibility;
@@ -6026,7 +6032,7 @@ function _applyReasoningChip(eff){
   if(chip){
     const inactive=!effort||effort==='none';
     chip.classList.toggle('inactive',inactive);
-    const labelText='Reasoning effort: '+text;
+    const labelText='Reasoning effort for this chat: '+text;
     chip.title=labelText;
     chip.setAttribute('aria-label',labelText);
   }
@@ -6181,7 +6187,7 @@ document.addEventListener('click',function(e){
           // For Default (effort=''), the returned reasoning_effort is '' (clear)
           // — display 'Default' rather than an empty toast.
           const display=(st&&st.reasoning_effort)||effort||'Default';
-          showToast('🧠 Reasoning effort set to '+display);
+          showToast('🧠 Reasoning effort set to '+display+' for this chat and new chats');
         })
         .catch(function(){showToast('🧠 Failed to set effort');});
       closeReasoningDropdown();
