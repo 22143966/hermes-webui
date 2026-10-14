@@ -13,7 +13,8 @@
       "dots": [],
       "overflow": true
     },
-    "page_errors": []
+    "page_errors": [],
+    "action_races": []
   },
   {
     "version": "before",
@@ -29,7 +30,8 @@
       "dots": [],
       "overflow": false
     },
-    "page_errors": []
+    "page_errors": [],
+    "action_races": []
   },
   {
     "version": "review-before",
@@ -48,7 +50,8 @@
       ],
       "overflow": true
     },
-    "page_errors": []
+    "page_errors": [],
+    "action_races": []
   },
   {
     "version": "review-before",
@@ -67,7 +70,8 @@
       ],
       "overflow": false
     },
-    "page_errors": []
+    "page_errors": [],
+    "action_races": []
   },
   {
     "version": "after",
@@ -86,7 +90,19 @@
       ],
       "overflow": true
     },
-    "page_errors": []
+    "page_errors": [],
+    "action_races": [
+      {
+        "state": "paused",
+        "pause": "none",
+        "resume": ""
+      },
+      {
+        "state": "active",
+        "pause": "",
+        "resume": "none"
+      }
+    ]
   },
   {
     "version": "after",
@@ -105,6 +121,18 @@
       ],
       "overflow": false
     },
-    "page_errors": []
+    "page_errors": [],
+    "action_races": [
+      {
+        "state": "paused",
+        "pause": "none",
+        "resume": ""
+      },
+      {
+        "state": "active",
+        "pause": "",
+        "resume": "none"
+      }
+    ]
   }
 ]

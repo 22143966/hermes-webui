@@ -1044,6 +1044,7 @@ async function loadCronGatewayNotice() {
 }
 
 let _cronLoadGeneration = 0;  // monotonically bumped per loadCrons() entry; stale loads bail
+let _cronDetailRefreshKey = null;  // explicit refresh intent survives a superseding poll
 
 async function loadCrons(animate, options) {
   const background = !!(options && options.background);
@@ -1058,6 +1059,10 @@ async function loadCrons(animate, options) {
   // at entry and bail once a superseded request realises it is no longer the
   // latest, so only the newest render wins.
   const _cronLoadSeq = ++_cronLoadGeneration;
+  if (!background) {
+    _cronDetailRefreshKey = _currentCronDetail && _cronMode !== 'create' && _cronMode !== 'edit'
+      ? _currentCronDetailKey : null;
+  }
   if (animate && refreshBtn) {
     refreshBtn.style.opacity = '0.5';
     refreshBtn.disabled = true;
@@ -1117,7 +1122,8 @@ async function loadCrons(animate, options) {
         : (t('cron_no_jobs') || 'No jobs yet');
       box.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:12px">${esc(emptyText)}</div>`;
       _appendCronProfileToggle(box);
-      if (!background && _cronMode !== 'create' && _cronMode !== 'edit') _clearCronDetail();
+      if ((!background || _cronDetailRefreshKey === _currentCronDetailKey) && _cronMode !== 'create' && _cronMode !== 'edit') _clearCronDetail();
+      _cronDetailRefreshKey = null;
       return data;
     }
     for (const entry of _activeJobs) _appendCronItem(box, entry);
@@ -1147,13 +1153,14 @@ async function loadCrons(animate, options) {
     // or collapsing a run the user is reading.
     if (_currentCronDetail && _cronMode !== 'create' && _cronMode !== 'edit') {
       const refreshed = _cronList.find(j => _cronJobKey(j) === _currentCronDetailKey);
-      if (background) {
+      if (background && _cronDetailRefreshKey !== _currentCronDetailKey) {
         const runs = $('cronDetailRuns');
         if (runs) runs.classList.toggle('has-new-run', !!(refreshed && !refreshed.read_only && _cronNewJobIds.has(String(refreshed.id))));
       }
       else if (refreshed) _renderCronDetail(refreshed);
       else _clearCronDetail();
     }
+    _cronDetailRefreshKey = null;
     return data;
   } catch(e) {
     if (_cronLoadSeq !== _cronLoadGeneration) return;
@@ -1256,6 +1263,7 @@ function _cronAgentPromptCardHtml(job){
 }
 
 function _renderCronDetail(job){
+  _cronDetailRefreshKey = null;
   _currentCronDetail = job;
   _currentCronDetailKey = _cronJobKey(job);
   const title = $('taskDetailTitle');
@@ -1535,6 +1543,7 @@ function openCronDetail(jobOrId, el){
 }
 
 function _clearCronDetail(){
+  _cronDetailRefreshKey = null;
   _currentCronDetail = null;
   _currentCronDetailKey = '';
   _cronMode = 'empty';

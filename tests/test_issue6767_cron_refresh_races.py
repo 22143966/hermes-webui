@@ -27,7 +27,9 @@ const document={createElement:node};
 let _cronList=[{id:'existing',name:'Existing'}],_cronOtherProfileCount=0,_showAllCronProfiles=false,_cronLoadGeneration=0;
 const _cronNewJobIds=new Set(['newer']);
 let _currentCronDetail='existing',_currentCronDetailKey='existing',_cronMode='detail',_editingCronId=null,_cronPreFormDetail=null,_cronIsDuplicate=false,_cronSelectedSkills=[];
-let renders=0,clears=0,opened=null,writes=[];const pending=[];
+let renders=0,clears=0,opened=null,writes=[],renderedJob=null;const pending=[];
+let _cronDetailRefreshKey = null;
+const localStorage = {getItem(){return null;},setItem(){}};
 function api(url,opts){if(opts){writes.push(url);return Promise.resolve({id:'saved'});}return new Promise((resolve,reject)=>pending.push({resolve,reject}));}
 async function loadCronProfiles(){} function loadCronGatewayNotice(){}
 function esc(s){return String(s);} function t(s){return s;} function showToast(){}
@@ -35,9 +37,10 @@ function _cronStatusMeta(){return {state:'active',label:'on',listClass:'active'}
 function _cronItemId(j){return 'cron-'+j.id;} function _cronJobKey(j){return j.id;}
 function _cronProfileLabel(p){return p;} function _cronOwnerProfileName(){return 'default';}
 function _appendCronProfileToggle(){} function _clearCronDetail(){clears++;output.innerHTML='';output.open=false;}
-function _renderCronDetail(){renders++;output.innerHTML='Rebuilt';output.open=false;}
+function _renderCronDetail(job){renders++;renderedJob=job;output.innerHTML='Rebuilt';output.open=false;}
 function openCronDetail(job){if(typeof job==='string')job=_cronList.find(j=>j.id===job);if(!job)return;opened=job;_cronMode='detail';}
 eval(extract('loadCrons'));eval(extract('saveCronForm'));
+eval(extract('cronPause'));eval(extract('cronResume'));
 async function waitRequests(n){for(let i=0;i<50&&pending.length<n;i++)await Promise.resolve();assert.equal(pending.length,n);}
 """
 
@@ -72,6 +75,49 @@ def test_current_load_failure_displays_error():
 def test_background_refresh_keeps_output_open_and_marks_list(empty):
     jobs = [] if empty else [{"id": "newer", "name": "Newer"}]
     run_js("const p=loadCrons(false,{background:true});await waitRequests(1);pending[0].resolve({jobs:" + json.dumps(jobs) + "});const data=await p;assert.equal(renders,0);assert.equal(clears,0);assert.equal(output.innerHTML,'Loaded output');assert.equal(output.open,true);assert.deepEqual(_cronList,data.jobs);if(data.jobs.length)assert(box.children[0].innerHTML.includes('cron-new-dot'));")
+
+
+@pytest.mark.parametrize("action,state", [("cronPause", "paused"), ("cronResume", "active")])
+@pytest.mark.parametrize("older_first", [False, True])
+def test_action_refresh_survives_background_supersession(action, state, older_first):
+    new_job = json.dumps({"id": "existing", "name": "Existing", "state": state})
+    old_job = json.dumps({"id": "existing", "name": "Older response", "state": "outdated"})
+    settle_old = "pending[0].resolve({jobs:[" + old_job + "]});await action;"
+    settle_new = "pending[1].resolve({jobs:[" + new_job + "]});await poll;"
+    run_js("const action=" + action + "('existing');await waitRequests(1);"
+           "const poll=loadCrons(false,{background:true});await waitRequests(2);" +
+           (settle_old + settle_new if older_first else settle_new + settle_old) + """
+assert.equal(renders,1);assert.equal(renderedJob.state,""" + json.dumps(state) + """);
+assert.equal(_cronDetailRefreshKey,null);
+// Subsequent unrelated background ticks must not rebuild it again.
+const next=loadCrons(false,{background:true});await waitRequests(3);
+pending[2].resolve({jobs:[""" + new_job + """]});await next;assert.equal(renders,1);
+""")
+
+
+@pytest.mark.parametrize("mode,key", [("edit", "existing"), ("create", "existing"), ("detail", "other")])
+def test_pending_refresh_does_not_override_new_selection_or_form(mode, key):
+    run_js("""
+const old=loadCrons();await waitRequests(1);
+_cronMode=""" + json.dumps(mode) + ";_currentCronDetailKey=" + json.dumps(key) + ";" + """
+const poll=loadCrons(false,{background:true});await waitRequests(2);
+pending[1].resolve({jobs:[{id:'existing',name:'Existing'},{id:'other',name:'Other'}]});await poll;
+pending[0].resolve({jobs:[{id:'existing',name:'Old'}]});await old;
+assert.equal(renders,0);assert.equal(_cronDetailRefreshKey,null);
+""")
+
+
+def test_failed_latest_refresh_retains_intent_until_successful_retry():
+    run_js("""
+const old=cronPause('existing');await waitRequests(1);
+const poll=loadCrons(false,{background:true});await waitRequests(2);
+pending[1].reject(new Error('temporary'));await poll;
+pending[0].resolve({jobs:[{id:'existing',name:'Old'}]});await old;
+assert.equal(renders,0);assert.equal(_cronDetailRefreshKey,'existing');
+const retry=loadCrons(false,{background:true});await waitRequests(3);
+pending[2].resolve({jobs:[{id:'existing',name:'Current',state:'paused'}]});await retry;
+assert.equal(renders,1);assert.equal(renderedJob.state,'paused');assert.equal(_cronDetailRefreshKey,null);
+""")
 
 
 def test_user_requested_refresh_still_updates_detail():

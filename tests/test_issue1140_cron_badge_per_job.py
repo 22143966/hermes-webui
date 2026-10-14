@@ -200,6 +200,7 @@ function _appendCronProfileToggle(box) {{}}
 function _clearCronDetail() {{}}
 function _renderCronDetail(job) {{}}
 let _cronLoadGeneration = 0;
+let _cronDetailRefreshKey = null;
 eval(extractFunc('loadCrons'));
 (async () => {{
   // Fire load #1 and load #2 without awaiting either.

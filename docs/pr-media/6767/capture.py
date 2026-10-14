@@ -61,10 +61,20 @@ try:
                         content=subprocess.check_output(['git','show',ref+':static/'+filename],cwd=ROOT)
                         ctx.route('**/'+filename+'*', lambda r, request, content=content, filename=filename: r.fulfill(body=content,content_type='text/css' if filename.endswith('css') else 'application/javascript'))
                 completed={'value':False}
-                def cron_route(route, request, completed=completed):
+                action_control={'hold_next':False,'held':[]}
+                def cron_route(route, request, completed=completed, action_control=action_control):
                     path=route.request.url.split('/api/crons',1)[1].split('?')[0]
                     if route.request.method!='GET':
+                        if path in ['/pause','/resume']:
+                            jobs[0]['state']='paused' if path=='/pause' else 'active'
+                            action_control['hold_next']=True
+                            route.fulfill(json={'ok':True})
+                            return
                         raise RuntimeError('Unexpected cron write')
+                    if path=='' and action_control['hold_next']:
+                        action_control['hold_next']=False
+                        action_control['held'].append(route)
+                        return
                     if path=='/recent':
                         data={'completions':[dict(job_id='finished',name='Sample backup check',completed_at=1791960000,status='success',toast_notifications=False)] if completed['value'] else []}
                         completed['value']=False
@@ -118,7 +128,30 @@ try:
                     page.wait_for_timeout(400)
                 page.locator('#cronDetailRuns').scroll_into_view_if_needed()
                 page.screenshot(path=str(OUT/f'{version}-{width}-output.png'))
-                results.append(dict(version=version,width=width,metrics=metrics,page_errors=errors))
+                action_results=[]
+                if version=='after':
+                    for action,state in [('cronPause','paused'),('cronResume','active')]:
+                        page.evaluate("action=>{window.fixtureActionPromise=window[action]('reading');}",action)
+                        for _ in range(50):
+                            if action_control['held']:break
+                            page.wait_for_timeout(100)
+                        assert action_control['held'],'Action list refresh was not intercepted'
+                        completed['value']=True
+                        page.evaluate('async()=>{await _runCronPollTick();}')
+                        for _ in range(50):
+                            actual=page.evaluate('_currentCronDetail.state')
+                            if actual==state:break
+                            page.wait_for_timeout(100)
+                        assert actual==state,(action,actual)
+                        action_control['held'].pop().fulfill(json={'jobs':jobs,'other_profile_count':0})
+                        page.evaluate('async()=>{await window.fixtureActionPromise;}')
+                        controls=page.evaluate("()=>({state:_currentCronDetail.state,pause:$('btnPauseTaskDetail').style.display,resume:$('btnResumeTaskDetail').style.display})")
+                        assert controls['state']==state,controls
+                        assert controls['pause']==('none' if state=='paused' else ''),controls
+                        assert controls['resume']==('' if state=='paused' else 'none'),controls
+                        page.screenshot(path=str(OUT/f'action-{state}-{width}.png'))
+                        action_results.append(controls)
+                results.append(dict(version=version,width=width,metrics=metrics,page_errors=errors,action_races=action_results))
                 ctx.close()
         browser.close()
     (OUT/'results.json').write_text(json.dumps(results,indent=2)+'\n')
