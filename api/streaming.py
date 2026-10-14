@@ -419,6 +419,13 @@ _STREAMING_CRON_PROFILE_HOME: contextvars.ContextVar[str | None] = contextvars.C
     default=None,
 )
 _STREAMING_CRONJOB_WRAPPER_INSTALLED = False
+# Set on the first failed install so the warning is logged once even though the
+# install itself keeps being retried (#8201).
+_STREAMING_CRONJOB_WRAPPER_WARNED = False
+# hermes-agent renamed the model-facing cron tool from ``cronjob`` to
+# ``cronjob_manage``. Older builds still register the old name, so resolve and
+# wrap every name that exists rather than one hardcoded name (#8189).
+_STREAMING_CRONJOB_TOOL_NAMES = ("cronjob_manage", "cronjob")
 
 
 def _stream_writeback_diag_threshold_seconds(environ=None):
@@ -491,40 +498,39 @@ def _install_streaming_cronjob_profile_wrapper() -> None:
 
     The in-chat agent run already binds per-turn contextvars for other
     session-scoped state. Cron jobs are special because ``cron.jobs`` snapshots
-    path constants at import time, so the model-facing ``cronjob`` tool must
-    enter the existing WebUI cron profile context at the tool-call boundary.
-    That context uses the cron-specific lock and restores the module caches as
-    soon as the single cron tool call returns, avoiding long-lived global path
-    mutation for the whole agent turn.
+    path constants at import time, so the model-facing cron tool must enter the
+    existing WebUI cron profile context at the tool-call boundary. That context
+    uses the cron-specific lock and restores the module caches as soon as the
+    single cron tool call returns, avoiding long-lived global path mutation for
+    the whole agent turn.
     """
-    global _STREAMING_CRONJOB_WRAPPER_INSTALLED
+    global _STREAMING_CRONJOB_WRAPPER_INSTALLED, _STREAMING_CRONJOB_WRAPPER_WARNED
     if _STREAMING_CRONJOB_WRAPPER_INSTALLED:
         return
     try:
-        from tools.registry import registry
+        installed = _wrap_streaming_cronjob_tool_entries()
     except Exception:
-        logger.debug("streaming cronjob wrapper: tools registry unavailable", exc_info=True)
+        # A future hermes-agent shape change must not abort a chat stream
+        # (#8186). Warn once to keep the logs quiet, but leave the installed flag
+        # unset: one failed registration must not disable profile pinning for the
+        # life of the process, or every later chat-created job lands in the
+        # default profile's store (#8201).
+        if not _STREAMING_CRONJOB_WRAPPER_WARNED:
+            _STREAMING_CRONJOB_WRAPPER_WARNED = True
+            logger.warning("streaming cronjob wrapper: install failed", exc_info=True)
         return
+    _STREAMING_CRONJOB_WRAPPER_INSTALLED = installed
 
-    entry = registry.get_entry("cronjob")
-    if entry is None:
-        try:
-            import tools.cronjob_tools  # noqa: F401
-        except Exception:
-            logger.debug("streaming cronjob wrapper: cronjob tool import failed", exc_info=True)
-        entry = registry.get_entry("cronjob")
-    if entry is None:
-        logger.debug("streaming cronjob wrapper: cronjob tool not registered")
-        return
-    original_handler = entry.handler
-    if getattr(original_handler, "_webui_streaming_profile_wrapper", False):
-        _STREAMING_CRONJOB_WRAPPER_INSTALLED = True
-        return
 
-    # This relies on the agent tool executor's ``propagate_context_to_thread``
-    # using an unfiltered ``contextvars.copy_context()`` so this WebUI-owned
-    # contextvar reaches the sync cronjob handler even when the tool call runs
-    # on the agent's ThreadPoolExecutor worker.
+def _streaming_cronjob_profile_handler(original_handler):
+    """Return a cron tool handler that enters the streaming cron profile.
+
+    This relies on the agent tool executor's ``propagate_context_to_thread``
+    using an unfiltered ``contextvars.copy_context()`` so this WebUI-owned
+    contextvar reaches the sync cronjob handler even when the tool call runs
+    on the agent's ThreadPoolExecutor worker.
+    """
+
     def _profile_scoped_cronjob_handler(args, **kwargs):
         profile_home = _STREAMING_CRON_PROFILE_HOME.get()
         if not profile_home:
@@ -535,27 +541,90 @@ def _install_streaming_cronjob_profile_wrapper() -> None:
 
     _profile_scoped_cronjob_handler.__dict__["_webui_streaming_profile_wrapper"] = True
     _profile_scoped_cronjob_handler.__dict__["_webui_original_handler"] = original_handler
-    register_kwargs = dict(
-        name=entry.name,
-        toolset=entry.toolset,
-        schema=entry.schema,
-        handler=_profile_scoped_cronjob_handler,
-        check_fn=entry.check_fn,
-        requires_env=entry.requires_env,
-        is_async=entry.is_async,
-        description=entry.description,
-        emoji=entry.emoji,
-        max_result_size_chars=entry.max_result_size_chars,
-    )
-    # Older hermes-agent builds predate ``ToolEntry.dynamic_schema_overrides``
-    # (and the matching ``register()`` kwarg). Forward it only when both sides
-    # know it, otherwise every chat stream fails with AttributeError (#8186).
-    if hasattr(entry, "dynamic_schema_overrides") and _supports_kwarg(
-        registry.register, "dynamic_schema_overrides"
-    ):
-        register_kwargs["dynamic_schema_overrides"] = entry.dynamic_schema_overrides
-    registry.register(**register_kwargs)
-    _STREAMING_CRONJOB_WRAPPER_INSTALLED = True
+    return _profile_scoped_cronjob_handler
+
+
+def _wrap_streaming_cronjob_tool_entries() -> bool:
+    """Wrap every registered cron tool name; True once at least one is wrapped.
+
+    Only the global registry slot is wrapped, so a profile-scoped tool override
+    stays scoped to its profile (#8201). Returns False when neither name
+    resolves, so a later stream can retry after the agent registers its tools.
+    """
+    try:
+        from tools.registry import registry
+    except Exception:
+        logger.debug("streaming cronjob wrapper: tools registry unavailable", exc_info=True)
+        return False
+
+    # ``get_entry`` resolves the merged view, where the active profile's scoped
+    # override wins over the global slot. Re-registering that entry without a
+    # scope would promote one profile's handler to every profile, so prefer the
+    # global-slot read where the registry offers it and leave scoped overrides
+    # untouched. Older builds only have ``get_entry``.
+    snapshot_registration = getattr(registry, "snapshot_registration", None)
+    if not callable(snapshot_registration):
+        snapshot_registration = None
+
+    def _resolve_entry(name):
+        if snapshot_registration is None:
+            return registry.get_entry(name)
+        return snapshot_registration(name, scope=None)
+
+    def _resolve_entries():
+        entries = []
+        for name in _STREAMING_CRONJOB_TOOL_NAMES:
+            entry = _resolve_entry(name)
+            if entry is not None:
+                entries.append(entry)
+        return entries
+
+    entries = _resolve_entries()
+    if not entries:
+        # Importing the tool module is what registers it. The module path is the
+        # same under both tool names.
+        try:
+            import tools.cronjob_tools  # noqa: F401
+        except Exception:
+            logger.debug("streaming cronjob wrapper: cronjob tool import failed", exc_info=True)
+        entries = _resolve_entries()
+    if not entries:
+        logger.debug("streaming cronjob wrapper: cronjob tool not registered")
+        return False
+
+    installed = False
+    seen = set()
+    for entry in entries:
+        if id(entry) in seen:
+            continue
+        seen.add(id(entry))
+        original_handler = entry.handler
+        if getattr(original_handler, "_webui_streaming_profile_wrapper", False):
+            installed = True
+            continue
+
+        register_kwargs = dict(
+            name=entry.name,
+            toolset=entry.toolset,
+            schema=entry.schema,
+            handler=_streaming_cronjob_profile_handler(original_handler),
+            check_fn=entry.check_fn,
+            requires_env=entry.requires_env,
+            is_async=entry.is_async,
+            description=entry.description,
+            emoji=entry.emoji,
+            max_result_size_chars=entry.max_result_size_chars,
+        )
+        # Older hermes-agent builds predate ``ToolEntry.dynamic_schema_overrides``
+        # (and the matching ``register()`` kwarg). Forward it only when both sides
+        # know it, otherwise every chat stream fails with AttributeError (#8186).
+        if hasattr(entry, "dynamic_schema_overrides") and _supports_kwarg(
+            registry.register, "dynamic_schema_overrides"
+        ):
+            register_kwargs["dynamic_schema_overrides"] = entry.dynamic_schema_overrides
+        registry.register(**register_kwargs)
+        installed = True
+    return installed
 
 
 def _supports_kwarg(func, kwarg_name: str) -> bool:
