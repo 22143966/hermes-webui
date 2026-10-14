@@ -1499,6 +1499,7 @@ class Session:
                  transcript_generation: int=0,
                  transcript_generation_baseline: int=0,
                  gateway_routing=None, gateway_routing_history=None,
+                 last_used_model=None,
                  llm_title_generated: bool=False,
                  manual_title: bool=False,
                 parent_session_id: str=None,
@@ -1610,6 +1611,7 @@ class Session:
         )
         self.gateway_routing = gateway_routing if isinstance(gateway_routing, dict) else None
         self.gateway_routing_history = gateway_routing_history if isinstance(gateway_routing_history, list) else []
+        self.last_used_model = str(last_used_model).strip()[:240] if last_used_model else None
         self.llm_title_generated = bool(llm_title_generated)
         self.manual_title = bool(manual_title)
         self.parent_session_id = parent_session_id
@@ -1708,7 +1710,7 @@ class Session:
             'intentional_shrink_generation',
             'transcript_generation',
             'transcript_generation_baseline',
-            'gateway_routing', 'gateway_routing_history', 'llm_title_generated', 'manual_title',
+            'gateway_routing', 'gateway_routing_history', 'last_used_model', 'llm_title_generated', 'manual_title',
             'parent_session_id',
             'worktree_path', 'worktree_branch', 'worktree_repo_root', 'worktree_created_at',
             'is_cli_session', 'source_tag', 'raw_source', 'session_source', 'source_label', 'read_only',
@@ -2213,6 +2215,7 @@ class Session:
             'recommended_recovery_action': self.recommended_recovery_action,
             'gateway_routing': self.gateway_routing,
             'gateway_routing_history': self.gateway_routing_history,
+            'last_used_model': self.last_used_model,
             'manual_title': self.manual_title,
             # Only emit 'parent_session_id' when set (the /branch fork link, #1342).
             # Sessions without a fork must not leak None — see test_session_lineage_metadata_api.
@@ -8169,6 +8172,18 @@ def save_projects(projects) -> None:
     PROJECTS_FILE.write_text(json.dumps(projects, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
+# ── Projects catalog lock ────────────────────────────────────────────────────
+# ONE lock for every load → modify → save pair of projects.json, wherever the
+# pair lives: the /api/projects/* mutation routes (which import this object as
+# ``_PROJECTS_CATALOG_LOCK``), the system-project bookkeeping below, and the
+# implicit assignment the bind path performs. Per-caller locks silently lost
+# writes — a cron/webhook scan that read the catalog first and saved last put
+# back its stale copy and erased a workspace / model / auto_assign binding the
+# user had just saved (Greptile P1 2026-10-10T13:00:52Z). Reentrant because a
+# caller may nest a catalog helper inside its own critical section.
+PROJECTS_CATALOG_LOCK = threading.RLock()
+
+
 CRON_PROJECT_NAME = 'Cron Jobs'
 _CRON_PROJECT_LOCK = threading.Lock()
 
@@ -8192,6 +8207,12 @@ def ensure_cron_project(create: bool = True, profile: str | None = None) -> str 
 
     Thread-safe and idempotent.  Returns a 12-char hex project_id string, or
     None if `create` is False and no existing cron project resolves.
+
+    The load → modify → save pair runs under ``PROJECTS_CATALOG_LOCK`` (the
+    catalog-wide lock shared with the /api/projects/* routes), so a scan can no
+    longer write back a catalog copy it read before a user's bind/save landed
+    (Greptile P1 2026-10-10T13:00:52Z). ``_CRON_PROJECT_LOCK`` is kept as the
+    inner, cron-only serialization.
     """
     from api.profiles import get_active_profile_name, _is_root_profile
 
@@ -8199,7 +8220,7 @@ def ensure_cron_project(create: bool = True, profile: str | None = None) -> str 
     # profile is only a fallback so a cross-profile scan never tags another
     # profile's system project onto the one currently selected.
     active = profile or get_active_profile_name() or 'default'
-    with _CRON_PROJECT_LOCK:
+    with PROJECTS_CATALOG_LOCK, _CRON_PROJECT_LOCK:
         projects = load_projects()
         # Look for an existing per-profile cron project. Match either an exact
         # profile tag or the renamed-root alias (a 'default'-tagged project
@@ -8239,12 +8260,17 @@ _WEBHOOK_PROJECT_LOCK = threading.Lock()
 
 
 def ensure_webhook_project(profile: str | None = None) -> str:
-    """Return the project_id of the system "Webhooks" project for `profile` (default: active)."""
+    """Return the project_id of the system "Webhooks" project for `profile` (default: active).
+
+    Like ``ensure_cron_project``, the load → modify → save pair runs under
+    ``PROJECTS_CATALOG_LOCK`` so a background scan cannot save a stale catalog
+    over a binding the user just saved (Greptile P1 2026-10-10T13:00:52Z).
+    """
     from api.profiles import get_active_profile_name, _is_root_profile
 
     # Owner of the scanned state.db wins over the selected profile (see ensure_cron_project).
     active = profile or get_active_profile_name() or 'default'
-    with _WEBHOOK_PROJECT_LOCK:
+    with PROJECTS_CATALOG_LOCK, _WEBHOOK_PROJECT_LOCK:
         projects = load_projects()
         for p in projects:
             if p.get('name') != WEBHOOK_PROJECT_NAME:

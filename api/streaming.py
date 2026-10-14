@@ -59,6 +59,7 @@ from api.config import (
     CUSTOM_ROUTE_NO_ENDPOINT,
     custom_provider_route_error,
     raise_for_custom_provider_route,
+    _parse_provider_qualified_model_id,
     model_with_provider_context,
     warm_models_catalog_provenance_if_cold,
     load_settings,
@@ -534,7 +535,7 @@ def _install_streaming_cronjob_profile_wrapper() -> None:
 
     _profile_scoped_cronjob_handler.__dict__["_webui_streaming_profile_wrapper"] = True
     _profile_scoped_cronjob_handler.__dict__["_webui_original_handler"] = original_handler
-    registry.register(
+    register_kwargs = dict(
         name=entry.name,
         toolset=entry.toolset,
         schema=entry.schema,
@@ -545,8 +546,15 @@ def _install_streaming_cronjob_profile_wrapper() -> None:
         description=entry.description,
         emoji=entry.emoji,
         max_result_size_chars=entry.max_result_size_chars,
-        dynamic_schema_overrides=entry.dynamic_schema_overrides,
     )
+    # Older hermes-agent builds predate ``ToolEntry.dynamic_schema_overrides``
+    # (and the matching ``register()`` kwarg). Forward it only when both sides
+    # know it, otherwise every chat stream fails with AttributeError (#8186).
+    if hasattr(entry, "dynamic_schema_overrides") and _supports_kwarg(
+        registry.register, "dynamic_schema_overrides"
+    ):
+        register_kwargs["dynamic_schema_overrides"] = entry.dynamic_schema_overrides
+    registry.register(**register_kwargs)
     _STREAMING_CRONJOB_WRAPPER_INSTALLED = True
 
 
@@ -1003,6 +1011,87 @@ def _runtime_preferred_base_url(
     if _same_base_url_endpoint(configured_base_url, runtime_base_url):
         return runtime_base_url
     return configured_base_url
+
+
+_ROUTING_ENV_REF_RE = re.compile(r"\$\{[^}]+\}")
+
+
+def _drop_unresolved_routing_refs(block):
+    """Drop ``provider_routing`` values that still carry an unexpanded
+    ``${...}`` reference after env expansion.
+
+    Both chat paths expand ``${VAR}`` references before routing reaches the
+    Agent: the sync seam under the fail-closed profile scope
+    (``block_process_env_fallback``) and the streaming path via the expanded
+    config loader. A ``${VAR}`` that the profile does not define (for example
+    a variable only the server process env holds, or one defined nowhere)
+    survives expansion as its literal text. Forwarding that literal would
+    make OpenRouter restrict the request to a provider that does not exist
+    and fail a turn that master (which forwarded no routing) completes. Dropping the affected value restores master's
+    outcome for it, with a warning, without widening what a profile may
+    read from the server environment.
+
+    A list item is dropped individually; a field is dropped when its scalar
+    value is unresolved or its list empties. Non-string values are kept as
+    is. Never mutates ``block``; returns ``(clean_block, dropped)`` where
+    ``dropped`` maps field name to the number of dropped values.
+    """
+    if not isinstance(block, dict):
+        return {}, {}
+    clean = {}
+    dropped = {}
+    for key, value in block.items():
+        if isinstance(value, str):
+            if _ROUTING_ENV_REF_RE.search(value):
+                dropped[key] = 1
+            else:
+                clean[key] = value
+        elif isinstance(value, list):
+            kept = [
+                item for item in value
+                if not (isinstance(item, str)
+                        and _ROUTING_ENV_REF_RE.search(item))
+            ]
+            lost = len(value) - len(kept)
+            if lost:
+                dropped[key] = lost
+            if kept:
+                clean[key] = kept
+        else:
+            clean[key] = value
+    return clean, dropped
+
+
+def _provider_routing_kwargs_for_agent(cfg, agent_params):
+    """Map a profile config's ``provider_routing`` block to AIAgent kwargs.
+
+    Returns only the routing kwargs the installed hermes-agent build accepts
+    (``agent_params``), so older builds degrade gracefully. The WebUI
+    in-process runtime reads the session's own profile config and must forward
+    these, or OpenRouter provider routing (sort/ignore/only/order) is silently
+    dropped for browser chat turns. Mirrors the gateway's TurnRunner.
+    """
+    pr = (cfg or {}).get("provider_routing") or {}
+    if not isinstance(pr, dict):
+        pr = {}
+    pr, dropped = _drop_unresolved_routing_refs(pr)
+    for key, count in dropped.items():
+        logger.warning(
+            "provider_routing.%s references an environment variable this "
+            "profile does not define; dropping %d value(s) for this turn "
+            "instead of forwarding the literal ${...} text",
+            key,
+            count,
+        )
+    mapping = {
+        "providers_allowed": pr.get("only"),
+        "providers_ignored": pr.get("ignore"),
+        "providers_order": pr.get("order"),
+        "provider_sort": pr.get("sort"),
+        "provider_require_parameters": pr.get("require_parameters", False),
+        "provider_data_collection": pr.get("data_collection"),
+    }
+    return {k: v for k, v in mapping.items() if k in agent_params}
 
 
 def _is_fallback_lifecycle_message(kind: str, message: str) -> bool:
@@ -3332,6 +3421,7 @@ _GATEWAY_ROUTING_TOP_LEVEL_KEYS = {
     'used_provider',
     'used_model',
     'requested_provider',
+    'requested_route_provider',
     'requested_model',
 }
 _GATEWAY_ROUTING_CONTAINER_KEYS = (
@@ -3372,7 +3462,7 @@ def _find_gateway_metadata_payload(payload):
     return None
 
 
-def _normalize_gateway_routing_metadata(payload, requested_model=None, requested_provider=None):
+def _normalize_gateway_routing_metadata(payload, requested_model=None, requested_provider=None, requested_route_provider=None):
     """Return safe LLM Gateway routing metadata, or None when absent.
 
     LLM Gateway response metadata can contain provider/model routing details,
@@ -3397,6 +3487,10 @@ def _normalize_gateway_routing_metadata(payload, requested_model=None, requested
         fallback_provider = _clean_gateway_routing_scalar(requested_provider)
         if fallback_provider is not None:
             normalized['requested_provider'] = fallback_provider
+    if 'requested_route_provider' not in normalized:
+        fallback_route_provider = _clean_gateway_routing_scalar(requested_route_provider)
+        if fallback_route_provider is not None:
+            normalized['requested_route_provider'] = fallback_route_provider
 
     routing = []
     raw_routing = src.get('routing')
@@ -3442,7 +3536,7 @@ def _normalize_gateway_routing_metadata(payload, requested_model=None, requested
     return normalized
 
 
-def _extract_gateway_routing_metadata(agent, result, requested_model=None, requested_provider=None):
+def _extract_gateway_routing_metadata(agent, result, requested_model=None, requested_provider=None, requested_route_provider=None):
     candidates = []
     if isinstance(result, dict):
         candidates.extend([
@@ -3469,10 +3563,29 @@ def _extract_gateway_routing_metadata(agent, result, requested_model=None, reque
             candidate,
             requested_model=requested_model,
             requested_provider=requested_provider,
+            requested_route_provider=requested_route_provider,
         )
         if normalized:
             return normalized
     return None
+
+
+def _capture_turn_served_model(s, agent) -> str | None:
+    """Capture the model that actually served this turn onto the session.
+
+    #6068: the served model must be read AFTER agent.run: the agent
+    mutates agent.model when a fallback fires, so the pre-run
+    resolved_model would mis-attribute exactly the turns where
+    attribution matters most.
+    The configured selection is not proof that it served this turn.
+    Sets s.last_used_model from observed agent.model only, and to None
+    when nothing was observed.
+    """
+    _observed_model = getattr(agent, 'model', None)
+    _used_model = _observed_model.strip() if isinstance(_observed_model, str) else None
+    if s is not None:
+        s.last_used_model = (_used_model[:240]) if _used_model else None
+    return _used_model
 
 
 def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, session_id: str, profile_home: str) -> dict:
@@ -6629,6 +6742,40 @@ def _is_generic_fallback_title(title) -> bool:
     return str(title or '').strip().lower() in {'conversation topic'}
 
 
+# Internal title-generation statuses are diagnostics, not user-facing text.
+# The manual regenerate route renders its 422 body verbatim in the sidebar
+# toast, so any status a user can trigger manually must be translated (#7693:
+# the toast used to show the raw internal code "llm_language_mismatch_aux").
+_TITLE_FAILURE_HUMAN_REASONS = {
+    'llm_language_mismatch': 'the generated title did not match the conversation language',
+    'llm_language_mismatch_aux': 'the generated title did not match the conversation language',
+    'llm_invalid': 'the title model returned an unusable title',
+    'llm_invalid_aux': 'the title model returned an unusable title',
+    'llm_empty': 'the title model returned an empty title',
+    'llm_empty_aux': 'the title model returned an empty title',
+    'llm_error': 'the title model could not be reached',
+    'llm_error_aux': 'the title model could not be reached',
+    'llm_empty_reasoning': 'the title model spent its budget on reasoning and returned no title',
+    'llm_empty_reasoning_aux': 'the title model spent its budget on reasoning and returned no title',
+    'llm_length': 'the title model hit its output limit before returning a title',
+    'llm_length_aux': 'the title model hit its output limit before returning a title',
+    'missing_exchange': 'this conversation has no assistant reply to title yet',
+    'empty_user_message': 'this session has no user message to title yet',
+    'empty_title': 'no title could be produced for this session',
+    'title_generation_disabled': 'title generation is disabled for this profile',
+}
+
+
+def _human_title_failure_reason(status) -> str:
+    """Map an internal title-generation status to readable failure text.
+
+    Known internal codes are translated; anything else passes through unchanged
+    so a new status stays debuggable instead of turning into an empty message.
+    """
+    key = str(status or '').strip()
+    return _TITLE_FAILURE_HUMAN_REASONS.get(key, key)
+
+
 # Recovery cap for a model that keeps answering badly: an invalid model output
 # suppresses the local fallback so the next completed exchange retries the LLM
 # (the local fallback would mark a warm-up opener as successfully titled). A
@@ -8537,6 +8684,12 @@ def _strip_orphan_tool_calls(messages):
             if following.get("role") == "user" and following.get("_recovered"):
                 probe += 1
                 continue
+            # Consecutive assistant rows merge in the Agent's repair, so an
+            # intermediate progress row between a call and its result is
+            # transparent here too (else a valid pair reads as an orphan).
+            if following.get("role") == "assistant":
+                probe += 1
+                continue
             if following.get("role") != "tool":
                 break
             covered.add(str(following.get("tool_call_id") or ""))
@@ -8561,7 +8714,9 @@ def _strip_orphan_tool_calls(messages):
         else:
             repaired_msg.pop("tool_calls", None)
         repaired[idx] = repaired_msg
-        logger.warning(
+        # debug, not warning: this runs on every projection of every turn, so an
+        # abandoned call would otherwise log several warnings per turn forever.
+        logger.debug(
             "Dropped %d orphan tool_call id(s) at context index %d (no tool_result "
             "immediately after); would have caused an upstream 400: %s",
             len(dropped),
@@ -12541,6 +12696,7 @@ def _compute_agent_cache_signature(
     reasoning_config=None,
     main_request_overrides=None,
     _main_request_overrides=None,
+    provider_routing_kwargs=None,
     prefill_context=None,
     profile_home: str | None = None,
     safe_profile_runtime_env: dict | None = None,
@@ -12567,6 +12723,7 @@ def _compute_agent_cache_signature(
         sorted(toolsets) if toolsets else [],
         reasoning_config or {},
         _main_request_overrides or {},
+        provider_routing_kwargs or {},
         _public_prefill_context_status(prefill_context),
         profile_home or '',
         _env.get('TERMINAL_ENV', '') or '',
@@ -13478,6 +13635,7 @@ def _run_agent_streaming(
             else getattr(s, "model_provider", None)
         )
         provider_context = str(provider_context).strip().lower() if provider_context else None
+        _turn_route_provider = provider_context
         _agent_lock = _get_session_agent_lock(session_id)
         # #4251: the route layer already persisted this turn's model under the
         # session lock before dispatch, so a mismatch here means a newer picker
@@ -13497,6 +13655,8 @@ def _run_agent_streaming(
                 _last_persisted_model = model
                 _last_persisted_provider = provider_context
                 _turn_owns_persisted_model = True
+                _turn_route_model = model
+                _turn_route_provider = provider_context
 
         # TD1: set thread-local env context so concurrent sessions don't clobber globals
         # Check for pre-flight cancel (user cancelled before agent even started)
@@ -13560,6 +13720,11 @@ def _run_agent_streaming(
                 s.model_provider = provider_context
                 if _repaired and model != (s.model or ""):
                     s.model = model
+                _last_persisted_model = s.model
+                _last_persisted_provider = s.model_provider
+                # ponytail: finalize route snapshot when profile normalization is accepted
+                _turn_route_model = s.model
+                _turn_route_provider = s.model_provider
 
         # Capture the resolved profile name now, while profile context is
         # reliable. Used in the compression migration block to stamp s.profile
@@ -14410,6 +14575,7 @@ def _run_agent_streaming(
             # detached worker for a NAMED profile paired that profile's endpoint
             # with the DEFAULT profile's API key (finding #3). No-op for the
             # default/root profile.
+            _session_requested_provider = None
             with profiles_api.profile_scope_for_detached_worker(
                 _resolved_profile_name, "model + credential resolution", logger_override=logger
             ):
@@ -14735,6 +14901,15 @@ def _run_agent_streaming(
             # re-instantiated fresh each turn (#855).
             if 'gateway_session_key' in _agent_params:
                 _agent_kwargs['gateway_session_key'] = session_id
+            # OpenRouter provider_routing (sort/ignore/only/order): mirror the
+            # gateway's TurnRunner so browser chat turns respect the profile's
+            # provider_routing block. Per-param guarded for older agent builds.
+            # Captured (not recomputed) so the agent-cache signature below can
+            # include the effective routing: editing sort/only/ignore must mint
+            # a new agent for an already-open session instead of reusing one
+            # built on the old routing.
+            _routing_kwargs = _provider_routing_kwargs_for_agent(_cfg, _agent_params)
+            _agent_kwargs.update(_routing_kwargs)
 
             # ── Agent cache: reuse across messages in the same session ──
             # Mirrors gateway _agent_cache.  Keeps _user_turn_count alive so
@@ -14760,6 +14935,7 @@ def _run_agent_streaming(
                     toolsets=_toolsets,
                     reasoning_config=_reasoning_config,
                     main_request_overrides=_main_request_overrides,
+                    provider_routing_kwargs=_routing_kwargs,
                     prefill_context=_prefill_context,
                     profile_home=_profile_home,
                     safe_profile_runtime_env=_safe_profile_runtime_env,
@@ -15748,6 +15924,7 @@ def _run_agent_streaming(
                                 toolsets=_toolsets,
                                 reasoning_config=_reasoning_config,
                                 main_request_overrides=_main_request_overrides,
+                                provider_routing_kwargs=_routing_kwargs,
                                 prefill_context=_prefill_context,
                                 profile_home=_profile_home,
                                 safe_profile_runtime_env=_safe_profile_runtime_env,
@@ -16216,18 +16393,48 @@ def _run_agent_streaming(
                 _gateway_routing = _extract_gateway_routing_metadata(
                     agent,
                     result,
+                    # The resolved (bare) model, as on master: a qualified
+                    # route hint such as @openrouter:gpt-4o served by gpt-4o
+                    # is not a model switch. The route provider rides along
+                    # separately for the settlement guard.
                     requested_model=resolved_model or model,
                     requested_provider=resolved_provider,
+                    requested_route_provider=_turn_route_provider,
                 )
-                # #6068: the served model must be read AFTER agent.run — the agent
+                # #6068: the served model must be read AFTER agent.run: the agent
                 # mutates agent.model when a fallback fires, so the pre-run
                 # resolved_model would mis-attribute exactly the turns where
                 # attribution matters most.
                 # The configured selection is not proof that it served this turn.
-                _observed_model = getattr(agent, 'model', None)
-                _used_model = _observed_model.strip() if isinstance(_observed_model, str) else None
+                # ponytail: normalize empty/whitespace to None for route equality
+                def _norm_str(v):
+                    val = str(v or '').strip().lower()
+                    return val if val else None
+
+                # ponytail: reuse shared parser for @provider:model tags
+                def _bare_route_model(v):
+                    val = str(v or '').strip()
+                    if val.startswith('@') and ':' in val:
+                        parsed = _parse_provider_qualified_model_id(val)
+                        if parsed:
+                            return parsed[0].strip().lower()
+                        return val.split(':', 1)[1].strip().lower()
+                    return val.lower() if val else None
+
+                _route_matches = True
+                if s is not None:
+                    _cur_m = getattr(s, 'model', None)
+                    _cur_p = getattr(s, 'model_provider', None)
+                    _target_m = _turn_route_model or resolved_model or model
+                    if _bare_route_model(_cur_m) != _bare_route_model(_target_m):
+                        _route_matches = False
+                    if _norm_str(_cur_p) != _norm_str(_turn_route_provider):
+                        _route_matches = False
+
+                _used_model = _capture_turn_served_model(s if _route_matches else None, agent)
                 if _gateway_routing:
-                    s.gateway_routing = _gateway_routing
+                    if _route_matches:
+                        s.gateway_routing = _gateway_routing
                     _history = list(getattr(s, 'gateway_routing_history', None) or [])
                     _history.append(_gateway_routing)
                     s.gateway_routing_history = _history[-50:]
@@ -17145,6 +17352,7 @@ def _run_agent_streaming(
                         toolsets=_toolsets,
                         reasoning_config=_reasoning_config,
                         main_request_overrides=_main_request_overrides,
+                        provider_routing_kwargs=_routing_kwargs,
                         prefill_context=_prefill_context,
                         profile_home=_profile_home,
                         safe_profile_runtime_env=_safe_profile_runtime_env,
