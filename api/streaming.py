@@ -10628,6 +10628,14 @@ def _materialize_pending_user_turn_before_error(
         existing = messages[-1]
         if not isinstance(existing, dict) or existing.get('role') != 'user':
             return False
+        if active_turn_token and existing.get('_active_turn_token') and existing.get('_active_turn_token') != active_turn_token:
+            # Text + integer-second timestamp is not ownership (re-gate
+            # 2026-10-06 item 3): a second interrupt of the same prompt
+            # inside one second carries a DIFFERENT stream token, and this
+            # turn's recovery must run instead of collapsing into the other
+            # turn's row. Token-less rows (legacy data) keep the established
+            # timestamp check.
+            return False
         existing_source = existing.get('_source') or 'webui'
         try:
             existing_ts = int(existing.get('timestamp'))
@@ -10639,6 +10647,43 @@ def _materialize_pending_user_turn_before_error(
             and existing_source == pending_source
             and list(existing.get('attachments') or []) == pending_attachments
         )
+
+    def ctx_already_has_turn_mirror(ctx):
+        """True when the model context already carries this turn's mirror.
+
+        The gateway cancel-time reconcile (_reconcile_gateway_cancelled_context)
+        mirrors the interrupted prompt into context_messages BEFORE
+        _persist_cancelled_turn runs (re-gate 2026-10-05 item 2 order), and the
+        mirrored partial may trail it. Scanning the recent tail (not just the
+        last row) recognizes that mirror by content + timestamp + source and
+        prevents a second user row on a replayed settle.
+        """
+        if not isinstance(ctx, list) or not ctx:
+            return False
+        for row in reversed(ctx[-8:]):
+            if not (isinstance(row, dict) and row.get('role') == 'user'):
+                continue
+            if _normalize_user_text(_message_text(row.get('content'))) != _normalize_user_text(pending_text):
+                break
+            if (
+                active_turn_token
+                and row.get('_active_turn_token')
+                and row.get('_active_turn_token') != active_turn_token
+            ):
+                # Not this stream's row (re-gate 2026-10-06 item 3): the
+                # reconcile may not have mirrored this turn yet, or the
+                # matching row belongs to a different interrupt of the same
+                # prompt inside the same second. Token-less rows keep the
+                # established timestamp check.
+                break
+            try:
+                row_ts = int(row.get('timestamp'))
+            except (TypeError, ValueError):
+                break
+            if row_ts == recovered_ts and (row.get('_source') or 'webui') == pending_source:
+                return True
+            break
+        return False
 
     if is_exact_checkpoint(getattr(session, 'messages', None)):
         return False
@@ -10657,7 +10702,10 @@ def _materialize_pending_user_turn_before_error(
         # Fork-internal delegation wakeup: keep the typed _source for hiding but
         # carry the fork-ownership proof regeneration requires (#7882 re-gate).
         recovered['_fork_child_turn'] = session.session_id
-    stamp_message_source(recovered, pending_source)
+    # The recovered row carries this stream's active-turn token so every
+    # downstream dedup can prove ownership by identity instead of by
+    # content + integer-second timestamp (re-gate 2026-10-06 item 3).
+    stamp_message_source(recovered, pending_source, active_turn_token=active_turn_token)
     if pending_attachments:
         recovered['attachments'] = pending_attachments
     session.messages.append(recovered)
@@ -10670,7 +10718,12 @@ def _materialize_pending_user_turn_before_error(
     # Placing the mirror here (rather than in _persist_cancelled_turn) covers
     # all three callers: cancel, provider-error, and exception paths.
     ctx = getattr(session, 'context_messages', None)
-    if isinstance(ctx, list) and ctx and not is_exact_checkpoint(ctx):
+    if (
+        isinstance(ctx, list)
+        and ctx
+        and not is_exact_checkpoint(ctx)
+        and not ctx_already_has_turn_mirror(ctx)
+    ):
         ctx.append(dict(recovered))
     # The new user turn is now committed to messages (#3831): advance a positive
     # truncation watermark left over from a prior retry/undo/edit so that
@@ -16928,7 +16981,21 @@ def cancel_stream(stream_id: str) -> bool:
                             if isinstance(_last_content, str) and _last_ts >= _pending_started:
                                 # Tolerate the workspace prefix the streaming thread prepends.
                                 if _pending_user == _last_content or _pending_user in _last_content:
-                                    _already_persisted = True
+                                    _row_token = _last_user.get('_active_turn_token')
+                                    if (
+                                        _cancel_turn_token
+                                        and _row_token
+                                        and _row_token != _cancel_turn_token
+                                    ):
+                                        # Content + recency is not turn ownership (re-gate
+                                        # 2026-10-06 item 3): a second interrupt of the same
+                                        # prompt inside one second must synthesize its OWN
+                                        # row (with its own token), not bind this turn's
+                                        # cancel identity to the previous interrupt's row.
+                                        # Token-less rows keep the established check.
+                                        _already_persisted = False
+                                    else:
+                                        _already_persisted = True
                         if _already_persisted:
                             _cancel_turn_start = _last_user_idx
                         else:
@@ -17037,6 +17104,44 @@ def cancel_stream(stream_id: str) -> bool:
                         "Failed to recover pending user message on cancel for %s",
                         _cancel_session_id,
                     )
+                # Gateway runs: mirror the interrupted turn (recovered user
+                # row + the streamed partial snapshot taken under streams_lock
+                # above) into the model-facing context BEFORE the stream id is
+                # cleared below. This runs while _stream_writeback_is_current
+                # still passes, so a normal user Stop reconciles the same
+                # snapshot a gateway-side cancel would, and the next turn's
+                # client-built conversation_history includes everything the
+                # gateway persisted at the moment of interruption.
+                try:
+                    _cancel_backend = ""
+                    if isinstance(active_run_entry, dict):
+                        _cancel_backend = str(active_run_entry.get("backend") or "")
+                    if _cancel_backend == "gateway" or (
+                        (getattr(_cs, "gateway_run", None) or {}).get("stream_id") == stream_id
+                    ):
+                        from api.gateway_chat import _reconcile_gateway_cancelled_context
+
+                        # ONE whole-second stamp shared by the model-facing
+                        # partial row and the display partial below: two
+                        # independent int(time.time()) calls can straddle a
+                        # second boundary and the display merge key (whole
+                        # seconds) would then insert a second copy of the
+                        # partial on the next successful turn (re-gate
+                        # 2026-10-05 item 5).
+                        _cancel_partial_ts = int(time.time())
+                        _reconcile_gateway_cancelled_context(
+                            _cs, stream_id, partial_text=_cancel_partial_text,
+                            partial_ts=_cancel_partial_ts,
+                        )
+                    else:
+                        _cancel_partial_ts = int(time.time())
+                except Exception:
+                    _cancel_partial_ts = int(time.time())
+                    logger.debug(
+                        "Failed gateway cancel-context reconcile for %s",
+                        stream_id,
+                        exc_info=True,
+                    )
                 _cs.active_stream_id = None
                 _cs.pending_user_message = None
                 _cs.pending_attachments = []
@@ -17062,6 +17167,12 @@ def cancel_stream(stream_id: str) -> bool:
                 # call and strict providers would 400 on the malformed entries.
                 # The underscore-prefixed key is not in the whitelist, so sanitize
                 # strips it. The UI reads it via static/messages.js. (v0.50.251.)
+                if _partial_msg is not None:
+                    # Same stamp the context reconcile used for its mirrored
+                    # partial row — one whole-second key so the display merge
+                    # cannot insert a second copy after a boundary straddle
+                    # (re-gate 2026-10-05 item 5).
+                    _partial_msg["timestamp"] = _cancel_partial_ts
                 _cancel_marker_exists = _session_has_cancel_marker(_cs)
                 _cancel_marker_idx = len(_cs.messages)
                 if _cancel_marker_exists:
