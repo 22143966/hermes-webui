@@ -297,6 +297,70 @@ assert.equal(opened.id,'saved');assert.equal(_cronMode,'detail');
 
 
 @pytest.mark.parametrize("editing", [False, True])
+@pytest.mark.parametrize(
+    "action,state,initial",
+    [("cronPause", "paused", "active"), ("cronResume", "active", "paused")],
+)
+def test_save_background_refresh_honors_selected_action_refresh(
+    editing, action, state, initial
+):
+    prefix = (
+        "_cronMode="
+        + json.dumps("edit" if editing else "create")
+        + ";"
+        + ("_editingCronId='saved';" if editing else "")
+    )
+    run_js(
+        prefix
+        + """
+const saved={id:'saved',name:'Saved',state:'active',prompt:'Saved prompt'};
+const other={id:'other',name:'Other',state:"""
+        + json.dumps(initial)
+        + """,prompt:'Other prompt'};
+const freshOther={...other,state:"""
+        + json.dumps(state)
+        + """};
+_cronList=[saved,other];_currentCronDetailKey='saved';_currentCronDetail=saved;
+let renderCalls=0;
+const productionRender=_renderCronDetail;
+_renderCronDetail=(job)=>{renderCalls++;return productionRender(job);};
+let settleSave;
+const originalApi=api;
+api=function(url,opts){
+  if(opts && (url==='/api/crons/create'||url==='/api/crons/update')){
+    writes.push(url);
+    return new Promise(resolve=>{settleSave=resolve;});
+  }
+  return originalApi(url,opts);
+};
+const save=saveCronForm();
+openCronDetail('other');
+const rendersBefore=renderCalls;
+const actionPromise="""
+        + action
+        + """('other');
+await waitRequests(1);
+assert.equal(_cronDetailRefreshKey,'other');
+settleSave({id:'saved'});
+await waitRequests(2);
+pending[1].resolve({jobs:[saved,freshOther]});
+await save;
+assert.equal(renderCalls,rendersBefore+1);
+assertControls("""
+        + json.dumps(state)
+        + """);
+assert.equal(_cronDetailRefreshKey,null);
+pending[0].resolve({jobs:[saved,other]});
+await actionPromise;
+assertControls("""
+        + json.dumps(state)
+        + """);
+""",
+        setup=REAL_DETAIL,
+    )
+
+
+@pytest.mark.parametrize("editing", [False, True])
 def test_successful_write_refreshes_list_in_background_after_navigation(editing):
     prefix = "_cronMode=" + json.dumps("edit" if editing else "create") + ";" + ("_editingCronId='saved';" if editing else "")
     run_js(prefix + """

@@ -1160,8 +1160,9 @@ async function loadCrons(animate, options) {
     if (_currentCronDetail && _cronMode !== 'create' && _cronMode !== 'edit') {
       const refreshed = _cronList.find(j => _cronJobKey(j) === _currentCronDetailKey);
       const differentDetailSelected = hasDetailRefreshKey && _currentCronDetailKey !== requestedDetailRefreshKey;
-      if (refreshed && (differentDetailSelected ||
-          (background && _cronDetailRefreshKey !== _currentCronDetailKey))) {
+      const selectedDetailRefreshPending = background && _cronDetailRefreshKey === _currentCronDetailKey;
+      if (refreshed && !selectedDetailRefreshPending &&
+          (differentDetailSelected || background)) {
         const runs = $('cronDetailRuns');
         if (runs) runs.classList.toggle('has-new-run', !!(refreshed && !refreshed.read_only && _cronNewJobIds.has(String(refreshed.id))));
       }
