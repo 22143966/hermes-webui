@@ -992,12 +992,22 @@ def _sidecars_with_active_stream(session_dir) -> list[str]:
 
 
 def _profile_config_path(home):
-    """config.yaml of a profile home, honouring an authoritative HERMES_CONFIG_PATH for the ambient profile."""
+    """config.yaml of a profile home. For the ACTIVE profile that is the authoritative ambient config file
+    (HERMES_CONFIG_PATH may point outside the profile home), the same rule get_config_for_profile_home() uses;
+    any other profile reads its own home, so a divergent profile never inherits the active custom config."""
+    from api import profiles as _profiles
     from api.config import _get_config_path
+    from api.workspace import _safe_resolve
 
+    target = _safe_resolve(Path(home).expanduser())
+    try:
+        if _safe_resolve(Path(_profiles.get_active_hermes_home()).expanduser()) == target:
+            return _get_config_path()
+    except Exception:
+        pass
     try:
         ambient = _get_config_path()
-        if ambient.parent.resolve() == Path(home).resolve():
+        if _safe_resolve(ambient.parent) == target:
             return ambient
     except Exception:
         pass
