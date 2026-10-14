@@ -58,7 +58,9 @@ global.window = { location: { href: '' } };
 const fn = eval('(' + js.slice(start, i) + ')');
 const results = hrefs.map(href => {
   global.window.location.href = href;
-  return fn();
+  const got = fn();
+  // Resolve the returned value the way the browser will navigate to it.
+  return [got, new URL(got, href).origin === new URL(href).origin];
 });
 console.log(JSON.stringify(results));
 """
@@ -73,6 +75,18 @@ CASES: dict[str, str] = {
     "https://victim/evil.com/": "./",
     # Review vector 3: doubled-slash path, no next -> stay put.
     "https://victim//evil.com": "./",
+    # The real chain: the //evil.com bounce lands on //login with next set.
+    "https://victim//login?next=/evil.com/": "/evil.com/",
+    "https://victim///login?next=/evil.com": "/evil.com",
+    "https://victim//login?next=//evil.com": "./",
+    # Slash-backslash and encoded/whitespace-prefixed protocol-relative forms.
+    "https://victim//login?next=/\\evil.com": "./",
+    "https://victim/hermes/login?next=/\\evil.com": "./",
+    "https://victim//login?next=%2F%2Fevil.com": "./",
+    "https://victim/hermes/login?next=%2F%09%2Fevil.com": "./",
+    "https://victim//login?next=%0A/evil.com": "./",
+    "https://victim/hermes/login?next=https://evil.com": "./",
+    "https://victim/hermes/login?next=javascript:alert(1)": "./",
     # Protocol-relative input was always rejected -> stays rejected.
     "https://victim/hermes/login?next=//evil.com": "./",
     # Backslash protocol-relative -> stays rejected.
@@ -118,9 +132,11 @@ def test_safenextpath_never_returns_protocol_relative(tmp_path: Path) -> None:
     assert len(results) == len(hrefs)
 
     failures = []
-    for href, (got, want) in enumerate(zip(results, CASES.values())):
+    for href, (got, same_origin), want in zip(hrefs, results, CASES.values(), strict=True):
         if got != want:
             failures.append(f"  {href}\n    got  {got!r}\n    want {want!r}")
         if got.startswith("//") or got.startswith("/\\"):
             failures.append(f"  {href}\n    PROTOCOL-RELATIVE (open redirect): {got!r}")
+        if not same_origin:
+            failures.append(f"  {href}\n    LEAVES THE ORIGIN when the browser navigates: {got!r}")
     assert not failures, "case-table failures:\n" + "\n".join(failures)
