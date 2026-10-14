@@ -1165,6 +1165,13 @@
 
 ### Changed
 
+- **Faster status polls and history reads on long sessions.** Finding the `messages` key in a session file's metadata
+  prefix uses a regex tokenizer instead of a per-character Python walk, with identical results. Thanks @dss539. (#8216)
+
+- **Faster saves on long sessions.** The exact-duplicate guard that runs on every save, including draft saves while
+  typing, now fingerprints only rows whose identity actually repeats, instead of hashing the whole transcript. The
+  rows it keeps are unchanged. Thanks @dss539. (#8215)
+
 - **Faster transcript rendering.** Message and worklog timestamps reuse cached Intl formatters instead of building a new
   one per call, and the cache resets when the language or clock setting changes. Thanks @dss539. (#8217)
 
