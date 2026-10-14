@@ -151,6 +151,11 @@
 
 ### Fixed
 
+- **A finished reply no longer vanishes when the final update arrives empty.** If the stream's closing event carried an
+  empty message list, the done handler replaced the visible transcript with nothing, so the reply you just watched stream
+  disappeared until a reload. The settle now keeps the streamed transcript when the payload is empty. Thanks
+  @MuhammadUsamaMX. (#7836, fixes #6112)
+
 - **Regenerating a title no longer shows an internal status code.** When title regeneration fails, the toast now gives
   a readable reason instead of leaking the server's internal status (the remaining #7693 cases). Thanks
   @MuhammadUsamaMX. (#8117)
