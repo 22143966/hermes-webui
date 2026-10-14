@@ -156,6 +156,11 @@
 
 ### Fixed
 
+- **A git pull that times out no longer returns a 500, and its output can't leak credentials.** The partial git
+  output is decoded instead of crashing the update handler. Credentials embedded in remote URLs or query strings
+  (including values containing quotes) are redacted from the pull-failure and timeout messages, and the redacted
+  text is no longer cut short. Thanks @happy5318. (#8202, fixes #8198)
+
 - **Background-subagent wakeups no longer appear as messages you typed.** When delegated background work finishes, the
   wakeup the Agent needs is still delivered, but the transcript no longer shows it as a user bubble, and it no longer
   counts toward message totals, provisional titles, forks or exports. That holds across reloads, session switches and
