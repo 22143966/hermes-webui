@@ -69,6 +69,15 @@ _FETCH_NETWORK_FAILURE_SIGNATURES = (
     'tls connection was non-properly terminated',
     'ssl certificate problem',
 )
+# Git < 2.51 names the blocking ref ("'refs/remotes/origin/x' exists; cannot
+# create 'refs/remotes/origin/x/y'"). Git >= 2.51 batches fetch ref updates
+# and reports the same name conflict only through the summary hint, which
+# fetch.c emits solely for REF_TRANSACTION_ERROR_NAME_CONFLICT; stale-lock
+# failures keep their "Unable to create '...lock'" wording and never match.
+_REMOTE_REF_COLLISION_RE = re.compile(
+    r"exists; cannot create ['\"]refs/remotes/origin/"
+    r"|some local refs could not be updated; try running\s+['\"]git remote prune origin['\"]"
+)
 _RELEASE_TAG_RE = re.compile(r'^v[0-9][0-9A-Za-z.+-]*$')
 _EXPERIMENTAL_RELEASE_TAG_RE = re.compile(r'^exp-v[0-9]+(?:\.[0-9]+)*$')
 _GITHUB_RELEASE_TAGS_URL = 'https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100'
@@ -286,6 +295,16 @@ def _run_git(args, cwd, timeout=10):
         stderr = (r.stderr or '').strip()
         if r.returncode == 0:
             return stdout, True
+        if (args[:2] == ['fetch', 'origin']
+                and all(arg in {'--quiet', '--tags', '--force'} for arg in args[2:])
+                and _REMOTE_REF_COLLISION_RE.search(stderr or stdout)):
+            refspec, refspec_ok = _run_git(['config', '--get-all', 'remote.origin.fetch'], cwd)
+            # Custom destinations may prune local tags or branches; fail closed.
+            if refspec_ok and refspec == '+refs/heads/*:refs/remotes/origin/*':
+                return _run_git([
+                    'fetch', 'origin', '--prune', '--no-prune-tags', '--refmap=',
+                    *args[2:], '+refs/heads/*:refs/remotes/origin/*',
+                ], cwd, timeout=timeout)
         return stderr or stdout or f"git exited with status {r.returncode}", False
     except subprocess.TimeoutExpired as exc:
         # text=True decodes only the *completed* run's pipes; on a timeout
