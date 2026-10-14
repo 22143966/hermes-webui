@@ -1990,6 +1990,7 @@ def test_gateway_endpoint_reads_the_active_profiles_env_fresh_not_the_cached_con
     envs = {"alpha": {"GW_ROUTE": "http://gw.local/p/A", "API_SERVER_KEY": "key-A"}}
     homes = _profile_homes(tmp_path, monkeypatch, envs)
     monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: homes["alpha"])   # alpha is the ambient profile
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(homes["alpha"] / "config.yaml"))     # the suite pins its own; point it at alpha's
 
     assert gateway_chat._gateway_endpoint_for_profile("alpha") == ("http://gw.local/p/A", "key-A")
     envs["alpha"] = {"GW_ROUTE": "http://gw.local/p/B", "API_SERVER_KEY": "key-B"}
