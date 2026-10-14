@@ -156,6 +156,10 @@
 
 ### Fixed
 
+- **API paths are case-insensitive under `/api/`.** `/API/Settings` and `/Api/...` now route like `/api/...`, and the
+  folded path is what the auth check sees, while dynamic segments (share tokens, MCP server names, session ids) keep
+  their original case. Thanks @webtecnica. (#6589, fixes #3943)
+
 - **Long virtualized transcripts measure rows before writing, and settle without a redundant second rebuild.** Row
   heights are read before layout is invalidated, and the transparent settle skips a rebuild that only repeated the
   first, so scrolling a long session does less work and keeps its place. Thanks @MuhammadUsamaMX. (#8232, fixes #7677)
