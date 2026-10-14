@@ -5910,7 +5910,11 @@ function _endReasoningProfileSwitch(){
 }
 
 function _saveReasoningEffort(effort){
-  if(_reasoningSavesFrozen) return Promise.reject(new Error('profile switch in progress'));
+  if(_reasoningSavesFrozen){
+    const frozen=new Error('profile switch in progress');
+    frozen.code='profile_switch_in_progress';
+    return Promise.reject(frozen);
+  }
   const context=_reasoningEffortContext();
   const profile=(S&&S.activeProfile)||'default';
   const owner=_reasoningSaveOwner(profile, context);

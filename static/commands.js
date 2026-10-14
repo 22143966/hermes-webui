@@ -2057,6 +2057,11 @@ function cmdReasoning(args){
         showToast(BRAIN+' Reasoning effort set to '+shown+' for this chat and new chats (applies to next turn)');
       })
       .catch(function(e){
+        // A pick during a profile switch is declined by design, not a failure.
+        if(e && e.code==='profile_switch_in_progress'){
+          showToast(BRAIN+' Profile switch in progress. Try /reasoning again in a moment.');
+          return;
+        }
         showToast(BRAIN+' Failed to set effort: '+(e && e.message ? e.message : arg));
       });
     return true;
