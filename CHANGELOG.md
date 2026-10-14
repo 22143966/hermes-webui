@@ -5,6 +5,10 @@
 
 ### Added
 
+- **English multilingual Edge TTS voices.** The English multilingual Edge text-to-speech voices are allowed and listed in
+  Settings alongside the existing voices; the server still accepts only allowlisted voice IDs. Thanks
+  @judah-hermes-agent. (#8210)
+
 - **Middle-click or Ctrl/Cmd-click a conversation in the sidebar to open it in a new tab.** Works for top-level rows
   and for nested sub-conversations (a child of a compressed conversation opens the child itself, also after a refresh),
   keeps each tab on its own profile, and leaves plain clicks, the action menu and touch gestures unchanged. Thanks
@@ -150,6 +154,19 @@
 - **Faster secret redaction on long values.** The redactor no longer runs its environment-assignment and code-key
   matchers on strings that contain no `=`, which those patterns need to match, so long URL-bearing values in API
   responses are masked with less CPU. Every other masking rule is unchanged. Thanks @tobenot. (#8192)
+
+- **A finished reply no longer vanishes when the final update arrives empty.** If the stream's closing event carried an
+  empty message list, the done handler replaced the visible transcript with nothing, so the reply you just watched stream
+  disappeared until a reload. The settle now keeps the streamed transcript when the payload is empty. Thanks
+  @MuhammadUsamaMX. (#7836, fixes #6112)
+
+- **Regenerating a title no longer shows an internal status code.** When title regeneration fails, the toast now gives
+  a readable reason instead of leaking the server's internal status (the remaining #7693 cases). Thanks
+  @MuhammadUsamaMX. (#8117)
+
+- **The sign-in page follows your browser language.** The server-rendered `/login` page now honours `Accept-Language`
+  (quality order and regional aliases such as `zh-HK`, `pt-PT`), and an explicitly chosen language still wins. Thanks
+  @MuhammadUsamaMX. (#8182, follow-up to #7622)
 
 - **Signing in works when another app on the same host sets a malformed cookie.** A cookie with illegal characters
   from a different service on the same host or domain made the WebUI ignore every cookie after it, so a correct password
