@@ -784,6 +784,129 @@ def test_check_for_updates_marks_every_cache_return(in_progress, force, monkeypa
     assert result['cached'] is True
 
 
+@pytest.mark.parametrize('packed', [False, True])
+@pytest.mark.parametrize('fetch_flags', [[], ['--quiet', '--tags', '--force']])
+@pytest.mark.parametrize('prune_tag_setting,change_refspec', [
+    (None, False), ('fetch.pruneTags', False), ('remote.origin.pruneTags', False),
+    pytest.param(None, True, id='refspec_changes_after_probe'),
+])
+def test_run_git_recovers_remote_tracking_ref_collision(
+    tmp_path, monkeypatch, packed, fetch_flags, prune_tag_setting, change_refspec,
+):
+    origin = tmp_path / 'origin.git'
+    _git(tmp_path, 'init', '--bare', '-q', str(origin))
+    seed = tmp_path / 'seed'
+    seed.mkdir()
+    _git(seed, 'init', '-q', '-b', 'main')
+    _git(seed, 'config', 'user.email', 't@t.co')
+    _git(seed, 'config', 'user.name', 'Test')
+    (seed / 'tracked.txt').write_text('original\n', encoding='utf-8')
+    _git(seed, 'add', 'tracked.txt')
+    _git(seed, 'commit', '-q', '-m', 'seed')
+    _git(seed, 'branch', 'onboarding')
+    _git(seed, 'remote', 'add', 'origin', str(origin))
+    _git(seed, 'push', '-q', '--all', 'origin')
+    repo = tmp_path / 'repo'
+    _git(tmp_path, 'clone', '-q', '--branch', 'main', str(origin), str(repo))
+    if prune_tag_setting:
+        _git(repo, 'config', prune_tag_setting, 'true')
+    if packed:
+        _git(repo, 'pack-refs', '--all', '--prune')
+
+    # The stale flat ref blocks the replacement branch's directory.
+    head, ok = updates._run_git(['rev-parse', 'HEAD'], repo)
+    assert ok
+    _git(origin, 'update-ref', '-d', 'refs/heads/onboarding')
+    _git(origin, 'update-ref', 'refs/heads/onboarding/next', head)
+    _git(repo, 'branch', 'local-work')
+    _git(repo, 'tag', 'local-only')
+    (repo / 'tracked.txt').write_text('local edit\n', encoding='utf-8')
+    (repo / 'untracked.txt').write_text('keep\n', encoding='utf-8')
+    status_before = updates._run_git(['status', '--porcelain'], repo)
+    if change_refspec:
+        real_run = subprocess.run
+
+        def change_mapping_after_probe(cmd, **kwargs):
+            result = real_run(cmd, **kwargs)
+            if cmd[-3:] == ['config', '--get-all', 'remote.origin.fetch']:
+                _git(repo, 'config', '--add', 'remote.origin.fetch', '+refs/tags/*:refs/tags/*')
+            return result
+
+        monkeypatch.setattr(subprocess, 'run', change_mapping_after_probe)
+
+    output, ok = updates._run_git(['fetch', 'origin', *fetch_flags], repo)
+
+    assert ok, output
+    assert updates._run_git(['rev-parse', 'refs/remotes/origin/onboarding/next'], repo) == (head, True)
+    assert not updates._run_git(['rev-parse', '--verify', 'refs/remotes/origin/onboarding'], repo)[1]
+    for ref in ['HEAD', 'refs/heads/local-work', 'refs/tags/local-only']:
+        assert updates._run_git(['rev-parse', ref], repo) == (head, True)
+    assert updates._run_git(['status', '--porcelain'], repo) == status_before
+    assert (repo / 'tracked.txt').read_text(encoding='utf-8') == 'local edit\n'
+    assert (repo / 'untracked.txt').read_text(encoding='utf-8') == 'keep\n'
+
+
+@pytest.mark.parametrize('args,diagnostic,expected_attempts', [
+    (['fetch', 'origin'], "exists; cannot create 'refs/remotes/origin/onboarding/next'", 2),
+    # Git >= 2.51 wording (batched ref updates): only the summary hint names the conflict.
+    (['fetch', 'origin'], "error: some local refs could not be updated; try running\n 'git remote prune origin' to remove any old, conflicting branches", 2),
+    (['fetch', 'origin'], "error: some local refs could not be updated; try running\n 'git remote prune upstream' to remove any old, conflicting branches", 1),
+    (['fetch', '--prune', 'origin'], "exists; cannot create 'refs/remotes/origin/onboarding/next'", 1),
+    (['pull', 'origin'], "exists; cannot create 'refs/remotes/origin/onboarding/next'", 1),
+    (['fetch', 'origin'], 'network unavailable', 1),
+    (['fetch', 'origin', '+refs/tags/*:refs/tags/*'], "exists; cannot create 'refs/remotes/origin/onboarding/next'", 1),
+])
+def test_run_git_ref_recovery_is_bounded_and_preserves_errors(
+    tmp_path, monkeypatch, args, diagnostic, expected_attempts,
+):
+    _git(tmp_path, 'init', '-q')
+    _git(tmp_path, 'remote', 'add', 'origin', 'https://example.invalid/repo.git')
+    real_run = subprocess.run
+    attempts = []
+
+    def failed_network_command(cmd, **kwargs):
+        if 'fetch' in cmd or 'pull' in cmd:
+            attempts.append(cmd)
+            return subprocess.CompletedProcess(cmd, 1, '', diagnostic)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'run', failed_network_command)
+    assert updates._run_git(args, tmp_path) == (diagnostic, False)
+    assert len(attempts) == expected_attempts
+
+
+@pytest.mark.parametrize('extra_refspec', ['+refs/tags/*:refs/tags/*', '+refs/heads/*:refs/heads/mirror/*'])
+def test_run_git_ref_recovery_preserves_custom_refspec_destinations(tmp_path, extra_refspec):
+    origin = tmp_path / 'origin.git'
+    _git(tmp_path, 'init', '--bare', '-q', str(origin))
+    seed = tmp_path / 'seed'
+    seed.mkdir()
+    _git(seed, 'init', '-q', '-b', 'main')
+    _git(seed, 'config', 'user.email', 't@t.co')
+    _git(seed, 'config', 'user.name', 'Test')
+    _git(seed, 'commit', '-q', '--allow-empty', '-m', 'seed')
+    _git(seed, 'branch', 'onboarding')
+    _git(seed, 'remote', 'add', 'origin', str(origin))
+    _git(seed, 'push', '-q', '--all', 'origin')
+    repo = tmp_path / 'repo'
+    _git(tmp_path, 'clone', '-q', '--branch', 'main', str(origin), str(repo))
+    _git(repo, 'config', '--add', 'remote.origin.fetch', extra_refspec)
+    _git(repo, 'tag', 'local-only')
+    _git(repo, 'branch', 'mirror/local-only')
+    head, ok = updates._run_git(['rev-parse', 'HEAD'], repo)
+    assert ok
+    _git(origin, 'update-ref', '-d', 'refs/heads/onboarding')
+    _git(origin, 'update-ref', 'refs/heads/onboarding/next', head)
+
+    output, ok = updates._run_git(['fetch', 'origin', '--tags', '--force'], repo)
+
+    assert not ok  # Unknown mappings retain the original failure instead of pruning.
+    # Git < 2.51 names the blocking ref; Git >= 2.51 emits only the prune hint.
+    assert updates._REMOTE_REF_COLLISION_RE.search(output), output
+    for ref in ['refs/tags/local-only', 'refs/heads/mirror/local-only']:
+        assert updates._run_git(['rev-parse', ref], repo) == (head, True)
+
+
 def test_run_git_returns_stderr_on_failure(tmp_path):
     """When a git command fails, _run_git should return stderr (not empty string)."""
     with patch.object(updates.shutil, 'which', return_value='C:/Tools/git.exe'), \
