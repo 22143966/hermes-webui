@@ -116,12 +116,12 @@ SEED_JS = """async () => {
     {role: 'assistant', content: 'hello back'},
   ];
   const sids = [];
-  for (const title of ['Alpha conversation', 'Beta conversation']) {
+  for (const title of ['Alpha conversation', 'Beta conversation', 'Gamma conversation']) {
     const data = await post('/api/session/import', {title, messages});
     sids.push(data.session.session_id);
   }
   await renderSessionList({deferWhileInteracting: false});
-  return {alpha: sids[0], beta: sids[1]};
+  return {alpha: sids[0], beta: sids[1], gamma: sids[2]};
 }"""
 
 # Count every sidebar open. _openSidebarSession is a global function the row
@@ -169,6 +169,17 @@ def _title(page, sid):
     return handle.as_element()
 
 
+def _focus_title(page, sid):
+    """Find and focus a row title in one page step: a repaint between a
+    separate lookup and focus() would leave a detached element."""
+    page.evaluate("""(sid) => {
+      const row = Array.from(document.querySelectorAll('#sessionList .session-item[data-sid]'))
+        .find(node => node.dataset.sid === sid);
+      const title = row && row.querySelector('.session-title');
+      if (title) title.focus();
+    }""", sid)
+
+
 def _open(page, sid):
     page.evaluate("(sid) => loadSession(sid)", sid)
     _wait_until(page, ACTIVE_JS, sid)
@@ -196,7 +207,7 @@ def _new_page(browser, **context_args):
 
 def _check_desktop(page, seed, name):
     failures = []
-    alpha, beta = seed["alpha"], seed["beta"]
+    alpha, beta, gamma = seed["alpha"], seed["beta"], seed["gamma"]
 
     def fail(message):
         failures.append(f"  [{name}] {message}")
@@ -345,6 +356,37 @@ def _check_desktop(page, seed, name):
     if _opens(page) != [alpha]:
         fail(f"a mouse click opened {_opens(page)}, expected exactly [alpha]")
 
+    # A mouse click, then Enter on another title as soon as the clicked
+    # conversation is open: each opens exactly once (the click leaves nothing
+    # behind that could swallow the Enter).
+    page.evaluate(COUNT_OPENS_JS)
+    _title(page, beta).click()
+    if not _wait_until(page, ACTIVE_JS, beta):
+        fail("a mouse click did not open the conversation")
+    page.wait_for_timeout(300)
+    _focus_title(page, gamma)
+    page.keyboard.press("Enter")
+    if not _wait_until(page, ACTIVE_JS, gamma):
+        fail("the first Enter after a mouse click did not open the conversation")
+    page.wait_for_timeout(SETTLE_MS)
+    if _opens(page) != [beta, gamma]:
+        fail(f"a mouse click then Enter opened {_opens(page)}, expected [beta, gamma]")
+
+    # A mouse drag along a row is a gesture, not an activation: the click the
+    # browser sends after it must not open the conversation.
+    _open(page, alpha)
+    page.evaluate("() => document.activeElement && document.activeElement.blur()")
+    page.evaluate(COUNT_OPENS_JS)
+    box = _title(page, beta).bounding_box()
+    x, y = box["x"] + min(20, box["width"] / 3), box["y"] + box["height"] / 2
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x + 30, y, steps=5)
+    page.mouse.up()
+    page.wait_for_timeout(SETTLE_MS)
+    if _opens(page) or not page.evaluate(ACTIVE_JS, alpha):
+        fail(f"a mouse drag along a row opened {_opens(page)}")
+
     _open(page, alpha)
     page.evaluate(COUNT_OPENS_JS)
     trigger = page.evaluate_handle("""(sid) => {
@@ -376,22 +418,102 @@ def _check_desktop(page, seed, name):
     return failures
 
 
-def _check_touch(page, seed):
-    failures = []
-    alpha, beta = seed["alpha"], seed["beta"]
-    _open(page, alpha)
+def _open_drawer_if_phone(page, phone):
+    if not phone:
+        return
     page.evaluate(
         "() => { if (typeof toggleMobileSidebar === 'function'"
         " && !document.querySelector('.sidebar.mobile-open')) toggleMobileSidebar(); }"
     )
     page.wait_for_timeout(400)
+
+
+def _native_short_swipe(cdp, box, dx=30, steps=3):
+    """A horizontal touch drag through Chromium's native input pipeline (not
+    dispatchEvent), shorter than the archive/delete thresholds: trusted
+    touch/pointer events and no compatibility click."""
+    x = box["x"] + min(20, box["width"] / 3)
+    y = box["y"] + box["height"] / 2
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]})
+    for i in range(1, steps + 1):
+        cdp.send("Input.dispatchTouchEvent", {"type": "touchMove", "touchPoints": [{"x": x + dx * i / steps, "y": y}]})
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+
+
+def _wait_since(page, started, ms):
+    left = ms - (time.time() - started) * 1000
+    if left > 0:
+        page.wait_for_timeout(left)
+
+
+AT_ACTIVATE_JS = """(el) => {
+  for (const type of ['mousedown', 'mouseup', 'click']) {
+    el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window, detail: 1, button: 0}));
+  }
+}"""
+
+
+def _check_touch(page, ctx, seed, label, phone):
+    """Mixed touch + keyboard/AT input in a touch context."""
+    failures = []
+    alpha, beta, gamma = seed["alpha"], seed["beta"], seed["gamma"]
+    cdp = ctx.new_cdp_session(page)
+
+    def fail(message):
+        failures.append(f"  [{label}] {message}")
+
+    # An ordinary tap opens exactly once.
+    _open(page, alpha)
+    _open_drawer_if_phone(page, phone)
     page.evaluate(COUNT_OPENS_JS)
     _title(page, beta).tap()
     if not _wait_until(page, ACTIVE_JS, beta):
-        failures.append("  [touch] a tap no longer opens the conversation")
+        fail("a tap no longer opens the conversation")
     page.wait_for_timeout(SETTLE_MS)
     if _opens(page) != [beta]:
-        failures.append(f"  [touch] a tap opened {_opens(page)}, expected exactly [beta]")
+        fail(f"a tap opened {_opens(page)}, expected exactly [beta]")
+
+    # A tap, then Enter on another title: each opens once.
+    if not phone:  # on a phone the opened conversation closes the drawer
+        page.evaluate(COUNT_OPENS_JS)
+        _focus_title(page, gamma)
+        page.keyboard.press("Enter")
+        if not _wait_until(page, ACTIVE_JS, gamma):
+            fail("Enter after a tap did not open the conversation")
+        page.wait_for_timeout(SETTLE_MS)
+        if _opens(page) != [gamma]:
+            fail(f"Enter after a tap opened {_opens(page)}, expected exactly [gamma]")
+
+    # A short native swipe (no compatibility click), then the FIRST Enter on
+    # another title about 200 ms after release must open it.
+    _open(page, alpha)
+    _open_drawer_if_phone(page, phone)
+    page.evaluate(COUNT_OPENS_JS)
+    _native_short_swipe(cdp, _title(page, beta).bounding_box())
+    released = time.time()
+    _focus_title(page, gamma)
+    _wait_since(page, released, 200)
+    page.keyboard.press("Enter")
+    if not _wait_until(page, ACTIVE_JS, gamma):
+        fail("the first Enter about 200 ms after a short swipe did not open the conversation")
+    page.wait_for_timeout(SETTLE_MS)
+    if _opens(page) != [gamma]:
+        fail(f"short swipe then Enter opened {_opens(page)}, expected exactly [gamma]")
+
+    # The same with a screen reader's activate command (mouse events, no
+    # pointer events) instead of Enter.
+    _open(page, alpha)
+    _open_drawer_if_phone(page, phone)
+    page.evaluate(COUNT_OPENS_JS)
+    _native_short_swipe(cdp, _title(page, beta).bounding_box())
+    released = time.time()
+    _wait_since(page, released, 200)
+    page.evaluate(AT_ACTIVATE_JS, _title(page, gamma))
+    if not _wait_until(page, ACTIVE_JS, gamma):
+        fail("assistive activation about 200 ms after a short swipe did not open the conversation")
+    page.wait_for_timeout(SETTLE_MS)
+    if _opens(page) != [gamma]:
+        fail(f"short swipe then assistive activation opened {_opens(page)}, expected exactly [gamma]")
     return failures
 
 
@@ -508,11 +630,21 @@ def main():
                     if page is None:
                         failures.append(f"  [touch] {errors}")
                     else:
-                        found = _check_touch(page, seed)
+                        found = _check_touch(page, ctx, seed, "phone 390x844", phone=True)
                         failures.extend(found)
                         if not found:
-                            print("OK  touch 390x844 — a tap opens the conversation once")
-                        failures.extend(f"  [touch] pageerror: {err}" for err in errors)
+                            print("OK  phone 390x844 — tap opens once; short swipe never swallows the next Enter or AT activation")
+                        failures.extend(f"  [phone 390x844] pageerror: {err}" for err in errors)
+                        ctx.close()
+                    ctx, page, errors = _new_page(browser, viewport={"width": 1440, "height": 1000}, has_touch=True)
+                    if page is None:
+                        failures.append(f"  [touch 1440x1000] {errors}")
+                    else:
+                        found = _check_touch(page, ctx, seed, "touch 1440x1000", phone=False)
+                        failures.extend(found)
+                        if not found:
+                            print("OK  touch 1440x1000 — tap opens once; tap/short swipe never swallow the next Enter or AT activation")
+                        failures.extend(f"  [touch 1440x1000] pageerror: {err}" for err in errors)
                         ctx.close()
                     if shots and seed:
                         _screenshots(browser, shots, seed)

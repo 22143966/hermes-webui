@@ -378,7 +378,7 @@ const _sessionStreamingById = new Map();
 const _sessionListSnapshotById = new Map();
 const _sessionListSourceById = new Map();
 let _sessionListPointerActive = false;
-let _sessionRowReleaseAt = 0;
+let _sessionRowPointerReleasePending = false;
 let _sessionListLastScrollAt = 0;
 let _pendingSessionListPayload = null;
 let _pendingSessionListApplyTimer = 0;
@@ -391,9 +391,9 @@ const SESSION_SWIPE_REFLOW_LEAD_MS = 220;
 const SESSION_REFLOW_TIMEOUT_MS = 420;
 const SESSION_LIST_FLIP_TIMEOUT_MS = 460;
 const SESSION_LONG_PRESS_DELAY_MS = 400;
-// A click this soon after a primary pointer/touch release on a session row
-// belongs to the gesture path; a bare click is keyboard or screen-reader input.
-const SESSION_ROW_RELEASE_CLICK_WINDOW_MS = 800;
+// Controls inside a session row that own their clicks; activating one never
+// opens the row's conversation.
+const SESSION_ROW_NESTED_CONTROL_SELECTOR = '.session-select-cb-wrapper,.session-tag,.session-title-input,.session-child-count,.session-child-sessions,.session-child-session,.session-lineage-count,.session-lineage-segments,.session-lineage-segment';
 const SESSION_ARCHIVE_SWIPE_THRESHOLD_PX = 128;
 const SESSION_DELETE_SWIPE_THRESHOLD_PX = 128;
 const SESSION_SWIPE_CANCEL_RATIO = 0.75;
@@ -9341,7 +9341,9 @@ function renderSessionListFromCache(){
       title.onkeydown=(e)=>{
         if(e.key!=='Enter'||e.ctrlKey||e.metaKey||e.altKey||e.shiftKey) return;
         e.preventDefault();
-        if(!e.repeat) title.click();
+        // Explicit keyboard activation: straight to the shared action-aware
+        // path, never through a click a gesture could be mistaken for.
+        if(!e.repeat) _activateRowWithoutPointer(title);
       };
     }
     const tsMs=_sessionTimestampMs(s);
@@ -10133,24 +10135,32 @@ function renderSessionListFromCache(){
         el.classList.remove('loading');
       }
     };
-    // Keyboard and assistive-technology activation. Enter on the title link and
-    // a screen reader's activate command (NVDA browse mode in Firefox) dispatch
-    // a bare click with no pointer/touch release before it, so the gesture
-    // machine never arms and the row would not open. The click a browser sends
-    // right after a primary pointer or touch release belongs to the gesture
-    // path and is skipped here. The release marker is list-wide, so a click
-    // that lands on a row rebuilt mid-tap is still recognised. Capture phase so
-    // inner controls that stop propagation still consume the marker.
-    el.addEventListener('click',(e)=>{
-      const released=_sessionRowReleaseAt&&Date.now()-_sessionRowReleaseAt<SESSION_ROW_RELEASE_CLICK_WINDOW_MS;
-      _sessionRowReleaseAt=0;
-      if(released) return;
-      if(_isSessionActionTarget(e.target)) return;
-      if(e.target&&e.target.closest&&e.target.closest('.session-select-cb-wrapper,.session-tag,.session-title-input,.session-child-count,.session-child-sessions,.session-child-session,.session-lineage-count,.session-lineage-segments,.session-lineage-segment')) return;
+    // Activation that does not come from this row's pointer/touch gesture:
+    // Enter on the title link, or a screen reader's activate command (NVDA
+    // browse mode in Firefox dispatches mousedown/mouseup/click with no pointer
+    // events, so the gesture machine never arms). Same guards as the gesture
+    // path: row controls, nested controls, an open menu, selection mode.
+    const _activateRowWithoutPointer=(target)=>{
+      if(_isSessionActionTarget(target)) return;
+      if(target&&target.closest&&target.closest(SESSION_ROW_NESTED_CONTROL_SELECTOR)) return;
       if(_sessionActionMenu){closeSessionActionMenu();return;}
       if(_sessionSelectMode){if(!readOnly)toggleSessionSelect(s.session_id);return;}
       clearTimeout(_tapTimer);_tapTimer=null;_lastTapTime=0;
       void _openRowSession();
+    };
+    // A bare click is assistive-technology activation. The gesture's own
+    // clicks never get here as one: a mouse/pen release flags the click the
+    // browser dispatches in the same task (cleared once that task ends, so it
+    // cannot outlive the gesture, and is list-wide so a row rebuilt in between
+    // still matches), and a handled touch tap cancels its compatibility click
+    // at touchend. Capture phase so inner controls that stop propagation still
+    // consume the flag.
+    el.addEventListener('click',(e)=>{
+      if(_sessionRowPointerReleasePending){
+        _sessionRowPointerReleasePending=false;
+        return;
+      }
+      _activateRowWithoutPointer(e.target);
     },true);
     el.onpointerdown=(e)=>{
       if(e.pointerType==='touch') return;
@@ -10176,7 +10186,10 @@ function renderSessionListFromCache(){
       if(_gesturePointerType==='mouse'&&_gestureState!=='idle') _clearPointerDragState();
     };
     el.onpointerup=(e)=>{
-      if(e.button===0) _sessionRowReleaseAt=Date.now();
+      if(e.pointerType!=='touch'&&e.button===0){
+        _sessionRowPointerReleasePending=true;
+        setTimeout(()=>{_sessionRowPointerReleasePending=false;},0);
+      }
       if(e.pointerType==='touch') return;
       if(e.pointerType==='mouse' && e.button!==0) return;  // ignore right/middle click
       if((e.ctrlKey||e.metaKey) && !_sessionSelectMode && !_renamingSid && _gestureState!=='idle' && !_longPressMenuOpened && (typeof _newTabOpenSupported!=='function'||_newTabOpenSupported())){
@@ -10236,11 +10249,18 @@ function renderSessionListFromCache(){
     },{passive:false});
     el.addEventListener('touchcancel',_clearPointerDragState,{passive:true});
     el.addEventListener('touchend',(e)=>{
-      _sessionRowReleaseAt=Date.now();
       const touch=e.changedTouches&&e.changedTouches[0];
       if(!touch) return;
+      // A tap (or long press) on the row itself is fully handled by the
+      // gesture machine; cancel the browser's compatibility click so it cannot
+      // act on the row a second time. Drags and swipes produce no click, and
+      // nested controls keep theirs.
+      const tapHandledHere=_gestureState==='pressing'&&!_swipeTracking
+        &&!_isSessionActionTarget(e.target)
+        &&!(e.target&&e.target.closest&&e.target.closest(SESSION_ROW_NESTED_CONTROL_SELECTOR));
       if(_finishSessionGesture(touch.clientX,touch.clientY,e.target,'touch')) e.stopPropagation();
-    },{passive:true});
+      if(tapHandledHere&&e.cancelable) e.preventDefault();
+    },{passive:false});
     return el;
   }
 }
