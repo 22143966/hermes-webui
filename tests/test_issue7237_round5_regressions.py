@@ -139,14 +139,58 @@ def test_the_flag_off_keeps_adjacent_assistants_separate():
 # ---------------------------------------------------------------------------
 
 
-def test_a_cancelled_history_row_keeps_the_next_exchange_addressable():
-    """The reviewer's regression 1: the follow-up answer must survive.
+def _settle_and_cold_load(
+    previous_context, agent_returned, msg_text, projection,
+    session_id, tmp_path, monkeypatch,
+):
+    """Drive the real settle core, real session save and real cold reload.
 
-    A cancelled-history splice leaves rows with durable provenance
-    (``_state_db_row_id``) and a float clock. Those rows must stay
-    individually addressable, and — critically — the merge must not leave
-    the OUTBOUND snapshot holding separate rows for a pair the installed
-    Agent will merge, which is what dropped the next exchange.
+    Returns the ``context_messages`` of the cold-loaded session — the exact
+    rows a restarting server would feed the next model call.
+    """
+    from api.streaming import _dedupe_replayed_context_messages
+
+    settled, _protected = _dedupe_replayed_context_messages(
+        list(previous_context),
+        list(agent_returned),
+        msg_text,
+        projected_history=list(projection),
+    )
+    import api.models as models
+
+    state_dir = tmp_path / "state"
+    session_dir = state_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", state_dir / "session_index.json")
+    session = models.Session(
+        session_id=session_id,
+        workspace=str(tmp_path),
+        messages=list(settled),
+        context_messages=list(settled),
+        model="test-model",
+        model_provider="test-provider",
+    )
+    session.save(touch_updated_at=False)
+    reloaded = models.Session.load(session_id)
+    assert reloaded is not None, "the cold reload must find the persisted session"
+    return reloaded.context_messages
+
+
+def test_a_cancelled_history_row_keeps_the_next_exchange_addressable(
+    tmp_path, monkeypatch
+):
+    """The reviewer's regression 1: the follow-up ANSWER must survive.
+
+    Round-6 rewrite (greptile P2 "Lost replies go unchecked"): the round-5
+    test only asserted the follow-up PROMPT survived the projection — never
+    the answer. A cancelled-history splice leaves rows with durable
+    provenance (``_state_db_row_id``) and a float clock. Round 6 removed the
+    raw-provenance exemption from the OUTBOUND snapshot (the installed Agent
+    merges the pair unconditionally), so addressability is proven on the
+    DURABLE side: both raw rows stay individually present in the persisted
+    context, and the follow-up's answer survives the real settle + save +
+    cold-load.
     """
     messages = [
         _user("first question"),
@@ -159,16 +203,18 @@ def test_a_cancelled_history_row_keeps_the_next_exchange_addressable():
         _user("follow-up"),
     ]
     out = _sanitize(messages, normalize_bare_assistant_adjacency=True)
-    # The durable rows stay separate (the cancelled-history contract)...
+    # The outbound snapshot mirrors the installed Agent's unconditional
+    # merge: the cancelled-history pair collapses into one turn.
     assistants = [m for m in out if m.get("role") == "assistant"]
-    assert len(assistants) == 2, (
-        f"the cancelled-history rows must stay individually addressable; "
-        f"got {assistants}"
+    assert len(assistants) == 1, (
+        f"the outbound snapshot must merge the pair the installed Agent "
+        f"merges; got {assistants}"
     )
-    # ...and the follow-up turn is still there to be answered.
-    users = [m for m in out if m.get("role") == "user"]
-    assert any(m.get("content") == "follow-up" for m in users), (
-        f"the follow-up prompt must survive the projection; got {users}"
+    assert "first answer" in assistants[0].get("content", ""), (
+        f"the merged row must carry the first answer; got {assistants[0]}"
+    )
+    assert "late answer continuation" in assistants[0].get("content", ""), (
+        f"the merged row must carry the continuation; got {assistants[0]}"
     )
     # The provenance that makes the rows addressable is not leaked to the
     # wire: the sanitizer still strips it.
@@ -176,28 +222,101 @@ def test_a_cancelled_history_row_keeps_the_next_exchange_addressable():
         assert "_state_db_row_id" not in row, (
             f"internal provenance must not reach the provider payload: {row}"
         )
+    # The installed Agent returns the merged projection plus the exchange.
+    agent_returned = [
+        _user("first question"),
+        _assistant("first answer\nlate answer continuation"),
+        _user("follow-up"),
+        _assistant("THE FOLLOW-UP ANSWER"),
+    ]
+    persisted = _settle_and_cold_load(
+        messages, agent_returned, "follow-up", out,
+        "r5_cancelled_history_answer_retention", tmp_path, monkeypatch,
+    )
+    # Durable addressability: both raw rows remain individually present.
+    raw_rows = [
+        m for m in persisted
+        if m.get("role") == "assistant"
+        and m.get("content") in ("first answer", "late answer continuation")
+    ]
+    assert len(raw_rows) == 2, (
+        "the durable raw rows must stay individually addressable in the "
+        f"persisted context; got {persisted}"
+    )
+    assert any(m.get("_state_db_row_id") == 41 for m in raw_rows), (
+        "the cancelled-history row must keep its provenance in the durable "
+        f"context; got {persisted}"
+    )
+    # The follow-up prompt AND its answer survive the cold reload.
+    assert any(
+        m.get("role") == "user" and m.get("content") == "follow-up"
+        for m in persisted
+    ), f"the follow-up prompt must survive; got {persisted}"
+    assert any(
+        m.get("role") == "assistant" and m.get("content") == "THE FOLLOW-UP ANSWER"
+        for m in persisted
+    ), (
+        "the follow-up ANSWER must survive the settle + save + cold-load "
+        f"(greptile P2); got {persisted}"
+    )
 
 
-def test_a_float_clock_row_is_not_treated_as_a_merge_blocker_only():
-    """The block list may keep a pair separate, but the exchange survives.
+def test_a_float_clock_row_is_not_treated_as_a_merge_blocker_only(
+    tmp_path, monkeypatch
+):
+    """Round-6 rewrite: durable raw rows are addressable WITHOUT the block list.
 
-    This pins the reviewer's "separate durable-row preservation from
-    outbound producer parity": the block list is about ADDRESSABILITY of
-    the durable rows, never a licence to drop the following turn.
+    The round-5 test pinned ``_replay_merge_blocked_by_cancelled_history``
+    keeping a float-clock assistant pair separate in the OUTBOUND snapshot.
+    Round 6 removes that exemption — the installed Agent merges the pair
+    unconditionally, so outbound segmentation was never durable
+    addressability, and the reviewer's scratch fixed both blockers by
+    removing the handoff. Addressability is now proven on the DURABLE side:
+    the raw float-clock rows remain individually present, each with its own
+    clock, in the persisted context after the real settle + save + cold-load,
+    while the outbound snapshot merges them.
     """
-    from api.streaming import _replay_merge_blocked_by_cancelled_history
-
     prev = _assistant("answer", timestamp=1.0)
     msg = _assistant("continuation", timestamp=2.0)
-    nxt = _user("follow-up")
-    assert _replay_merge_blocked_by_cancelled_history(prev, msg, nxt) is True
-    # The blocked pair does not consume the following turn.
-    messages = [_user("q"), prev, msg, nxt]
+    messages = [_user("q"), prev, msg, _user("follow-up")]
     out = _sanitize(messages, normalize_bare_assistant_adjacency=True)
-    users = [m for m in out if m.get("role") == "user"]
-    assert [m.get("content") for m in users] == ["q", "follow-up"], (
-        f"the user turns must survive verbatim; got {users}"
+    # Outbound: the pair merges unconditionally (no raw-provenance block
+    # list may keep it separate).
+    assistants = [m for m in out if m.get("role") == "assistant"]
+    assert len(assistants) == 1, (
+        f"the outbound snapshot must merge the float-clock pair; got {assistants}"
     )
+    # The installed Agent returns the merged projection plus the exchange.
+    agent_returned = [
+        _user("q"),
+        _assistant("answer\ncontinuation"),
+        _user("follow-up"),
+        _assistant("THE ANSWER"),
+    ]
+    persisted = _settle_and_cold_load(
+        messages, agent_returned, "follow-up", out,
+        "r5_float_clock_durable_addressability", tmp_path, monkeypatch,
+    )
+    # Durable addressability: both raw rows survive individually, each with
+    # its own float clock, in the persisted context.
+    clock_rows = [
+        m for m in persisted
+        if m.get("role") == "assistant"
+        and isinstance(m.get("timestamp"), float)
+        and m.get("content") in ("answer", "continuation")
+    ]
+    assert len(clock_rows) == 2, (
+        "the durable float-clock rows must stay individually addressable in "
+        f"the persisted context; got {persisted}"
+    )
+    assert {m.get("content") for m in clock_rows} == {"answer", "continuation"}, (
+        f"both raw rows must be present with their own clocks; got {clock_rows}"
+    )
+    # And the exchange survives the cold reload.
+    assert any(
+        m.get("role") == "assistant" and m.get("content") == "THE ANSWER"
+        for m in persisted
+    ), f"the answer must survive the settle + save + cold-load; got {persisted}"
 
 
 # ---------------------------------------------------------------------------

@@ -7858,39 +7858,11 @@ def _sanitize_messages_for_agent(
     against the Agent's returned list, so it must model the Agent's merge or
     every second successive follow-up drops its prompt and reply.
     """
-    # #7237 round 5: the cancelled-history block decisions pre-computed on the
-    # RAW rows (see the first branch below). Declared up front so the second
-    # branch can pass it unconditionally.
-    _blocked_pairs: set = set()
     if normalize_bare_assistant_adjacency:
-        # #7237 round 5: pre-compute the cancelled-history block decisions on
-        # the RAW rows and carry them into the post-projection merge. The
-        # block list reads provenance (``_state_db_row_id``, ``_partial``,
-        # ``_recovered*``, float clocks) that ``_sanitize_messages_for_api``
-        # strips, so the decision cannot be re-derived on the projected rows.
-        # The projection preserves row order, so the raw indices still name
-        # the same pair.
-        _blocked_pairs = set()
-        for _idx in range(1, len(messages)):
-            _prev = messages[_idx - 1]
-            _msg = messages[_idx]
-            if (
-                isinstance(_prev, dict)
-                and isinstance(_msg, dict)
-                and _prev.get("role") == "assistant"
-                and _msg.get("role") == "assistant"
-                and _replay_merge_blocked_by_cancelled_history(
-                    _prev,
-                    _msg,
-                    messages[_idx + 1] if _idx + 1 < len(messages) else None,
-                )
-            ):
-                _blocked_pairs.add((_idx - 1, _idx))
         # The user-pair merge mirrors the installed Agent's pass-3
         # consecutive-user repair. It stays BEFORE the projection (the
-        # reviewer's direction): plain-text user rows carry no provenance the
-        # block list needs, and merging them early cannot interact with the
-        # sanitizer's own pass-0.
+        # reviewer's direction): plain-text user rows carry no provenance, and
+        # merging them early cannot interact with the sanitizer's own pass-0.
         messages = _merge_agent_replay_bare_user_rows(messages)
     sanitized = _sanitize_messages_for_api(
         messages,
@@ -7923,65 +7895,22 @@ def _sanitize_messages_for_agent(
         # contract (union for plain pairs, REPLACE for a superseded
         # verification candidate) on the projected rows, and this merge only
         # re-applies the Agent's unconditional collapse to the BARE pairs the
-        # pass-0 deliberately leaves alone. The pre-computed block set above
-        # keeps the cancelled-history rows separate across the projection. The
-        # user merge still runs on the raw rows, which is where its contract
-        # lives.
-        sanitized = _merge_agent_replay_bare_assistant_rows(sanitized, _blocked_pairs)
+        # pass-0 deliberately leaves alone. The user merge still runs on the
+        # raw rows, which is where its contract lives.
+        #
+        # #7237 round 6 (review blockers, nesquena-hermes 2026-10-12): the
+        # raw-provenance blocked-pair handoff is REMOVED. It carried a
+        # cancellation exemption into the producer-normalized snapshot that
+        # the installed Agent does not honor (the merged answer of a
+        # float-clock follow-up pair was lost across save/cold-reload), and
+        # its raw index positions misattach once the sanitizer replaces or
+        # merges rows (the verification supersession schedule dropped the
+        # next exchange's follow-up/answer). The outbound merge now mirrors
+        # the installed Agent unconditionally; durable raw-row addressability
+        # is proven separately on the settle/persist side, which keeps the
+        # raw rows verbatim.
+        sanitized = _merge_agent_replay_bare_assistant_rows(sanitized)
     return sanitized
-
-
-def _replay_merge_blocked_by_cancelled_history(prev, msg, next_row):
-    """Return True when an adjacent assistant pair must stay separate.
-
-    The Agent-replay projection is the snapshot the settle diffs against the
-    Agent's return, so it normally mirrors the installed Agent's unconditional
-    merge of adjacent bare assistant rows. Rows the cancelled-history contract
-    spliced in (state.db reconciliation / cancel-journal recovery) are
-    pre-stop mirrors that must stay individually addressable: absorbing them
-    into the preceding turn's row breaks the row-level prefix the readers and
-    boundary tests pin. The installed Agent would merge them, but the WebUI
-    persist path cannot re-split a merged row, so the projection keeps them
-    separate and the settle's exact-prefix proof stays exact.
-
-    The block list mirrors the provenance of such rows on the RAW (pre
-    projection) list, which is why the normalizer runs before
-    ``_sanitize_messages_for_api`` strips those fields:
-
-    ① a durable row id on the later row (``_state_db_row_id`` / ``_row_id``)
-       — the row exists only in the state.db view;
-    ② a cancel-stop / recovery marker on either row (``_partial``,
-       ``_error``, ``_recovered*``, ``_active_turn_token``);
-    ③ a state.db-origin clock: a float timestamp on either row (the sqlite
-       REAL round-trip), or a later-row timestamp NEWER than the row that
-       follows the pair (a late-output splice the reconciliation inserted
-       out of order).
-    """
-    for row in (prev, msg):
-        if not isinstance(row, dict):
-            continue
-        if row.get("_state_db_row_id") is not None or row.get("_row_id") is not None:
-            return True
-        if row.get("_partial") is True or row.get("_error") is True:
-            return True
-        if any(str(key).startswith("_recovered") for key in row):
-            return True
-        if row.get("_active_turn_token"):
-            return True
-        if isinstance(row.get("timestamp"), float):
-            return True
-    later_ts = msg.get("timestamp") if isinstance(msg, dict) else None
-    if isinstance(next_row, dict):
-        next_ts = next_row.get("timestamp")
-        if (
-            isinstance(later_ts, (int, float))
-            and not isinstance(later_ts, bool)
-            and isinstance(next_ts, (int, float))
-            and not isinstance(next_ts, bool)
-            and later_ts > next_ts
-        ):
-            return True
-    return False
 
 
 def _replay_user_row_is_plain_mergeable(row):
@@ -8063,7 +7992,7 @@ def _merge_agent_replay_bare_user_rows(messages):
     return merged
 
 
-def _merge_agent_replay_bare_assistant_rows(messages, blocked_pairs=None):
+def _merge_agent_replay_bare_assistant_rows(messages):
     """Mirror the installed Agent's merge of adjacent bare assistant rows.
 
     The Agent's ``repair_message_sequence`` merges consecutive assistant turns
@@ -8080,52 +8009,38 @@ def _merge_agent_replay_bare_assistant_rows(messages, blocked_pairs=None):
     (#7237 review round 3 finding 5).
 
     This helper applies the Agent's rule only, on a copy, for that one caller.
-    It never widens the provider projection. Three exclusions mirror the
-    installed contract and the cancelled-history invariants:
+    It never widens the provider projection. The exclusions mirror the
+    installed contract:
 
     - Codex interim rows are exempt, exactly like the Agent's own
       ``_is_codex_interim`` gate (#7237 review round 4 finding).
     - Pairs with a tool call on either side are left to the sanitizer's own
       pass-0 merge (tool-call union semantics); this helper only collapses
       the BARE pair that merge deliberately keeps.
-    - Pairs flagged by ``_replay_merge_blocked_by_cancelled_history`` stay
-      separate so pre-stop mirror rows keep their individual identity.
     - A merge that changes the visible content drops the survivor's
       ``api_content`` sidecar (mirror of the Agent's
       ``drop_stale_api_content``), so the replay never resends pre-merge
       bytes the rewrite discarded.
 
-    ``blocked_pairs`` is the round-5 addition: the set of ``(prev_idx,
-    msg_idx)`` index pairs the caller pre-computed on the RAW rows. The
-    cancelled-history block list reads provenance (``_state_db_row_id``,
-    ``_partial``, float clocks) that ``_sanitize_messages_for_api`` strips, so
-    when this helper runs on the PROJECTED rows — which is where round 5 put
-    it — the block decision must be carried in rather than re-derived. The
-    caller computes it before the projection; the indices are positions in the
-    same list the sanitizer received, and the projection preserves row order,
-    so they still name the same pair.
+    #7237 round 6 (review blockers, nesquena-hermes 2026-10-12): the round-5
+    blocked-pair raw-provenance handoff is REMOVED. The cancellation
+    exemption it carried into the snapshot is not honored by the installed
+    Agent (the merged answer of a float-clock follow-up pair was lost across
+    save/cold-reload), and its raw index positions misattach once the
+    sanitizer replaces or merges rows (the verification supersession schedule
+    dropped the next exchange's follow-up/answer). The outbound merge mirrors
+    the installed Agent unconditionally; durable raw rows stay individually
+    addressable on the settle/persist side, which keeps the raw history
+    verbatim.
     """
     if not isinstance(messages, list):
         return messages
-    _blocked = blocked_pairs if blocked_pairs is not None else set()
     merged: list = []
-    for idx, msg in enumerate(messages):
+    for msg in messages:
         if not isinstance(msg, dict):
             merged.append(msg)
             continue
         prev = merged[-1] if merged and isinstance(merged[-1], dict) else None
-        next_row = messages[idx + 1] if idx + 1 < len(messages) else None
-        # #7237 round 5: the cancelled-history block decision. When the caller
-        # pre-computed it on the RAW rows (the projected-row call path), the
-        # pair is blocked iff it is in that set — re-deriving it here would
-        # read provenance the projection already stripped and silently
-        # un-block a pair that must stay separate. Without a pre-computed set
-        # (a raw-row caller) the live predicate still applies.
-        _pair_blocked = (
-            (idx - 1, idx) in _blocked
-            if _blocked
-            else _replay_merge_blocked_by_cancelled_history(prev, msg, next_row)
-        )
         if (
             prev is not None
             and prev.get("role") == "assistant"
@@ -8138,7 +8053,6 @@ def _merge_agent_replay_bare_assistant_rows(messages, blocked_pairs=None):
             and not _is_reasoning_only_assistant_message(msg)
             and not _is_non_replayable_history_row(prev)
             and not _is_non_replayable_history_row(msg)
-            and not _pair_blocked
         ):
             survivor = copy.deepcopy(prev)
             prev_content = survivor.get("content")
