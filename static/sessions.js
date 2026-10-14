@@ -11212,13 +11212,23 @@ function _showProjectPicker(session, anchorEl){
     const focusedIndex=ownedFocus?oldItems.indexOf(active):-1;
     const byId=new Map(oldProjectItems.map(item=>[String(item.getAttribute('data-project-id')),item]));
     const retained=new Set();
-    for(const p of visibleProjects){
+    // Keep every surviving choice exactly where it is: in real browsers a DOM
+    // move drops the focus of the row the user is on (Chromium blurs a focused
+    // node the moment it is re-inserted), so only genuinely new choices are
+    // inserted — each one before the next expected row, or in the tail.
+    let anchor=createItem;
+    for(let index=visibleProjects.length-1;index>=0;index--){
+      const p=visibleProjects[index];
       const id=String(p.project_id);
-      const item=_projectPickerChoice(p,byId.get(id));
+      let item=byId.get(id);
       if(item){
         retained.add(item);
-        picker.insertBefore(item,createItem);
+        _projectPickerChoice(p,item);
+      }else{
+        item=_projectPickerChoice(p);
+        if(item) picker.insertBefore(item,anchor);
       }
+      if(item) anchor=item;
     }
     for(const item of oldProjectItems){
       if(!retained.has(item)) item.remove();

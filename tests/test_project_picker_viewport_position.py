@@ -1694,6 +1694,12 @@ FakeElement.prototype.contains = function(target) {
   return this.children.some(child => child === target || (child.contains && child.contains(target)));
 };
 FakeElement.prototype.insertBefore = function(child, before) {
+  // Chromium blurs a focused node the moment it is DOM-moved; the fake must do
+  // the same or a rebuild that relocates surviving rows would pass here while
+  // dropping the user's focus in a real browser.
+  const currentIndex = this.children.indexOf(child);
+  const alreadyInPlace = currentIndex >= 0 && this.children[currentIndex + 1] === before;
+  if (!alreadyInPlace && document.activeElement === child) document.activeElement = documentBody;
   if (child.parent) child.remove();
   const idx = this.children.indexOf(before);
   child.parent = this;
@@ -1772,6 +1778,154 @@ console.log(JSON.stringify({afterUnchanged,afterMutation,afterFocusedDelete}));
         row["id"] for row in data["afterFocusedDelete"]["labels"]
     }
     assert data["afterFocusedDelete"]["preventScroll"] is True
+
+
+_REFRESH_FAKE_EXTENSIONS = r"""
+document.activeElement = null;
+FakeElement.prototype.contains = function(target) {
+  if (target === this) return true;
+  return this.children.some(child => child === target || (child.contains && child.contains(target)));
+};
+const refreshMoves = [];
+FakeElement.prototype.insertBefore = function(child, before) {
+  // Chromium blurs a focused node the moment it is DOM-moved; mirror that so
+  // these tests catch a rebuild that relocates surviving rows.
+  const currentIndex = this.children.indexOf(child);
+  const alreadyInPlace = currentIndex >= 0 && this.children[currentIndex + 1] === before;
+  if (!alreadyInPlace) {
+    refreshMoves.push(child.getAttribute && child.getAttribute('data-project-id'));
+    if (document.activeElement === child) document.activeElement = documentBody;
+  }
+  if (child.parent) child.remove();
+  const idx = this.children.indexOf(before);
+  child.parent = this;
+  child.isConnected = true;
+  if (idx < 0) this.children.push(child); else this.children.splice(idx, 0, child);
+  return child;
+};
+const focusCalls = [];
+FakeElement.prototype.focus = function(options) {
+  document.activeElement = this;
+  this.focused = true;
+  focusCalls.push({target: this, preventScroll: !!(options && options.preventScroll)});
+};
+FakeElement.prototype.querySelectorAll = function(selector) {
+  const out = [];
+  if (selector === '.project-picker-item' || selector === '.project-picker-item[data-project-id]') {
+    const visit = node => {
+      for (const child of node.children || []) {
+        const classes = new Set(String(child.className || '').split(/\s+/).filter(Boolean));
+        const id = child.getAttribute && child.getAttribute('data-project-id');
+        if (selector === '.project-picker-item' && classes.has('project-picker-item')) out.push(child);
+        if (selector === '.project-picker-item[data-project-id]' && classes.has('project-picker-item') && id !== null) out.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+  }
+  return out;
+};
+"""
+
+
+def test_picker_refresh_leaves_an_unchanged_list_and_its_focus_alone():
+    """An unchanged refresh must keep every choice node and never re-focus it.
+
+    The court report for the kept picker was that unchanged re-anchors
+    replaced the focused project row and called bare focus(). This pins the
+    strict no-op: same nodes, no moves, no removes, no focus calls.
+    """
+    assert NODE is not None
+    script = _DRIVER_PREFIX + _REFRESH_FAKE_EXTENSIONS + _show_project_picker_source() + r"""
+openPicker(260);
+const rowsBefore = mountedPicker.querySelectorAll('.project-picker-item[data-project-id]');
+rowsBefore.find(row => row.getAttribute('data-project-id') === 'p2').focus();
+const focusBefore = focusCalls.length;
+_openProjectPicker.refreshChoices();
+const rowsAfter = mountedPicker.querySelectorAll('.project-picker-item[data-project-id]');
+console.log(JSON.stringify({
+  keptNodes: rowsBefore.length === rowsAfter.length && rowsBefore.every((row, i) => row === rowsAfter[i]),
+  removedCount: rowsBefore.filter(row => row.removed).length,
+  moves: refreshMoves,
+  focusAdded: focusCalls.length - focusBefore,
+  activeId: document.activeElement && document.activeElement.getAttribute('data-project-id'),
+}));
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["keptNodes"] is True
+    assert data["removedCount"] == 0
+    assert data["moves"] == []
+    assert data["focusAdded"] == 0, "An unchanged refresh must not call focus()"
+    assert data["activeId"] == "p2"
+
+
+def test_picker_refresh_reconciles_by_identity_and_no_scroll_focus_for_replacement():
+    """A deleted focused choice hands focus to its replacement via the helper.
+
+    The reconcile keeps surviving choices in place (no DOM move, so a focused
+    row keeps its focus in real browsers), and when the focused choice itself
+    is deleted the replacement focus runs through the no-scroll focus helper
+    instead of a bare focus() jump.
+    """
+    assert NODE is not None
+    script = _DRIVER_PREFIX + _REFRESH_FAKE_EXTENSIONS + _show_project_picker_source() + r"""
+openPicker(260);
+const rowsBefore = mountedPicker.querySelectorAll('.project-picker-item[data-project-id]');
+rowsBefore.find(row => row.getAttribute('data-project-id') === 'p1').focus();
+_allProjects.splice(_allProjects.findIndex(p => p.project_id === 'p1'), 1);
+const focusBefore = focusCalls.length;
+_openProjectPicker.refreshChoices();
+const rowsAfter = mountedPicker.querySelectorAll('.project-picker-item[data-project-id]');
+const survivorsKept = rowsAfter.every(row => {
+  const before = rowsBefore.find(r => r.getAttribute('data-project-id') === row.getAttribute('data-project-id'));
+  return before === row;
+});
+const refreshFocus = focusCalls.slice(focusBefore);
+console.log(JSON.stringify({
+  survivorsKept,
+  moves: refreshMoves,
+  refreshFocusCount: refreshFocus.length,
+  lastPreventScroll: refreshFocus.length ? refreshFocus[refreshFocus.length - 1].preventScroll : null,
+  activeId: document.activeElement && document.activeElement.getAttribute('data-project-id'),
+  ids: rowsAfter.map(r => r.getAttribute('data-project-id')),
+}));
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["survivorsKept"] is True, "Surviving choices must keep their nodes"
+    assert data["moves"] == [], "Surviving choices must not be DOM-moved"
+    assert data["refreshFocusCount"] == 1, "Only the replacement focus may run"
+    assert data["lastPreventScroll"] is True, "The replacement focus must be a no-scroll focus"
+    assert data["activeId"] == "p2"
+    assert "p1" not in data["ids"]
+
+
+def test_picker_refresh_never_steals_focus_from_outside_the_picker():
+    """A refresh must leave focus alone when the user is elsewhere."""
+    assert NODE is not None
+    script = _DRIVER_PREFIX + _REFRESH_FAKE_EXTENSIONS + _show_project_picker_source() + r"""
+openPicker(260);
+const outside = new FakeElement('button');
+outside.isConnected = true;
+document.activeElement = outside;
+_allProjects.splice(0, 1);
+const focusBefore = focusCalls.length;
+_openProjectPicker.refreshChoices();
+console.log(JSON.stringify({
+  moves: refreshMoves,
+  focusAdded: focusCalls.length - focusBefore,
+  stillOutside: document.activeElement === outside,
+}));
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["moves"] == []
+    assert data["focusAdded"] == 0
+    assert data["stillOutside"] is True
 
 
 def test_completion_repaints_keep_and_reanchor_the_newer_picker():
