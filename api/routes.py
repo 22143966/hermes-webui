@@ -12409,6 +12409,45 @@ def _resolve_login_locale_key(raw_lang: str | None) -> str:
             return key
     return "en"
 
+
+def _login_locale_from_accept_language(header: str | None) -> str | None:
+    """Pick a login-page locale from the browser's Accept-Language header (#7622).
+
+    The login page is server-rendered, so it renders before any client-side
+    locale detection runs. While ``settings.language`` is still unset (a fresh
+    install) this is what decides the language of the very first page a new
+    user sees. Entries are tried in the browser's own preference order
+    (``q=`` value, highest first).
+    Returns None when the header is absent or names no locale _LOGIN_LOCALE knows.
+    """
+    if not header:
+        return None
+    candidates: list[tuple[float, str]] = []
+    for part in str(header).split(","):
+        tag, _, params = part.partition(";")
+        tag = tag.strip().strip('"')
+        if not tag or tag == "*":
+            continue
+        quality = 1.0
+        for param in params.split(";"):
+            param = param.strip()
+            if not param.startswith("q="):
+                continue
+            try:
+                quality = float(param[2:])
+            except ValueError:
+                quality = 0.0
+        if quality > 0:
+            candidates.append((quality, tag))
+    for _, tag in sorted(candidates, key=lambda c: -c[0]):
+        key = _resolve_login_locale_key(tag)
+        # _resolve_login_locale_key falls back to "en" for anything unknown, so
+        # only trust that result when the tag really is an English tag —
+        # otherwise an unknown language would silently pin the page to English.
+        if key != "en" or tag.replace("_", "-").split("-")[0].lower() == "en":
+            return key
+    return None
+
 # ── Login page (self-contained, no external deps) ────────────────────────────
 _LOGIN_PAGE_HTML = """<!doctype html>
 <html lang="{{LANG}}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -15068,10 +15107,21 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/login":
         _settings = load_settings()
         _bn = _html.escape(_settings.get("bot_name") or "Hermes")
-        _lang = _settings.get("language", "en")
-        _login_strings = _LOGIN_LOCALE[
-            _resolve_login_locale_key(_lang)
-        ]
+        # `settings.language` is None until the user explicitly picks a locale
+        # (#7622). This page is server-rendered, so client-side browser
+        # detection has not run yet — honour Accept-Language here too, or the
+        # very first page a new install shows is still English for everyone.
+        _lang = _settings.get("language")
+        if _lang:
+            _login_locale_key = _resolve_login_locale_key(_lang)
+        else:
+            _login_locale_key = (
+                _login_locale_from_accept_language(
+                    handler.headers.get("Accept-Language")
+                )
+                or "en"
+            )
+        _login_strings = _LOGIN_LOCALE[_login_locale_key]
         from urllib.parse import quote
         from api.updates import WEBUI_VERSION
         # #7056: only render the password input / submit / passkey controls
@@ -17422,7 +17472,16 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Read-only imported sessions cannot regenerate titles", 403)
         next_title, reason, raw_preview = generate_session_title_for_session(s, prefer_latest=prefer_latest)
         if not next_title:
-            return bad(handler, f"Could not generate a better title ({reason or 'empty'})", 422)
+            # The 422 body is rendered verbatim in the sidebar toast, so map
+            # internal statuses to readable text instead of leaking codes like
+            # "llm_language_mismatch_aux" (#7693). The existing title is kept
+            # either way — nothing is persisted on this path.
+            from api.streaming import _human_title_failure_reason
+            return bad(
+                handler,
+                f"Could not generate a better title ({_human_title_failure_reason(reason) or 'empty'})",
+                422,
+            )
         _persist_generated_session_title(s, next_title, event_reason="session_title_regenerate")
         return j(handler, {
             "session": s.compact(),
@@ -22441,6 +22500,8 @@ def _handle_tts(handler, parsed):
         "zh-CN-XiaoxiaoNeural", "zh-CN-XiaoyiNeural", "zh-CN-YunxiNeural",
         "zh-CN-YunjianNeural", "zh-CN-YunyangNeural",
         "en-US-AriaNeural", "en-US-GuyNeural",
+        "en-US-AndrewMultilingualNeural", "en-US-AvaMultilingualNeural",
+        "en-US-BrianMultilingualNeural", "en-US-EmmaMultilingualNeural",
         "fr-CA-AntoineNeural", "fr-CA-JeanNeural",
         "fr-CA-SylvieNeural", "fr-CA-ThierryNeural",
         "fr-FR-DeniseNeural", "fr-FR-EloiseNeural", "fr-FR-HenriNeural",
