@@ -11117,19 +11117,28 @@ function _showProjectPicker(session, anchorEl){
     if(projProfile === 'default' || sessionProfile === 'default') return false;
     return true;
   };
-  const _projectPickerChoice=(p)=>{
+  const _projectPickerChoiceSignature=(p)=>JSON.stringify([
+    String(p.project_id),String(p.name||''),String(p.color||''),String(p.profile||'')
+  ]);
+  const _projectPickerChoice=(p,item)=>{
     if (_profileHidesProject(p.profile)) return null;
-    const item=_projectPickerItem('',session.project_id===p.project_id);
+    item=item||_projectPickerItem('',session.project_id===p.project_id);
     item.setAttribute('data-project-id',String(p.project_id));
-    if(p.color){
-      const dot=document.createElement('span');
-      dot.className='color-dot';
-      dot.style.cssText='width:6px;height:6px;border-radius:50%;background:'+p.color+';flex-shrink:0;';
-      item.appendChild(dot);
+    const signature=_projectPickerChoiceSignature(p);
+    if(item._projectPickerChoiceSignature!==signature){
+      for(const child of Array.from(item.children||[])) child.remove();
+      item.textContent='';
+      if(p.color){
+        const dot=document.createElement('span');
+        dot.className='color-dot';
+        dot.style.cssText='width:6px;height:6px;border-radius:50%;background:'+p.color+';flex-shrink:0;';
+        item.appendChild(dot);
+      }
+      const name=document.createElement('span');
+      name.textContent=p.name;
+      item.appendChild(name);
+      item._projectPickerChoiceSignature=signature;
     }
-    const name=document.createElement('span');
-    name.textContent=p.name;
-    item.appendChild(name);
     item.onclick=async()=>{
       teardown();
       try{
@@ -11187,28 +11196,47 @@ function _showProjectPicker(session, anchorEl){
       return 'deferred';
     }
     const oldItems=Array.from(picker.querySelectorAll('.project-picker-item'));
+    const oldProjectItems=Array.from(picker.querySelectorAll('.project-picker-item[data-project-id]'))
+      .filter(item=>String(item.getAttribute('data-project-id')||'')!=='');
+    const visibleProjects=_allProjects.filter(p=>!_profileHidesProject(p.profile));
+    const unchanged=oldProjectItems.length===visibleProjects.length
+      &&oldProjectItems.every((item,index)=>
+        String(item.getAttribute('data-project-id')||'')===String(visibleProjects[index].project_id)
+        &&item._projectPickerChoiceSignature===_projectPickerChoiceSignature(visibleProjects[index]));
+    if(unchanged) return false;
     const active=(typeof document!=='undefined')?document.activeElement:null;
     const ownedFocus=!!(active&&typeof picker.contains==='function'&&picker.contains(active));
     const focusedId=ownedFocus&&typeof active.getAttribute==='function'
       ? active.getAttribute('data-project-id')
       : null;
     const focusedIndex=ownedFocus?oldItems.indexOf(active):-1;
-    for(const item of Array.from(picker.querySelectorAll('.project-picker-item[data-project-id]'))){
-      const id=typeof item.getAttribute==='function'?item.getAttribute('data-project-id'):null;
-      if(id!==null&&id!=='') item.remove();
+    const byId=new Map(oldProjectItems.map(item=>[String(item.getAttribute('data-project-id')),item]));
+    const retained=new Set();
+    for(const p of visibleProjects){
+      const id=String(p.project_id);
+      const item=_projectPickerChoice(p,byId.get(id));
+      if(item){
+        retained.add(item);
+        picker.insertBefore(item,createItem);
+      }
     }
-    for(const p of _allProjects){
-      const item=_projectPickerChoice(p);
-      if(item) picker.insertBefore(item,createItem);
+    for(const item of oldProjectItems){
+      if(!retained.has(item)) item.remove();
     }
     if(ownedFocus&&active!==none&&active!==createItem){
       const fresh=Array.from(picker.querySelectorAll('.project-picker-item'));
-      let target=fresh.find(item=>typeof item.getAttribute==='function'
+      const surviving=fresh.find(item=>typeof item.getAttribute==='function'
         &&item.getAttribute('data-project-id')===focusedId);
+      let target=surviving;
       if(!target&&fresh.length){
         target=fresh[Math.min(Math.max(focusedIndex,0),fresh.length-1)];
       }
-      if(target&&typeof target.focus==='function') target.focus();
+      // Identity reconciliation leaves a surviving focused choice in place.
+      // Only a deleted choice needs a replacement focus target, and that handoff
+      // must not scroll the sidebar or viewport.
+      if(!surviving&&target&&typeof _focusSessionActionMenuRestoreTarget==='function'){
+        _focusSessionActionMenuRestoreTarget(target);
+      }
     }
     return true;
   };

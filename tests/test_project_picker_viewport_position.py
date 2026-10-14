@@ -205,7 +205,11 @@ let _projectPickerTeardown = null;
 // chunk: the resize hook re-finds a repainted row, and dismiss()/focus helpers
 // hand focus back through these names.
 function _findSessionRenameRow() { return null; }
-function _focusSessionActionMenuRestoreTarget() { return false; }
+function _focusSessionActionMenuRestoreTarget(target) {
+  if(!target || typeof target.focus !== 'function') return false;
+  target.focus({preventScroll:true});
+  return document.activeElement === target;
+}
 
 let anchorRect = {top: 680, bottom: 720, left: 410, right: 440, width: 30, height: 40};
 let anchorConnected = true;
@@ -1697,7 +1701,12 @@ FakeElement.prototype.insertBefore = function(child, before) {
   if (idx < 0) this.children.push(child); else this.children.splice(idx, 0, child);
   return child;
 };
-FakeElement.prototype.focus = function() { document.activeElement = this; this.focused = true; };
+const focusCalls = [];
+FakeElement.prototype.focus = function(options) {
+  document.activeElement = this;
+  this.focused = true;
+  focusCalls.push({target:this,preventScroll:!!(options&&options.preventScroll)});
+};
 FakeElement.prototype.querySelectorAll = function(selector) {
   const out = [];
   const visit = node => {
@@ -1722,6 +1731,13 @@ const labels = () => rows().map(item => ({
 }));
 openPicker(260);
 byId('p1').focus();
+focusCalls.length = 0;
+const originalFocusedChoice = byId('p1');
+_openProjectPicker.refreshChoices();             // unchanged cache: strict no-op
+const afterUnchanged = {
+  sameNode: byId('p1') === originalFocusedChoice,
+  focusCalls: focusCalls.length,
+};
 _allProjects.splice(0, 1);                  // delete p0
 _allProjects.find(p => p.project_id === 'p1').name = 'Renamed project';
 _allProjects.push({project_id:'new-project',name:'New project',profile:'default',color:'#123456'});
@@ -1729,26 +1745,33 @@ _openProjectPicker.refreshChoices();
 const afterMutation = {
   labels: labels(),
   focusedId: document.activeElement.getAttribute('data-project-id'),
+  sameNode: byId('p1') === originalFocusedChoice,
+  focusCalls: focusCalls.length,
 };
 _allProjects.splice(_allProjects.findIndex(p => p.project_id === 'p1'), 1);
 _openProjectPicker.refreshChoices();
 const afterFocusedDelete = {
   labels: labels(),
   focusedId: document.activeElement.getAttribute('data-project-id'),
+  preventScroll: focusCalls.at(-1)?.preventScroll === true,
 };
-console.log(JSON.stringify({afterMutation,afterFocusedDelete}));
+console.log(JSON.stringify({afterUnchanged,afterMutation,afterFocusedDelete}));
 """
     result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout)
+    assert data["afterUnchanged"] == {"sameNode": True, "focusCalls": 0}
     assert all(row["id"] != "p0" for row in data["afterMutation"]["labels"])
     assert {row["id"]: row["name"] for row in data["afterMutation"]["labels"]}["p1"] == "Renamed project"
     assert "new-project" in {row["id"] for row in data["afterMutation"]["labels"]}
     assert data["afterMutation"]["focusedId"] == "p1"
+    assert data["afterMutation"]["sameNode"] is True
+    assert data["afterMutation"]["focusCalls"] == 0
     assert "p1" not in {row["id"] for row in data["afterFocusedDelete"]["labels"]}
     assert data["afterFocusedDelete"]["focusedId"] in {
         row["id"] for row in data["afterFocusedDelete"]["labels"]
     }
+    assert data["afterFocusedDelete"]["preventScroll"] is True
 
 
 def test_completion_repaints_keep_and_reanchor_the_newer_picker():
