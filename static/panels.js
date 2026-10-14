@@ -1044,6 +1044,8 @@ async function loadCronGatewayNotice() {
 }
 
 let _cronLoadGeneration = 0;  // monotonically bumped per loadCrons() entry; stale loads bail
+let _cronAcceptedLoadGeneration = 0;  // latest load that published _cronList
+let _cronLatestLoadSettled = Promise.resolve();  // lets save completion await a superseding reader
 let _cronDetailRefreshKey = null;  // explicit refresh intent survives a superseding poll
 
 async function loadCrons(animate, options) {
@@ -1061,6 +1063,9 @@ async function loadCrons(animate, options) {
   // at entry and bail once a superseded request realises it is no longer the
   // latest, so only the newest render wins.
   const _cronLoadSeq = ++_cronLoadGeneration;
+  let _resolveCronLoadSettled;
+  const _cronLoadSettled = new Promise(resolve => { _resolveCronLoadSettled = resolve; });
+  _cronLatestLoadSettled = _cronLoadSettled;
   if (!background) {
     _cronDetailRefreshKey = hasDetailRefreshKey
       ? (requestedDetailRefreshKey || null)
@@ -1076,6 +1081,7 @@ async function loadCrons(animate, options) {
     const allProfilesQS = _showAllCronProfiles ? '?all_profiles=1' : '';
     const data = await api('/api/crons' + allProfilesQS);
     if (_cronLoadSeq !== _cronLoadGeneration) return data;  // callers still need their fetched jobs
+    _cronAcceptedLoadGeneration = _cronLoadSeq;
     _cronList = data.jobs || [];
     _cronOtherProfileCount = Number(data.other_profile_count || 0);
     if (_showAllCronProfiles && !_cronList.some(job => job && job.read_only)) {
@@ -1184,6 +1190,7 @@ async function loadCrons(animate, options) {
     box.innerHTML = `<div style="padding:12px;color:var(--accent);font-size:12px">${esc(t('error_prefix'))}${esc(e.message)}</div>`;
   }
   finally {
+    _resolveCronLoadSettled();
     if (animate && refreshBtn) {
       refreshBtn.style.opacity = '';
       refreshBtn.disabled = false;
@@ -2086,14 +2093,46 @@ async function saveCronForm(){
   const formDetailKey = _currentCronDetailKey;
   const formStillCurrent = () => $('cronFormError') === errEl &&
     _currentPanel === formPanel && _cronMode === formMode && _currentCronDetailKey === formDetailKey;
-  const acceptedJobsForCurrentForm = async (data) => {
+  const acceptedJobForCurrentForm = async (data, savedId) => {
     if (!formStillCurrent()) return null;
+    const savedJob = () => {
+      if (!formStillCurrent()) return null;
+      return savedId
+        ? (_cronList.find(job => job.id === savedId) || null)
+        : (_cronList[_cronList.length - 1] || null);
+    };
+    if (data && data.jobs === _cronList) {
+      const job = savedJob();
+      if (job) return job;
+    }
     // A completion poll can supersede this save's list request. If its accepted
     // response has not landed yet, take one foreground read so the still-current
     // form completes from the authoritative list rather than remaining saveable.
-    if (!data || data.jobs !== _cronList) data = await loadCrons(false, {detailRefreshKey: formDetailKey});
-    if (!formStillCurrent() || !data || data.jobs !== _cronList) return null;
-    return _cronList;
+    const recoveryGeneration = _cronLoadGeneration + 1;
+    data = await loadCrons(false, {detailRefreshKey: formDetailKey});
+    if (!formStillCurrent()) return null;
+    if (data && data.jobs === _cronList) {
+      const job = savedJob();
+      if (job) return job;
+    }
+    // The recovery read can itself be superseded. Await a bounded number of
+    // later readers instead of starting an unbounded chain of foreground reads.
+    // Each accepted reader publishes both its generation and _cronList.
+    let waitedFor = null;
+    for (let i = 0; i < 4 && formStillCurrent(); i++) {
+      if (_cronAcceptedLoadGeneration > recoveryGeneration) {
+        const job = savedJob();
+        if (job) return job;
+      }
+      const latestSettlement = _cronLatestLoadSettled;
+      if (!latestSettlement || latestSettlement === waitedFor) break;
+      waitedFor = latestSettlement;
+      await latestSettlement;
+    }
+    // The write already succeeded. Do not leave Create/Edit available for a
+    // duplicate submission when bounded list reconciliation could not settle it.
+    if (formStillCurrent()) _clearCronDetail();
+    return null;
   };
   try{
     const modelEl = $('cronFormModel');
@@ -2136,10 +2175,8 @@ async function saveCronForm(){
       // A background refresh keeps a newer selection/output untouched. Only the
       // still-current form may auto-open its saved job from the accepted list.
       if (!saveViewCurrent) return;
-      const jobs = await acceptedJobsForCurrentForm(data);
-      if (!jobs) return;
-      const job = jobs.find(j => j.id === editedId);
-      if (job) openCronDetail(job);
+      const job = await acceptedJobForCurrentForm(data, editedId);
+      if (job && formStillCurrent()) openCronDetail(job);
       return;
     }
     const body={schedule,prompt,deliver,profile: profile, toast_notifications: toastNotifications, badge_notifications: badgeNotifications};
@@ -2160,6 +2197,7 @@ async function saveCronForm(){
     }
     const res = await api('/api/crons/create',{method:'POST',body:JSON.stringify(body)});
     showToast(t('cron_job_created'));
+    const newId = res && (res.id || (res.job && res.job.id));
     const saveViewCurrent = formStillCurrent();
     if (!saveViewCurrent && _currentPanel !== 'tasks') return;
     const data = await loadCrons(false, {
@@ -2167,11 +2205,8 @@ async function saveCronForm(){
       detailRefreshKey: formDetailKey,
     });
     if (!saveViewCurrent) return;
-    const jobs = await acceptedJobsForCurrentForm(data);
-    if (!jobs) return;
-    const newId = res && (res.id || (res.job && res.job.id));
-    const job = jobs && (newId ? jobs.find(j => j.id === newId) : jobs[jobs.length - 1]);
-    if (job) {
+    const job = await acceptedJobForCurrentForm(data, newId);
+    if (job && formStillCurrent()) {
       _cronIsDuplicate = false;
       openCronDetail(job);
     }

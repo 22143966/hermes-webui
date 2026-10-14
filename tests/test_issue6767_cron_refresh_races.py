@@ -24,11 +24,11 @@ const box=node(),button=node(),output=node();output.innerHTML='Loaded output';ou
 const fields={cronList:box,cronRefreshBtn:button,cronDetailRuns:output,cronFormName:{value:'Saved'},cronFormSchedule:{value:'0 8 * * *'},cronFormPrompt:{value:'Do work'},cronFormError:node()};
 function $(id){return fields[id]||null;}
 const document={createElement:node};
-let _cronList=[{id:'existing',name:'Existing'}],_cronOtherProfileCount=0,_showAllCronProfiles=false,_cronLoadGeneration=0;
+let _cronList=[{id:'existing',name:'Existing'}],_cronOtherProfileCount=0,_showAllCronProfiles=false,_cronLoadGeneration=0,_cronAcceptedLoadGeneration=0;
 const _cronNewJobIds=new Set(['newer']);
 let _currentCronDetail='existing',_currentCronDetailKey='existing',_cronMode='detail',_editingCronId=null,_cronPreFormDetail=null,_cronIsDuplicate=false,_cronSelectedSkills=[];
 let renders=0,clears=0,opened=null,writes=[],renderedJob=null;const pending=[];
-let _cronDetailRefreshKey = null;
+let _cronDetailRefreshKey = null,_cronLatestLoadSettled=Promise.resolve();
 const localStorage = {getItem(){return null;},setItem(){}};
 let _currentPanel = 'tasks';
 function api(url,opts){if(opts){writes.push(url);return Promise.resolve({id:'saved'});}return new Promise((resolve,reject)=>pending.push({resolve,reject}));}
@@ -264,6 +264,44 @@ const poll=loadCrons(false,{background:true});await waitRequests(2);
 """ + ordering + """
 await save;
 assert.equal(opened.id,'saved');assert.equal(opened.name,'Accepted saved');assert.equal(writes.length,1);
+""")
+
+
+@pytest.mark.parametrize("editing", [False, True])
+@pytest.mark.parametrize("accepted_first", [False, True])
+def test_current_save_survives_second_supersession(editing, accepted_first):
+    prefix = "_cronMode=" + json.dumps("edit" if editing else "create") + ";" + ("_editingCronId='saved';" if editing else "")
+    saved = "[{id:'existing',name:'Existing'},{id:'saved',name:'Accepted saved'}]"
+    run_js(prefix + """
+const save=saveCronForm();await waitRequests(1); // save-owned list read A
+const firstPoll=loadCrons(false,{background:true});await waitRequests(2); // B supersedes A
+pending[1].resolve({jobs:""" + saved + """});await firstPoll;
+pending[0].resolve({jobs:""" + saved + """});await waitRequests(3); // recovery C
+const secondPoll=loadCrons(false,{background:true});await waitRequests(4); // D supersedes C
+""" + (
+        "pending[3].resolve({jobs:" + saved + "});await secondPoll;"
+        "pending[2].resolve({jobs:" + saved + "});"
+        if accepted_first
+        else
+        "pending[2].resolve({jobs:" + saved + "});"
+        "pending[3].resolve({jobs:" + saved + "});await secondPoll;"
+    ) + """
+await save;
+assert.equal(opened.id,'saved');assert.equal(opened.name,'Accepted saved');
+assert.equal(writes.length,1);
+""")
+
+
+@pytest.mark.parametrize("editing", [False, True])
+def test_successful_write_closes_form_after_bounded_reconciliation_failure(editing):
+    prefix = "_cronMode=" + json.dumps("edit" if editing else "create") + ";" + ("_editingCronId='saved';" if editing else "")
+    run_js(prefix + """
+const save=saveCronForm();await waitRequests(1);
+pending[0].resolve({jobs:[{id:'existing',name:'Existing'}]});
+await waitRequests(2);
+pending[1].resolve({jobs:[{id:'existing',name:'Still missing saved task'}]});
+await save;
+assert.equal(opened,null);assert.equal(clears,1);assert.equal(writes.length,1);
 """)
 
 
