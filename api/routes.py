@@ -6830,6 +6830,25 @@ def _match_api_segments(handler, parsed, template):
     return capture or None
 
 
+def fold_api_path(handler, parsed):
+    """Case-fold ``/api/*`` paths for route matching; retain the original on the handler.
+
+    Only the *matching* path is folded (``/API/Settings`` dispatches like
+    ``/api/settings``). The original-case path is kept as ``handler._raw_api_path``
+    so handlers slice case-sensitive dynamic values (share tokens, MCP server
+    names, session ids) via ``_original_api_path`` / ``_match_api_segments``.
+    The handler instance is reused across HTTP/1.1 keep-alive requests, so the
+    retained path is reset for EVERY request: a non-API request must never see
+    a stale ``_raw_api_path`` left by an earlier /api/ request (#6589).
+    """
+    handler._raw_api_path = None
+    raw_path = parsed.path
+    if raw_path.casefold().startswith("/api/"):
+        handler._raw_api_path = raw_path
+        return parsed._replace(path=raw_path.casefold())
+    return parsed
+
+
 _HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",

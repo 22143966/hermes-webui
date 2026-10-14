@@ -25,7 +25,7 @@ from unittest.mock import patch
 from urllib.parse import urlparse
 
 from api.routes import handle_delete, handle_get, handle_patch, handle_put
-from server import _fold_api_path
+from api.routes import fold_api_path as _fold_api_path
 
 
 class _Headers(dict):
@@ -209,7 +209,7 @@ def test_sidecar_proxy_path_capture_preserved():
             "origin": "http://example.com",
             "auth_token": None,
         }
-        with patch("api.routes.Request") as fake_request, patch(
+        with patch("api.routes.Request"), patch(
             "api.routes._extension_sidecar_proxy_same_origin_opener",
             return_value=_FakeOpener(),
         ):
@@ -235,7 +235,6 @@ class TestDynamicCapturesPreserveCase:
 
     def test_match_api_segments_session_id_preserves_case(self):
         from api.routes import _match_api_segments
-        from urllib.parse import urlsplit
 
         parsed = urlparse("/api/sessions/abc/events")
         h = self._handler("/API/Sessions/AbC/events")
@@ -244,7 +243,6 @@ class TestDynamicCapturesPreserveCase:
 
     def test_match_api_segments_rejects_wrong_shape(self):
         from api.routes import _match_api_segments
-        from urllib.parse import urlsplit
 
         parsed = urlparse("/api/sessions/abc")
         h = self._handler("/API/Sessions/AbC")
@@ -252,7 +250,6 @@ class TestDynamicCapturesPreserveCase:
 
     def test_session_events_dispatch_uses_original_case_sid(self):
         import api.routes as routes
-        from urllib.parse import urlsplit
 
         captured = {}
         orig = routes._handle_session_sse_stream_for_session
@@ -299,7 +296,6 @@ class TestDynamicCapturesPreserveCase:
 
     def test_kanban_task_id_preserves_case(self):
         import api.kanban_bridge as kb
-        from urllib.parse import urlsplit
 
         captured = {}
         orig = kb._task_log_payload
@@ -319,7 +315,6 @@ class TestDynamicCapturesPreserveCase:
 
     def test_kanban_board_slug_preserves_case(self):
         import api.kanban_bridge as kb
-        from urllib.parse import urlsplit
 
         captured = {}
         orig = kb._update_board_payload
