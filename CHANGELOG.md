@@ -156,6 +156,11 @@
 
 ### Fixed
 
+- **WebUI finds the same Agent whether it starts as a service or through bootstrap, and recovers from a half-finished
+  Agent install.** Direct service startup and `bootstrap.py` now share one Agent discovery path, keep the interpreter
+  that actually proved the Agent install for later Agent subprocesses, and retry an incomplete install instead of
+  starting against it. Thanks @rodboev. (#7247, fixes #1019)
+
 - **A git pull that times out no longer returns a 500, and its output can't leak credentials.** The partial git
   output is decoded instead of crashing the update handler. Credentials embedded in remote URLs or query strings
   (including values containing quotes) are redacted from the pull-failure and timeout messages, and the redacted
