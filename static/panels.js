@@ -12485,12 +12485,12 @@ async function checkUpdatesNow(channelOverride){
       if(data.agent&&data.agent.no_git&&!data.agent.ignored) noGitParts.push('Agent');
       // Release-tag context for the status line (display-only; update
       // decisions are made by the per-target checks above).  WebUI-first so
-      // the suffix matches the panel's own version line order; falls back to
-      // the release-path field names (latest_version) when the branch-path
-      // fields (latest_tag) are absent — the stable channel never reaches
-      // the branch path (suppress_stable_fallthrough).
-      const tagInfo=(data.webui&&(data.webui.latest_tag||data.webui.latest_version))
-        ||(data.agent&&(data.agent.latest_tag||data.agent.latest_version))||'';
+      // the suffix matches the panel's own version line order. No fallback to
+      // the release-path version field: on the stable up-to-date payload it
+      // holds the CURRENT tag, which would mislabel it as "Latest". Both
+      // payload shapes carry latest_tag from the backend (#6859 review S1).
+      const tagInfo=(data.webui&&data.webui.latest_tag)
+        ||(data.agent&&data.agent.latest_tag)||'';
       if(parts.length){
         let txt=t('settings_updates_available').replace('{count}',parts.join(', '));
         if(manualInstruction) txt+=' · '+manualInstruction;

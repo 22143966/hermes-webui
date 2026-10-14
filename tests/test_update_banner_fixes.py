@@ -2332,26 +2332,29 @@ class TestUpdateBannerUx:
         assert "data.webui&&data.webui.no_git&&!data.webui.manual_update" in fn
 
     def test_check_updates_now_tag_fallback_is_webui_first_and_spaced(self):
-        """PR #6859 — the tag suffix must keep the WebUI-first fallback chain
-        (`latest_tag || latest_version`) and an explicit space before the
-        localized suffix on both status branches.
+        """PR #6859 — the tag suffix must keep the WebUI-first chain and an
+        explicit space before the localized suffix on both status branches.
 
-        Pins the two frontend shapes the backend tests cannot see: the
-        fallback ORDER (WebUI tag data wins over agent tag data) and the
-        separator that needed the follow-up spacing commit.
+        Pins the two frontend shapes the backend tests cannot see: the source
+        ORDER (WebUI tag data wins over agent tag data) and the separator that
+        needed the follow-up spacing commit. NO latest_version fallback: on
+        the stable up-to-date payload it holds the CURRENT tag, which would
+        mislabel it as "Latest" (review item S1) — the backend emits
+        latest_tag on both payload shapes instead.
         """
         src = read('static/panels.js')
         m = re.search(r'async function checkUpdatesNow\b.*?\n\}', src, re.DOTALL)
         assert m, "checkUpdatesNow() not found"
         fn = m.group(0)
-        # Fallback chain must prefer the WebUI tag (latest_tag before
-        # latest_version), and only fall to the agent chain afterwards.
-        webui_fallback = 'data.webui.latest_tag||data.webui.latest_version'
-        agent_fallback = 'data.agent.latest_tag||data.agent.latest_version'
-        assert webui_fallback in fn, 'WebUI tag fallback chain missing'
-        assert agent_fallback in fn, 'agent tag fallback chain missing'
-        assert fn.index(webui_fallback) < fn.index(agent_fallback), (
+        # Frontend must use latest_tag only — no latest_version fallback.
+        assert 'data.webui.latest_tag' in fn, 'WebUI tag chain missing'
+        assert 'data.agent.latest_tag' in fn, 'agent tag chain missing'
+        assert fn.index('data.webui.latest_tag') < fn.index('data.agent.latest_tag'), (
             'WebUI tag data must be preferred over agent tag data'
+        )
+        assert 'latest_version' not in fn, (
+            'latest_version fallback must be gone (S1: it holds the CURRENT '
+            'tag on the stable up-to-date payload and would mislabel "Latest")'
         )
         # Both the updates-available and up-to-date branches must append the
         # suffix with an explicit space (never a cramped '·').
@@ -2372,6 +2375,7 @@ class TestUpdateBannerUx:
         error_fn = extract_js_function(ui_src, '_formatUpdateCheckError')
         check_fn = extract_js_function(panels_src, 'checkUpdatesNow')
         script = f"""
+global.window = {{}};
 const state = {{
   btnCheckUpdatesNow: {{ disabled: false }},
   checkUpdatesLabel: {{ textContent: '' }},
@@ -2413,8 +2417,9 @@ function _showUpdateBanner() {{}}
   if(txt.indexOf('v0.51.913') === -1) throw new Error('webui tag missing: '+txt);
   if(txt.indexOf('v9.9.9') !== -1) throw new Error('agent tag must not win over webui: '+txt);
   if(txt.indexOf(' · Latest tag: v0.51.913') === -1) throw new Error('tag suffix must be spaced: '+txt);
-  // Release path (stable channel): latest_version only.
-  apiData = {{ webui: {{ latest_version: 'v0.51.900', behind: 1 }}, agent: null }};
+  // Release path (stable channel): backend now emits latest_tag on the
+  // release payload too — no latest_version fallback in the frontend (S1).
+  apiData = {{ webui: {{ latest_tag: 'v0.51.900', behind: 1 }}, agent: null }};
   state.checkUpdatesStatus.textContent = '';
   await checkUpdatesNow();
   if(state.checkUpdatesStatus.textContent.indexOf(' · Latest tag: v0.51.900') === -1) throw new Error('release-path fallback failed: '+state.checkUpdatesStatus.textContent);
@@ -2486,6 +2491,7 @@ function _showUpdateBanner() {{}}
         error_fn = extract_js_function(ui_src, '_formatUpdateCheckError')
         check_fn = extract_js_function(panels_src, 'checkUpdatesNow')
         script = f"""
+global.window = {{}};
 const state = {{
   btnCheckUpdatesNow: {{ disabled: false }},
   checkUpdatesLabel: {{ textContent: '' }},

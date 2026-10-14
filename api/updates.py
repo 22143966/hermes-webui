@@ -1166,7 +1166,7 @@ def _select_apply_compare_ref(path, channel=DEFAULT_UPDATE_CHANNEL, target=None)
     return f'origin/{branch}'
 
 
-def _channel_up_to_date_info(path, name, channel, current_tag):
+def _channel_up_to_date_info(path, name, channel, current_tag, latest_tag=None):
     """Return an 'up to date' payload for a channel that must NOT branch-compare.
 
     Used by the stable channel: stable tags are a promoted subset of master, so
@@ -1186,6 +1186,10 @@ def _channel_up_to_date_info(path, name, channel, current_tag):
         'release_based': True,
         'current_version': current_tag,
         'latest_version': current_tag,
+        # Real latest channel tag for the frontend's "Latest tag:" suffix —
+        # latest_version here holds the CURRENT tag (HEAD is on it), so the
+        # frontend must never fall back to it as a "latest" tag. (#6859 S1)
+        'latest_tag': latest_tag or current_tag,
         'channel': channel,
     }
 
@@ -1252,7 +1256,7 @@ def _check_repo_release(path, name, channel=DEFAULT_UPDATE_CHANNEL):
     suppress_stable_fallthrough = (channel == 'stable' and name == 'webui')
     if behind == 0 and _head_is_past_latest_tag(path, current_tag, channel):
         if suppress_stable_fallthrough:
-            return _channel_up_to_date_info(path, name, channel, current_tag)
+            return _channel_up_to_date_info(path, name, channel, current_tag, latest_tag)
         return None
 
     # Users tracking main can already contain the newest fetched release tag
@@ -1262,7 +1266,7 @@ def _check_repo_release(path, name, channel=DEFAULT_UPDATE_CHANNEL):
     # configured upstream instead of advertising a tag that cannot fast-forward.
     if behind > 0 and _head_contains_ref(path, latest_tag):
         if suppress_stable_fallthrough:
-            return _channel_up_to_date_info(path, name, channel, current_tag)
+            return _channel_up_to_date_info(path, name, channel, current_tag, latest_tag)
         return None
 
     # Patch releases can land on a side branch while day-to-day installs track
@@ -1270,7 +1274,7 @@ def _check_repo_release(path, name, channel=DEFAULT_UPDATE_CHANNEL):
     # that `git pull --ff-only <latest-tag>` cannot reach.
     if behind > 0 and not _can_fast_forward_to(path, latest_tag):
         if suppress_stable_fallthrough:
-            return _channel_up_to_date_info(path, name, channel, current_tag)
+            return _channel_up_to_date_info(path, name, channel, current_tag, latest_tag)
         return None
 
     remote_url, _ = _run_git(['remote', 'get-url', 'origin'], path)
@@ -1293,6 +1297,7 @@ def _check_repo_release(path, name, channel=DEFAULT_UPDATE_CHANNEL):
         'release_based': True,
         'current_version': current_version_display,
         'latest_version': latest_tag,
+        'latest_tag': latest_tag,
         'channel': channel,
     }
 

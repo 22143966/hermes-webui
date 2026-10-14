@@ -1307,6 +1307,40 @@ def test_check_repo_release_not_affected_when_head_exactly_on_tag(tmp_path):
     assert result['latest_version'] == 'v2026.5.16'
 
 
+def test_check_repo_stable_up_to_date_payload_carries_real_latest_tag(tmp_path):
+    """Stable-channel up-to-date payload must carry the REAL latest tag.
+
+    Review item S1 on PR #6859: on this payload latest_version is the CURRENT
+    tag (HEAD is on it), so a frontend fallback to latest_version rendered
+    "Up to date · Latest tag: vOLD" — wrong label. The frontend now reads
+    latest_tag only, so this payload must emit it (latest_tag != current_tag).
+    """
+    (tmp_path / '.git').mkdir()
+
+    def fake_git(args, cwd, timeout=10):
+        if args == ['tag', '--list', 'v*', '--sort=-v:refname']:
+            return 'v0.52.1\nv0.52.0', True
+        if args == ['describe', '--tags', '--abbrev=0', '--match', 'v*']:
+            return 'v0.52.0', True
+        # HEAD contains the latest tag → suppress_stable_fallthrough wins.
+        if args == ['merge-base', '--is-ancestor', 'v0.52.1', 'HEAD']:
+            return '', True
+        if args == ['remote', 'get-url', 'origin']:
+            return 'https://github.com/nesquena/hermes-webui.git', True
+        raise AssertionError(f'unexpected git args: {args!r}')
+
+    with patch.object(updates, '_run_git', side_effect=fake_git):
+        result = updates._check_repo_release(tmp_path, 'webui', channel='stable')
+
+    assert result is not None
+    assert result['behind'] == 0
+    # The wrong-label scenario: current_version is v0.52.0 (HEAD's tag) but
+    # the "Latest tag" suffix must show v0.52.1, the newest channel tag.
+    assert result['current_version'] == 'v0.52.0'
+    assert result['latest_version'] == 'v0.52.0'
+    assert result['latest_tag'] == 'v0.52.1'
+
+
 def test_check_repo_branch_check_runs_for_post_tag_commits(tmp_path):
     """End-to-end: when HEAD is past latest tag, _check_repo uses branch check.
 
