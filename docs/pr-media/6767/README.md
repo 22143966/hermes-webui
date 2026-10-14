@@ -142,3 +142,36 @@ The browser script starts only its own loopback server and stops it in finally;
 all cron responses and actions are controlled fixtures with an inert Agent root.
 No live scheduling, production restart or maintainer visual approval is claimed.
 The full-suite and GitHub CI status are reported separately in the PR update.
+
+## Review 5522946238: save completion must not reopen a deleted task
+
+`save_review.py` compares exact reviewed source `5dcb2fa54b04582f0ae012a983328d011c646701`
+with the fixed checkout. It starts its own isolated loopback server and intercepts
+create/update/delete/list requests; no production task, provider call or scheduler
+is used. Chromium runs the actual form, detail and delete functions. The save's
+list response is held; the task is selected and deleted; a newer accepted list
+contains only the other task; then the stale save response is released. For create,
+a separate accepted read first makes the new task selectable.
+
+All four before runs reopen the deleted task with Run/Edit visible despite its
+absence from the list. All four fixed runs keep an empty selection and hide both
+controls. Both create and edit are tested at 1440×1000 and 390×1000, default dark
+skin, with no uncaught page errors. Exact state is recorded in
+`save_review_results.json`; images are `save-before-*` and `save-fixed-*`.
+Reproduce with `python docs/pr-media/6767/save_review.py` using Playwright/Chromium.
+
+Save completion now checks the original form element, panel, mode and selection
+before mutating form state and before navigating. It only opens a job from the
+accepted current list, not the discarded response. Normal accepted saves still
+open their saved task. Edit/duplicate metadata is not cleared while a read is
+pending or when a newer form replaces it.
+
+The old regression explicitly expected a superseded save response to reopen a
+job absent from the latest list; that unsafe expectation is intentionally replaced.
+Auto-selection now yields to superseding reads and newer user navigation. This
+changes browser completion ownership, not backend save/delete semantics.
+Eight stale-response cases failed on the reviewed source before the fix; normal
+save cases already passed. Additional tests cover navigation during an accepted
+read and form replacement during the pending write. The final broader cron,
+selection, profile-isolation and read-only suite passes 355 tests with 8 skips.
+Full-suite/CI results remain separately reported, not inferred from these fixtures.

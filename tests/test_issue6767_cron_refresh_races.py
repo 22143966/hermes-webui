@@ -235,6 +235,60 @@ assert.equal(box.scrollTop,160);
 
 
 @pytest.mark.parametrize("editing", [False, True])
-def test_save_selects_saved_job_even_when_poll_supersedes_refresh(editing):
+def test_save_does_not_select_job_from_superseded_response(editing):
     prefix = "_cronMode=" + json.dumps("edit" if editing else "create") + ";" + ("_editingCronId='saved';" if editing else "")
-    run_js(prefix + "const save=saveCronForm();await waitRequests(1);const poll=loadCrons(false,{background:true});await waitRequests(2);pending[1].resolve({jobs:[{id:'existing',name:'Existing'}]});await poll;pending[0].resolve({jobs:[{id:'existing',name:'Existing'},{id:'saved',name:'Saved'}]});await save;assert.equal(opened&&opened.id,'saved');assert.equal(typeof opened,'object');assert.equal(_cronMode,'detail');assert.equal(writes.length,1);")
+    run_js(prefix + "const save=saveCronForm();await waitRequests(1);const poll=loadCrons(false,{background:true});await waitRequests(2);pending[1].resolve({jobs:[{id:'existing',name:'Existing'}]});await poll;pending[0].resolve({jobs:[{id:'existing',name:'Existing'},{id:'saved',name:'Saved'}]});await save;assert.equal(opened,null);assert.equal(writes.length,1);")
+
+
+@pytest.mark.parametrize("editing", [False, True])
+@pytest.mark.parametrize("replacement", ["deleted", "selection", "new_form", "panel"])
+def test_save_completion_preserves_newer_view(editing, replacement):
+    prefix = "_cronMode=" + json.dumps("edit" if editing else "create") + ";" + ("_editingCronId='saved';" if editing else "")
+    switch = {
+        "deleted": "_cronMode='detail';_currentCronDetail=null;_currentCronDetailKey=null;",
+        "selection": "_cronMode='detail';_currentCronDetail='other';_currentCronDetailKey='other';",
+        "new_form": "fields.cronFormError=node();_editingCronId='other';",
+        "panel": "_currentPanel='chat';",
+    }[replacement]
+    run_js(prefix + "const save=saveCronForm();await waitRequests(1);" + switch + """
+const newer=loadCrons(false,{background:true});await waitRequests(2);
+pending[1].resolve({jobs:[{id:'other',name:'Other'}]});await newer;
+pending[0].resolve({jobs:[{id:'saved',name:'Deleted saved job'}]});await save;
+assert.equal(opened,null);
+assert.deepEqual(_cronList.map(j=>j.id),['other']);
+""" + ("assert.equal(_editingCronId,'other');" if replacement == "new_form" else ""))
+
+
+@pytest.mark.parametrize("editing", [False, True])
+def test_current_save_selects_job_from_accepted_read(editing):
+    prefix = "_cronMode=" + json.dumps("edit" if editing else "create") + ";" + ("_editingCronId='saved';" if editing else "")
+    run_js(prefix + """
+const save=saveCronForm();await waitRequests(1);
+pending[0].resolve({jobs:[{id:'saved',name:'Saved'}]});await save;
+assert.equal(opened.id,'saved');assert.equal(_cronMode,'detail');
+""")
+
+
+@pytest.mark.parametrize("editing", [False, True])
+def test_save_write_completion_does_not_clear_replacement_form(editing):
+    prefix = "_cronMode=" + json.dumps("edit" if editing else "create") + ";" + ("_editingCronId='saved';" if editing else "")
+    run_js(prefix + """
+let settleWrite;
+api=function(url,opts){assert(opts);return new Promise(resolve=>{settleWrite=resolve;});};
+const save=saveCronForm();
+fields.cronFormError=node();_editingCronId='other';_cronPreFormDetail={id:'other'};
+settleWrite({id:'saved'});await save;
+assert.equal(_editingCronId,'other');assert.equal(_cronPreFormDetail.id,'other');
+assert.equal(opened,null);assert.equal(pending.length,0);
+""")
+
+
+@pytest.mark.parametrize("editing", [False, True])
+def test_save_accepted_read_does_not_override_new_selection(editing):
+    prefix = "_cronMode=" + json.dumps("edit" if editing else "create") + ";" + ("_editingCronId='saved';" if editing else "")
+    run_js(prefix + """
+const save=saveCronForm();await waitRequests(1);
+_cronMode='detail';_currentCronDetail='other';_currentCronDetailKey='other';
+pending[0].resolve({jobs:[{id:'saved',name:'Saved'},{id:'other',name:'Other'}]});await save;
+assert.equal(opened,null);assert.equal(_currentCronDetailKey,'other');
+""")

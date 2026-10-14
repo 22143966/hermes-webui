@@ -2072,6 +2072,13 @@ async function saveCronForm(){
   errEl.style.display='none';
   if(!schedule){errEl.textContent=t('cron_schedule_required_example');errEl.style.display='';return;}
   if(!isNoAgent && !prompt){errEl.textContent=t('cron_prompt_required');errEl.style.display='';return;}
+  // Save completion owns only this form/view. Navigation or a replacement
+  // form must not be undone by either the write or its subsequent list read.
+  const formMode = _cronMode;
+  const formPanel = _currentPanel;
+  const formDetailKey = _currentCronDetailKey;
+  const formStillCurrent = () => $('cronFormError') === errEl &&
+    _currentPanel === formPanel && _cronMode === formMode && _currentCronDetailKey === formDetailKey;
   try{
     const modelEl = $('cronFormModel');
     const modelLoaded = !!(modelEl && modelEl.dataset.loaded === '1');
@@ -2097,13 +2104,15 @@ async function saveCronForm(){
         }
         // else: select not yet populated — omit model/provider to preserve saved value
       }
-      await api('/api/crons/update', {method:'POST', body: JSON.stringify(updates)});
       const editedId = _editingCronId;
-      _editingCronId = null;
-      _cronPreFormDetail = null;
+      await api('/api/crons/update', {method:'POST', body: JSON.stringify(updates)});
       showToast(t('cron_job_updated'));
+      if (!formStillCurrent()) return;
       const data = await loadCrons();
-      const job = data && (data.jobs || []).find(j => j.id === editedId);
+      // Discarded responses remain available to other callers, but may not
+      // reopen a task absent from the current authoritative list.
+      if (!formStillCurrent() || !data || data.jobs !== _cronList) return;
+      const job = _cronList.find(j => j.id === editedId);
       if (job) openCronDetail(job);
       return;
     }
@@ -2124,14 +2133,17 @@ async function saveCronForm(){
       body.provider = _cronPreFormDetail.provider || null;
     }
     const res = await api('/api/crons/create',{method:'POST',body:JSON.stringify(body)});
-    _cronPreFormDetail = null;
-    _cronIsDuplicate = false;
     showToast(t('cron_job_created'));
+    if (!formStillCurrent()) return;
     const data = await loadCrons();
+    if (!formStillCurrent() || !data || data.jobs !== _cronList) return;
     const newId = res && (res.id || (res.job && res.job.id));
-    const jobs = data && (data.jobs || []);
+    const jobs = _cronList;
     const job = jobs && (newId ? jobs.find(j => j.id === newId) : jobs[jobs.length - 1]);
-    if (job) openCronDetail(job);
+    if (job) {
+      _cronIsDuplicate = false;
+      openCronDetail(job);
+    }
   }catch(e){
     errEl.textContent=t('error_prefix')+e.message;errEl.style.display='';
   }
