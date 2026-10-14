@@ -419,6 +419,9 @@ _STREAMING_CRON_PROFILE_HOME: contextvars.ContextVar[str | None] = contextvars.C
     default=None,
 )
 _STREAMING_CRONJOB_WRAPPER_INSTALLED = False
+# Set on the first failed install so the warning is logged once even though the
+# install itself keeps being retried (#8201).
+_STREAMING_CRONJOB_WRAPPER_WARNED = False
 # hermes-agent renamed the model-facing cron tool from ``cronjob`` to
 # ``cronjob_manage``. Older builds still register the old name, so resolve and
 # wrap every name that exists rather than one hardcoded name (#8189).
@@ -501,16 +504,20 @@ def _install_streaming_cronjob_profile_wrapper() -> None:
     single cron tool call returns, avoiding long-lived global path mutation for
     the whole agent turn.
     """
-    global _STREAMING_CRONJOB_WRAPPER_INSTALLED
+    global _STREAMING_CRONJOB_WRAPPER_INSTALLED, _STREAMING_CRONJOB_WRAPPER_WARNED
     if _STREAMING_CRONJOB_WRAPPER_INSTALLED:
         return
     try:
         installed = _wrap_streaming_cronjob_tool_entries()
     except Exception:
         # A future hermes-agent shape change must not abort a chat stream
-        # (#8186). Warn once and stop retrying instead of failing every stream.
-        logger.warning("streaming cronjob wrapper: install failed", exc_info=True)
-        _STREAMING_CRONJOB_WRAPPER_INSTALLED = True
+        # (#8186). Warn once to keep the logs quiet, but leave the installed flag
+        # unset: one failed registration must not disable profile pinning for the
+        # life of the process, or every later chat-created job lands in the
+        # default profile's store (#8201).
+        if not _STREAMING_CRONJOB_WRAPPER_WARNED:
+            _STREAMING_CRONJOB_WRAPPER_WARNED = True
+            logger.warning("streaming cronjob wrapper: install failed", exc_info=True)
         return
     _STREAMING_CRONJOB_WRAPPER_INSTALLED = installed
 
@@ -540,8 +547,9 @@ def _streaming_cronjob_profile_handler(original_handler):
 def _wrap_streaming_cronjob_tool_entries() -> bool:
     """Wrap every registered cron tool name; True once at least one is wrapped.
 
-    Returns False when neither name resolves, so a later stream can retry after
-    the agent registers its tools.
+    Only the global registry slot is wrapped, so a profile-scoped tool override
+    stays scoped to its profile (#8201). Returns False when neither name
+    resolves, so a later stream can retry after the agent registers its tools.
     """
     try:
         from tools.registry import registry
@@ -549,10 +557,24 @@ def _wrap_streaming_cronjob_tool_entries() -> bool:
         logger.debug("streaming cronjob wrapper: tools registry unavailable", exc_info=True)
         return False
 
+    # ``get_entry`` resolves the merged view, where the active profile's scoped
+    # override wins over the global slot. Re-registering that entry without a
+    # scope would promote one profile's handler to every profile, so prefer the
+    # global-slot read where the registry offers it and leave scoped overrides
+    # untouched. Older builds only have ``get_entry``.
+    snapshot_registration = getattr(registry, "snapshot_registration", None)
+    if not callable(snapshot_registration):
+        snapshot_registration = None
+
+    def _resolve_entry(name):
+        if snapshot_registration is None:
+            return registry.get_entry(name)
+        return snapshot_registration(name, scope=None)
+
     def _resolve_entries():
         entries = []
         for name in _STREAMING_CRONJOB_TOOL_NAMES:
-            entry = registry.get_entry(name)
+            entry = _resolve_entry(name)
             if entry is not None:
                 entries.append(entry)
         return entries
