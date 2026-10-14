@@ -1165,6 +1165,11 @@
 
 ### Changed
 
+- **An order-dependent CI test failure is fixed.** `test_custom_provider_detected_by_get_available_models` (and four
+  siblings) seeded the config in memory but didn't pin the loaded-config path, so a stale path left by an earlier test
+  reloaded `config.yaml` over the seed in CI shard 0. The tests now pin it, and a regression test proves the fix.
+  (#8237, fixes #8226)
+
 - **Faster status polls and history reads on long sessions.** Finding the `messages` key in a session file's metadata
   prefix uses a regex tokenizer instead of a per-character Python walk, with identical results. Thanks @dss539. (#8216)
 
