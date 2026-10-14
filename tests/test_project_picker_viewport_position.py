@@ -533,7 +533,7 @@ def test_project_picker_teardown_runs_on_selection_outside_click_and_replacement
     assert replacement["listenerCounts"] == {
         "window": 2,
         "visualViewport": 2,
-        "document": 2,
+        "document": 4,
     }, (
         "Exactly one picker's listeners may be live after a replacement; got "
         f"{replacement['listenerCounts']}"
@@ -771,7 +771,7 @@ console.log(JSON.stringify({oldRemoved: oldPicker.removed, ...placement()}));
     assert not data["removed"]
     assert data["frames"] == 0
     assert data["observers"] == 1
-    assert data["listenerCounts"] == {"window": 2, "visualViewport": 2, "document": 2}
+    assert data["listenerCounts"] == {"window": 2, "visualViewport": 2, "document": 4}
 
 
 def test_picker_scroll_does_not_schedule_reposition_or_close():
@@ -880,7 +880,7 @@ console.log(JSON.stringify({firstRemoved: first.removed, live, closed: placement
 """)
     assert data["firstRemoved"]
     assert data["live"]["observers"] == 1
-    assert data["live"]["listenerCounts"] == {"window": 2, "visualViewport": 2, "document": 2}
+    assert data["live"]["listenerCounts"] == {"window": 2, "visualViewport": 2, "document": 4}
     assert data["closed"]["removed"]
     assert data["closed"]["observers"] == 0
     assert data["closed"]["listenerCounts"] == {"window": 1, "visualViewport": 0, "document": 0}
@@ -3175,8 +3175,8 @@ console.log(JSON.stringify({withPoint, rowOnly}));
     result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout)
-    # Right edge at the recorded point (250), not the window corner (8, 8).
-    assert data["withPoint"] == {"left": "31px", "top": "307px"}, (
+    # Left edge at the recorded point (250), matching the project picker.
+    assert data["withPoint"] == {"left": "250px", "top": "307px"}, (
         "A zero-sized menu anchor must place from the recorded context point; "
         f"got {data['withPoint']}"
     )
@@ -3186,6 +3186,42 @@ console.log(JSON.stringify({withPoint, rowOnly}));
         "Without a recorded point the menu must borrow the visible row; "
         f"got {data['rowOnly']}"
     )
+
+
+def test_picker_defers_choice_replacement_until_pointer_click_finishes():
+    """A repaint between pointerdown and pointerup must not replace the pressed row."""
+    body = _show_project_picker_source()
+    assert "if(pointerGestureId!==null&&!(opts&&opts.force===true))" in body
+    assert "return 'deferred';" in body
+    assert "choiceRefreshTimer=setTimeout" in body
+    assert "refreshChoices({force:true});" in body
+    assert "document.addEventListener('pointerup',finishPointerGesture,true);" in body
+    assert "document.addEventListener('pointercancel',finishPointerGesture,true);" in body
+
+    data = _run_picker_cases("""
+openPicker(260);
+const pressed = mountedPicker.children[1];
+const before = mountedPicker.children.slice();
+(mountedPicker.listeners.pointerdown || [])[0]({button:0,pointerId:7});
+const refreshResult = _openProjectPicker.refreshChoices();
+docEmitter.dispatch('pointerup',{pointerId:7},true);
+const beforeClick = {
+  samePressedNode: mountedPicker.children[1] === pressed,
+  sameChildren: before.every((item,index) => mountedPicker.children[index] === item),
+  timers: timers.size,
+};
+console.log(JSON.stringify({refreshResult,beforeClick}));
+""")
+    assert data["refreshResult"] == "deferred"
+    assert data["beforeClick"]["samePressedNode"] is True
+    assert data["beforeClick"]["sameChildren"] is True
+    assert data["beforeClick"]["timers"] >= 1
+
+
+def test_picker_refresh_restores_focus_only_when_picker_owned_it():
+    body = _show_project_picker_source()
+    assert "const ownedFocus=!!(active&&typeof picker.contains==='function'&&picker.contains(active));" in body
+    assert "if(ownedFocus&&active!==none&&active!==createItem)" in body
 
 
 def test_context_point_picker_keeps_its_left_edge_at_the_pointer():

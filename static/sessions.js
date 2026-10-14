@@ -5558,7 +5558,7 @@ function _positionSessionActionMenu(anchorEl){
     }
   }
   const menuW=Math.min(280, Math.max(220, _sessionActionMenu.scrollWidth || 220));
-  let left=rect.right-menuW;
+  let left=rect.pointAnchored?rect.left:rect.right-menuW;
   if(left<8) left=8;
   if(left+menuW>window.innerWidth-8) left=window.innerWidth-menuW-8;
   _sessionActionMenu.style.left=left+'px';
@@ -11021,7 +11021,15 @@ function _reanchorProjectPickerAfterRepaint(){
   // repaints intentionally keep a newer interaction open. Refresh its choices
   // before the radio state: delete/create/rename must not leave stale project
   // IDs, missing rows or old labels clickable until the picker is reopened.
-  if(typeof open.refreshChoices==='function') open.refreshChoices();
+  const choicesRefresh=typeof open.refreshChoices==='function'?open.refreshChoices():false;
+  const gestureDeferred=choicesRefresh==='deferred';
+  // A pressed choice must remain the same DOM node, at the same screen
+  // position, through pointerup/click. Repaint may still retarget a detached
+  // anchor, but choice replacement and placement wait until the gesture ends.
+  if(gestureDeferred){
+    const current=open.anchorEl;
+    if(current&&current.isConnected!==false) return false;
+  }
   if(typeof _syncProjectPickerSelection==='function') _syncProjectPickerSelection(open);
   const current=open.anchorEl;
   if(current&&current.isConnected!==false){
@@ -11050,8 +11058,8 @@ function _reanchorProjectPickerAfterRepaint(){
   if(contextPoint) next._projectPickerContextPoint=contextPoint;
   if(typeof open.retarget==='function') open.retarget(next);
   else open.anchorEl=next;
-  if(typeof _positionProjectPicker==='function') _positionProjectPicker(open.picker,next);
-  if(typeof requestAnimationFrame==='function'){
+  if(!gestureDeferred&&typeof _positionProjectPicker==='function') _positionProjectPicker(open.picker,next);
+  if(!gestureDeferred&&typeof requestAnimationFrame==='function'){
     requestAnimationFrame(()=>{
       if(open.picker&&open.picker.isConnected!==false&&open.anchorEl&&open.anchorEl.isConnected!==false
          &&typeof _positionProjectPicker==='function'){
@@ -11169,8 +11177,15 @@ function _showProjectPicker(session, anchorEl){
     }
   };
   picker.appendChild(createItem);
-  const refreshChoices=()=>{
+  let pointerGestureId=null;
+  let pendingChoiceRefresh=false;
+  let choiceRefreshTimer=null;
+  const refreshChoices=(opts)=>{
     if(!picker||picker.isConnected===false||typeof picker.querySelectorAll!=='function') return false;
+    if(pointerGestureId!==null&&!(opts&&opts.force===true)){
+      pendingChoiceRefresh=true;
+      return 'deferred';
+    }
     const oldItems=Array.from(picker.querySelectorAll('.project-picker-item'));
     const active=(typeof document!=='undefined')?document.activeElement:null;
     const ownedFocus=!!(active&&typeof picker.contains==='function'&&picker.contains(active));
@@ -11196,6 +11211,30 @@ function _showProjectPicker(session, anchorEl){
       if(target&&typeof target.focus==='function') target.focus();
     }
     return true;
+  };
+  const finishPointerGesture=(event)=>{
+    if(pointerGestureId===null) return;
+    if(event&&event.pointerId!=null&&event.pointerId!==pointerGestureId) return;
+    pointerGestureId=null;
+    if(!pendingChoiceRefresh) return;
+    // Pointerup is followed by click. Keep the pressed node alive until that
+    // click selects it, then apply the queued refresh on the next task.
+    choiceRefreshTimer=setTimeout(()=>{
+      choiceRefreshTimer=null;
+      if(!pendingChoiceRefresh||picker.isConnected===false) return;
+      pendingChoiceRefresh=false;
+      refreshChoices({force:true});
+      const open=(typeof _openProjectPicker!=='undefined')?_openProjectPicker:null;
+      if(open&&open.picker===picker){
+        if(typeof _syncProjectPickerSelection==='function') _syncProjectPickerSelection(open);
+        if(open.anchorEl&&open.anchorEl.isConnected!==false
+           &&typeof _positionProjectPicker==='function') _positionProjectPicker(picker,open.anchorEl);
+      }
+    },0);
+  };
+  const beginPointerGesture=(event)=>{
+    if(event&&event.button!=null&&event.button!==0) return;
+    pointerGestureId=event&&event.pointerId!=null?event.pointerId:0;
   };
   // Append to body and position using getBoundingClientRect so it isn't clipped
   // by overflow:hidden on .session-item ancestors
@@ -11256,6 +11295,9 @@ function _showProjectPicker(session, anchorEl){
     if(repositionFrame!==null){cancelAnimationFrame(repositionFrame);repositionFrame=null;}
     pendingCloseWhenAway=false;
     if(closeTimer!==null){clearTimeout(closeTimer);closeTimer=null;}
+    if(choiceRefreshTimer!==null){clearTimeout(choiceRefreshTimer);choiceRefreshTimer=null;}
+    pointerGestureId=null;
+    pendingChoiceRefresh=false;
     if(anchorObserver){anchorObserver.disconnect();anchorObserver=null;}
     window.removeEventListener('resize',onViewportChange);
     if(visualViewport){
@@ -11264,6 +11306,9 @@ function _showProjectPicker(session, anchorEl){
     }
     document.removeEventListener('scroll',onScroll,true);
     document.removeEventListener('click',close);
+    picker.removeEventListener('pointerdown',beginPointerGesture,true);
+    document.removeEventListener('pointerup',finishPointerGesture,true);
+    document.removeEventListener('pointercancel',finishPointerGesture,true);
     picker.remove();
     // Replay a sidebar repaint that was skipped while this picker was open, once
     // no other picker has taken over (next tick, after any selection handler has
@@ -11289,6 +11334,9 @@ function _showProjectPicker(session, anchorEl){
     visualViewport.addEventListener('scroll',onViewportChange);
   }
   document.addEventListener('scroll',onScroll,true);
+  picker.addEventListener('pointerdown',beginPointerGesture,true);
+  document.addEventListener('pointerup',finishPointerGesture,true);
+  document.addEventListener('pointercancel',finishPointerGesture,true);
   // A sidebar render can remove the row without any viewport event. Observe
   // only child-list mutations while this picker is open, and avoid layout
   // reads for unrelated transcript updates.
