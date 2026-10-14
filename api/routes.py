@@ -8439,6 +8439,42 @@ def _repair_bare_custom_provider_model(
         return None
 
 
+def _repair_removed_qualified_custom_provider_model(
+    model: str,
+    provider: str | None,
+    *,
+    config_obj: dict | None,
+) -> str | None:
+    """Move a removed named-custom model to that provider's configured default."""
+    prov = _clean_session_model_provider(provider)
+    bare_model, qualified_provider = _split_provider_qualified_model(model)
+    if (
+        not isinstance(config_obj, dict)
+        or not prov
+        or not prov.startswith("custom:")
+        or qualified_provider != prov
+    ):
+        return None
+
+    from api.config import _custom_provider_entries, _custom_provider_slug_from_name
+
+    provider_slug = prov.removeprefix("custom:")
+    for entry in _custom_provider_entries(config_obj):
+        slug = _custom_provider_slug_from_name(entry.get("name")).removeprefix("custom:")
+        if slug != provider_slug:
+            continue
+        models_cfg = entry.get("models")
+        if not isinstance(models_cfg, (dict, list)):
+            return None
+        configured = _ordered_custom_provider_model_ids(entry)
+        configured_bare = {_split_provider_qualified_model(item)[0] for item in configured}
+        if bare_model in configured_bare or not configured:
+            return None
+        replacement = str(entry.get("model") or configured[0]).strip()
+        return f"@{prov}:{_split_provider_qualified_model(replacement)[0]}"
+    return None
+
+
 def _moa_fast_path_model_state(model: str) -> tuple[str, str, bool]:
     """Strip an optional ``@moa:``/``moa/`` prefix from an MoA-routed model.
 
@@ -8502,6 +8538,18 @@ def _resolve_compatible_session_model_state(
     if model and requested_provider == "moa":
         return _moa_fast_path_model_state(model)
     if model and requested_provider and model.startswith(f"@{requested_provider}:"):
+        repaired_model = _repair_removed_qualified_custom_provider_model(
+            model,
+            requested_provider,
+            config_obj=profile_config,
+        )
+        if repaired_model:
+            return repaired_model, requested_provider, True
+        if requested_provider.startswith("custom:") and _provider_is_known_or_configured(
+            requested_provider,
+            profile_config,
+        ):
+            return model, requested_provider, False
         try:
             from api.config import cfg as _active_cfg
 
