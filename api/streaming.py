@@ -7732,6 +7732,19 @@ def _sanitize_messages_for_api(
             if preserve_row_clocks and 'timestamp' in msg:
                 _clocked = dict(sanitized)
                 _clocked['_replay_ts'] = msg['timestamp']
+                # Ride the cancelled-stop provenance through the projection
+                # too: the ``allowed_keys`` filter above drops ``_partial`` /
+                # ``_error``, so without this marker the splice guard cannot
+                # tell a state.db stopped row (must stay addressable) from an
+                # ordinary float-clock assistant pair (must merge like the
+                # installed Agent) — the two are otherwise identical on the
+                # projected list. Stripped before the wire payload returns.
+                # Only the STOP markers qualify: a bare ``_state_db_row_id``
+                # or float clock is exactly the round-5/6 cancelled-history
+                # pair that the outbound snapshot MUST merge (the installed
+                # Agent merges it, the durable side keeps it addressable).
+                if msg.get('_partial') is True or msg.get('_error') is True:
+                    _clocked['_replay_stop'] = True
                 clean.append(_clocked)
             else:
                 clean.append(sanitized)
@@ -7936,11 +7949,11 @@ def _sanitize_messages_for_agent(
         sanitized = _merge_agent_replay_bare_assistant_rows(
             sanitized, preserve_splices=True
         )
-        # The clock marker is a transient projection-internal discriminator: it
-        # must not ride the wire payload (the installed Agent clones all keys
-        # and strict providers reject unknown fields).
+        # The clock and stop markers are transient projection-internal
+        # discriminators: they must not ride the wire payload (the installed
+        # Agent clones all keys and strict providers reject unknown fields).
         sanitized = [
-            {k: v for k, v in row.items() if k != '_replay_ts'}
+            {k: v for k, v in row.items() if k not in ('_replay_ts', '_replay_stop')}
             if isinstance(row, dict)
             else row
             for row in sanitized
@@ -8046,9 +8059,9 @@ def _agent_replay_settle_projection(sent_history):
     )
 
 
-def _replay_pair_is_out_of_clock_order(messages, idx):
-    """Return True when the adjacent assistant pair ending at ``idx`` is an
-    out-of-clock-order splice the reconciliation inserted late.
+def _replay_pair_is_cancelled_history_splice(messages, idx):
+    """Return True when the adjacent assistant pair ending at ``idx`` is a
+    cancelled-history splice that must stay individually addressable.
 
     #7237 boundary matrix pins the row-level prefix for the ``late-output``
     shapes: a late assistant row whose clock is NEWER than the row that
@@ -8059,18 +8072,62 @@ def _replay_pair_is_out_of_clock_order(messages, idx):
     (``_replay_ts``) through the sanitizer, so a raw index can never misattach
     after a sanitizer merge/replacement (round-6 blocker 2).
 
-    Pairs in clock order — including the float-clock and
-    supersession-continuation schedules the round-6 durable-preservation
-    tests pin — merge unconditionally, exactly like the installed Agent.
+    Round-6 blocker fix (``bbd805369``) restored only the clock-order clause;
+    the remaining round-5 provenance signals kept being dropped, which
+    regressed the cancelled-stream readers (``test_real_stop_earlier_identical_clocks_cannot_veto_next_worker``):
+    a state.db-origin stopped row carries a REAL round-trip float clock
+    (sqlite ``REAL`` column), and in the identical-clock shape that clock is
+    NEWER than nothing that follows, so the clock-order clause alone does not
+    fire and the row got absorbed into the preceding assistant row. The full
+    round-5 signal set is therefore evaluated here, on the projected rows:
+
+    - a cancel-stop / recovery marker on either row (``_partial``,
+      ``_error``, ``_recovered*``, ``_active_turn_token``), carried through
+      the projection as the transient ``_replay_stop`` marker because the
+      sanitizer's ``allowed_keys`` filter drops the raw markers.
+
+    The round-5 float-clock clause is deliberately NOT restored: the
+    round-6 durable-preservation contract pins that a plain adjacent
+    assistant pair with ordinary sqlite REAL float clocks merges
+    unconditionally, exactly like the installed Agent (restoring it there
+    drops the follow-up answer across cold load). The cancelled-stream
+    reader shape is covered by its stop marker instead.
+
+    Pairs in clock order with no splice provenance — including the
+    float-clock-free and supersession-continuation schedules the round-6
+    durable-preservation tests pin — merge unconditionally, exactly like the
+    installed Agent.
     """
-    if idx < 1 or idx + 1 >= len(messages):
+    if idx < 1:
         return False
     msg = messages[idx]
-    nxt = messages[idx + 1]
-    if not isinstance(msg, dict) or not isinstance(nxt, dict):
+    prev = messages[idx - 1]
+    if not isinstance(msg, dict):
         return False
-    later_ts = msg.get('_replay_ts')
-    next_ts = nxt.get('_replay_ts')
+    # Provenance signals first: the splice row can be the LAST row of the
+    # projection (``_deduplicate_context_messages`` drops the duplicate user
+    # turn between a checkpoint assistant row and the state.db stopped row,
+    # which leaves the stopped row at the list tail with nothing after it).
+    # The round-6 restore only looked at pairs with a following row, so that
+    # tail shape lost its protection and the reader test regressed.
+    for row in (prev, msg):
+        if not isinstance(row, dict):
+            continue
+        if row.get("_replay_stop") is True:
+            return True
+        if row.get("_partial") is True or row.get("_error") is True:
+            return True
+        if any(str(key).startswith("_recovered") for key in row):
+            return True
+        if row.get("_active_turn_token"):
+            return True
+    if idx + 1 >= len(messages):
+        return False
+    nxt = messages[idx + 1]
+    if not isinstance(nxt, dict):
+        return False
+    later_ts = msg.get("_replay_ts", msg.get("timestamp"))
+    next_ts = nxt.get("_replay_ts", nxt.get("timestamp"))
     if not isinstance(later_ts, (int, float)) or isinstance(later_ts, bool):
         return False
     if not isinstance(next_ts, (int, float)) or isinstance(next_ts, bool):
@@ -8141,7 +8198,7 @@ def _merge_agent_replay_bare_assistant_rows(messages, *, preserve_splices: bool 
             and not _is_non_replayable_history_row(msg)
             and not (
                 preserve_splices
-                and _replay_pair_is_out_of_clock_order(messages, _idx)
+                and _replay_pair_is_cancelled_history_splice(messages, _idx)
             )
         ):
             survivor = copy.deepcopy(prev)
