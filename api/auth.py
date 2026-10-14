@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from api.config import STATE_DIR, get_config, load_settings
+from api.helpers import request_declares_body
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,12 @@ _TRUSTED_AUTH_HEADER_ENV = 'HERMES_WEBUI_TRUSTED_AUTH_HEADER'
 _TRUSTED_GROUPS_HEADER_ENV = 'HERMES_WEBUI_TRUSTED_GROUPS_HEADER'
 _TRUSTED_GROUP_PROFILE_MAP_ENV = 'HERMES_WEBUI_GROUP_PROFILE_MAP'
 _TRUSTED_AUTH_LOGOUT_URL_ENV = 'HERMES_WEBUI_TRUSTED_AUTH_LOGOUT_URL'
+# Opt-in: also treat '|' as a group separator in the trusted-groups header.
+# Off by default so an existing deployment whose group NAME legitimately
+# contains a literal '|' is never silently re-split into two groups (which
+# could change its profile binding). Set to 1/true/yes/on for identity
+# providers (some Authentik outpost configs) that emit "admins|developpeur".
+_TRUSTED_GROUPS_PIPE_SEPARATOR_ENV = 'HERMES_WEBUI_TRUSTED_GROUPS_PIPE_SEPARATOR'
 _TRUSTED_AUTH_WARNINGS_EMITTED: set[str] = set()
 
 
@@ -493,7 +500,8 @@ def is_oidc_auth_enabled() -> bool:
 
 
 def get_oidc_startup_warning() -> str | None:
-    """Return a startup warning when OIDC auth is only partially configured."""
+    """Return a startup warning when OIDC auth is only partially configured,
+    or when allow_values uses whitespace that is no longer a separator."""
     try:
         cfg = get_config()
         raw = cfg.get("webui_oidc") if isinstance(cfg, dict) else {}
@@ -511,28 +519,52 @@ def get_oidc_startup_warning() -> str | None:
     issuer = bool(pick("issuer", "HERMES_WEBUI_OIDC_ISSUER"))
     client_id = bool(pick("client_id", "HERMES_WEBUI_OIDC_CLIENT_ID"))
     allow_claim = bool(pick("allow_claim", "HERMES_WEBUI_OIDC_ALLOW_CLAIM"))
-    allow_values = bool(pick("allow_values", "HERMES_WEBUI_OIDC_ALLOW_VALUES"))
+    raw_allow_env = os.getenv("HERMES_WEBUI_OIDC_ALLOW_VALUES")
+    raw_allow = raw_allow_env if raw_allow_env is not None else raw.get("allow_values")
+    normalized_allow_values = []
+    allow_values_warning = None
+    try:
+        from api import auth_oidc
+
+        normalized_allow_values = auth_oidc._normalize_allow_values(raw_allow)
+        allow_values_warning = auth_oidc._ALLOW_VALUES_WHITESPACE_WARNING
+    except Exception:
+        logger.debug("Failed to normalize OIDC allow_values", exc_info=True)
+    allow_values = bool(normalized_allow_values)
 
     if not any((issuer, client_id, allow_claim, allow_values)):
         return None
-    if issuer and client_id and allow_claim and allow_values:
-        return None
 
-    missing = []
-    if not issuer:
-        missing.append("issuer")
-    if not client_id:
-        missing.append("client_id")
-    if not allow_claim:
-        missing.append("allow_claim")
-    if not allow_values:
-        missing.append("allow_values")
+    warnings = []
 
-    joined = ", ".join(missing)
-    return (
-        "Native OIDC login is only partially configured; missing "
-        f"{joined}. The WebUI will not enable OIDC auth until all four fields are set."
-    )
+    if not (issuer and client_id and allow_claim and allow_values):
+        missing = []
+        if not issuer:
+            missing.append("issuer")
+        if not client_id:
+            missing.append("client_id")
+        if not allow_claim:
+            missing.append("allow_claim")
+        if not allow_values:
+            missing.append("allow_values")
+        joined = ", ".join(missing)
+        warnings.append(
+            "Native OIDC login is only partially configured; missing "
+            f"{joined}. The WebUI will not enable OIDC auth until all four fields are set."
+        )
+
+    # Detect whitespace-only allow_values scalar that may contain multiple intended values.
+    # Runs unconditionally so the warning reaches startup even when other auth methods
+    # short-circuit is_auth_enabled() before the OIDC branch is evaluated.
+    if (
+        allow_values_warning is not None
+        and raw_allow is not None
+        and not isinstance(raw_allow, (list, tuple, set))
+        and any(any(ch.isspace() for ch in v) for v in normalized_allow_values)
+    ):
+        warnings.append(allow_values_warning)
+
+    return "\n".join(warnings) if warnings else None
 
 
 def is_auth_enabled() -> bool:
@@ -697,7 +729,20 @@ def _trusted_groups_header_value(handler) -> list[str]:
     if not raw:
         return []
     values = []
-    for part in str(raw).replace('\n', ',').split(','):
+    # Authentik's outpost typically joins multiple group names with a comma or
+    # newline; parse those as separators by default. Some proxy provider /
+    # property-mapping configs instead emit a pipe-separated list (e.g.
+    # "admins|developpeur"), which a comma-only split would treat as one
+    # unmatched group name — silently dropping the session to the unbound
+    # "default" profile despite a legitimate mapped membership. Pipe splitting
+    # is therefore available but OPT-IN (HERMES_WEBUI_TRUSTED_GROUPS_PIPE_SEPARATOR),
+    # because a group NAME can legitimately contain a literal '|' and must not be
+    # re-split by default — doing so unconditionally could change an existing
+    # deployment's profile binding.
+    normalized = str(raw).replace('\n', ',')
+    if str(os.getenv(_TRUSTED_GROUPS_PIPE_SEPARATOR_ENV, '')).strip().lower() in ('1', 'true', 'yes', 'on'):
+        normalized = normalized.replace('|', ',')
+    for part in normalized.split(','):
         part = part.strip()
         if part:
             values.append(part)
@@ -993,18 +1038,35 @@ def invalidate_session(cookie_value) -> None:
                 _save_sessions(_sessions)
 
 
-def parse_cookie(handler) -> str | None:
-    """Extract the auth cookie from the request headers."""
+def read_cookie(handler, name: str) -> str | None:
+    """Read one named cookie from the request headers, tolerating its neighbours.
+
+    A cookie we do not own must not hide ours: SimpleCookie.load() over the WHOLE header
+    silently drops every cookie that follows a malformed one, so an unrelated app's cookie
+    on a shared host/domain (seen live: `__sec_id` carrying raw JSON with quotes) makes the
+    real cookie unreadable and the user is bounced to /login. Parse one cookie at a time so
+    a bad cookie only skips itself. ``;`` always separates cookies (RFC 6265 section 4.2.1:
+    a quoted cookie-value cannot contain one), so no quoting/unescaping layer is needed.
+    """
     cookie_header = handler.headers.get('Cookie', '')
     if not cookie_header:
         return None
-    cookie = http.cookies.SimpleCookie()
-    try:
-        cookie.load(cookie_header)
-    except http.cookies.CookieError:
-        return None
-    morsel = cookie.get(_resolve_cookie_name())
-    return morsel.value if morsel else None
+    found = None
+    for part in cookie_header.split(';'):
+        cookie = http.cookies.SimpleCookie()
+        try:
+            cookie.load(part)
+        except http.cookies.CookieError:
+            continue
+        morsel = cookie.get(name)
+        if morsel is not None:
+            found = morsel.value  # last match wins, as the whole-header parse did
+    return found
+
+
+def parse_cookie(handler) -> str | None:
+    """Extract the auth cookie from the request headers."""
+    return read_cookie(handler, _resolve_cookie_name())
 
 
 def _safe_login_inner_next(query: str | None) -> str:
@@ -1160,6 +1222,42 @@ def check_auth(handler, parsed) -> bool:
         handler.send_header('Location', 'login?next=' + _next)
         handler.send_header('Content-Length', '0')
         handler.end_headers()
+    return False
+
+
+def check_auth_or_close(handler, parsed) -> bool:
+    """Check auth; when rejected, close so an unread body can't poison HTTP/1.1 reuse.
+
+    The flag is armed BEFORE check_auth() writes its 401/302, so end_headers()
+    can advertise ``Connection: close``; success restores the prior flag so an
+    authenticated request keeps its keep-alive.
+
+    Armed ONLY when the request's framing declares a body still queued in
+    ``rfile`` (see ``request_declares_body()``), which is the same rule the other
+    reject-before-read sites apply through ``arm_connection_close_if_body_pending()``.
+    Arming unconditionally was the mirror image of the over-close this PR already
+    fixed on the sidecar path: a body-less POST that failed auth answered
+    ``401`` WITH ``Connection: close`` and dropped the client's pipelined
+    follow-up, killing a healthy keep-alive connection for no framing reason.
+    Verified on the wire, pipelined down one socket against the production
+    handler: ``POST /api/session/new`` with no ``Content-Length`` (and with
+    ``Content-Length: 0``) answered ``401`` + ``Connection: close`` and the
+    following ``GET /api/auth/status`` was never served. The helper cannot be
+    swapped in directly here because the arming has to happen before
+    ``check_auth()`` writes its response and be undone if it succeeds.
+
+    ``close_connection`` only exists once BaseHTTPRequestHandler has parsed a
+    request line, so partially-built handler stubs may not have it at all. Read
+    it defensively and only arm/restore when it was really there: inventing the
+    attribute on a stub would leave a bogus keep-alive verdict behind.
+    """
+    if not hasattr(handler, 'close_connection') or not request_declares_body(handler):
+        return check_auth(handler, parsed)
+    prior_close = handler.close_connection
+    handler.close_connection = True
+    if check_auth(handler, parsed):
+        handler.close_connection = prior_close
+        return True
     return False
 
 

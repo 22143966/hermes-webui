@@ -48,11 +48,12 @@ def _run_node(script: str) -> dict:
     assert NODE is not None
     result = subprocess.run(
         [NODE, "-e", script],
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         timeout=30,
     )
+    assert result.returncode == 0, f"node failed: {result.stderr}"
     return json.loads(result.stdout)
 
 
@@ -378,6 +379,7 @@ def test_cron_recent_does_not_cross_match_newer_long_prefix_session_when_only_sh
             "status": "success",
             "completed_at": 250.0,
             "toast_notifications": True,
+            "badge_notifications": True,
             "session_id": "cron_backup_20260610_090000",
             "message_count": 4,
         }
@@ -488,6 +490,8 @@ let _cronPollTimer = null;
 let _cronUnreadCount = 0;
 let _cronPollGeneration = 0;
 const _cronNewJobIds = new Set();
+const _cronPendingToasts = [];
+let _cronPollInFlight = false;
 const markCalls = [];
 const toastCalls = [];
 let badgeUpdates = 0;
@@ -511,6 +515,15 @@ function t(...args) {{ return args.join('|'); }}
 function updateCronBadge() {{ badgeUpdates += 1; }}
 function _markSessionCompletionUnreadIfBackground(sid, count) {{ markCalls.push([sid, count]); }}
 eval(extractFunc('startCronPolling'));
+// The tick is async (`await api(...)`) and its declaration must reach the
+// harness scope, so eval it directly. extractFunc matches `function <name>(`
+// without the `async` keyword, so restore it here.
+const tickFnSource = extractFunc('_runCronPollTick');
+if (!/^async\s/.test(tickFnSource)) {{
+  eval(tickFnSource.replace(/^function\\s+(\\w+)/, 'async function $1'));
+}} else {{
+  eval(tickFnSource);
+}}
 (async() => {{
   startCronPolling();
   await global.__tick();
@@ -574,6 +587,9 @@ let _cronPollGeneration = 0;
 const _cronNewJobIds = new Set();
 let badgeUpdates = 0;
 let loadCronsCalls = 0;
+let refreshOptions = null;
+let _cronPollInFlight = false;
+const _cronPendingToasts = [];
 let _currentPanel = {json.dumps(current_panel)};
 global.document = {{ hidden: false }};
 global.setInterval = (fn, _ms) => {{ global.__tick = fn; return 1; }};
@@ -595,7 +611,9 @@ function t(...args) {{ return args.join('|'); }}
 function updateCronBadge() {{ badgeUpdates += 1; }}
 function _markSessionCompletionUnreadIfBackground(sid, count) {{}}
 function $(id) {{ return id === 'cronList' && {json.dumps(cron_list_present)} ? {{ tagName: 'UL' }} : null; }}
-function loadCrons() {{ loadCronsCalls += 1; }}
+function loadCrons(animate, options) {{ loadCronsCalls += 1; refreshOptions = options; }}
+const tickSource = extractFunc('_runCronPollTick');
+eval('async ' + tickSource);
 eval(extractFunc('startCronPolling'));
 (async() => {{
   startCronPolling();
@@ -603,7 +621,9 @@ eval(extractFunc('startCronPolling'));
   console.log(JSON.stringify({{
     unreadJobs: Array.from(_cronNewJobIds),
     badgeUpdates,
-    loadCronsCalls
+    loadCronsCalls,
+    refreshOptions,
+    inFlight: _cronPollInFlight
   }}));
 }})().catch(err => {{
   console.error(err);
@@ -642,3 +662,5 @@ def test_cron_polling_live_refresh_guard(
     # ...but the unread bookkeeping always runs regardless of panel/list state.
     assert payload["unreadJobs"] == ["job6767"], "job must always be marked unread"
     assert payload["badgeUpdates"] == 1, "badge must always be updated"
+    assert payload["inFlight"] is False
+    assert payload["refreshOptions"] == ({"background": True} if expected_refresh else None)
