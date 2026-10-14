@@ -156,6 +156,11 @@
 
 ### Fixed
 
+- **A git pull that times out no longer returns a 500, and its output can't leak credentials.** The partial git
+  output is decoded instead of crashing the update handler. Credentials embedded in remote URLs or query strings
+  (including values containing quotes) are redacted from the pull-failure and timeout messages, and the redacted
+  text is no longer cut short. Thanks @happy5318. (#8202, fixes #8198)
+
 - **Settings search shows results right away.** Typing in the Settings search box now lists matches from the
   already-loaded panes immediately, instead of waiting for every pane to finish loading, and a result you've clicked
   no longer reappears when the slower panes arrive. Thanks @yugui923. (#6370)
