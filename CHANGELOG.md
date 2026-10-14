@@ -151,6 +151,10 @@
 
 ### Fixed
 
+- **Settings search shows results right away.** Typing in the Settings search box now lists matches from the
+  already-loaded panes immediately, instead of waiting for every pane to finish loading, and a result you've clicked
+  no longer reappears when the slower panes arrive. Thanks @yugui923. (#6370)
+
 - **A finished reply no longer vanishes when the final update arrives empty.** If the stream's closing event carried an
   empty message list, the done handler replaced the visible transcript with nothing, so the reply you just watched stream
   disappeared until a reload. The settle now keeps the streamed transcript when the payload is empty. Thanks
