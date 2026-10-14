@@ -74,11 +74,13 @@ const assert=require('node:assert/strict');
 const _activityNowSeconds=()=>1700000000;
 let _serverTz='+0530';
 FUNCTIONS
-let constructed=0;
+let constructed=0, probes=0;
 const Native=Intl.DateTimeFormat;
-// Count formatter builds (with options); the argument-less default-zone probe
-// that guards the cache runs once per task and is not a per-row cost.
-Intl.DateTimeFormat=new Proxy(Native,{construct(target,args){if(args.length)constructed++;return Reflect.construct(target,args);}});
+// Formatter builds (with options) and the argument-less default locale/zone
+// probe that guards the cache are counted separately: the probe must run once
+// per task, not once per row.
+Intl.DateTimeFormat=new Proxy(Native,{construct(target,args){if(args.length)constructed++;else probes++;return Reflect.construct(target,args);}});
+(async()=>{
 for(let i=0;i<100;i++){
   _activityClockLabel(1700000000+i);
   _activityFullClockLabel(1700000000+i);
@@ -86,6 +88,7 @@ for(let i=0;i<100;i++){
   _formatInServerTz(new Date((1700000000+i)*1000),{});
 }
 assert.equal(constructed,4);
+assert.equal(probes,1);
 // Server offset changes shift the Date anew but reuse the identical UTC format.
 _serverTz='-0330';
 _formatInServerTz(new Date(1700000000000),{hour:'2-digit',minute:'2-digit'});
@@ -94,6 +97,13 @@ assert.equal(constructed,4);
 _serverTz='+0000';
 _formatInServerTz(new Date(1700000000000),{hour:'2-digit',minute:'2-digit'});
 assert.equal(constructed,5);
+assert.equal(probes,1);
+// The next task checks the default locale/zone again, once.
+await Promise.resolve();
+for(let i=0;i<100;i++) _activityClockLabel(1700000000+i);
+assert.equal(probes,2);
+assert.equal(constructed,5);
+})().catch(e=>{console.error(e);process.exitCode=1;});
 """
     _run(script)
 
