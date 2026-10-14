@@ -848,6 +848,9 @@ def test_run_git_recovers_remote_tracking_ref_collision(
 
 @pytest.mark.parametrize('args,diagnostic,expected_attempts', [
     (['fetch', 'origin'], "exists; cannot create 'refs/remotes/origin/onboarding/next'", 2),
+    # Git >= 2.51 wording (batched ref updates): only the summary hint names the conflict.
+    (['fetch', 'origin'], "error: some local refs could not be updated; try running\n 'git remote prune origin' to remove any old, conflicting branches", 2),
+    (['fetch', 'origin'], "error: some local refs could not be updated; try running\n 'git remote prune upstream' to remove any old, conflicting branches", 1),
     (['fetch', '--prune', 'origin'], "exists; cannot create 'refs/remotes/origin/onboarding/next'", 1),
     (['pull', 'origin'], "exists; cannot create 'refs/remotes/origin/onboarding/next'", 1),
     (['fetch', 'origin'], 'network unavailable', 1),
@@ -898,7 +901,8 @@ def test_run_git_ref_recovery_preserves_custom_refspec_destinations(tmp_path, ex
     output, ok = updates._run_git(['fetch', 'origin', '--tags', '--force'], repo)
 
     assert not ok  # Unknown mappings retain the original failure instead of pruning.
-    assert "exists; cannot create 'refs/remotes/origin/onboarding/next'" in output
+    # Git < 2.51 names the blocking ref; Git >= 2.51 emits only the prune hint.
+    assert updates._REMOTE_REF_COLLISION_RE.search(output), output
     for ref in ['refs/tags/local-only', 'refs/heads/mirror/local-only']:
         assert updates._run_git(['rev-parse', ref], repo) == (head, True)
 

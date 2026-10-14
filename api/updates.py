@@ -69,7 +69,15 @@ _FETCH_NETWORK_FAILURE_SIGNATURES = (
     'tls connection was non-properly terminated',
     'ssl certificate problem',
 )
-_REMOTE_REF_COLLISION_RE = re.compile(r"exists; cannot create ['\"]refs/remotes/origin/")
+# Git < 2.51 names the blocking ref ("'refs/remotes/origin/x' exists; cannot
+# create 'refs/remotes/origin/x/y'"). Git >= 2.51 batches fetch ref updates
+# and reports the same name conflict only through the summary hint, which
+# fetch.c emits solely for REF_TRANSACTION_ERROR_NAME_CONFLICT; stale-lock
+# failures keep their "Unable to create '...lock'" wording and never match.
+_REMOTE_REF_COLLISION_RE = re.compile(
+    r"exists; cannot create ['\"]refs/remotes/origin/"
+    r"|some local refs could not be updated; try running\s+['\"]git remote prune origin['\"]"
+)
 _RELEASE_TAG_RE = re.compile(r'^v[0-9][0-9A-Za-z.+-]*$')
 _EXPERIMENTAL_RELEASE_TAG_RE = re.compile(r'^exp-v[0-9]+(?:\.[0-9]+)*$')
 _GITHUB_RELEASE_TAGS_URL = 'https://api.github.com/repos/nesquena/hermes-webui/tags?per_page=100'
