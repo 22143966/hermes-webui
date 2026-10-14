@@ -3083,6 +3083,11 @@ function _inlineMediaHtmlForRef(ref, sessionId, altText){
       ref=decodeURIComponent(u.pathname||ref.replace(/^file:\/\//i,''));
       ref=ref.replace(/^[\\/]([A-Za-z]:[\\/])/,'$1');
     }catch(_){
+      // Fail-closed on a parse failure (AGENTS.md): the raw string may hide
+      // a non-local authority that the URL parse above never got to check.
+      // Reject anything shaped like 'file://<authority>/...' rather than
+      // silently rendering a local media element from it.
+      if(/^file:\/\/[^/?#]+/i.test(ref)) return '';
       try{ref=decodeURIComponent(ref.replace(/^file:\/\//i,''));}
       catch(__){ref=ref.replace(/^file:\/\//i,'');}
       ref=ref.replace(/^[\\/]([A-Za-z]:[\\/])/,'$1');

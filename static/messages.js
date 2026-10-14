@@ -4802,6 +4802,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // generic leading-slash removal: POSIX/UNC semantics differ).
       return 'api/media?path='+encodeURIComponent(path.replace(/^[\\/]([A-Za-z]:[\\/])/,'$1'))+'&inline=1';
     }catch(_){
+      // Fail-closed on a parse failure (AGENTS.md): a file URI we cannot
+      // parse may hide a non-local authority, and the raw string still
+      // carries it after the prefix strip. Reject anything that looks like
+      // 'file://<authority>/...' with a non-empty authority instead of
+      // silently building a local media URL from it.
+      if(/^file:\/\/[^/?#]+/i.test(href)) return href;
       return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,'').replace(/^[\\/]([A-Za-z]:[\\/])/,'$1'))+'&inline=1';
     }
   }

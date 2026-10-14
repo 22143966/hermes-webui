@@ -48,7 +48,12 @@ UI_JS_PATH = REPO_ROOT / "static" / "ui.js"
 MESSAGES_JS_PATH = REPO_ROOT / "static" / "messages.js"
 
 NODE = shutil.which("node")
-pytestmark = pytest.mark.skipif(NODE is None, reason="node not on PATH")
+
+# Node is required only by the two client-converter test classes (they eval the
+# real JS functions in a node VM). The server-side helper and route tests are
+# pure Python and must keep running on a node-less environment, so the skip is
+# scoped to those classes instead of the whole module.
+_NODE_REQUIRED = pytest.mark.skipif(NODE is None, reason="node not on PATH")
 
 # 1-pixel transparent PNG (67 bytes)
 _PNG_BYTES = (
@@ -186,7 +191,17 @@ class TestHandleMediaWiresNormalization:
         """
         from api import routes
 
-        with tempfile.TemporaryDirectory(dir="/tmp") as tmpd, \
+        # /tmp is an allowed media root, but a native Windows checkout has no
+        # /tmp — use the platform temp dir and skip when it is not one of the
+        # route's allowed roots (the wiring proof below needs the file inside
+        # an allowed root to reach the 200 path).
+        _tmp_root = pathlib.Path(tempfile.gettempdir()).resolve()
+        if not (
+            _tmp_root == pathlib.Path("/tmp").resolve()
+            or str(_tmp_root).startswith(str(pathlib.Path("/tmp").resolve()))
+        ):
+            pytest.skip("platform temp dir is not an allowed media root")
+        with tempfile.TemporaryDirectory(dir=str(_tmp_root)) as tmpd, \
              tempfile.TemporaryDirectory() as home:
             hermes_home = pathlib.Path(home) / ".hermes"
             hermes_home.mkdir(parents=True)
@@ -394,6 +409,8 @@ _SETTLED_CASES = [
     "file://server/share/x.png",            # ② UNC authority → explicit reject
     "file://localhost/C:/x.png",            # localhost authority → local
     "file:///C:/Users/me/report.md",        # non-image drive-letter path
+    "file://server:abc/share/x.png",        # ② malformed authority (URL parse
+    #                                         throws) → fail-closed reject
 ]
 
 _STREAMING_CASES = _SETTLED_CASES
@@ -426,6 +443,7 @@ def streaming_results(tmp_path_factory):
     return _run_node_driver(_STREAMING_DRIVER, MESSAGES_JS_PATH, _STREAMING_CASES, tmp_path_factory)
 
 
+@_NODE_REQUIRED
 class TestSettledFileUriConverter:
     """Real _inlineMediaHtmlForRef from static/ui.js, driven in node."""
 
@@ -455,6 +473,15 @@ class TestSettledFileUriConverter:
         assert not r["hasMediaRoute"], "UNC must never be rewired to api/media"
         assert r["html"] == ""
 
+    def test_malformed_authority_fails_closed(self, settled_results):
+        """A file URI whose authority makes URL parsing throw must not fall
+        through the catch path into a local media URL (AGENTS.md fail-closed)."""
+        r = settled_results["file://server:abc/share/x.png"]
+        assert not r["hasMediaRoute"], (
+            "a malformed authority must be rejected, not rewired to api/media"
+        )
+        assert r["html"] == ""
+
     def test_localhost_authority_treated_as_local(self, settled_results):
         r = settled_results["file://localhost/C:/x.png"]
         assert r["pathParam"] == "C:/x.png"
@@ -464,6 +491,7 @@ class TestSettledFileUriConverter:
         assert r["pathParam"] == "C:/Users/me/report.md"
 
 
+@_NODE_REQUIRED
 class TestStreamingFileUriConverter:
     """Real _smdLinkHref from static/messages.js, driven in node."""
 
@@ -492,6 +520,15 @@ class TestStreamingFileUriConverter:
         r = streaming_results["file://server/share/x.png"]
         assert not r["hasMediaRoute"], "UNC must never be rewired to api/media"
         assert r["result"] == "file://server/share/x.png"  # left as inert file:// href
+
+    def test_malformed_authority_fails_closed(self, streaming_results):
+        """A file URI whose authority makes URL parsing throw must not fall
+        through the catch path into a local media URL (AGENTS.md fail-closed)."""
+        r = streaming_results["file://server:abc/share/x.png"]
+        assert not r["hasMediaRoute"], (
+            "a malformed authority must be rejected, not rewired to api/media"
+        )
+        assert r["result"] == "file://server:abc/share/x.png"
 
     def test_localhost_authority_treated_as_local(self, streaming_results):
         r = streaming_results["file://localhost/C:/x.png"]
