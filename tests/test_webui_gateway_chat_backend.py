@@ -1881,6 +1881,7 @@ def test_gateway_chat_401_hint_reports_the_session_profile_key_not_the_process_k
     # The process-wide environment has NO key; the 'coder' profile has one.
     monkeypatch.delenv("HERMES_WEBUI_GATEWAY_API_KEY", raising=False)
     monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)     # the suite may set one; tests that need it set it themselves
     monkeypatch.setattr(
         gateway_chat, "_gateway_endpoint_for_profile",
         lambda profile_name: ("http://gateway.local/p/coder", "coder-key"),
