@@ -5747,11 +5747,16 @@ function _fitComposerFooter(){
     // task so no intermediate geometry is ever committed to the screen.
     footer.classList.toggle('cf-icons',next.includes('cf-icons'));
     footer.classList.toggle('cf-burger',next.includes('cf-burger'));
-    footer.classList.remove('cf-measuring');
     if(frozenHeight>0){
       footer.style.height=prevHeight;
       footer.style.visibility=prevVisibility;
     }
+    // Commit the restored, visible style while transitions are still frozen,
+    // then unfreeze: otherwise every `transition:all` descendant animates its
+    // inherited visibility from the hidden measuring state and blinks out for a
+    // frame on each fit pass (#8253 Fable r2).
+    void footer.offsetWidth;
+    footer.classList.remove('cf-measuring');
   }
 }
 window._fitComposerFooter=_fitComposerFooter;
@@ -6186,8 +6191,8 @@ document.addEventListener('click',function(e){
         .then(function(st){
           // For Default (effort=''), the returned reasoning_effort is '' (clear)
           // — display 'Default' rather than an empty toast.
-          const display=(st&&st.reasoning_effort)||effort||'Default';
-          showToast('🧠 Reasoning effort set to '+display+' for this chat and new chats');
+          const display=_formatReasoningEffortLabel((st&&st.reasoning_effort)||effort||'');
+          showToast('🧠 Reasoning effort set to '+display+' for this chat and new chats (applies to next turn)');
         })
         .catch(function(){showToast('🧠 Failed to set effort');});
       closeReasoningDropdown();

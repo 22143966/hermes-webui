@@ -2053,7 +2053,8 @@ function cmdReasoning(args){
     _saveReasoningEffort(arg)
       .then(function(st){
         const eff=(st && st.reasoning_effort)||arg;
-        showToast(BRAIN+' Reasoning effort: '+eff+' for this chat and new chats (applies to next turn)');
+        const shown=typeof _formatReasoningEffortLabel==='function'?_formatReasoningEffortLabel(eff):eff;
+        showToast(BRAIN+' Reasoning effort set to '+shown+' for this chat and new chats (applies to next turn)');
       })
       .catch(function(e){
         showToast(BRAIN+' Failed to set effort: '+(e && e.message ? e.message : arg));
