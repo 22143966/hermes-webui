@@ -11017,6 +11017,11 @@ function _syncProjectPickerSelection(open){
 function _reanchorProjectPickerAfterRepaint(){
   const open=(typeof _openProjectPicker!=='undefined')?_openProjectPicker:null;
   if(!open||!open.picker||open.picker.isConnected===false) return false;
+  // The picker can outlive a durable project mutation because completion
+  // repaints intentionally keep a newer interaction open. Refresh its choices
+  // before the radio state: delete/create/rename must not leave stale project
+  // IDs, missing rows or old labels clickable until the picker is reopened.
+  if(typeof open.refreshChoices==='function') open.refreshChoices();
   if(typeof _syncProjectPickerSelection==='function') _syncProjectPickerSelection(open);
   const current=open.anchorEl;
   if(current&&current.isConnected!==false) return false;
@@ -11097,8 +11102,8 @@ function _showProjectPicker(session, anchorEl){
     if(projProfile === 'default' || sessionProfile === 'default') return false;
     return true;
   };
-  for(const p of _allProjects){
-    if (_profileHidesProject(p.profile)) continue;
+  const _projectPickerChoice=(p)=>{
+    if (_profileHidesProject(p.profile)) return null;
     const item=_projectPickerItem('',session.project_id===p.project_id);
     item.setAttribute('data-project-id',String(p.project_id));
     if(p.color){
@@ -11121,7 +11126,11 @@ function _showProjectPicker(session, anchorEl){
         showToast('Moved to '+p.name);
       }catch(e){showToast('Move failed: '+(e.message||e));}
     };
-    picker.appendChild(item);
+    return item;
+  };
+  for(const p of _allProjects){
+    const item=_projectPickerChoice(p);
+    if(item) picker.appendChild(item);
   }
   // "+ New project" shortcut at the bottom
   const createItem=_projectPickerItem('project-picker-create');
@@ -11153,6 +11162,34 @@ function _showProjectPicker(session, anchorEl){
     }
   };
   picker.appendChild(createItem);
+  const refreshChoices=()=>{
+    if(!picker||picker.isConnected===false||typeof picker.querySelectorAll!=='function') return false;
+    const oldItems=Array.from(picker.querySelectorAll('.project-picker-item'));
+    const active=(typeof document!=='undefined')?document.activeElement:null;
+    const ownedFocus=!!(active&&typeof picker.contains==='function'&&picker.contains(active));
+    const focusedId=ownedFocus&&typeof active.getAttribute==='function'
+      ? active.getAttribute('data-project-id')
+      : null;
+    const focusedIndex=ownedFocus?oldItems.indexOf(active):-1;
+    for(const item of Array.from(picker.querySelectorAll('.project-picker-item[data-project-id]'))){
+      const id=typeof item.getAttribute==='function'?item.getAttribute('data-project-id'):null;
+      if(id!==null&&id!=='') item.remove();
+    }
+    for(const p of _allProjects){
+      const item=_projectPickerChoice(p);
+      if(item) picker.insertBefore(item,createItem);
+    }
+    if(ownedFocus&&active!==none&&active!==createItem){
+      const fresh=Array.from(picker.querySelectorAll('.project-picker-item'));
+      let target=fresh.find(item=>typeof item.getAttribute==='function'
+        &&item.getAttribute('data-project-id')===focusedId);
+      if(!target&&fresh.length){
+        target=fresh[Math.min(Math.max(focusedIndex,0),fresh.length-1)];
+      }
+      if(target&&typeof target.focus==='function') target.focus();
+    }
+    return true;
+  };
   // Append to body and position using getBoundingClientRect so it isn't clipped
   // by overflow:hidden on .session-item ancestors
   document.body.appendChild(picker);
@@ -11291,7 +11328,7 @@ function _showProjectPicker(session, anchorEl){
     _focusSessionActionMenuRestoreTarget(_projectPickerFocusReturnTarget(session,anchorEl));
   };
   _wireProjectPickerKeys(picker,dismiss);
-  _openProjectPicker={picker,anchorEl,sessionId:session.session_id,dismiss,openEpoch:pickerEpoch,retarget:(nextAnchor)=>{
+  _openProjectPicker={picker,anchorEl,sessionId:session.session_id,dismiss,openEpoch:pickerEpoch,refreshChoices,retarget:(nextAnchor)=>{
     // Follow a sidebar rebuild to the row that conversation has now (see
     // _reanchorProjectPickerAfterRepaint). Rebind the closure's anchor and the
     // module-level copy so every listener, observer and placement reads the

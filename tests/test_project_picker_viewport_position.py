@@ -1645,6 +1645,7 @@ def test_kept_same_owner_picker_refreshes_selected_project_without_moving_focus(
 let _allSessions=[{session_id:'s',project_id:'project-b'}];
 let _openProjectPicker=null;
 let positioned=0;
+let refreshed=0;
 let focused='project-a';
 const makeItem=(id,active)=>{
   const attrs={'data-project-id':id,'aria-checked':active?'true':'false'};
@@ -1660,11 +1661,11 @@ const a=makeItem('project-a',true);
 const b=makeItem('project-b',false);
 const picker={isConnected:true,querySelectorAll:()=>[a,b]};
 const anchor={isConnected:true};
-_openProjectPicker={picker,anchorEl:anchor,sessionId:'s'};
+_openProjectPicker={picker,anchorEl:anchor,sessionId:'s',refreshChoices:()=>{refreshed+=1;}};
 function _positionProjectPicker(){positioned+=1;}
 """ + _sync_project_picker_selection_source() + _reanchor_project_picker_after_repaint_source() + r"""
 const result=_reanchorProjectPickerAfterRepaint();
-console.log(JSON.stringify({result,a:a.state(),b:b.state(),focused,positioned}));
+console.log(JSON.stringify({result,a:a.state(),b:b.state(),focused,positioned,refreshed}));
 """
     result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
@@ -1674,6 +1675,78 @@ console.log(JSON.stringify({result,a:a.state(),b:b.state(),focused,positioned}))
         "b": {"active": True, "checked": "true"},
         "focused": "project-a",
         "positioned": 0,
+        "refreshed": 1,
+    }
+
+
+def test_kept_picker_refreshes_created_renamed_and_deleted_project_choices():
+    """A kept picker mirrors the latest project cache and preserves focus."""
+    assert NODE is not None
+    script = _DRIVER_PREFIX + r"""
+document.activeElement = null;
+FakeElement.prototype.contains = function(target) {
+  if (target === this) return true;
+  return this.children.some(child => child === target || (child.contains && child.contains(target)));
+};
+FakeElement.prototype.insertBefore = function(child, before) {
+  if (child.parent) child.remove();
+  const idx = this.children.indexOf(before);
+  child.parent = this;
+  child.isConnected = true;
+  if (idx < 0) this.children.push(child); else this.children.splice(idx, 0, child);
+  return child;
+};
+FakeElement.prototype.focus = function() { document.activeElement = this; this.focused = true; };
+FakeElement.prototype.querySelectorAll = function(selector) {
+  const out = [];
+  const visit = node => {
+    for (const child of node.children || []) {
+      const classes = new Set(String(child.className || '').split(/\s+/).filter(Boolean));
+      const id = child.getAttribute && child.getAttribute('data-project-id');
+      const projectRow = classes.has('project-picker-item') && id !== null;
+      if (selector === '.project-picker-item' && classes.has('project-picker-item')) out.push(child);
+      if (selector === '.project-picker-item[data-project-id]' && projectRow) out.push(child);
+      visit(child);
+    }
+  };
+  visit(this);
+  return out;
+};
+""" + _show_project_picker_source() + r"""
+const rows = () => mountedPicker.querySelectorAll('.project-picker-item[data-project-id]');
+const byId = id => rows().find(item => item.getAttribute('data-project-id') === id);
+const labels = () => rows().map(item => ({
+  id: item.getAttribute('data-project-id'),
+  name: item.children.map(child => child.textContent || '').filter(Boolean).join(''),
+}));
+openPicker(260);
+byId('p1').focus();
+_allProjects.splice(0, 1);                  // delete p0
+_allProjects.find(p => p.project_id === 'p1').name = 'Renamed project';
+_allProjects.push({project_id:'new-project',name:'New project',profile:'default',color:'#123456'});
+_openProjectPicker.refreshChoices();
+const afterMutation = {
+  labels: labels(),
+  focusedId: document.activeElement.getAttribute('data-project-id'),
+};
+_allProjects.splice(_allProjects.findIndex(p => p.project_id === 'p1'), 1);
+_openProjectPicker.refreshChoices();
+const afterFocusedDelete = {
+  labels: labels(),
+  focusedId: document.activeElement.getAttribute('data-project-id'),
+};
+console.log(JSON.stringify({afterMutation,afterFocusedDelete}));
+"""
+    result = subprocess.run([NODE, "-e", script], check=False, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert all(row["id"] != "p0" for row in data["afterMutation"]["labels"])
+    assert {row["id"]: row["name"] for row in data["afterMutation"]["labels"]}["p1"] == "Renamed project"
+    assert "new-project" in {row["id"] for row in data["afterMutation"]["labels"]}
+    assert data["afterMutation"]["focusedId"] == "p1"
+    assert "p1" not in {row["id"] for row in data["afterFocusedDelete"]["labels"]}
+    assert data["afterFocusedDelete"]["focusedId"] in {
+        row["id"] for row in data["afterFocusedDelete"]["labels"]
     }
 
 
