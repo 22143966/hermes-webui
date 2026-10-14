@@ -156,6 +156,10 @@
 
 ### Fixed
 
+- **Long virtualized transcripts measure rows before writing, and settle without a redundant second rebuild.** Row
+  heights are read before layout is invalidated, and the transparent settle skips a rebuild that only repeated the
+  first, so scrolling a long session does less work and keeps its place. Thanks @MuhammadUsamaMX. (#8232, fixes #7677)
+
 - **Cron jobs created from chat run under the right profile again.** The Agent renamed its scheduling tool from `cronjob`
   to `cronjob_manage`, which left WebUI's cron profile wrapper inert. The wrapper now installs under the new name and
   still works with older Agents that expose `cronjob`. Thanks @angel291592. (#8201)
