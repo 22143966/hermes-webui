@@ -2168,8 +2168,13 @@ async function cmdBranch(args){
 // from the beginning of the full transcript.  We capture the absolute
 // count (_oldestIdx + msgIdx) BEFORE awaiting _ensureAllMessagesLoaded,
 // which resets _oldestIdx to 0 after its wholesale replace.  See #2184.
-async function forkFromMessage(msgIdx){
+async function forkFromMessage(msgIdx, btn){
   if(!S.session)return;
+  // The button bakes its 1-based index at render time; re-read it from the row,
+  // since loading full history (e.g. the outline) re-bases indices without a
+  // re-render (#2184).
+  const forkRow=btn&&btn.closest?btn.closest('[data-msg-idx]'):null;
+  if(forkRow&&typeof _rowCurrentRawIdx==='function') msgIdx=_rowCurrentRawIdx(forkRow,msgIdx-1)+1;
   // During streaming, only block fork if the clicked message is the
   // currently-streaming (live) message itself.  Past messages that are
   // already committed server-side can be forked immediately without

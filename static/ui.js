@@ -1070,6 +1070,17 @@ function _messageRawIdxForSessionIndex(sessionIdx){
   if(!Number.isFinite(n)) return null;
   return n-_messageSessionIndexBase();
 }
+// Current S.messages index of the message a rendered row shows. data-msg-idx is
+// relative to the _oldestIdx at render time and goes stale when full history
+// loads without a re-render (opening the outline does that); the row's
+// data-session-msg-idx is absolute and does not. Edit, regenerate and fork turn
+// this into an absolute keep_count (#2184), so a stale value truncated or forked
+// at the wrong turn.
+function _rowCurrentRawIdx(row, fallback){
+  const abs=row&&row.dataset?Number(row.dataset.sessionMsgIdx):NaN;
+  const raw=Number.isSafeInteger(abs)&&abs>=0?_messageRawIdxForSessionIndex(abs):null;
+  return Number.isSafeInteger(raw)&&raw>=0?raw:fallback;
+}
 function _messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, container){
   const idx=Math.max(0,Number(visibleIdx)||0);
   _syncMessageVirtualHeightCache(visWithIdx);
@@ -7361,10 +7372,36 @@ function _activityLastObservedAge(group){
   if(!Number.isFinite(stamp)||stamp<=0)return null;
   return Math.max(0,_activityNowSeconds()-stamp);
 }
+function _intlFormatter(locales, options){
+  // Shared Intl.DateTimeFormat cache for per-row timestamp labels: building a
+  // formatter per row dominated long-transcript renders. The browser's default
+  // locale/time zone can change while the page is open (OS time-zone change),
+  // so re-check it once per task (one probe per render, not per row) and drop
+  // every cached formatter when it differs.
+  const f=_intlFormatter;
+  if(!f._envChecked){
+    const o=new Intl.DateTimeFormat().resolvedOptions();
+    const env=o.locale+'|'+o.timeZone;
+    if(env!==f._env||!f._cache){ f._cache=new Map(); f._env=env; }
+    f._envChecked=true;
+    queueMicrotask(()=>{ f._envChecked=false; });
+  }
+  const key=JSON.stringify([locales,options]);
+  let fmt=f._cache.get(key);
+  if(!fmt){ fmt=new Intl.DateTimeFormat(locales,options); f._cache.set(key,fmt); }
+  return fmt;
+}
 function _activityClockLabel(ts){
   const stamp=Number(ts||_activityNowSeconds());
   if(!Number.isFinite(stamp)||stamp<=0)return'';
-  try{return new Date(stamp*1000).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});}catch(_){return'';}
+  try{
+    const d=new Date(stamp*1000);
+    // Date's locale methods return "Invalid Date", whereas Intl.format throws.
+    if(isNaN(d.getTime()))return d.toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+    const opts={hour:'numeric',minute:'2-digit'};
+    const fmt=typeof _intlFormatter==='function'?_intlFormatter([],opts):new Intl.DateTimeFormat([],opts);
+    return fmt.format(d);
+  }catch(_){return'';}
 }
 // Full date+time label for the worklog event-time tooltip (title attr). Guards the
 // same valid-Date range as _timestampSeconds so a bad epoch never yields "Invalid
@@ -7375,7 +7412,9 @@ function _activityFullClockLabel(ts){
   try{
     const d=new Date(stamp*1000);
     if(isNaN(d.getTime()))return'';
-    return d.toLocaleString([], {year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+    const opts={year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'};
+    const fmt=typeof _intlFormatter==='function'?_intlFormatter([],opts):new Intl.DateTimeFormat([],opts);
+    return fmt.format(d);
   }catch(_){return'';}
 }
 function _timestampSeconds(value){
@@ -19109,7 +19148,7 @@ function renderMessages(options){
     const branchableReadOnlySession=typeof _isBranchableReadOnlySession==='function'
       ? _isBranchableReadOnlySession(S.session)
       : false;
-    const forkBtn  = (readOnlySession&&!branchableReadOnlySession) ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
+    const forkBtn  = (readOnlySession&&!branchableReadOnlySession) ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1},this)">${li('git-branch',13)}</button>`;
     const ttsBtn   = !isUser ? `<button class="msg-action-btn msg-tts-btn" title="${t('tts_listen')||'Listen'}" onclick="speakMessage(this)">${li('volume-2',13)}</button>` : '';
     const tsVal=m._ts||m.timestamp;
     // _formatInServerTz handles fractional-hour offsets (India +0530 etc.)
@@ -21380,7 +21419,7 @@ function editMessage(btn) {
   if(S.busy) return;
   const row = btn.closest('[data-msg-idx]');
   if(!row) return;
-  const msgIdx = parseInt(row.dataset.msgIdx, 10);
+  let msgIdx = parseInt(row.dataset.msgIdx, 10);
   const originalText = row.dataset.rawText || '';
   const body = row.querySelector('.msg-body');
   if(!body || row.dataset.editing) return;
@@ -21404,6 +21443,9 @@ function editMessage(btn) {
   bar.querySelector('.msg-edit-send').onclick = async () => {
     const newText = ta.value.trim();
     if(!newText) return;
+    // Re-read the row's index at send time: history can load (e.g. the outline
+    // opening) after the edit opened, which re-bases data-msg-idx (#2184).
+    if(typeof _rowCurrentRawIdx==='function') msgIdx = _rowCurrentRawIdx(row, msgIdx);
     await submitEdit(msgIdx, newText);
   };
   bar.querySelector('.msg-edit-cancel').onclick = () => cancelEdit(row, originalText, body);
@@ -21492,7 +21534,8 @@ async function regenerateResponse(btn) {
   if(!S.session || S.busy) return;
   const row=btn&&btn.closest&&btn.closest('[data-msg-idx]');
   if(!row)return;
-  const clickedAbsoluteIndex=_oldestIdx+parseInt(row.dataset.msgIdx,10);
+  const clickedRowIdx=parseInt(row.dataset.msgIdx,10);
+  const clickedAbsoluteIndex=_oldestIdx+(typeof _rowCurrentRawIdx==='function'?_rowCurrentRawIdx(row,clickedRowIdx):clickedRowIdx);
   const initialSid = S.session.session_id;
   if(typeof _ensureAllMessagesLoaded==='function'){
     await _ensureAllMessagesLoaded();
