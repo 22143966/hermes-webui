@@ -160,6 +160,10 @@
   heights are read before layout is invalidated, and the transparent settle skips a rebuild that only repeated the
   first, so scrolling a long session does less work and keeps its place. Thanks @MuhammadUsamaMX. (#8232, fixes #7677)
 
+- **Cron jobs created from chat run under the right profile again.** The Agent renamed its scheduling tool from `cronjob`
+  to `cronjob_manage`, which left WebUI's cron profile wrapper inert. The wrapper now installs under the new name and
+  still works with older Agents that expose `cronjob`. Thanks @angel291592. (#8201)
+
 - **Outline jumps land on the message right after a long session opens.** Load-time bottom settling no longer pulls
   the reader back, and the jump reuses already-loaded history instead of fetching it again. Thanks @dss539. (#8219)
 
@@ -1168,6 +1172,8 @@
 - **The `/api/models` cache invalidation contract is documented.** `#7556` shipped a change to the catalog cache's source fingerprint, and its review flagged the surrounding contract as undocumented runtime behavior. `docs/architecture/models-cache-invalidation.md` now records what is cached (in-memory snapshot, per-profile `models_cache.json`, cold vs hot path), the three source axes (`config_yaml` stat identity, `auth_json` content hash with a volatile-key deny-list, baked-in plus Codex catalog hashes) and why each is fingerprinted the way it is, and the invariant that both volatile-key sets are deny-lists that may only remove fields which provably do not gate the provider/model set. Changes no runtime behavior. Thanks @webtecnica. (#7560, #7556)
 
 ### Changed
+
+- **The WAL snapshot refusal test now exercises a real temporary database.** Thanks @tobenot. (#8233)
 
 - **An order-dependent CI test failure is fixed.** `test_custom_provider_detected_by_get_available_models` (and four
   siblings) seeded the config in memory but didn't pin the loaded-config path, so a stale path left by an earlier test
