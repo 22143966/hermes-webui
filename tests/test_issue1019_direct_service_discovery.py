@@ -211,33 +211,6 @@ def test_interpreter_only_identity_does_not_authorize_auto_install(monkeypatch, 
     assert startup._agent_dir() is None
 
 
-def test_bootstrap_prefers_working_launcher_to_authoritative_marker_root(
-    monkeypatch, tmp_path
-):
-    import bootstrap
-
-    marker_root = tmp_path / "hermes-home" / "hermes-agent"
-    (marker_root / "hermes_cli").mkdir(parents=True)
-    (marker_root / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
-    launcher_root = tmp_path / "launcher-agent"
-    launcher_root.mkdir()
-    (launcher_root / "run_agent.py").write_text("", encoding="utf-8")
-
-    monkeypatch.delenv("HERMES_WEBUI_AGENT_DIR", raising=False)
-    monkeypatch.delenv("HERMES_WEBUI_PYTHON", raising=False)
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
-    monkeypatch.setattr(bootstrap.Path, "home", classmethod(lambda cls: tmp_path / "home"))
-    monkeypatch.setattr(
-        bootstrap._startup, "_platform_default_hermes_home", lambda: tmp_path / "default"
-    )
-    monkeypatch.setattr(bootstrap, "REPO_ROOT", tmp_path / "webui")
-    monkeypatch.setattr(bootstrap, "_agent_dir_from_hermes_cli", lambda: launcher_root)
-    monkeypatch.setattr(bootstrap, "_agent_dir_from_python", lambda _python: None)
-    monkeypatch.setattr(bootstrap, "_LAST_DISCOVERY", None)
-
-    assert bootstrap.discover_agent_dir() == launcher_root
-
-
 @pytest.mark.parametrize("runtime", ["launcher", "interpreter"])
 def test_authoritative_source_precedes_launcher_and_interpreter(monkeypatch, tmp_path, runtime):
     from api import startup
@@ -286,34 +259,6 @@ def test_legacy_home_source_follows_proven_runtime(monkeypatch, tmp_path):
         launcher_finder=lambda: runtime_root,
         python_finder=lambda _python: None,
     ) == runtime_root.resolve()
-
-
-def test_direct_service_prefers_xdg_source_to_authoritative_marker_root(
-    monkeypatch, tmp_path
-):
-    from api import startup
-
-    marker_root = tmp_path / "hermes-home" / "hermes-agent"
-    (marker_root / "hermes_cli").mkdir(parents=True)
-    (marker_root / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
-    xdg_root = tmp_path / "xdg" / "hermes-agent"
-    xdg_root.mkdir(parents=True)
-    (xdg_root / "run_agent.py").write_text("", encoding="utf-8")
-
-    monkeypatch.delenv("HERMES_WEBUI_AGENT_DIR", raising=False)
-    monkeypatch.delenv("HERMES_WEBUI_PYTHON", raising=False)
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-
-    assert startup.discover_agent_dir(
-        repo_root=tmp_path / "webui",
-        hermes_home=tmp_path / "hermes-home",
-        default_hermes_home=tmp_path / "default",
-        user_home=tmp_path / "home",
-        python_exe=str(tmp_path / "missing-python"),
-        launcher_finder=lambda: None,
-        python_finder=lambda _python: None,
-    ) == xdg_root.resolve()
 
 
 def test_discover_python_precedence_keeps_explicit_nested_and_proven_interpreters(

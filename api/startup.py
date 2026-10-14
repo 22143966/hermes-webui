@@ -102,8 +102,10 @@ def _looks_like_pip_style_agent_source_root(path: Path) -> bool:
     return (hermes_cli / "__init__.py").exists() or (hermes_cli / "main.py").exists()
 
 
-def _looks_like_agent_source_root(path: Path) -> bool:
-    return (path / "run_agent.py").exists() or _looks_like_pip_style_agent_source_root(path)
+def _looks_like_agent_source_root(path: Path, *, allow_marker_only: bool = True) -> bool:
+    return (path / "run_agent.py").exists() or (
+        allow_marker_only and _looks_like_pip_style_agent_source_root(path)
+    )
 
 
 def _first_valid_agent_candidate(candidates: list[Path | None], *, marker_only=False) -> Path | None:
@@ -133,6 +135,7 @@ def _discover_agent_identity(
     user_home: Path | None = None,
     python_exe: str | None = None,
     python_fallbacks: tuple[str, ...] = (),
+    allow_marker_only: bool = True,
     launcher_finder=_agent_dir_from_hermes_cli,
     python_finder=_agent_dir_from_python,
 ) -> _AgentDiscovery:
@@ -147,13 +150,17 @@ def _discover_agent_identity(
     default_hermes_home = Path(default_hermes_home).expanduser()
     explicit = os.getenv("HERMES_WEBUI_AGENT_DIR", "").strip()
     explicit_candidate = Path(explicit).expanduser() if explicit else None
-    if explicit_candidate is not None and _looks_like_agent_source_root(explicit_candidate):
+    if explicit_candidate is not None and _looks_like_agent_source_root(
+        explicit_candidate, allow_marker_only=allow_marker_only,
+    ):
         return _AgentDiscovery(explicit_candidate.resolve())
 
     authoritative_candidates = [
         hermes_home / "hermes-agent",
         repo_root.parent / "hermes-agent",
-        repo_root.parent if _looks_like_agent_source_root(repo_root.parent) else None,
+        repo_root.parent if _looks_like_agent_source_root(
+            repo_root.parent, allow_marker_only=allow_marker_only,
+        ) else None,
         default_hermes_home / "hermes-agent",
         user_home / "hermes-agent",
         Path("/usr/local/lib/hermes-agent"),
@@ -186,9 +193,11 @@ def _discover_agent_identity(
     found = _first_valid_agent_candidate(fallback_candidates)
     if found:
         return _AgentDiscovery(found)
-    return _AgentDiscovery(_first_valid_agent_candidate(
-        authoritative_candidates + fallback_candidates, marker_only=True,
-    ))
+    if allow_marker_only:
+        return _AgentDiscovery(_first_valid_agent_candidate(
+            authoritative_candidates + fallback_candidates, marker_only=True,
+        ))
+    return _AgentDiscovery(None)
 
 
 def discover_agent_dir(
@@ -198,6 +207,7 @@ def discover_agent_dir(
     default_hermes_home: Path | None = None,
     user_home: Path | None = None,
     python_exe: str | None = None,
+    allow_marker_only: bool = True,
     launcher_finder=_agent_dir_from_hermes_cli,
     python_finder=_agent_dir_from_python,
 ) -> Path | None:
@@ -208,6 +218,7 @@ def discover_agent_dir(
         default_hermes_home=default_hermes_home,
         user_home=user_home,
         python_exe=python_exe,
+        allow_marker_only=allow_marker_only,
         launcher_finder=launcher_finder,
         python_finder=python_finder,
     ).agent_dir

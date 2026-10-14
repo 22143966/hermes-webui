@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import textwrap
+from types import SimpleNamespace
 
 import pytest
 
@@ -423,6 +424,43 @@ def test_hermes_cli_takes_precedence_over_configured_python(monkeypatch, tmp_pat
     )
 
     assert bootstrap.discover_agent_dir() == install.resolve()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_partial_agent_install_reaches_installer(monkeypatch, tmp_path, explicit):
+    partial = tmp_path / "hermes-home" / "hermes-agent"
+    (partial / "cron").mkdir(parents=True)
+    (partial / "cron" / "jobs.py").write_text("", encoding="utf-8")
+    (partial / "hermes_cli").mkdir()
+    (partial / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    _isolate_discover_agent_dir(monkeypatch, tmp_path, hermes_path=tmp_path / "missing")
+    monkeypatch.setenv(
+        "HERMES_HOME",
+        str(partial.parent if not explicit else tmp_path / "empty-hermes-home"),
+    )
+    if explicit:
+        monkeypatch.setenv("HERMES_WEBUI_AGENT_DIR", str(partial))
+    monkeypatch.setattr(bootstrap, "hermes_command_exists", lambda: False)
+    monkeypatch.setattr(bootstrap, "ensure_supported_platform", lambda: None)
+    monkeypatch.setattr(bootstrap, "_check_port_available", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        bootstrap,
+        "parse_args",
+        lambda: SimpleNamespace(
+            host="127.0.0.1", port=8765, skip_agent_install=False,
+        ),
+    )
+
+    class InstallerReached(Exception):
+        pass
+
+    def stop_at_installer():
+        raise InstallerReached
+
+    monkeypatch.setattr(bootstrap, "install_hermes_agent", stop_at_installer)
+
+    with pytest.raises(InstallerReached):
+        bootstrap.main()
 
 
 @pytest.mark.parametrize("stale_source", [False, True])

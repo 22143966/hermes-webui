@@ -119,7 +119,7 @@ def _agent_dir_from_python(python_exe: str) -> Path | None:
     return _startup._agent_dir_from_python(python_exe)
 
 
-def _discover_agent_identity():
+def _discover_agent_identity(*, allow_marker_only: bool = True):
     selected_python = discover_launcher_python(None)
     return _startup._discover_agent_identity(
         repo_root=REPO_ROOT,
@@ -128,6 +128,7 @@ def _discover_agent_identity():
         user_home=Path.home(),
         python_exe=selected_python,
         python_fallbacks=() if os.getenv("HERMES_WEBUI_PYTHON") else (sys.executable,),
+        allow_marker_only=allow_marker_only,
         launcher_finder=_agent_dir_from_hermes_cli,
         python_finder=_agent_dir_from_python,
     )
@@ -138,7 +139,7 @@ _LAST_DISCOVERY = None
 
 def discover_agent_dir() -> Path | None:
     global _LAST_DISCOVERY
-    _LAST_DISCOVERY = _discover_agent_identity()
+    _LAST_DISCOVERY = _discover_agent_identity(allow_marker_only=False)
     return _LAST_DISCOVERY.agent_dir
 
 
