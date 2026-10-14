@@ -5867,6 +5867,176 @@ def _session_persist_lock(sid):
         return lock
 
 
+# The source-identity fields CLI materialization stamps on a session, and the
+# subset whose presence marks a sidecar as already owning an identity.
+_CLI_SOURCE_IDENTITY_FIELDS = (
+    "is_cli_session", "source_tag", "raw_source", "session_source", "source_label",
+    "user_id", "chat_id", "chat_type", "thread_id", "session_key", "platform",
+)
+_CLI_SOURCE_IDENTITY_MARKERS = ("is_cli_session", "source_tag", "raw_source", "session_source", "source_label")
+
+# Top-level sidecar keys that save() writes after the metadata prefix.
+_SIDECAR_BODY_KEYS = frozenset({'messages', 'tool_calls', 'anchor_activity_scenes'})
+
+
+def _set_sidecar_metadata_fields(data: dict, fields: dict) -> dict:
+    """Return ``data`` with ``fields`` set; a key the sidecar lacks is placed
+    before the message body, where save() and the bounded prefix reader keep
+    metadata. Existing keys keep their position."""
+    missing = {k: v for k, v in fields.items() if k not in data}
+    for key, value in fields.items():
+        if key in data:
+            data[key] = value
+    if not missing:
+        return data
+    rebuilt = {}
+    for key, item in data.items():
+        if missing and key in _SIDECAR_BODY_KEYS:
+            rebuilt.update(missing)
+            missing = {}
+        rebuilt[key] = item
+    rebuilt.update(missing)
+    return rebuilt
+
+
+#: ``set_session_reasoning_effort(profile=...)`` default: keep the sidecar's owner.
+_KEEP_PERSISTED_PROFILE = object()
+
+
+def _write_persisted_reasoning_effort(sid, value, identity_source=None, profile=_KEEP_PERSISTED_PROFILE):
+    """Replace ONLY ``reasoning_effort`` in ``sid``'s LATEST sidecar (#7881).
+
+    The caller holds ``_session_persist_lock(sid)``, so no save can land
+    between this read and the replacement. Every other persisted field
+    (share token, draft, turns, ...) is written back exactly as read, so an
+    effort pick can neither roll another writer's fields back nor be ignored
+    because a cached object's baseline already equals the requested value.
+    The CLI source identity of ``identity_source`` is copied only into a
+    sidecar that has none (the ``_carry_cli_source_identity`` rule: an
+    existing identity, a fork's included, is never overwritten). ``profile``
+    is written only when given (the pick's refusal path, see
+    set_session_reasoning_effort).
+
+    Returns ``(previous, written)`` -- the persisted effort before this write
+    (None when the key was absent) and the parsed sidecar as written -- or
+    None, writing nothing, when there is no sidecar or it is not a JSON
+    object (the caller then saves the session whole). A sidecar that exists
+    but cannot be read raises.
+    """
+    if not is_safe_session_id(sid):
+        raise ValueError(f"Unsafe session_id {sid!r}; refusing to write outside session store")
+    path = SESSION_DIR / f'{sid}.json'
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return None
+    except ValueError:  # corrupt JSON or undecodable bytes
+        logger.warning("session sidecar %s is not valid JSON; saving the session whole", path)
+        return None
+    if not isinstance(data, dict):
+        return None
+    previous = _normalize_persisted_reasoning_effort(data.get('reasoning_effort'))
+    fields = {'reasoning_effort': value}
+    if profile is not _KEEP_PERSISTED_PROFILE:
+        fields['profile'] = profile
+    if (
+        identity_source is not None
+        and str(getattr(identity_source, 'session_id', '') or '') == str(sid)
+        and any(getattr(identity_source, name, None) for name in _CLI_SOURCE_IDENTITY_MARKERS)
+        and not any(data.get(name) for name in _CLI_SOURCE_IDENTITY_MARKERS)
+    ):
+        for name in _CLI_SOURCE_IDENTITY_FIELDS:
+            fields[name] = getattr(identity_source, name, None)
+    data = _set_sidecar_metadata_fields(data, fields)
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    try:
+        payload.encode('utf-8')
+    except UnicodeEncodeError:
+        payload = json.dumps(data, ensure_ascii=True, indent=2)
+    tmp = path.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        with _INDEX_WRITE_LOCK:
+            _safe_replace(tmp, path)
+            # The sidebar projection is built from the sidecar just written,
+            # never from a possibly stale live object (same ordered publish
+            # as save()).
+            index_session = Session(**dict(data))
+            index_session._metadata_message_count = len(index_session.messages or [])
+            _write_session_index(updates=[index_session])
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+    return previous, data
+
+
+def set_session_reasoning_effort(session_id_or_session, value, *, profile=_KEEP_PERSISTED_PROFILE):
+    """Persist an explicit reasoning-effort pick for one session (#7881).
+
+    Writes only ``reasoning_effort`` against the LATEST sidecar under the
+    session's persistence lock instead of saving a whole (possibly older)
+    cached object, so the pick cannot erase fields another writer saved in
+    the meantime (share token, draft, turns) and is never mistaken for an
+    unchanged snapshot. With no sidecar yet (a never-sent New Conversation)
+    the session object is saved whole, as nothing persisted can be lost.
+
+    The given session (or, for an id, the cached one) and the cached entry
+    for the id get the written value as both ``reasoning_effort`` and their
+    ``_reasoning_effort_saved`` baseline; on failure nothing in memory
+    changes and the error propagates. Returns the persisted effort before the
+    write (the value a rollback restores). The general ``Session.save()``
+    contract is unchanged: an object that changes its own effort and saves
+    still writes it.
+
+    ``profile`` is for the /api/reasoning refusal rollback only: when the
+    post-write owner recheck finds the canonical object retagged to another
+    profile during the pick, the rollback also persists that newer in-memory
+    owner, as the whole-object save it replaces did (#7738 contract).
+    """
+    if isinstance(session_id_or_session, str):
+        sid = session_id_or_session
+        session = None
+    else:
+        session = session_id_or_session
+        sid = str(getattr(session, 'session_id', '') or '')
+    normalized = _normalize_persisted_reasoning_effort(value)
+    with _session_persist_lock(sid):
+        with LOCK:
+            cached = SESSIONS.get(sid)
+        if cached is not None and str(getattr(cached, 'session_id', '') or '') != sid:
+            cached = None
+        if session is None:
+            session = cached
+        result = _write_persisted_reasoning_effort(
+            sid, normalized, identity_source=session, profile=profile,
+        )
+        if result is None:
+            if session is None:
+                raise KeyError(sid)
+            previous = getattr(session, 'reasoning_effort', None)
+            previous_baseline = getattr(session, '_reasoning_effort_saved', previous)
+            session.reasoning_effort = normalized
+            try:
+                # A preference change is not conversation activity.
+                session.save(touch_updated_at=False)
+            except Exception:
+                session.reasoning_effort = previous
+                session._reasoning_effort_saved = previous_baseline
+                raise
+        else:
+            previous = result[0]
+        for target in {id(o): o for o in (session, cached) if o is not None}.values():
+            target.reasoning_effort = normalized
+            target._reasoning_effort_saved = normalized
+        return previous
+
+
 def _legacy_sidecar_facts_get(sid):
     """Return cached authoritative facts for a LEGACY sidecar, or None (#5854).
 

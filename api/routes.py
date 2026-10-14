@@ -4780,12 +4780,9 @@ def _resolve_session_under_lock(sid: str, outside=None):
     return latest
 
 
-# The source-identity fields _apply_cli_source_meta_to_session() stamps.
-_CLI_SOURCE_IDENTITY_FIELDS = (
-    "is_cli_session", "source_tag", "raw_source", "session_source", "source_label",
-    "user_id", "chat_id", "chat_type", "thread_id", "session_key", "platform",
-)
-_CLI_SOURCE_IDENTITY_MARKERS = ("is_cli_session", "source_tag", "raw_source", "session_source", "source_label")
+# The source-identity fields _apply_cli_source_meta_to_session() stamps; one
+# definition shared with the effort pick's field-only sidecar writer.
+from api.models import _CLI_SOURCE_IDENTITY_FIELDS, _CLI_SOURCE_IDENTITY_MARKERS  # noqa: E402
 
 
 def _carry_cli_source_identity(target, outside) -> None:
@@ -11955,6 +11952,7 @@ from api.models import (
     WorkspaceBindingPersistenceError,
     new_session,
     _session_persist_lock,
+    set_session_reasoning_effort,
     all_sessions,
     title_from,
     SESSION_INDEX_FILE,
@@ -17636,14 +17634,13 @@ def handle_post(handler, parsed) -> bool:
                 # lock so the lock-held Session.load() cannot drop it on save.
                 _reasoning_cli_meta = _lookup_cli_session_metadata(session_id) or {}
                 with _get_session_agent_lock(session_id):
-                    # #7881: the resolve, the in-memory change and its save
-                    # hold the persistence lock every Session.save() of this
-                    # id takes. A save without the session lock (share
-                    # create/revoke) then either lands before this resolve
-                    # (and is in the snapshot saved here) or after this save
-                    # (and adopts the pick); it can no longer read the old
-                    # effort and land after the pick, nor can the pick write
-                    # a snapshot older than that save.
+                    # #7881: the resolve and the effort write hold the
+                    # persistence lock every Session.save() of this id takes.
+                    # A save without the session lock (share create/revoke)
+                    # then either lands before the pick's field-only write
+                    # (which keeps every field it saved) or after it (and
+                    # adopts the pick); it can no longer read the old effort
+                    # and land after the pick.
                     with _session_persist_lock(session_id):
                         # #7738: re-resolve the canonical session under the lock.
                         try:
@@ -17671,32 +17668,37 @@ def handle_post(handler, parsed) -> bool:
                                 )
                             if _reasoning_cli_meta:
                                 _apply_cli_source_meta_to_session(reasoning_session, _reasoning_cli_meta)
-                            previous_effort = getattr(reasoning_session, "reasoning_effort", None)
-                            reasoning_session.reasoning_effort = normalized_effort
-                            try:
-                                # A preference change is not conversation activity.
-                                reasoning_session.save(touch_updated_at=False)
-                            except Exception:
-                                # Keep the cached session equal to its sidecar.
-                                reasoning_session.reasoning_effort = previous_effort
-                                raise
+                            # #8253 a1: write ONLY the effort against the latest
+                            # sidecar, never this (possibly older) cached object
+                            # whole -- that erased a share token saved after it
+                            # was cached -- and always write the requested
+                            # value, even when it equals a stale cached
+                            # baseline. Memory changes only after the write
+                            # lands; the persisted previous value is returned
+                            # for the rollbacks below.
+                            previous_effort = set_session_reasoning_effort(
+                                reasoning_session, normalized_effort
+                            )
                     if reasoning_session is not None:
-                        # A retag after the check could have been persisted with
-                        # this pick. Recheck the owner of what was just saved; if
-                        # the request no longer owns the chat, undo and refuse.
+                        # A retag after the check (chat start, under LOCK) changes
+                        # the owner this pick checked. Recheck the canonical owner;
+                        # if the request no longer owns the chat, undo and refuse.
                         with LOCK:
                             saved_profile = getattr(reasoning_session, "profile", None)
                         if not _session_visible_to_active_profile(saved_profile, handler):
-                            with _session_persist_lock(session_id):
-                                reasoning_session.reasoning_effort = previous_effort
-                                try:
-                                    reasoning_session.save(touch_updated_at=False)
-                                except Exception:
-                                    reasoning_session.reasoning_effort = normalized_effort
-                                    logger.warning(
-                                        "reasoning effort rollback save failed for %s",
-                                        session_id, exc_info=True,
-                                    )
+                            try:
+                                # Same field-only write; it also persists the
+                                # retagged owner that caused this refusal. On
+                                # failure the sidecar and memory both keep the
+                                # new value.
+                                set_session_reasoning_effort(
+                                    reasoning_session, previous_effort, profile=saved_profile,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "reasoning effort rollback save failed for %s",
+                                    session_id, exc_info=True,
+                                )
                             return _session_profile_mismatch_response(
                                 handler, session_id, saved_profile
                             )
@@ -17707,18 +17709,15 @@ def handle_post(handler, parsed) -> bool:
                                 effort, get_hermes_home_for_profile(reasoning_profile)
                             )
                         except Exception:
-                            with _session_persist_lock(session_id):
-                                reasoning_session.reasoning_effort = previous_effort
-                                try:
-                                    reasoning_session.save(touch_updated_at=False)
-                                except Exception:
-                                    # The sidecar kept the new value; match it in memory
-                                    # and surface the original profile-write error.
-                                    reasoning_session.reasoning_effort = normalized_effort
-                                    logger.warning(
-                                        "reasoning effort rollback save failed for %s",
-                                        session_id, exc_info=True,
-                                    )
+                            try:
+                                set_session_reasoning_effort(reasoning_session, previous_effort)
+                            except Exception:
+                                # The sidecar and memory kept the new value;
+                                # surface the original profile-write error.
+                                logger.warning(
+                                    "reasoning effort rollback save failed for %s",
+                                    session_id, exc_info=True,
+                                )
                             raise
                         _publish_saved_session(session_id, reasoning_session)
                 if reasoning_session is None:

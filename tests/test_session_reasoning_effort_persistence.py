@@ -2,9 +2,11 @@
 survive overlapping and stale ``Session.save()`` calls.
 
 Contract kept from #7881: an object that changes its own ``reasoning_effort``
-and saves writes it (the ``/api/reasoning`` pick and its rollbacks do exactly
-that); an object that did NOT change it since it last loaded/saved adopts the
-persisted value instead of writing its stale copy.
+and saves writes it; an object that did NOT change it since it last
+loaded/saved adopts the persisted value instead of writing its stale copy.
+The ``/api/reasoning`` pick and its rollbacks do not save an object at all:
+``set_session_reasoning_effort()`` writes only the effort against the latest
+sidecar under the persistence lock (#8253 a1).
 
 Covers the four findings left open on contributor head ``e71fd219``:
 
@@ -19,7 +21,10 @@ Covers the four findings left open on contributor head ``e71fd219``:
    must not later write that value back over a newer pick;
 4. a writer whose lock-held reload drops the CLI source identity the
    outside-resolved object carried must not persist it as a WebUI session
-   (and the carry never overwrites an identity the reload already has).
+   (and the carry never overwrites an identity the reload already has);
+5. (#8253 a1) a pick must neither erase fields another writer persisted after
+   the pick's object was cached (a share token) nor be ignored when it equals
+   a stale cached baseline.
 """
 
 from __future__ import annotations
@@ -521,3 +526,106 @@ def test_lock_held_reload_carry_fills_only_a_reload_without_identity(tmp_path, m
     assert resolved is not outside
     assert resolved.session_source == "fork"
     assert resolved.is_cli_session is False
+
+
+# ---------------------------------------------------------------------------
+# #8253 a1 -- the pick writes only the effort, against the latest sidecar
+# ---------------------------------------------------------------------------
+
+
+def test_pick_during_share_create_save_keeps_share_token_and_revoke_unpublishes(
+    tmp_path, monkeypatch,
+):
+    """Codex repro (#8253 a1, CORE): pause a real share create inside its
+    sidecar save, evict the cached session, submit a pick. Both return 200;
+    the pick must not erase the share token the create persisted, so a later
+    real revoke still finds it and the public share stops resolving."""
+    import api.shares as shares
+
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(shares, "SHARES_DIR", tmp_path / "shares")
+    sid = "share-token-pick"
+    seeded = _seed_low_session(tmp_path, sid)
+    SESSIONS[sid] = seeded
+    _stub_reasoning_profile_side_effects(monkeypatch)
+    monkeypatch.setattr(routes, "_session_requires_cli_metadata_lookup", lambda s: False)
+    monkeypatch.setattr(routes, "_publish_session_list_changed", lambda *a, **kw: None)
+    post = _PerThreadPost(monkeypatch)
+
+    paused = threading.Event()
+    resume = threading.Event()
+    real_dedupe = models._deduplicate_exact_stable_messages
+
+    def _pause_share_save(messages):
+        caller = sys._getframe(1).f_code.co_name
+        if (
+            threading.current_thread().name == "share"
+            and caller in {"save", "_save_locked"}
+            and not paused.is_set()
+        ):
+            paused.set()  # the share file exists; its token is not on disk yet
+            assert resume.wait(10), "test never resumed the share save"
+        return real_dedupe(messages)
+
+    monkeypatch.setattr(models, "_deduplicate_exact_stable_messages", _pause_share_save)
+
+    share = threading.Thread(
+        target=post.post, args=("share", "/api/share/create", {"session_id": sid}), name="share",
+    )
+    share.start()
+    assert paused.wait(10), "the share create never reached its sidecar save"
+    SESSIONS.pop(sid, None)  # count-cap eviction
+    pick = threading.Thread(
+        target=post.post, args=("pick", "/api/reasoning", {"effort": "xhigh", "session_id": sid}),
+        name="pick",
+    )
+    pick.start()
+    pick.join(0.5)
+    resume.set()
+    share.join(10)
+    pick.join(10)
+    assert not share.is_alive() and not pick.is_alive(), "a writer deadlocked"
+    assert post.results["share"][0] == 200, post.results["share"]
+    assert post.results["pick"][0] == 200, post.results["pick"]
+    token = post.results["share"][1]["share"]["token"]
+    assert shares.load_share(token) is not None, "precondition: the share is public"
+
+    on_disk = json.loads((session_dir / f"{sid}.json").read_text(encoding="utf-8"))
+    assert on_disk["reasoning_effort"] == "xhigh"
+    assert on_disk.get("share_token") == token, (
+        f"the effort pick erased the share token the create persisted: {on_disk.get('share_token')!r}"
+    )
+
+    SESSIONS.clear()  # eviction/restart: the revoke resolves the persisted sidecar
+    # The cold cache isolates the pick's own contract. A revoke served from a
+    # copy cached by ANY read during the share-save window (a plain
+    # get_session() included, no pick involved) also misses the token: the
+    # share handlers' cache coherence, unchanged from master and out of scope.
+    revoked = post.post("revoke", "/api/share/revoke", {"session_id": sid})
+    assert revoked is not None and revoked[0] == 200, revoked
+    assert shares.load_share(token) is None, "revoke returned 200 but the share is still public"
+    on_disk = json.loads((session_dir / f"{sid}.json").read_text(encoding="utf-8"))
+    assert on_disk.get("share_token") is None
+    assert _cold_effort(sid) == "xhigh"
+
+
+def test_explicit_pick_equal_to_stale_cached_baseline_is_written(tmp_path, monkeypatch):
+    """Codex repro (#8253 a1, SILENT): a delayed read republishes a cached Low
+    copy after XHigh reached disk. Selecting Low must persist Low -- not answer
+    200/Low while save() treats Low == baseline as unchanged and adopts XHigh."""
+    _isolate_session_store(tmp_path, monkeypatch)
+    sid = "pick-equals-stale-baseline"
+    _seed_low_session(tmp_path, sid)
+    SESSIONS.clear()
+    _stub_reasoning_profile_side_effects(monkeypatch)
+    post = _PerThreadPost(monkeypatch)
+
+    delayed = Session.load(sid)  # a read that loaded Low before the pick
+    _pick(post, sid, "xhigh")
+    assert Session.load(sid).reasoning_effort == "xhigh"
+    with models.LOCK:
+        SESSIONS[sid] = delayed  # ...and publishes its Low copy afterwards
+
+    status, payload = post.post("low", "/api/reasoning", {"effort": "low", "session_id": sid})
+    assert status == 200 and payload.get("reasoning_effort") == "low", (status, payload)
+    assert _cold_effort(sid) == "low", "the explicit Low pick was answered 200 but not persisted"
