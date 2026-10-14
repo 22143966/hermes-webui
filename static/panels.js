@@ -2107,11 +2107,12 @@ async function saveCronForm(){
       const editedId = _editingCronId;
       await api('/api/crons/update', {method:'POST', body: JSON.stringify(updates)});
       showToast(t('cron_job_updated'));
-      if (!formStillCurrent()) return;
-      const data = await loadCrons();
-      // Discarded responses remain available to other callers, but may not
-      // reopen a task absent from the current authoritative list.
-      if (!formStillCurrent() || !data || data.jobs !== _cronList) return;
+      const saveViewCurrent = formStillCurrent();
+      if (!saveViewCurrent && _currentPanel !== 'tasks') return;
+      const data = await loadCrons(false, {background: !saveViewCurrent});
+      // A background refresh keeps a newer selection/output untouched. Only the
+      // still-current form may auto-open its saved job from the accepted list.
+      if (!saveViewCurrent || !formStillCurrent() || !data || data.jobs !== _cronList) return;
       const job = _cronList.find(j => j.id === editedId);
       if (job) openCronDetail(job);
       return;
@@ -2134,9 +2135,10 @@ async function saveCronForm(){
     }
     const res = await api('/api/crons/create',{method:'POST',body:JSON.stringify(body)});
     showToast(t('cron_job_created'));
-    if (!formStillCurrent()) return;
-    const data = await loadCrons();
-    if (!formStillCurrent() || !data || data.jobs !== _cronList) return;
+    const saveViewCurrent = formStillCurrent();
+    if (!saveViewCurrent && _currentPanel !== 'tasks') return;
+    const data = await loadCrons(false, {background: !saveViewCurrent});
+    if (!saveViewCurrent || !formStillCurrent() || !data || data.jobs !== _cronList) return;
     const newId = res && (res.id || (res.job && res.job.id));
     const jobs = _cronList;
     const job = jobs && (newId ? jobs.find(j => j.id === newId) : jobs[jobs.length - 1]);

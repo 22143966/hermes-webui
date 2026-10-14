@@ -172,6 +172,11 @@ Auto-selection now yields to superseding reads and newer user navigation. This
 changes browser completion ownership, not backend save/delete semantics.
 Eight stale-response cases failed on the reviewed source before the fix; normal
 save cases already passed. Additional tests cover navigation during an accepted
-read and form replacement during the pending write. The final broader cron,
-selection, profile-isolation and read-only suite passes 355 tests with 8 skips.
-Full-suite/CI results remain separately reported, not inferred from these fixtures.
+read and form replacement during the pending write. Review 5523242756 follow-up:
+a successful create/update whose original form is no longer current still refreshes
+the list in the background while Tasks is visible; only the still-current form
+may auto-select the saved task. Parameterized create/edit regressions prove the
+updated list includes saved data without rebuilding the selected task's open
+output. The broader cron, selection, profile-isolation and read-only suite passes
+353 tests with 8 skips. Full-suite/CI results remain separately reported, not
+inferred from these fixtures.

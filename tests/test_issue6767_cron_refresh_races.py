@@ -270,25 +270,28 @@ assert.equal(opened.id,'saved');assert.equal(_cronMode,'detail');
 
 
 @pytest.mark.parametrize("editing", [False, True])
-def test_save_write_completion_does_not_clear_replacement_form(editing):
+def test_successful_write_refreshes_list_in_background_after_navigation(editing):
     prefix = "_cronMode=" + json.dumps("edit" if editing else "create") + ";" + ("_editingCronId='saved';" if editing else "")
     run_js(prefix + """
 let settleWrite;
-api=function(url,opts){assert(opts);return new Promise(resolve=>{settleWrite=resolve;});};
+const originalApi=api;
+api=function(url,opts){if(opts){assert(opts);return new Promise(resolve=>{settleWrite=resolve;});}return originalApi(url,opts);};
+const saved={id:'saved',name:'Saved',state:'active',prompt:'Saved prompt'};
+const other={id:'other',name:'Other',state:'paused',prompt:'Other prompt'};
+_cronList=[saved,other];_currentCronDetailKey='saved';_currentCronDetail=saved;
+const realLoad=loadCrons;let loadOptions;
+loadCrons=(...args)=>{loadOptions=args[1];return realLoad(...args);};
 const save=saveCronForm();
-fields.cronFormError=node();_editingCronId='other';_cronPreFormDetail={id:'other'};
-settleWrite({id:'saved'});await save;
-assert.equal(_editingCronId,'other');assert.equal(_cronPreFormDetail.id,'other');
-assert.equal(opened,null);assert.equal(pending.length,0);
-""")
-
-
-@pytest.mark.parametrize("editing", [False, True])
-def test_save_accepted_read_does_not_override_new_selection(editing):
-    prefix = "_cronMode=" + json.dumps("edit" if editing else "create") + ";" + ("_editingCronId='saved';" if editing else "")
-    run_js(prefix + """
-const save=saveCronForm();await waitRequests(1);
-_cronMode='detail';_currentCronDetail='other';_currentCronDetailKey='other';
-pending[0].resolve({jobs:[{id:'saved',name:'Saved'},{id:'other',name:'Other'}]});await save;
-assert.equal(opened,null);assert.equal(_currentCronDetailKey,'other');
-""")
+openCronDetail('other');
+const visibleBefore=fields.taskDetailBody.innerHTML;
+settleWrite({id:'saved'});
+await waitRequests(1);
+pending[0].resolve({jobs:[{...saved,name:'Updated saved'},{...other,name:'Other'}]});
+await save;
+assert.equal(loadOptions.background,true);
+assert.equal(_cronList[0].name,'Updated saved');
+assert.equal(_currentCronDetail.id,'other');
+assert.equal(_currentCronDetail.name,'Other');
+assert.equal(fields.taskDetailBody.innerHTML,visibleBefore);
+assert.equal(fields.btnResumeTaskDetail.style.display,'');
+""", setup=REAL_DETAIL)
