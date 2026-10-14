@@ -1539,7 +1539,7 @@ async function _loadRunContent(jobId, filename, runId){
 function openCronDetail(jobOrId, el){
   const job = _findCronJob(jobOrId);
   if (!job) return;
-  const refreshPending = !!_cronDetailRefreshKey;
+  const refreshPending = typeof _cronDetailRefreshKey !== 'undefined' && !!_cronDetailRefreshKey;
   const detailKey = _cronJobKey(job);
   document.querySelectorAll('.cron-item').forEach(e => e.classList.remove('active'));
   const target = el || $(_cronItemId(job));
@@ -1552,9 +1552,10 @@ function openCronDetail(jobOrId, el){
   _editingCronId = null;
   _stopCronWatch();
   _renderCronDetail(job);
-  // Navigation cancels the old selection intent, but cached rows may predate
-  // the action. Give the newly selected detail its own authoritative refresh.
-  if (refreshPending) loadCrons();
+  // A pending action refresh belongs to the visible selection. Retarget it so
+  // the next authoritative load updates this detail without starting a request
+  // for every selection change.
+  if (refreshPending) _cronDetailRefreshKey = detailKey;
   if (!job.read_only) _checkCronWatchOnDetail(job.id, detailKey);
   _closeMobileSidebarAfterPanelSelection();
 }

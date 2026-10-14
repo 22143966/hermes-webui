@@ -217,9 +217,8 @@ def test_action_refresh_survives_away_and_back(action, state, initial):
     run_js("_cronList=" + json.dumps([job, other]) + ";openCronDetail('existing');" +
            "const action=" + action + "('existing');await waitRequests(1);" +
            "openCronDetail('other');openCronDetail('existing');" +
-           "const poll=loadCrons(false,{background:true});" +
-           "for(let i=0;i<50;i++)await Promise.resolve();" +
-           "const latest=pending[pending.length-1];latest.resolve({jobs:" + json.dumps([fresh, other]) + "});await poll;" +
+           "const poll=loadCrons(false,{background:true});await waitRequests(2);" +
+           "pending[1].resolve({jobs:" + json.dumps([fresh, other]) + "});await poll;" +
            "assertControls(" + json.dumps(state) + ");" +
            "for(const req of pending)req.resolve({jobs:" + json.dumps([fresh, other]) + "});await action;", setup=REAL_DETAIL)
 
