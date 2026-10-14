@@ -156,6 +156,37 @@
 
 ### Fixed
 
+- **Long virtualized transcripts measure rows before writing, and settle without a redundant second rebuild.** Row
+  heights are read before layout is invalidated, and the transparent settle skips a rebuild that only repeated the
+  first, so scrolling a long session does less work and keeps its place. Thanks @MuhammadUsamaMX. (#8232, fixes #7677)
+
+- **Cron jobs created from chat run under the right profile again.** The Agent renamed its scheduling tool from `cronjob`
+  to `cronjob_manage`, which left WebUI's cron profile wrapper inert. The wrapper now installs under the new name and
+  still works with older Agents that expose `cronjob`. Thanks @angel291592. (#8201)
+
+- **Outline jumps land on the message right after a long session opens.** Load-time bottom settling no longer pulls
+  the reader back, and the jump reuses already-loaded history instead of fetching it again. Thanks @dss539. (#8219)
+
+- **Edit, regenerate and fork act on the message you clicked, even after the outline loads full history.** Opening the
+  conversation outline loads older messages without re-rendering, which left on-screen rows with indexes relative to
+  the old window. These actions now resolve each row's current index. Thanks @dss539. (#8218)
+
+- **Updates recover from a renamed remote branch instead of failing to fetch.** When a branch on the remote was renamed
+  so its old name now blocks the new one (`'refs/remotes/origin/x' exists; cannot create ...`, or on git 2.51+ only
+  "some local refs could not be updated; try running 'git remote prune origin'"), the updater prunes just the stale
+  remote-tracking ref and retries once. Local branches, local tags and working-tree changes are never touched. Thanks
+  @UncleLiu-0306. (#8227)
+
+- **WebUI finds the same Agent whether it starts as a service or through bootstrap, and recovers from a half-finished
+  Agent install.** Direct service startup and `bootstrap.py` now share one Agent discovery path, keep the interpreter
+  that actually proved the Agent install for later Agent subprocesses, and retry an incomplete install instead of
+  starting against it. Thanks @rodboev. (#7247, fixes #1019)
+
+- **A git pull that times out no longer returns a 500, and its output can't leak credentials.** The partial git
+  output is decoded instead of crashing the update handler. Credentials embedded in remote URLs or query strings
+  (including values containing quotes) are redacted from the pull-failure and timeout messages, and the redacted
+  text is no longer cut short. Thanks @happy5318. (#8202, fixes #8198)
+
 - **Background-subagent wakeups no longer appear as messages you typed.** When delegated background work finishes, the
   wakeup the Agent needs is still delivered, but the transcript no longer shows it as a user bubble, and it no longer
   counts toward message totals, provisional titles, forks or exports. That holds across reloads, session switches and
@@ -1141,6 +1172,23 @@
 - **The `/api/models` cache invalidation contract is documented.** `#7556` shipped a change to the catalog cache's source fingerprint, and its review flagged the surrounding contract as undocumented runtime behavior. `docs/architecture/models-cache-invalidation.md` now records what is cached (in-memory snapshot, per-profile `models_cache.json`, cold vs hot path), the three source axes (`config_yaml` stat identity, `auth_json` content hash with a volatile-key deny-list, baked-in plus Codex catalog hashes) and why each is fingerprinted the way it is, and the invariant that both volatile-key sets are deny-lists that may only remove fields which provably do not gate the provider/model set. Changes no runtime behavior. Thanks @webtecnica. (#7560, #7556)
 
 ### Changed
+
+- **The WAL snapshot refusal test now exercises a real temporary database.** Thanks @tobenot. (#8233)
+
+- **An order-dependent CI test failure is fixed.** `test_custom_provider_detected_by_get_available_models` (and four
+  siblings) seeded the config in memory but didn't pin the loaded-config path, so a stale path left by an earlier test
+  reloaded `config.yaml` over the seed in CI shard 0. The tests now pin it, and a regression test proves the fix.
+  (#8237, fixes #8226)
+
+- **Faster status polls and history reads on long sessions.** Finding the `messages` key in a session file's metadata
+  prefix uses a regex tokenizer instead of a per-character Python walk, with identical results. Thanks @dss539. (#8216)
+
+- **Faster saves on long sessions.** The exact-duplicate guard that runs on every save, including draft saves while
+  typing, now fingerprints only rows whose identity actually repeats, instead of hashing the whole transcript. The
+  rows it keeps are unchanged. Thanks @dss539. (#8215)
+
+- **Faster transcript rendering.** Message and worklog timestamps reuse cached Intl formatters instead of building a new
+  one per call, and the cache resets when the language or clock setting changes. Thanks @dss539. (#8217)
 
 - **Two flaky tests are stable again.** Three `get_available_models()` cache-metadata tests raced the 4-second live-rebuild budget on a loaded CI host and could time out onto the stale-cache path. They now pin the budget to `0`, which is the documented setting for the legacy unbounded synchronous rebuild, so they still exercise the real rebuild (#7735). A source-text oracle that string-matched `delete_cli_session`'s source to prove it opens a writable connection is removed. The behavioral test in `test_issue1494_state_db_fd_leak.py` still guards that contract: it fails with `attempt to write a readonly database` if the delete path is ever switched to a read-only connection (#7726). Test-only; no runtime change. Thanks @webtecnica. (#7744, #7742)
 - **The chat composer grows natively instead of being resized by JavaScript on every keystroke.** `autoResize()` measured `scrollHeight` and wrote `style.height` on each input event — a forced synchronous reflow on the most-typed-in surface in the app. Browsers that support CSS `field-sizing: content` (Chromium today; also Firefox 152 and Safari 26.2) now own the geometry directly, gated on `CSS.supports()`, and the existing JavaScript path is untouched for every other engine. Measured behaviour is identical across both paths: 44px resting height, no jump when the first character is typed or the last deleted, growth to the 200px ceiling, then internal scrolling. Because `field-sizing` deliberately includes placeholder text in content sizing, `:placeholder-shown` pins fixed sizing while the composer is empty so a long placeholder can't inflate it. Thanks @starship-s. (#6760, #5514)
