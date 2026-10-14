@@ -10467,17 +10467,23 @@ function renderSessionListFromCache(){
       if(_sessionActionMenu){closeSessionActionMenu();return;}
       if(_sessionSelectMode){if(!readOnly)toggleSessionSelect(s.session_id);return;}
       clearTimeout(_tapTimer);_tapTimer=null;_lastTapTime=0;
-      void _openRowSession().then(_refocusOpenedRowTitle);
+      void _openRowSession().then(_refocusOpenSessionTitle);
     };
     // Opening rebuilds the list and detaches the focused title, dropping focus
-    // to <body>. Hand it to the opened row's rebuilt title so the next Tab
-    // continues from there. Focus that went somewhere real is left alone, and
-    // focus() is a no-op inside the closed (inert) phone drawer.
-    const _refocusOpenedRowTitle=()=>{
+    // to <body>. Hand it to the open conversation's rebuilt title so the next
+    // Tab continues from there. Focus that went somewhere real is left alone,
+    // and focus() is a no-op inside the closed (inert) phone drawer. A newer
+    // open still loading refocuses when it lands; an open superseded by one
+    // that already landed hands focus to the conversation that is current,
+    // never to its own stale row.
+    const _refocusOpenSessionTitle=()=>{
       const current=document.activeElement;
       if(current&&current!==document.body&&current.isConnected) return;
+      if(_loadingSessionId) return;
+      const sid=S.session&&S.session.session_id;
+      if(!sid) return;
       const list=$('sessionList');
-      const row=list&&list.querySelector('.session-item[data-sid="'+CSS.escape(s.session_id)+'"]');
+      const row=list&&list.querySelector('.session-item[data-sid="'+CSS.escape(sid)+'"]');
       const rowTitle=row&&row.querySelector('.session-title[tabindex]');
       if(rowTitle) _focusSessionActionMenuRestoreTarget(rowTitle);
     };

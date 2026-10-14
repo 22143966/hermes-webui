@@ -256,7 +256,9 @@ a screen reader's activate command, e.g. NVDA in browse mode), a bare
 conversation, and a sidebar repaint must never move focus to a title (a screen
 reader would pull its reading cursor back to the list). After Enter opens a
 conversation, focus must be on that row's rebuilt title, so the next Tab reaches
-its ⋮ trigger; on a phone, focus must not stay inside the closed drawer. A mouse
+its ⋮ trigger; Enter on one title and then another before the first has loaded
+must leave focus on the second (open) conversation's title, never the first; on
+a phone, focus must not stay inside the closed drawer. A mouse
 press on a title must not park focus there (a refresh deferred while the user
 interacts must apply once the mouse leaves), and double-click must still rename.
 Dragging from a title onto the row's ⋮ trigger must not open the conversation.

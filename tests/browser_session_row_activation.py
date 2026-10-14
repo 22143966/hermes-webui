@@ -297,6 +297,42 @@ def _check_desktop(page, seed, name):
     if not page.evaluate("(sid) => document.activeElement === (" + ACTIONS_TRIGGER_JS + ")(sid)", beta):
         fail("Tab after Enter did not continue to the opened row's actions button")
 
+    # Enter on A, then on B before A has loaded: A's late completion rebuilds
+    # the list after B's focus return. Focus must end on B (the conversation
+    # that is open), never back on A, or the next Enter would reopen A.
+    _open(page, gamma)
+    page.evaluate(COUNT_OPENS_JS)
+    held = []
+
+    def hold_alpha(route):
+        if not held and f"session_id={alpha}" in route.request.url:
+            held.append(route)
+        else:
+            route.continue_()
+
+    page.route("**/api/session?*", hold_alpha)
+    _focus_title(page, alpha)
+    page.keyboard.press("Enter")
+    for _ in range(100):
+        if held:
+            break
+        page.wait_for_timeout(50)
+    if not held:
+        fail("could not hold the first conversation's load (race setup)")
+    _focus_title(page, beta)
+    page.keyboard.press("Enter")
+    if not _wait_until(page, ACTIVE_JS, beta):
+        fail("Enter on a second title while the first was loading did not open it")
+    page.wait_for_timeout(SETTLE_MS)
+    for route in held:
+        route.continue_()
+    page.unroute("**/api/session?*", hold_alpha)
+    page.wait_for_timeout(SETTLE_MS)
+    if not page.evaluate(ACTIVE_JS, beta):
+        fail("the first conversation's late load replaced the second one")
+    if page.evaluate(FOCUSED_SID_JS) != beta:
+        fail(f"after a superseded open finished late, focus was on {page.evaluate(FOCUSED_SID_JS)!r}, expected the open conversation's title")
+
     # A held Enter auto-repeats; only the first keydown may open.
     page.evaluate(COUNT_OPENS_JS)
     page.evaluate("""(el) => {
@@ -470,9 +506,12 @@ def _check_desktop(page, seed, name):
     # Double-click still renames (the title drops mouse focus, not the press).
     _open(page, alpha)
     _title(page, beta).dblclick()
-    if not _wait_until(page, "() => !!document.querySelector('#sessionList .session-title-input')", timeout_ms=2000):
+    focused_input = "() => !!(document.activeElement && document.activeElement.matches('#sessionList .session-title-input'))"
+    if not _wait_until(page, focused_input, timeout_ms=2000):
         fail("double-clicking a title no longer starts a rename")
     page.keyboard.press("Escape")
+    if not _wait_until(page, "() => !_renamingSid && !document.querySelector('#sessionList .session-title-input')", timeout_ms=2000):
+        fail("Escape did not end the rename started by double-click")
     page.wait_for_timeout(300)
 
     page.evaluate("() => toggleSessionSelectMode()")
