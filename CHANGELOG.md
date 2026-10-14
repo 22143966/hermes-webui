@@ -1152,6 +1152,13 @@
 
 ### Changed
 
+- **Faster status polls and history reads on long sessions.** Finding the `messages` key in a session file's metadata
+  prefix uses a regex tokenizer instead of a per-character Python walk, with identical results. Thanks @dss539. (#8216)
+
+- **Faster saves on long sessions.** The exact-duplicate guard that runs on every save, including draft saves while
+  typing, now fingerprints only rows whose identity actually repeats, instead of hashing the whole transcript. The
+  rows it keeps are unchanged. Thanks @dss539. (#8215)
+
 - **Two flaky tests are stable again.** Three `get_available_models()` cache-metadata tests raced the 4-second live-rebuild budget on a loaded CI host and could time out onto the stale-cache path. They now pin the budget to `0`, which is the documented setting for the legacy unbounded synchronous rebuild, so they still exercise the real rebuild (#7735). A source-text oracle that string-matched `delete_cli_session`'s source to prove it opens a writable connection is removed. The behavioral test in `test_issue1494_state_db_fd_leak.py` still guards that contract: it fails with `attempt to write a readonly database` if the delete path is ever switched to a read-only connection (#7726). Test-only; no runtime change. Thanks @webtecnica. (#7744, #7742)
 - **The chat composer grows natively instead of being resized by JavaScript on every keystroke.** `autoResize()` measured `scrollHeight` and wrote `style.height` on each input event — a forced synchronous reflow on the most-typed-in surface in the app. Browsers that support CSS `field-sizing: content` (Chromium today; also Firefox 152 and Safari 26.2) now own the geometry directly, gated on `CSS.supports()`, and the existing JavaScript path is untouched for every other engine. Measured behaviour is identical across both paths: 44px resting height, no jump when the first character is typed or the last deleted, growth to the 200px ceiling, then internal scrolling. Because `field-sizing` deliberately includes placeholder text in content sizing, `:placeholder-shown` pins fixed sizing while the composer is empty so a long placeholder can't inflate it. Thanks @starship-s. (#6760, #5514)
 
