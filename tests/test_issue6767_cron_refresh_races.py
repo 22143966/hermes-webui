@@ -45,8 +45,9 @@ async function waitRequests(n){for(let i=0;i<50&&pending.length<n;i++)await Prom
 """
 
 
-def run_js(body):
+def run_js(body, setup=""):
     script = HARNESS.replace("PANELS_PATH", json.dumps(str(PANELS)))
+    script += setup
     script += "\n(async()=>{" + body + "})().catch(e=>{console.error(e);process.exit(1);});"
     result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
@@ -118,6 +119,58 @@ const retry=loadCrons(false,{background:true});await waitRequests(3);
 pending[2].resolve({jobs:[{id:'existing',name:'Current',state:'paused'}]});await retry;
 assert.equal(renders,1);assert.equal(renderedJob.state,'paused');assert.equal(_cronDetailRefreshKey,null);
 """)
+
+
+REAL_DETAIL = r"""
+for (const id of ['taskDetailTitle','taskDetailBody','taskDetailEmpty',
+  'btnRunTaskDetail','btnPauseTaskDetail','btnResumeTaskDetail','btnEditTaskDetail',
+  'btnDuplicateTaskDetail','btnDeleteTaskDetail','btnCancelTaskDetail','btnSaveTaskDetail']) fields[id]=node();
+const expansionStorage=new Map();
+localStorage.getItem=key=>expansionStorage.get(key)||null;
+localStorage.setItem=(key,value)=>expansionStorage.set(key,value);
+function jsArg(s){return JSON.stringify(s);}
+function _cronProfileTitle(p){return p||'Default';}
+function _cronProfileName(p){return p||'default';}
+function _isCronNeedsAttention(job){return job.state==='needs_attention';}
+function _isCronScheduleError(job){return job.state==='schedule_error';}
+function _loadCronDetailRuns(){} function _stopCronWatch(){}
+eval(['_renderCronDetail','toggleCronPromptExpanded','_setCronHeaderButtons',
+ '_cronPanelExpandKey','_cronExpansionGet','_cronExpansionSet','_cronStatusMeta',
+ '_isCronScriptJob','_cronModeLabel','_cronOutputTitle','_cronAgentPromptCardHtml',
+ '_clearCronDetail'].map(extract).join('\n'));
+function assertControls(state){
+ assert.equal(_currentCronDetail.state,state);
+ assert(fields.taskDetailBody.innerHTML.includes('cron_status_'+state));
+ assert.equal(fields.btnPauseTaskDetail.style.display,state==='paused'?'none':'');
+ assert.equal(fields.btnResumeTaskDetail.style.display,state==='paused'?'':'none');
+}
+"""
+
+
+@pytest.mark.parametrize("action,state,initial", [("cronPause", "paused", "active"), ("cronResume", "active", "paused")])
+@pytest.mark.parametrize("older_first", [False, True])
+@pytest.mark.parametrize("expanded", [False, True])
+def test_prompt_toggle_preserves_action_refresh_with_real_renderer(action, state, initial, older_first, expanded):
+    job = {"id": "existing", "name": "Existing", "prompt": "Task prompt", "state": initial}
+    fresh_job = dict(job, state=state)
+    older = "pending[0].resolve({jobs:" + json.dumps([fresh_job]) + "});await action;"
+    latest = "pending[1].resolve({jobs:" + json.dumps([fresh_job]) + "});await poll;"
+    run_js("_renderCronDetail(" + json.dumps(job) + ");" +
+           "_cronExpansionSet(_cronPanelExpandKey('existing','prompt')," + json.dumps(expanded) + ");" +
+           "const action=" + action + "('existing');await waitRequests(1);" +
+           "toggleCronPromptExpanded('existing');assertControls(" + json.dumps(initial) + ");" +
+           "assert.equal(_cronExpansionGet(_cronPanelExpandKey('existing','prompt'))," + json.dumps(not expanded) + ");" +
+           "const poll=loadCrons(false,{background:true});await waitRequests(2);" +
+           (older + latest if older_first else latest + older) +
+           "assertControls(" + json.dumps(state) + ");assert.equal(_cronDetailRefreshKey,null);", setup=REAL_DETAIL)
+
+
+@pytest.mark.parametrize("cancel", ["_renderCronDetail({id:'other',state:'active',prompt:'Other'});", "_clearCronDetail();"])
+def test_real_detail_cancellation_clears_pending_intent(cancel):
+    run_js("_renderCronDetail({id:'existing',state:'active'});" +
+           "const action=cronPause('existing');await waitRequests(1);assert.equal(_cronDetailRefreshKey,'existing');" +
+           cancel + "assert.equal(_cronDetailRefreshKey,null);" +
+           "pending[0].resolve({jobs:[{id:'other',state:'active'}]});await action;", setup=REAL_DETAIL)
 
 
 def test_user_requested_refresh_still_updates_detail():

@@ -1263,7 +1263,10 @@ function _cronAgentPromptCardHtml(job){
 }
 
 function _renderCronDetail(job){
-  _cronDetailRefreshKey = null;
+  // A same-selection presentation redraw (e.g. Prompt expansion) is not
+  // authoritative fresh data and must not cancel a pending action refresh.
+  // loadCrons consumes that intent after applying the latest list response.
+  if (_currentCronDetailKey !== _cronJobKey(job)) _cronDetailRefreshKey = null;
   _currentCronDetail = job;
   _currentCronDetailKey = _cronJobKey(job);
   const title = $('taskDetailTitle');

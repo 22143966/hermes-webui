@@ -151,7 +151,38 @@ try:
                         assert controls['resume']==('' if state=='paused' else 'none'),controls
                         page.screenshot(path=str(OUT/f'action-{state}-{width}.png'))
                         action_results.append(controls)
-                results.append(dict(version=version,width=width,metrics=metrics,page_errors=errors,action_races=action_results))
+                prompt_results=[]
+                if version=='after':
+                    for older_first in [False,True]:
+                        for action,state in [('cronPause','paused'),('cronResume','active')]:
+                            page.evaluate("action=>{window.fixtureActionPromise=window[action]('reading');}",action)
+                            for _ in range(50):
+                                if action_control['held']:break
+                                page.wait_for_timeout(100)
+                            assert len(action_control['held'])==1
+                            page.locator('[onclick^="toggleCronPromptExpanded"]').click()
+                            action_control['hold_next']=True
+                            page.evaluate('()=>{window.fixturePollPromise=loadCrons(false,{background:true});}')
+                            for _ in range(50):
+                                if len(action_control['held'])==2:break
+                                page.wait_for_timeout(100)
+                            assert len(action_control['held'])==2
+                            older,latest=action_control['held']
+                            action_control['held'].clear()
+                            ordered=[(older,'fixtureActionPromise'),(latest,'fixturePollPromise')]
+                            if not older_first:ordered.reverse()
+                            for route,promise in ordered:
+                                route.fulfill(json={'jobs':jobs,'other_profile_count':0})
+                                page.evaluate('async name=>{await window[name];}',promise)
+                            controls=page.evaluate("()=>({state:_currentCronDetail.state,pause:$('btnPauseTaskDetail').style.display,resume:$('btnResumeTaskDetail').style.display})")
+                            assert controls['state']==state,controls
+                            assert controls['pause']==('none' if state=='paused' else ''),controls
+                            assert controls['resume']==('' if state=='paused' else 'none'),controls
+                            order='older-first' if older_first else 'latest-first'
+                            page.screenshot(path=str(OUT/f'prompt-{state}-{order}-{width}.png'))
+                            prompt_results.append(dict(controls,order=order))
+                assert not errors,errors
+                results.append(dict(version=version,width=width,metrics=metrics,page_errors=errors,action_races=action_results,prompt_races=prompt_results))
                 ctx.close()
         browser.close()
     (OUT/'results.json').write_text(json.dumps(results,indent=2)+'\n')

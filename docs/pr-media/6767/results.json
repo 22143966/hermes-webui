@@ -14,7 +14,8 @@
       "overflow": true
     },
     "page_errors": [],
-    "action_races": []
+    "action_races": [],
+    "prompt_races": []
   },
   {
     "version": "before",
@@ -31,7 +32,8 @@
       "overflow": false
     },
     "page_errors": [],
-    "action_races": []
+    "action_races": [],
+    "prompt_races": []
   },
   {
     "version": "review-before",
@@ -51,7 +53,8 @@
       "overflow": true
     },
     "page_errors": [],
-    "action_races": []
+    "action_races": [],
+    "prompt_races": []
   },
   {
     "version": "review-before",
@@ -71,7 +74,8 @@
       "overflow": false
     },
     "page_errors": [],
-    "action_races": []
+    "action_races": [],
+    "prompt_races": []
   },
   {
     "version": "after",
@@ -101,6 +105,32 @@
         "state": "active",
         "pause": "",
         "resume": "none"
+      }
+    ],
+    "prompt_races": [
+      {
+        "state": "paused",
+        "pause": "none",
+        "resume": "",
+        "order": "latest-first"
+      },
+      {
+        "state": "active",
+        "pause": "",
+        "resume": "none",
+        "order": "latest-first"
+      },
+      {
+        "state": "paused",
+        "pause": "none",
+        "resume": "",
+        "order": "older-first"
+      },
+      {
+        "state": "active",
+        "pause": "",
+        "resume": "none",
+        "order": "older-first"
       }
     ]
   },
@@ -132,6 +162,32 @@
         "state": "active",
         "pause": "",
         "resume": "none"
+      }
+    ],
+    "prompt_races": [
+      {
+        "state": "paused",
+        "pause": "none",
+        "resume": "",
+        "order": "latest-first"
+      },
+      {
+        "state": "active",
+        "pause": "",
+        "resume": "none",
+        "order": "latest-first"
+      },
+      {
+        "state": "paused",
+        "pause": "none",
+        "resume": "",
+        "order": "older-first"
+      },
+      {
+        "state": "active",
+        "pause": "",
+        "resume": "none",
+        "order": "older-first"
       }
     ]
   }

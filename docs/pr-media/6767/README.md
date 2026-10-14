@@ -40,6 +40,16 @@ still preserve the loaded output. Subsequent polls do not repeat a completed
 explicit detail refresh. Node regressions also cover both completion orders,
 form/selection changes and recovery after a failed latest request.
 
+The same-selection Prompt redraw follow-up also holds Pause/Resume's foreground
+response, clicks the real Prompt toggle, and starts a background list refresh.
+It releases the two requests in both orders at both widths and checks selected
+state and actual Pause/Resume button visibility. `prompt-*` screenshots and
+`prompt_races` measurements record these checks. The Node regression uses the
+real Prompt toggle, detail renderer, status helper and header-button renderer:
+all eight action/order/expand-collapse cases failed on `d0289c95` before the fix.
+The final suite also checks that changing selection or clearing detail cancels
+pending intent. These contributor fixtures are not maintainer gate acceptance.
+
 ## Images
 
 | State | Desktop list | Desktop output | Phone drawer | Phone output |
@@ -74,12 +84,12 @@ python docs/pr-media/6767/capture.py
 ```
 
 `capture.py` starts and stops its own loopback-only server, allocates temporary
-fixture state, captures the 16 PNGs, and writes exact browser measurements to
+fixture state, captures the 24 PNGs, and writes exact browser measurements to
 `results.json`. It asserts the reviewed-head collapse and the fixed-head
 preservation at both widths. The `after` assets come from the current checkout;
 rerunning on changed implementation will produce new evidence.
 
-Related automated verification: 46 tests passed across
+Related automated verification: 56 tests passed across
 `test_cron_refresh_button_835.py`, `test_issue6767_cron_refresh_races.py`,
 `test_issue3460_cron_session_unread.py`, and `test_issue1140_cron_badge_per_job.py`.
 The refresh-button static signature test now accepts the optional `options`
