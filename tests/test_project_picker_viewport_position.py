@@ -173,7 +173,8 @@ const _allProjects = Array.from({length: 12}, (_, i) => ({
 }));
 const _allSessions = [];
 let currentSessionRow = null;
-const api = async () => ({});
+const apiCalls = [];
+const api = async (url, opts) => { apiCalls.push({url: String(url), body: opts && opts.body}); return {}; };
 const showToast = () => {};
 const showPromptDialog = async () => null;
 const renderSessionList = async () => {};
@@ -1507,6 +1508,30 @@ def test_session_list_refresh_defaults_to_immediate_picker_preserving_repaint():
         r"renderSessionList\(\{[^}]*deferWhileInteracting:true",
         outside_helper,
     ) is None
+
+
+def test_forced_session_events_refresh_paints_immediately_not_deferred():
+    """A forced SSE refresh must land while the list is hovered or focused.
+
+    ``force:true`` (the sessions_changed path) reached
+    ``_refreshSidebarForBackgroundChurn()``, whose ``deferWhileInteracting:true``
+    parked the payload until the pointer or focus left the list — a remote
+    rename stayed stale where master painted it immediately. Forced refreshes
+    now pass the explicit immediate pair and still enter as background-class
+    (no keep-picker claim), so an open picker is protected by its own repaint
+    deferral instead.
+    """
+    start = SESSIONS_JS.index("async function refreshSessionList(")
+    end = SESSIONS_JS.index("\nfunction ", start + 1)
+    body = SESSIONS_JS[start:end]
+    assert "const force = !!(opts && opts.force);" in body
+    immediate = "renderSessionList({deferWhileInteracting:false,keepProjectPicker:false});"
+    assert immediate in body
+    # The forced branch sits between the user-owned path and the deferred
+    # background-churn path: only the latter may defer behind interaction.
+    assert body.index("if(userOwnedRefresh){") < body.index("else if(force){")
+    assert body.index("else if(force){") < body.index("_refreshSidebarForBackgroundChurn();")
+    assert body.index(immediate) < body.index("_refreshSidebarForBackgroundChurn();")
 
 
 def _repaint_sidebar_keeping_project_picker_source() -> str:
@@ -3393,6 +3418,56 @@ console.log(JSON.stringify({refreshResult,beforeClick}));
     assert data["beforeClick"]["samePressedNode"] is True
     assert data["beforeClick"]["sameChildren"] is True
     assert data["beforeClick"]["timers"] >= 1
+
+
+def test_picker_tap_click_in_a_later_task_moves_to_the_pressed_project():
+    """A touch tap's click arrives in a task AFTER pointerup.
+
+    Pre-fix, ``finishPointerGesture`` applied the queued refresh on a
+    zero-delay timer, so on touch the picker was rebuilt/repositioned before
+    Chromium dispatched the tap's synthetic click — the click then landed on
+    whatever row sat under the finger ("No project" in the 390x844 CDP repro).
+    The refresh must wait for the gesture's own click; dispatching that click
+    as its own later task must move the session to the pressed row's project.
+    """
+    data = _run_picker_cases("""
+openPicker(260);
+const pressed = mountedPicker.children[1];
+const pressedId = pressed.getAttribute('data-project-id');
+const listenersBefore = docEmitter.count();
+(mountedPicker.listeners.pointerdown || [])[0]({button:0,pointerId:9});
+const refreshResult = _openProjectPicker.refreshChoices();
+docEmitter.dispatch('pointerup',{pointerId:9},true);
+const afterUp = {
+  samePressedNode: mountedPicker.children[1] === pressed,
+  listeners: docEmitter.count(),
+  timerKeys: [...timers.keys()],
+};
+// The tap's click is its own later task; it must be consumed by the gesture.
+docEmitter.dispatch('click',{target: pressed}, true);
+const afterClick = {
+  listeners: docEmitter.count(),
+  timerKeys: [...timers.keys()],
+};
+pressed.onclick();
+const moveCall = apiCalls.filter(c => String(c.url).indexOf('/api/session/move') !== -1).pop();
+const movedProjectId = moveCall ? JSON.parse(moveCall.body).project_id : null;
+flushTimers();
+console.log(JSON.stringify({pressedId, refreshResult, listenersBefore, afterUp, afterClick,
+  movedProjectId, settledTimers: timers.size}));
+""")
+    assert data["refreshResult"] == "deferred"
+    assert data["afterUp"]["samePressedNode"] is True
+    # Pointerup arms the gesture's click listener (one extra document listener)
+    # instead of applying the refresh on a zero-delay timer.
+    assert data["afterUp"]["listeners"] == data["listenersBefore"] + 1
+    # The later-task click is consumed by the gesture, which re-arms the apply
+    # to run after the click.
+    assert data["afterClick"]["listeners"] == data["listenersBefore"]
+    assert data["afterClick"]["timerKeys"] != data["afterUp"]["timerKeys"]
+    # The click moved the session to the PRESSED project, not "No project".
+    assert data["movedProjectId"] == data["pressedId"]
+    assert data["settledTimers"] == 0
 
 
 def test_picker_refresh_restores_focus_only_when_picker_owned_it():

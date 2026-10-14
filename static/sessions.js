@@ -7345,6 +7345,13 @@ async function refreshSessionList(reason='manual', opts={}){
     const userOwnedRefresh = (opts&&opts.keepProjectPicker===true) || reason==='pull';
     if(userOwnedRefresh){
       await renderSessionList();
+    }else if(force){
+      // A forced sessions_changed refresh must paint immediately even while
+      // the list is hovered or focused (a remote rename painted at once on
+      // master; the churn deferral parked it until the pointer or focus left
+      // the list). It enters as background-class — no keep-picker claim — so
+      // an open picker is still protected by its own repaint deferral.
+      await renderSessionList({deferWhileInteracting:false,keepProjectPicker:false});
     }else{
       await _refreshSidebarForBackgroundChurn();
     }
@@ -11250,25 +11257,40 @@ function _showProjectPicker(session, anchorEl){
     }
     return true;
   };
+  let gestureClickListener=null;
+  const applyPendingChoiceRefresh=()=>{
+    choiceRefreshTimer=null;
+    if(gestureClickListener){document.removeEventListener('click',gestureClickListener,true);gestureClickListener=null;}
+    if(!pendingChoiceRefresh||picker.isConnected===false) return;
+    pendingChoiceRefresh=false;
+    refreshChoices({force:true});
+    const open=(typeof _openProjectPicker!=='undefined')?_openProjectPicker:null;
+    if(open&&open.picker===picker){
+      if(typeof _syncProjectPickerSelection==='function') _syncProjectPickerSelection(open);
+      if(open.anchorEl&&open.anchorEl.isConnected!==false
+         &&typeof _positionProjectPicker==='function') _positionProjectPicker(picker,open.anchorEl);
+    }
+  };
   const finishPointerGesture=(event)=>{
     if(pointerGestureId===null) return;
     if(event&&event.pointerId!=null&&event.pointerId!==pointerGestureId) return;
     pointerGestureId=null;
     if(!pendingChoiceRefresh) return;
-    // Pointerup is followed by click. Keep the pressed node alive until that
-    // click selects it, then apply the queued refresh on the next task.
-    choiceRefreshTimer=setTimeout(()=>{
-      choiceRefreshTimer=null;
-      if(!pendingChoiceRefresh||picker.isConnected===false) return;
-      pendingChoiceRefresh=false;
-      refreshChoices({force:true});
-      const open=(typeof _openProjectPicker!=='undefined')?_openProjectPicker:null;
-      if(open&&open.picker===picker){
-        if(typeof _syncProjectPickerSelection==='function') _syncProjectPickerSelection(open);
-        if(open.anchorEl&&open.anchorEl.isConnected!==false
-           &&typeof _positionProjectPicker==='function') _positionProjectPicker(picker,open.anchorEl);
-      }
-    },0);
+    // Pointerup is followed by click: in the same task for a mouse, in a later
+    // one for a touch tap (Chromium synthesizes the click after touchend). The
+    // pressed node and the picker's place must survive until that click has
+    // been dispatched, so apply the queued refresh right after it, with a
+    // grace period for gestures that end without a click (pointercancel, a
+    // release outside the picker).
+    if(gestureClickListener) document.removeEventListener('click',gestureClickListener,true);
+    gestureClickListener=()=>{
+      document.removeEventListener('click',gestureClickListener,true);gestureClickListener=null;
+      if(choiceRefreshTimer!==null) clearTimeout(choiceRefreshTimer);
+      choiceRefreshTimer=setTimeout(applyPendingChoiceRefresh,0);
+    };
+    document.addEventListener('click',gestureClickListener,true);
+    if(choiceRefreshTimer!==null) clearTimeout(choiceRefreshTimer);
+    choiceRefreshTimer=setTimeout(applyPendingChoiceRefresh,400);
   };
   const beginPointerGesture=(event)=>{
     if(event&&event.button!=null&&event.button!==0) return;
@@ -11334,6 +11356,7 @@ function _showProjectPicker(session, anchorEl){
     pendingCloseWhenAway=false;
     if(closeTimer!==null){clearTimeout(closeTimer);closeTimer=null;}
     if(choiceRefreshTimer!==null){clearTimeout(choiceRefreshTimer);choiceRefreshTimer=null;}
+    if(gestureClickListener){document.removeEventListener('click',gestureClickListener,true);gestureClickListener=null;}
     pointerGestureId=null;
     pendingChoiceRefresh=false;
     if(anchorObserver){anchorObserver.disconnect();anchorObserver=null;}

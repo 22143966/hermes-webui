@@ -207,7 +207,9 @@ def test_session_events_refresh_forces_hidden_sidebar_render_from_event_path():
     )
     out = _run_node(script)
     assert out == [
-        {"kind": "render", "opts": {"deferWhileInteracting": True, "keepProjectPicker": False}},
+        # A forced refresh paints immediately: the explicit non-deferred
+        # background pair, never the churn deferral (re-gate finding).
+        {"kind": "render", "opts": {"deferWhileInteracting": False, "keepProjectPicker": False}},
         {"kind": "active", "reason": "event-active-session"},
     ]
 
@@ -268,7 +270,8 @@ def test_session_list_external_refresh_forced_resume_survives_hidden_inflight_re
     assert out["record"] == [
         {"kind": "render", "opts": {"deferWhileInteracting": True, "keepProjectPicker": False}},
         {"kind": "active", "reason": "event"},
-        {"kind": "render", "opts": {"deferWhileInteracting": True, "keepProjectPicker": False}},
+        # The queued forced resume paints immediately, not via the deferral.
+        {"kind": "render", "opts": {"deferWhileInteracting": False, "keepProjectPicker": False}},
     ]
     assert "refreshSessionList(reason, {force:true})" in out["resumeSrc"]
     assert "refreshActive:true" not in out["resumeSrc"]
@@ -312,7 +315,8 @@ def test_session_events_refresh_timer_merges_pending_force_and_active_options():
         """
     )
     assert _run_node(script) == [
-        {"kind": "render", "opts": {"deferWhileInteracting": True, "keepProjectPicker": False}},
+        # The merged forced intent paints immediately, not via the deferral.
+        {"kind": "render", "opts": {"deferWhileInteracting": False, "keepProjectPicker": False}},
         {"kind": "active", "reason": "event-active-session"},
     ]
 
