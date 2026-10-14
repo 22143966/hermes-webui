@@ -299,7 +299,8 @@ def _run_git(args, cwd, timeout=10):
         # The partial output is user-facing git text: a pull that died on a
         # credentialed remote can echo the URL (with its token) before timing
         # out, so run it through the same credential scrub the fetch path uses.
-        detail = _sanitize_git_diagnostic(raw, limit=len(raw))
+        # limit=sys.maxsize: never truncate. Redaction can lengthen the text, so len(raw) would cut its tail.
+        detail = _sanitize_git_diagnostic(raw, limit=sys.maxsize)
         return detail or f"git {' '.join(args)} timed out after {timeout}s", False
     except FileNotFoundError:
         return 'git executable not found', False
@@ -2456,7 +2457,7 @@ def _apply_update_inner(target, channel=DEFAULT_UPDATE_CHANNEL):
         # Every pull-failure message below interpolates git's own output, and
         # git echoes the remote URL (token included) when a pull dies. Scrub
         # once here so no branch can leak it (#8198 follow-up).
-        pull_out = _sanitize_git_diagnostic(pull_out, limit=len(pull_out))
+        pull_out = _sanitize_git_diagnostic(pull_out, limit=sys.maxsize)  # never truncate (redaction can lengthen)
         if _is_git_lock_error(pull_out):
             # Lock conflict during pull. If a stash was pushed for the local
             # modifications, attempt to restore it before returning so the
