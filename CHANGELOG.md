@@ -147,6 +147,10 @@
 
 ### Fixed
 
+- **Faster secret redaction on long values.** The redactor no longer runs its environment-assignment and code-key
+  matchers on strings that contain no `=`, which those patterns need to match, so long URL-bearing values in API
+  responses are masked with less CPU. Every other masking rule is unchanged. Thanks @tobenot. (#8192)
+
 - **Signing in works when another app on the same host sets a malformed cookie.** A cookie with illegal characters
   from a different service on the same host or domain made the WebUI ignore every cookie after it, so a correct password
   bounced back to the login page and a switched profile fell back to `default`. Cookies are now read one pair at a time,
