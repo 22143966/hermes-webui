@@ -8571,10 +8571,10 @@ def _repair_removed_qualified_custom_provider_model(
         # Serialized list that failed to decode: not proof of anything.
         # A plain single-model string is still a valid one-model allowlist.
         return None
-    default_raw = str(entry.get("model") or "").strip()
-    if any("${" in item for item in [*pinned, default_raw]):
+    if any("${" in item for item in pinned):
         # Unresolved env reference: the raw profile YAML isn't the real ID.
         return None
+    default_raw = str(entry.get("model") or "").strip()
 
     def _own_bare(item: str) -> str:
         # Unwrap only this provider's own wrapper; ``@safe:x`` is a real ID.

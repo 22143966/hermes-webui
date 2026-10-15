@@ -269,6 +269,33 @@ class TestIssue5127CustomProviderBareSuffixRepair:
         assert (model, provider, normalized) == ("@custom:lab:saved-a", "custom:lab", False)
         assert config.resolve_model_provider(model)[0] == "saved-a"
 
+    def test_unresolved_env_default_falls_back_to_pinned_list(self, monkeypatch):
+        """A concrete pinned list still proves removal when only the default is ``${VAR}``."""
+        import api.config as config
+        from api.routes import _resolve_compatible_session_model_state
+
+        profile_cfg = {
+            "custom_providers": [
+                {
+                    "name": "lab",
+                    "base_url": "http://lab.invalid/v1",
+                    "model": "${LAB_MODEL}",
+                    "models": ["chat-new"],
+                }
+            ]
+        }
+        monkeypatch.setattr(config, "cfg", profile_cfg)
+
+        model, provider, normalized = _resolve_compatible_session_model_state(
+            "@custom:lab:chat-old",
+            "custom:lab",
+            profile_config=profile_cfg,
+            prefer_cached_catalog=True,
+        )
+
+        assert (model, provider, normalized) == ("@custom:lab:chat-new", "custom:lab", True)
+        assert config.resolve_model_provider(model)[0] == "chat-new"
+
     def test_no_profile_config_never_repairs_from_shared_cfg(self, monkeypatch):
         """The shared cfg may belong to another profile, so it can't drive a rewrite."""
         import api.config as config
