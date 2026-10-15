@@ -191,12 +191,17 @@ const t = key => key;
 let nextTask = 0;
 const frames = new Map();
 const timers = new Map();
-const setTimeout = fn => { const id = ++nextTask; timers.set(id, fn); return id; };
+const setTimeout = (fn, delay = 0) => { const id = ++nextTask; timers.set(id, {fn, delay: Number(delay) || 0}); return id; };
 const clearTimeout = id => timers.delete(id);
 const requestAnimationFrame = fn => { const id = ++nextTask; frames.set(id, fn); return id; };
 const cancelAnimationFrame = id => frames.delete(id);
 function flushFrames() { const batch = [...frames.values()]; frames.clear(); batch.forEach(fn => fn()); }
-function flushTimers() { const batch = [...timers.values()]; timers.clear(); batch.forEach(fn => fn()); }
+function flushTimers() { const batch = [...timers.values()]; timers.clear(); batch.forEach(entry => entry.fn()); }
+function flushTimersDue(maxDelay) {
+  for (const [id, entry] of [...timers.entries()]) {
+    if (entry.delay <= maxDelay) { timers.delete(id); entry.fn(); }
+  }
+}
 
 // Module-scope teardown hook declared just above _showProjectPicker in
 // static/sessions.js; the extracted function body assigns it.
@@ -3423,24 +3428,44 @@ console.log(JSON.stringify({refreshResult,beforeClick}));
 def test_picker_tap_click_in_a_later_task_moves_to_the_pressed_project():
     """A touch tap's click arrives in a task AFTER pointerup.
 
-    Pre-fix, ``finishPointerGesture`` applied the queued refresh on a
-    zero-delay timer, so on touch the picker was rebuilt/repositioned before
-    Chromium dispatched the tap's synthetic click — the click then landed on
-    whatever row sat under the finger ("No project" in the 390x844 CDP repro).
-    The refresh must wait for the gesture's own click; dispatching that click
-    as its own later task must move the session to the pressed row's project.
+    Pre-fix, ``finishPointerGesture`` cleared the gesture id at pointerup, so a
+    repaint completing between the release and Chromium's synthesized click
+    (the pin action's follow-up GET) could re-place the picker under the finger
+    and the tap moved the session to whatever row took the pressed row's place
+    ("No project" in the 390x844 CDP repro). The gesture must stay open —
+    deferring repaints and holding the pressed node — until its own click (or
+    the grace timeout) settles the queued refresh.
     """
     data = _run_picker_cases("""
+let positions = [];
+function _positionProjectPicker() { positions.push(1); }
 openPicker(260);
+// The repaint path reads the live children: keep the harness honest so an
+// unchanged list short-circuits refreshChoices instead of rebuilding.
+mountedPicker.querySelectorAll = (selector) => {
+  if (selector === '.project-picker-item') return mountedPicker.children.slice();
+  if (selector === '.project-picker-item[data-project-id]')
+    return mountedPicker.children.filter((item) => item.getAttribute && item.getAttribute('data-project-id'));
+  return [];
+};
 const pressed = mountedPicker.children[1];
 const pressedId = pressed.getAttribute('data-project-id');
 const listenersBefore = docEmitter.count();
 (mountedPicker.listeners.pointerdown || [])[0]({button:0,pointerId:9});
+positions.length = 0;
 const refreshResult = _openProjectPicker.refreshChoices();
 docEmitter.dispatch('pointerup',{pointerId:9},true);
-const afterUp = {
+flushTimersDue(0);
+// The tap's own click has not happened yet. A repaint completing in this gap
+// (the pressed row's mutation GET) must still be deferred: only a settlement
+// due now — the pre-fix zero-delay apply, or a shortened grace — would take
+// the queued refresh inside it and re-place the picker.
+const gapRefresh = _openProjectPicker.refreshChoices();
+const beforeClick = {
+  positions: positions.length,
   samePressedNode: mountedPicker.children[1] === pressed,
   listeners: docEmitter.count(),
+  pendingTimers: [...timers.values()].filter((entry) => entry.delay > 0).length,
   timerKeys: [...timers.keys()],
 };
 // The tap's click is its own later task; it must be consumed by the gesture.
@@ -3453,20 +3478,33 @@ pressed.onclick();
 const moveCall = apiCalls.filter(c => String(c.url).indexOf('/api/session/move') !== -1).pop();
 const movedProjectId = moveCall ? JSON.parse(moveCall.body).project_id : null;
 flushTimers();
-console.log(JSON.stringify({pressedId, refreshResult, listenersBefore, afterUp, afterClick,
+console.log(JSON.stringify({pressedId, refreshResult, gapRefresh, listenersBefore, beforeClick, afterClick,
   movedProjectId, settledTimers: timers.size}));
 """)
     assert data["refreshResult"] == "deferred"
-    assert data["afterUp"]["samePressedNode"] is True
-    # Pointerup arms the gesture's click listener (one extra document listener)
-    # instead of applying the refresh on a zero-delay timer.
-    assert data["afterUp"]["listeners"] == data["listenersBefore"] + 1
+    # Nothing may rebuild or re-place the picker between the release and the
+    # click the tap is waiting for.
+    assert data["beforeClick"]["positions"] == 0
+    assert data["beforeClick"]["samePressedNode"] is True
+    # The gesture is still open: its click listener (one extra document
+    # listener) and the 400 ms grace timer are armed, and nothing settled.
+    assert data["beforeClick"]["listeners"] == data["listenersBefore"] + 1
+    assert data["beforeClick"]["pendingTimers"] == 1
+    # A repaint completing in the gap (the pressed row's mutation GET) must
+    # still be deferred: only a settlement due now — the pre-fix zero-delay
+    # apply, or a shortened grace — would take the queued refresh inside it.
+    assert data["gapRefresh"] == "deferred", (
+        "A repaint between pointerup and the tap's click must stay deferred "
+        "until the gesture settles; got " + repr(data["gapRefresh"])
+    )
     # The later-task click is consumed by the gesture, which re-arms the apply
     # to run after the click.
     assert data["afterClick"]["listeners"] == data["listenersBefore"]
-    assert data["afterClick"]["timerKeys"] != data["afterUp"]["timerKeys"]
-    # The click moved the session to the PRESSED project, not "No project".
+    assert data["afterClick"]["timerKeys"] != data["beforeClick"]["timerKeys"]
+    # The click moved the session to the PRESSED project, not the row that
+    # would have taken its place.
     assert data["movedProjectId"] == data["pressedId"]
+    # The settled gesture releases the picker again.
     assert data["settledTimers"] == 0
 
 

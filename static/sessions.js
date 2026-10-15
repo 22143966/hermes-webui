@@ -11260,6 +11260,11 @@ function _showProjectPicker(session, anchorEl){
   let gestureClickListener=null;
   const applyPendingChoiceRefresh=()=>{
     choiceRefreshTimer=null;
+    // The gesture settles here: release the picker for normal repaints again.
+    // Until this runs the gesture id stays bound, so a repaint that completes
+    // between the release and the gesture's click (or its grace timeout) is
+    // still deferred instead of re-placing the picker under the finger.
+    pointerGestureId=null;
     if(gestureClickListener){document.removeEventListener('click',gestureClickListener,true);gestureClickListener=null;}
     if(!pendingChoiceRefresh||picker.isConnected===false) return;
     pendingChoiceRefresh=false;
@@ -11274,14 +11279,17 @@ function _showProjectPicker(session, anchorEl){
   const finishPointerGesture=(event)=>{
     if(pointerGestureId===null) return;
     if(event&&event.pointerId!=null&&event.pointerId!==pointerGestureId) return;
-    pointerGestureId=null;
-    if(!pendingChoiceRefresh) return;
+    // The gesture id stays bound until applyPendingChoiceRefresh settles the
+    // gesture. A repaint that lands in between (e.g. a mutation's follow-up GET
+    // completing on touch) must still be deferred, or it can re-place the picker
+    // under the finger and the tap lands on the wrong row.
     // Pointerup is followed by click: in the same task for a mouse, in a later
     // one for a touch tap (Chromium synthesizes the click after touchend). The
     // pressed node and the picker's place must survive until that click has
     // been dispatched, so apply the queued refresh right after it, with a
     // grace period for gestures that end without a click (pointercancel, a
-    // release outside the picker).
+    // release outside the picker). Settle every release, with or without a
+    // queued refresh, so the id never outlives the gesture.
     if(gestureClickListener) document.removeEventListener('click',gestureClickListener,true);
     gestureClickListener=()=>{
       document.removeEventListener('click',gestureClickListener,true);gestureClickListener=null;
