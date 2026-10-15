@@ -25135,28 +25135,35 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
         if p.name.startswith("_"):
             continue
         try:
-            s = Session.load(p.stem)
-            if zero_only:
-                should_delete = s and len(s.messages) == 0
-            else:
-                should_delete = s and s.title == "Untitled" and len(s.messages) == 0
-            if should_delete:
-                with LOCK:
-                    SESSIONS.pop(p.stem, None)
-                    p.unlink(missing_ok=True)
-                session_deleted = not p.exists()
-                if session_deleted:
-                    phase1_removed_ids.add(p.stem)
-                try:
-                    draft_deleted = bool(_delete_session_draft(p.stem))
-                except Exception:
-                    logger.debug("Failed to delete draft sidecar during cleanup for %s", p.stem, exc_info=True)
-                    draft_delete_failed = True
-                    draft_deleted = False
-                if not draft_deleted:
-                    draft_delete_failed = True
-                if session_deleted:
-                    cleaned += 1
+            session_lock = _get_session_agent_lock(p.stem)
+            if not session_lock.acquire(timeout=5):
+                logger.debug("Session %s is busy; leaving it for later cleanup", p.stem)
+                continue
+            try:
+                s = Session.load(p.stem)
+                if zero_only:
+                    should_delete = s and len(s.messages) == 0
+                else:
+                    should_delete = s and s.title == "Untitled" and len(s.messages) == 0
+                if should_delete:
+                    with LOCK:
+                        SESSIONS.pop(p.stem, None)
+                        p.unlink(missing_ok=True)
+                    session_deleted = not p.exists()
+                    if session_deleted:
+                        phase1_removed_ids.add(p.stem)
+                    try:
+                        draft_deleted = bool(_delete_session_draft(p.stem))
+                    except Exception:
+                        logger.debug("Failed to delete draft sidecar during cleanup for %s", p.stem, exc_info=True)
+                        draft_delete_failed = True
+                        draft_deleted = False
+                    if not draft_deleted:
+                        draft_delete_failed = True
+                    if session_deleted:
+                        cleaned += 1
+            finally:
+                session_lock.release()
         except Exception:
             logger.debug("Failed to clean up session file %s", p)
 

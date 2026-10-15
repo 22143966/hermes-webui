@@ -396,6 +396,12 @@ this fallback lasts only for the current page. Draft POSTs to the same target
 are serialized, including continuation replays and clears, while different
 session targets can save concurrently.
 
+In-process session cleanup checks eligibility under the session's agent lock
+and retains it through cache eviction and owner and dedicated-draft deletion.
+A concurrent writer cannot publish a new draft between those deletions.
+Busy sessions are left for a later cleanup. The session lock is released before
+index maintenance.
+
 ## Goals
 
 - Define the state layers involved in active and recovered WebUI turns.

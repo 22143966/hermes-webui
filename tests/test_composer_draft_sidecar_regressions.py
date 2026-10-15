@@ -1454,6 +1454,107 @@ def test_sessions_cleanup_retries_orphaned_draft_after_owner_delete(tmp_path, mo
     assert live_draft.read_bytes() == live_draft_bytes
 
 
+@pytest.mark.parametrize("zero_only", [False, True])
+def test_sessions_cleanup_preserves_republished_owner_draft_at_unlink_seam(
+    tmp_path, monkeypatch, zero_only
+):
+    models, routes, session_dir = _build_draft_env(tmp_path, monkeypatch)
+
+    victim_sid = "sid-cleanup-republished-owner"
+    live_sid = "sid-cleanup-republished-control"
+    victim_owner = session_dir / f"{victim_sid}.json"
+    victim_draft = session_dir / ".drafts" / f"{victim_sid}.json"
+    live_owner = session_dir / f"{live_sid}.json"
+    live_draft = session_dir / ".drafts" / f"{live_sid}.json"
+    old_draft = {"text": "old embedded draft", "files": []}
+    latest_draft = {"text": "new latest draft", "files": []}
+
+    models.Session(
+        session_id=victim_sid,
+        title="Untitled",
+        messages=[],
+        composer_draft=old_draft,
+    ).save(touch_updated_at=False, skip_index=True)
+    models._save_session_draft(victim_sid, old_draft)
+    models.Session(
+        session_id=live_sid,
+        title="Live control",
+        messages=[{"role": "user", "content": "keep this session"}],
+        composer_draft={"text": "control draft", "files": []},
+    ).save(touch_updated_at=False, skip_index=True)
+    models._save_session_draft(live_sid, {"text": "control draft", "files": []})
+    live_owner_bytes = live_owner.read_bytes()
+    live_draft_bytes = live_draft.read_bytes()
+
+    sid_lock = routes._get_session_agent_lock(victim_sid)
+    real_delete = routes._delete_session_draft
+    start_writer = threading.Event()
+    writer_attempted = threading.Event()
+    writer_done = threading.Event()
+    writer_errors = []
+    seam = {"cleanup_owns_lock": None}
+
+    def publish_latest_draft():
+        try:
+            if not start_writer.wait(timeout=5):
+                raise AssertionError("cleanup did not reach the draft-delete seam")
+            writer_attempted.set()
+            with sid_lock:
+                models.Session(
+                    session_id=victim_sid,
+                    title="Republished live session",
+                    messages=[{"role": "user", "content": "worker wrote live owner"}],
+                    composer_draft=old_draft,
+                ).save(touch_updated_at=False, skip_index=True)
+                models._save_session_draft(victim_sid, latest_draft)
+        except BaseException as exc:
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    def delete_at_unlink_seam(sid):
+        if sid == victim_sid:
+            seam["cleanup_owns_lock"] = sid_lock.locked()
+            start_writer.set()
+            assert writer_attempted.wait(timeout=5), "writer did not reach the session lock"
+            if not seam["cleanup_owns_lock"]:
+                assert writer_done.wait(timeout=5), "writer did not publish inside the cleanup gap"
+        return real_delete(sid)
+
+    monkeypatch.setattr(routes, "_delete_session_draft", delete_at_unlink_seam)
+    writer = threading.Thread(target=publish_latest_draft, daemon=True)
+    try:
+        writer.start()
+        status, _ = _cleanup_route(monkeypatch, routes, zero_only=zero_only)
+        writer.join(timeout=5)
+
+        assert not writer.is_alive(), "draft writer did not finish after cleanup"
+        assert not writer_errors, f"draft writer failed: {writer_errors!r}"
+        assert status == 200
+        assert victim_owner.exists()
+        assert victim_draft.exists()
+        with routes.LOCK:
+            models.SESSIONS.pop(victim_sid, None)
+        loaded = models.Session.load(victim_sid)
+        owner_data = json.loads(victim_owner.read_text(encoding="utf-8"))
+        assert owner_data["messages"] == [{"role": "user", "content": "worker wrote live owner"}]
+        assert owner_data["composer_draft"] == old_draft
+        assert loaded is not None
+        assert loaded.composer_draft["text"] == "new latest draft"
+        assert live_owner.read_bytes() == live_owner_bytes
+        assert live_draft.read_bytes() == live_draft_bytes
+    finally:
+        start_writer.set()
+        if writer.ident is not None:
+            writer.join(timeout=5)
+        with routes.LOCK:
+            models.SESSIONS.pop(victim_sid, None)
+            models.SESSIONS.pop(live_sid, None)
+        with streaming.SESSION_AGENT_LOCKS_LOCK:
+            streaming.SESSION_AGENT_LOCKS.pop(victim_sid, None)
+            streaming.SESSION_AGENT_LOCKS.pop(live_sid, None)
+
+
 def test_session_delete_reports_draft_delete_failure(tmp_path, monkeypatch):
     import api.routes as routes
 
