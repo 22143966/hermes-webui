@@ -22,6 +22,14 @@ plus the four 2026-10-05 greptile follow-ups (second-pointer pan guard,
 editable-target shortcut guard, focus into the dialog on open, stale
 geometry dropped — zoom level preserved — on a failed load).
 
+The 2026-10-15T17:54:15Z maintainer re-gate (review 5537610966) added seven
+silent gesture edge cases — gestures overwriting a fresh fit, a wheel zoom
+mid-pan snapping the next move, a same-source navigation skipping its
+re-centre, a resize keeping an obsolete zoom-out limit, a replaced finger
+keeping a dead pinch baseline, a reversed drag waiting out its overshoot, and
+line/page wheel deltas treated as pixels. Each has its own ``gate1015_*``
+check below, asserted by ``TestComposedMaintainerRegate20261015``.
+
 The per-check script lives in ``_img_lightbox_composed_checks.js`` and is
 injected into the page; there is no DOM emulation layer and no third-party JS
 package involved. Chromium is provisioned by the CI test job
@@ -225,6 +233,66 @@ class TestComposedReviewFollowups:
 
     def test_a_deliberate_scale_survives_a_failed_load_mobile(self, composed):
         _check(composed.mobile, "navigation_after_a_failed_load_keeps_a_deliberate_scale")
+
+
+class TestComposedMaintainerRegate20261015:
+    """Maintainer re-gate 2026-10-15T17:54:15Z (review 5537610966): seven silent
+    gesture edge cases driven on desktop and iPhone, one browser check each.
+    Every check is asserted here — ``_check`` is what turns a red in-page check
+    into a red CI run, so adding a check without its item leaves the suite green
+    (greptile P2, 2026-10-15T18:33:30Z)."""
+
+    def test_a_gesture_started_without_geometry_cannot_overwrite_the_fit(self, composed):
+        """Item 1 (static/ui.js:2795): a pinch armed while the image was still
+        decoding kept the previous frame's baseline and rescaled the next one
+        (4000x3000: fitted 351px -> 4080px)."""
+        _check(composed.desktop, "gate1015_fit_survives_a_gesture_started_without_geometry")
+
+    def test_a_gesture_started_without_geometry_cannot_overwrite_the_fit_mobile(self, composed):
+        _check(composed.mobile, "gate1015_fit_survives_a_gesture_started_without_geometry")
+
+    def test_fit_ends_the_gesture_in_flight(self, composed):
+        _check(composed.desktop, "gate1015_fit_resets_an_active_pinch")
+
+    def test_fit_ends_the_gesture_in_flight_mobile(self, composed):
+        _check(composed.mobile, "gate1015_fit_resets_an_active_pinch")
+
+    def test_a_wheel_zoom_mid_pan_does_not_snap_the_next_move(self, composed):
+        """Item 2 (static/ui.js:3134): 1px of pointer movement moved the image
+        674px because the drag baseline stayed on the pre-zoom position."""
+        _check(composed.desktop, "gate1015_wheel_zoom_mid_pan_does_not_snap")
+
+    def test_same_source_navigation_still_recentres(self, composed):
+        """Item 3 (static/ui.js:2843): two entries sharing a source were read as
+        the previous frame's duplicate load, so init/recentring were skipped and
+        pendingNav stayed armed."""
+        _check(composed.desktop, "gate1015_same_source_navigation_recentres")
+
+    def test_same_source_navigation_still_recentres_mobile(self, composed):
+        _check(composed.mobile, "gate1015_same_source_navigation_recentres")
+
+    def test_resize_recomputes_the_zoom_out_limit(self, composed):
+        """Item 4 (static/ui.js:3145): the old fit baseline survived a resize,
+        so zoom-out stopped at 0.25 while the new fit was 0.08775."""
+        _check(composed.desktop, "gate1015_resize_recomputes_the_zoom_out_limit")
+
+    def test_a_replaced_finger_reanchors_the_pinch(self, composed):
+        """Item 5 (static/ui.js:3088): the pinch kept a baseline belonging to a
+        contact that was no longer down (2.06x scale jump on a 1px move)."""
+        _check(composed.desktop, "gate1015_replaced_finger_reanchors_the_pinch")
+
+    def test_a_replaced_finger_reanchors_the_pinch_mobile(self, composed):
+        _check(composed.mobile, "gate1015_replaced_finger_reanchors_the_pinch")
+
+    def test_a_reversed_drag_moves_the_image_immediately(self, composed):
+        """Item 6 (static/ui.js:2993): the baseline kept the clamped-away
+        overshoot, so a reversed drag had to retrace it first."""
+        _check(composed.desktop, "gate1015_overshoot_reversal_responds_immediately")
+
+    def test_line_mode_wheel_deltas_zoom_like_pixels(self, composed):
+        """Item 7 (static/ui.js:3133): a three-line tick zoomed by 0.45% because
+        deltaMode was ignored."""
+        _check(composed.desktop, "gate1015_line_mode_wheel_zooms")
 
 
 # Trusted-input regressions for the 2026-10-06 maintainer gate certificate.
