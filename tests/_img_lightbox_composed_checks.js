@@ -1323,10 +1323,13 @@
     touch(box.vp, "touchmove", [{ x: cx - 100, y: cy, id: 1 }, { x: cx + 100, y: cy, id: 2 }]);
     assert_(box.z.pinching === true, "fixture: two contacts must be pinching");
     assert_(box.z.scale > box.z.fitScale, "fixture: the pinch must zoom in");
+    // Measure the key alone: the pinch above already scaled the image, so
+    // comparing against fitScale would pass even if `+` did nothing.
+    var scaleBeforeKey = box.z.scale;
     key("+");
     var zoomed = box.z.scale;
     var xAfterZoom = box.z.x;
-    assert_(zoomed > box.z.fitScale * 1.2, "fixture: the keyboard zoom must zoom in during the pinch");
+    assert_(zoomed > scaleBeforeKey, "fixture: the keyboard zoom must zoom in during the pinch");
     // The fingers do not move: the pinch baseline was re-anchored onto these
     // contacts, so neither the scale nor the position may change.
     touch(box.vp, "touchmove", [{ x: cx - 100, y: cy, id: 1 }, { x: cx + 100, y: cy, id: 2 }]);
