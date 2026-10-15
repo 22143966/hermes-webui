@@ -1568,7 +1568,7 @@ def test_insights_bucketing_five_year_window_runs_the_shipped_js_helper(tmp_path
     """) % {"fn": fn}
     proc = _subprocess.run(
         [node, "-e", harness, str(payload_file)],
-        capture_output=True, text=True, timeout=60, check=False,
+        capture_output=True, text=True, encoding="utf-8", timeout=60, check=False,
     )
     assert proc.returncode == 0, "node bucket probe failed: " + proc.stdout + proc.stderr
     got = _json.loads(proc.stdout.strip().splitlines()[-1])
