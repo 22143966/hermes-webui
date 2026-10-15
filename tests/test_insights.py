@@ -1522,6 +1522,91 @@ def test_insights_bucketing_helper_five_year_window_stays_bounded_and_lossless()
             assert ' -- ' in first['title'] or first['title'] == rows[0]['date']
 
 
+def test_insights_bucketing_five_year_window_runs_the_shipped_js_helper(tmp_path):
+    """Greptile P2 on head `99bfbf42cd37` (2026-10-15T19:09:44Z, tests/test_insights.py
+    "Chart test checks a copy"): the five-year window assertions above ran
+    `_py_bucket`, a Python RE-IMPLEMENTATION, so the SHIPPED
+    `_bucketDailyTokensForChart` could drop rows or mis-sum them and the suite
+    stayed green. This drives the real helper out of static/panels.js in node and
+    checks the per-bucket slices (dates, sums, labels) as well as the size and
+    endpoint invariants; `_py_bucket` stays the expected-result oracle.
+    """
+    import datetime as _datetime
+    import json as _json
+    import math as _math
+    import shutil as _shutil
+    import subprocess as _subprocess
+    import textwrap as _textwrap
+
+    node = _shutil.which("node")
+    if not node:  # pragma: no cover
+        pytest.skip("node not available")
+    fn = _function_body(PANELS_JS, "_bucketDailyTokensForChart")
+    assert "Math.ceil(len / 52)" in fn, "the shipped helper must keep the 5-year branch"
+
+    # Payload goes through a FILE: 1827 rows would blow the Windows command line.
+    windows = (31, 366, 730, 1826, 1827)
+    rows_by_n = {}
+    for n in windows:
+        rows = _make_daily_rows(n)
+        base = _datetime.date(2021, 5, 4)
+        for i, r in enumerate(rows):
+            r["date"] = (base + _datetime.timedelta(days=i)).isoformat()
+        rows_by_n[str(n)] = rows
+    payload_file = tmp_path / "bucket_rows.json"
+    payload_file.write_text(_json.dumps(rows_by_n), encoding="utf-8")
+
+    harness = _textwrap.dedent(r"""
+        const fs = require('fs');
+        %(fn)s
+        const payload = JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));
+        const out = {};
+        for (const [n, rows] of Object.entries(payload)) {
+          out[n] = _bucketDailyTokensForChart(rows);
+        }
+        console.log(JSON.stringify(out));
+    """) % {"fn": fn}
+    proc = _subprocess.run(
+        [node, "-e", harness, str(payload_file)],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert proc.returncode == 0, "node bucket probe failed: " + proc.stdout + proc.stderr
+    got = _json.loads(proc.stdout.strip().splitlines()[-1])
+
+    for n in windows:
+        rows = rows_by_n[str(n)]
+        js = got[str(n)]
+        expected_bs = _math.ceil(n / 52) if n > 365 else (2 if n <= 90 else 3 if n <= 180 else 8)
+        # Same shape as the Python oracle (which encodes the invariant).
+        assert len(js) == len(_py_bucket(rows)), f"n={n}: JS bucket count differs from the oracle"
+        assert len(js) == _math.ceil(n / expected_bs), f"n={n}: expected {_math.ceil(n / expected_bs)} bars"
+        assert len(js) <= 52, f"n={n} must stay <=52 bars, got {len(js)}"
+        assert js[0]["date"] == rows[0]["date"], f"n={n} first bucket date must be first input date"
+        assert js[-1]["date"] == rows[(len(js) - 1) * expected_bs]["date"]
+        # Per-bucket slices: a dropped row or a bad sum has to fail here.
+        for i, bucket in enumerate(js):
+            start = i * expected_bs
+            end = min(start + expected_bs, n) - 1
+            sl = rows[start:end + 1]
+            assert bucket["date"] == sl[0]["date"], f"n={n} bucket {i}: date"
+            assert bucket["input_tokens"] == sum(r["input_tokens"] for r in sl), f"n={n} bucket {i}: input"
+            assert bucket["output_tokens"] == sum(r["output_tokens"] for r in sl), f"n={n} bucket {i}: output"
+            assert bucket["sessions"] == sum(r["sessions"] for r in sl), f"n={n} bucket {i}: sessions"
+            assert bucket["cost"] == pytest.approx(sum(r["cost"] for r in sl), abs=1e-9), f"n={n} bucket {i}: cost"
+            first_lbl, last_lbl = sl[0]["date"][5:], sl[-1]["date"][5:]
+            if sl[0]["date"] == sl[-1]["date"]:
+                assert bucket["label"] == first_lbl, f"n={n} bucket {i}: label"
+                assert bucket["title"] == sl[0]["date"], f"n={n} bucket {i}: title"
+            else:
+                assert bucket["label"] == first_lbl + "\u2013" + last_lbl, f"n={n} bucket {i}: label"
+                assert bucket["title"] == sl[0]["date"] + " \u2013 " + sl[-1]["date"], f"n={n} bucket {i}: title"
+        # Nothing may be lost across the whole window.
+        assert sum(b["input_tokens"] for b in js) == sum(r["input_tokens"] for r in rows)
+        assert sum(b["output_tokens"] for b in js) == sum(r["output_tokens"] for r in rows)
+        assert sum(b["sessions"] for b in js) == sum(r["sessions"] for r in rows)
+        assert sum(b["cost"] for b in js) == pytest.approx(sum(r["cost"] for r in rows), abs=1e-9)
+
+
 def test_insights_period_change_preserves_custom_range_and_seeds_default_only_when_empty():
     """insightsPeriodChange must preserve Custom(A/B) across preset detour
     (seed trailing-30 only when BOTH inputs empty), and must seed a
@@ -1968,7 +2053,14 @@ def test_insights_period_select_carries_no_inline_visual_style():
     assert 'background-image:url("data:image/svg+xml' in shared_decl
     assert "no-repeat" in shared_decl
     # Full width now comes from the Insights rule instead of an inline style.
-    assert ".insights-range-bar .insights-period-select{width:100%;}" in STYLE_CSS
+    # UX fold 2026-10-15T19:15:14Z: the narrow select must ELLIPSIZE a long
+    # translation instead of hard-clipping it at the chevron (German at the 180px
+    # sidebar showed "Benutzerdefinierter" with no ellipsis; five locales clipped
+    # in the 223px phone drawer).
+    assert (
+        ".insights-range-bar .insights-period-select{width:100%;overflow:hidden;"
+        "white-space:nowrap;text-overflow:ellipsis;}" in STYLE_CSS
+    )
 
 
 def test_insights_range_bar_layout_lives_in_stylesheet():

@@ -6800,7 +6800,7 @@ main.main.showing-insights > #mainInsights{display:flex;overflow-y:auto;}
    <select> resets the shared select chevron background-image while
    `appearance:none` remains, which left the control looking like static text. */
 .insights-range-bar{display:flex;flex-direction:column;gap:8px;padding:12px 12px 6px;}
-.insights-range-bar .insights-period-select{width:100%;}
+.insights-range-bar .insights-period-select{width:100%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}
 #insightsCustomRange{display:none;flex-direction:column;gap:6px;}
 #insightsCustomRange input[type="date"]{width:100%;min-width:0;background:var(--input-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;padding:5px 10px;font-size:12px;}
 #insightsCustomRange input[type="date"]:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-bg);}
