@@ -207,6 +207,13 @@ START_PROJECT_RENAME_JS = """async () => {
   return proj.project_id;
 }"""
 
+DELETE_GATE_PROJECTS_JS = """async () => {
+  for (const project of (_allProjects || []).filter(p => p.name.startsWith('Gate project'))) {
+    await api('/api/projects/delete', {method: 'POST', body: JSON.stringify({project_id: project.project_id})});
+  }
+  await renderSessionList({deferWhileInteracting: false});
+}"""
+
 PROJECT_INPUT_FOCUSED_JS = "() => !!(document.activeElement && document.activeElement.classList.contains('project-create-input'))"
 
 PROJECT_RENAMED_JS = """async ([projectId, suffix]) => {
@@ -547,6 +554,19 @@ def _check_desktop(page, seed, name):
     page.evaluate("() => typeof closeSessionActionMenu === 'function' && closeSessionActionMenu()")
     page.wait_for_timeout(300)
 
+    # A press on the title that already has focus (a screen reader's activate
+    # command starts with mousedown) must leave focus there, as a native press
+    # on a focusable element would; otherwise an activation that then opens
+    # nothing (an open action menu only closes) drops the reading position to
+    # <body>.
+    _open(page, alpha)
+    _focus_title(page, beta)
+    page.evaluate("""(el) => el.dispatchEvent(new MouseEvent('mousedown',
+      {bubbles: true, cancelable: true, view: window, detail: 1, button: 0}))""", _title(page, beta))
+    if page.evaluate(FOCUSED_SID_JS) != beta:
+        fail("a screen reader's press on the focused title moved focus off it")
+    page.wait_for_timeout(300)
+
     # Double-click still renames (the title drops mouse focus, not the press).
     _open(page, alpha)
     _title(page, beta).dblclick()
@@ -607,6 +627,10 @@ def _check_desktop(page, seed, name):
         _title(page, gamma).click()
         if not _wait_until(page, PROJECT_RENAMED_JS, [project_id, suffix], timeout_ms=3000):
             fail("clicking a conversation title during a project rename did not save the new project name")
+        # Let the app's own refresh after the rename land before going on.
+        _wait_until(page, "(suffix) => Array.from(document.querySelectorAll('.project-chip')).some(c => c.textContent.includes(suffix))", suffix, timeout_ms=3000)
+    # Remove the project so later runs and screenshots show the usual sidebar.
+    page.evaluate(DELETE_GATE_PROJECTS_JS)
     page.wait_for_timeout(300)
 
     page.evaluate("() => toggleSessionSelectMode()")
@@ -629,27 +653,27 @@ def _open_drawer_if_phone(page, phone):
     page.wait_for_timeout(400)
 
 
-# SESSION_LONG_PRESS_DELAY_MS in static/sessions.js is 400 ms; hold well past it.
-LONG_PRESS_HOLD_MS = 700
+def _touch_point(box):
+    """Where native touches land on a row title: near its start, mid-height."""
+    return box["x"] + min(20, box["width"] / 3), box["y"] + box["height"] / 2
 
 
 def _native_short_swipe(cdp, box, dx=30, steps=3):
     """A horizontal touch drag through Chromium's native input pipeline (not
     dispatchEvent), shorter than the archive/delete thresholds: trusted
     touch/pointer events and no compatibility click."""
-    x = box["x"] + min(20, box["width"] / 3)
-    y = box["y"] + box["height"] / 2
+    x, y = _touch_point(box)
     cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]})
     for i in range(1, steps + 1):
         cdp.send("Input.dispatchTouchEvent", {"type": "touchMove", "touchPoints": [{"x": x + dx * i / steps, "y": y}]})
     cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
 
 
-def _native_long_press(cdp, box, hold_ms=LONG_PRESS_HOLD_MS):
-    """Hold a touch on a row through Chromium's native input pipeline, longer
-    than the app's long-press delay, then lift it."""
-    x = box["x"] + min(20, box["width"] / 3)
-    y = box["y"] + box["height"] / 2
+def _native_long_press(page, cdp, box):
+    """Hold a touch on a row through Chromium's native input pipeline, well
+    past the app's long-press delay, then lift it."""
+    hold_ms = page.evaluate("() => SESSION_LONG_PRESS_DELAY_MS") + 300
+    x, y = _touch_point(box)
     cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]})
     time.sleep(hold_ms / 1000)
     cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
@@ -761,7 +785,7 @@ def _check_touch(page, ctx, seed, label, phone):
     # for a tap).
     _open(page, alpha)
     _open_drawer_if_phone(page, phone)
-    _native_long_press(cdp, _title(page, beta).bounding_box())
+    _native_long_press(page, cdp, _title(page, beta).bounding_box())
     page.wait_for_timeout(300)
     if not page.evaluate("() => !!document.querySelector('.session-action-menu')"):
         fail("a long press did not open the action menu")

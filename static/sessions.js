@@ -5724,9 +5724,12 @@ function _findSessionRenameRow(sessionId){
 // it, so editors that save on blur (a session or project rename, a queued
 // message) commit and the on-screen keyboard closes. Row handlers that cancel
 // that press (the title's mousedown, the row's touchend) do it with this.
-function _releaseFocusLikeRowPress(){
+// A press on the focusable title keeps focus there when it already has it
+// (a screen reader's activate command starts with mousedown).
+function _releaseFocusLikeRowPress(pressedTitle){
   const active=document.activeElement;
-  if(active&&active!==document.body&&typeof active.blur==='function') active.blur();
+  if(!active||active===document.body||active===pressedTitle) return;
+  if(typeof active.blur==='function') active.blur();
 }
 
 function _buildSessionRenameStarter(session, displayEl, renderDisplay){
@@ -9673,7 +9676,7 @@ function renderSessionListFromCache(){
         if(e.button!==0) return;
         e.preventDefault();
         // The prevented default also leaves focus where it was.
-        _releaseFocusLikeRowPress();
+        _releaseFocusLikeRowPress(title);
       };
     }
     const tsMs=_sessionTimestampMs(s);
@@ -10620,7 +10623,7 @@ function renderSessionListFromCache(){
         // gets no mousedown either). During a rename this commits it, and it
         // must come after _finishSessionGesture: an unchanged rename ends at
         // once, and the gesture must still see it active and open nothing.
-        if(!_longPressMenuOpened) _releaseFocusLikeRowPress();
+        if(!_longPressMenuOpened) _releaseFocusLikeRowPress(el.querySelector('.session-title'));
       }
     },{passive:false});
     return el;
