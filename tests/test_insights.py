@@ -429,11 +429,15 @@ def test_insights_refresh_restored_by_latest_request_runtime():
     # so the extracted function stays async exactly like the shipped source.
     if load_fn.startswith("function loadInsights("):
         load_fn = "async " + load_fn
+    # The refresh path re-caps the custom-range pickers, so the extracted
+    # loadInsights() needs the helper (and a _toDateLocal shim) in scope.
+    sync_fn = _function_body(PANELS_JS, "_insightsSyncDateLimits")
 
     harness = textwrap.dedent(
         """
         %(load_fn)s
-
+        %(sync_fn)s
+        function _toDateLocal(d){const pad=n=>String(n).padStart(2,'0');return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;}
         // Mutable holders so BOTH scenarios read the `$`-resolved elements.
         let curBox = { innerHTML: '' };
         let curBtn = { style: {}, disabled: false };
@@ -514,7 +518,7 @@ def test_insights_refresh_restored_by_latest_request_runtime():
 
         console.log(JSON.stringify({ successPass: true, errorPass: true }));
         """
-    ) % {"load_fn": load_fn}
+    ) % {"load_fn": load_fn, "sync_fn": sync_fn}
 
     # `--input-type=module` is explicit: `node -e` input is parsed as CommonJS
     # on some Node 20 releases, where this harness's top-level `await` was a
@@ -1614,6 +1618,8 @@ def test_insights_period_change_preserves_custom_range_and_seeds_default_only_wh
     Static guarantee of MUST-FIX 2 plus runtime probe of the real handler."""
     import json, shutil, subprocess, textwrap
     period_fn = _function_body(PANELS_JS, "insightsPeriodChange")
+    # The cap now lives in a shared helper that insightsPeriodChange calls.
+    sync_fn = _function_body(PANELS_JS, "_insightsSyncDateLimits")
     assert "!startEl.value && !endEl.value" in period_fn, "must guard seeding on both inputs empty"
     assert "Math.ceil(len / 52)" in PANELS_JS, "panels.js must use Math.ceil(len/52) for >365"
     # r1 UX (2026-10-13): the row no longer wraps side by side, so the
@@ -1627,6 +1633,7 @@ def test_insights_period_change_preserves_custom_range_and_seeds_default_only_wh
         _pytest.skip("node not available")
     harness = textwrap.dedent(r"""
         %(period_fn)s
+        %(sync_fn)s
         function _toDateLocal(d){const pad=n=>String(n).padStart(2,'0');return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;}
         let periodVal = 'custom';
         let startVal = '';
@@ -1664,7 +1671,7 @@ def test_insights_period_change_preserves_custom_range_and_seeds_default_only_wh
         periodVal='custom'; insightsPeriodChange();
         if(startVal!=='2026-01-10' || endVal!=='') throw new Error('partial fill must not reseed, got '+startVal+'/'+endVal);
         console.log(JSON.stringify({ok:true}));
-    """) % {"period_fn": period_fn}
+    """) % {"period_fn": period_fn, "sync_fn": sync_fn}
     proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=10, check=False)
     assert proc.returncode == 0, "node handler probe failed: " + proc.stdout + proc.stderr
     out = json.loads(proc.stdout.strip().splitlines()[-1])
@@ -2588,6 +2595,64 @@ def test_insights_date_inputs_are_capped_at_today():
     date after today, so the platform picker stops suggesting windows the
     server rejects (the server-side check stays authoritative)."""
     assert "if (startEl && endEl) startEl.max = endEl.max = _toDateLocal(new Date());" in PANELS_JS
+
+
+def test_insights_date_cap_refreshes_on_focus_and_on_every_refresh():
+    """Greptile P2 on the merge-only head 5d045ad4 (2026-10-15T22:36:54Z,
+    static/panels.js:4604, "Today's date stays unavailable"): ``max`` was written
+    only by insightsPeriodChange, so a panel left open across midnight kept
+    yesterday as the cap and today stayed unselectable until the user detoured
+    through a preset and back. The cap now lives in one helper that the refresh
+    path (loadInsights) and both pickers' focus handlers call, and it is computed
+    at CALL time - a parse-time constant would keep returning yesterday, which is
+    exactly the reported symptom.
+    """
+    import shutil
+    import subprocess
+    import textwrap
+
+    helper = _function_body(PANELS_JS, "_insightsSyncDateLimits")
+    assert "startEl.max = endEl.max = _toDateLocal(new Date())" in helper, \
+        "the cap must live in the shared helper"
+    assert "_insightsSyncDateLimits()" in _function_body(PANELS_JS, "insightsPeriodChange"), \
+        "entering Custom must still cap the controls"
+    assert "_insightsSyncDateLimits()" in _function_body(PANELS_JS, "loadInsights"), \
+        "a refresh must re-cap the controls (yesterday must not survive midnight)"
+    for eid in ("insightsStart", "insightsEnd"):
+        assert 'onfocus="_insightsSyncDateLimits()"' in _open_tag_source(INDEX_HTML, eid), \
+            f"#{eid} must re-cap when its picker is opened"
+
+    node = shutil.which("node")
+    if not node:  # pragma: no cover
+        pytest.skip("node not available")
+    harness = textwrap.dedent(r"""
+        %(helper)s
+        function _toDateLocal(d){const pad=n=>String(n).padStart(2,'0');return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;}
+        let startObj = {max:''};
+        let endObj = {max:''};
+        global.$ = (id)=>{
+          if(id==='insightsStart') return startObj;
+          if(id==='insightsEnd') return endObj;
+          return null;
+        };
+        const RealDate = Date;
+        let now = new RealDate('2026-10-15T12:00:00');
+        global.Date = class extends RealDate {
+          constructor(...args){ if(args.length===0){ super(now.getTime()); } else { super(...args); } }
+        };
+        _insightsSyncDateLimits();
+        if(startObj.max!=='2026-10-15' || endObj.max!=='2026-10-15')
+          throw new Error('the cap must be today on the first call, got '+startObj.max+'/'+endObj.max);
+        // Midnight passes while the Insights tab stays open.
+        now = new RealDate('2026-10-16T09:00:00');
+        _insightsSyncDateLimits();
+        if(startObj.max!=='2026-10-16' || endObj.max!=='2026-10-16')
+          throw new Error('the re-cap must follow the new day, got '+startObj.max+'/'+endObj.max);
+        console.log(JSON.stringify({ok:true}));
+    """) % {"helper": helper}
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=10, check=False)
+    assert proc.returncode == 0, "node cap probe failed: " + proc.stdout + proc.stderr
+    assert json.loads(proc.stdout.strip().splitlines()[-1])["ok"] is True
 
 
 def test_insights_range_fallback_note_is_localized_at_runtime():

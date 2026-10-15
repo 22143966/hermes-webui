@@ -4543,6 +4543,10 @@ async function loadInsights(animate) {
     refreshBtn.disabled = true;
   }
   const period = ($('insightsPeriod') || {}).value || '30';
+  // Re-cap the custom-range pickers on every refresh: a tab left open across
+  // midnight otherwise keeps yesterday as `max` and today stays unselectable
+  // (greptile P2, 2026-10-15T22:36:54Z, static/panels.js:4604).
+  _insightsSyncDateLimits();
   const qs = new URLSearchParams();
   if (period === 'custom') {
     const startEl = $('insightsStart');
@@ -4587,6 +4591,20 @@ async function loadInsights(animate) {
   }
 }
 
+// A future bound is not a servable window: cap both date controls at today so
+// the platform picker cannot offer dates the server will reject (#6970).
+// Lives in one helper because the cap must be recomputed whenever it could have
+// aged: entering Custom, every refresh, and whenever a picker is opened. Writing
+// it only from insightsPeriodChange left a panel that stayed open across
+// midnight with yesterday as the cap, so today was unselectable until the user
+// detoured through a preset (greptile P2, 2026-10-15T22:36:54Z,
+// static/panels.js:4604).
+function _insightsSyncDateLimits() {
+  const startEl = $('insightsStart');
+  const endEl = $('insightsEnd');
+  if (startEl && endEl) startEl.max = endEl.max = _toDateLocal(new Date());
+}
+
 function insightsPeriodChange() {
   const sel = $('insightsPeriod');
   const customWrap = $('insightsCustomRange');
@@ -4599,9 +4617,7 @@ function insightsPeriodChange() {
     // Custom still shows A/B instead of silently erasing it.
     const startEl = $('insightsStart');
     const endEl = $('insightsEnd');
-    // A future bound is not a servable window: cap both controls at today so
-    // the platform picker cannot offer dates the server will reject (#6970).
-    if (startEl && endEl) startEl.max = endEl.max = _toDateLocal(new Date());
+    _insightsSyncDateLimits();
     if (startEl && endEl && !startEl.value && !endEl.value) {
       const end = new Date();
       const start = new Date();
