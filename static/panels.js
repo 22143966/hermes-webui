@@ -7817,13 +7817,28 @@ function _sanitizeTabPanelList(panels){
   return out;
 }
 
+// The localStorage key is a CACHE of the resolved preference, never the
+// authority (gate certificate 2026-10-13, "stale hidden-tabs replay,
+// including when the tray is off"): _setHiddenTabs tolerates a failed write
+// (quota exhausted, storage blocked/disabled), which leaves the READABLE
+// mirror holding the PREVIOUS list.  A later reader then restored that stale
+// preference over the hidden_tabs the server had just resolved - the in-chat
+// tray's rail-sync replay calls _applyTabVisibility(_getHiddenTabs()), so a
+// tray-off profile switch reversed the freshly applied tabs (Todos hidden /
+// Memory visible became Todos visible / Memory hidden).  Remember the
+// resolved list in memory and prefer it over the mirror.
+let _hiddenTabsResolved = null;
+
 function _getHiddenTabs(){
+  if(_hiddenTabsResolved) return _hiddenTabsResolved.slice();
   try{var h=localStorage.getItem(_HIDDEN_TABS_LS_KEY);if(h)return _sanitizeTabPanelList(JSON.parse(h));}catch(e){}
   return[];
 }
 
 function _setHiddenTabs(panels){
-  try{localStorage.setItem(_HIDDEN_TABS_LS_KEY,JSON.stringify(_sanitizeTabPanelList(panels)));}catch(e){}
+  var resolved=_sanitizeTabPanelList(panels);
+  _hiddenTabsResolved=resolved;
+  try{localStorage.setItem(_HIDDEN_TABS_LS_KEY,JSON.stringify(resolved));}catch(e){}
 }
 
 function _getTabOrder(){

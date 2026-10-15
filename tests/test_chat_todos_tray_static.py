@@ -2058,3 +2058,150 @@ def test_clear_conversation_drops_the_tray_tasks(tmp_path):
     assert _run_node(tmp_path, "clear_todos_probe.js", script).strip() == "ok"
 
 
+# ---------------------------------------------------------------------------
+# Gate certificate 2026-10-13 (RED) — a READABLE but STALE hidden-tabs mirror
+# must never beat the hidden_tabs the reconciliation just resolved
+# ---------------------------------------------------------------------------
+
+_MIRROR_WRITE_FAILURE_PROBE = r"""
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+__COUNTER__
+__GUARD__
+__HIDDEN_TABS__
+let _tabVisGuardHeld = false;
+globalThis.window = {};
+const S = {session: null};
+let _profileSwitchGeneration = 11;
+const _switchGen = _profileSwitchGeneration;
+let fulfill = null;
+let applied = [];
+// The gate's selective-storage-failure schedule: the mirror still READS fine
+// and holds the PREVIOUS profile's list, while exactly one write is rejected
+// (quota exhausted, storage blocked/disabled).
+let mirrorValue = JSON.stringify(['todos']);
+let rejectMirrorWrite = false;
+let rejectedWrites = 0;
+let acceptedWrites = 0;
+globalThis.localStorage = {
+  getItem(k) { return k === _HIDDEN_TABS_LS_KEY ? mirrorValue : null; },
+  setItem(k, v) {
+    if (k !== _HIDDEN_TABS_LS_KEY) return;
+    if (rejectMirrorWrite) { rejectMirrorWrite = false; rejectedWrites++; throw new Error('QuotaExceededError'); }
+    acceptedWrites++; mirrorValue = v;
+  },
+};
+function api(path) {
+  assert(path === '/api/settings', 'unexpected api path: ' + path);
+  return new Promise(function (res) { fulfill = res; });
+}
+function loadWorkspaceList() { return Promise.resolve(); }
+function syncTopbar() {}
+function _setTabOrder() {}
+function _applyTabOrder() {}
+function _applyTabVisibility(h) { applied.push(h.slice()); }
+function _ensureComposerControlVisibilityState() {}
+function _setComposerControlOrder() { return []; }
+function _renderComposerControlChips() {}
+function _renderComposerSituationalControlChips() {}
+function _applyComposerFooterVisibilitySettings() {}
+function _applyTitlebarProfileVisibility() {}
+__RECONCILE__
+let trayOn = false;                 // the certificate's repro runs tray OFF
+function chatTodosEnabled() { return trayOn; }
+const todosEls = [{classList:{_s:new Set(),add(c){this._s.add(c);},remove(c){this._s.delete(c);},contains(c){return this._s.has(c);}}}];
+globalThis.document = {
+  querySelectorAll(sel) { return sel === '[data-panel="todos"]' ? todosEls : []; },
+  getElementById() { return null; },
+  querySelector() { return null; },
+};
+globalThis._tabVisibilitySnapshotStale = _tabVisibilitySnapshotStale;
+__RAIL__
+function settled() { return new Promise(function (r) { setImmediate(r); }); }
+(async function () {
+  // Cold boot: nothing resolved in memory yet, so the mirror is the source.
+  assert(_getHiddenTabs().join() === 'todos',
+    'cold boot must hydrate from the mirror, got ' + _getHiddenTabs().join());
+
+  // A profile switch arms the stale-snapshot guard and hands it to the
+  // reconciliation, whose mirror write is REJECTED.
+  __ARM__
+  __HANDOFF__
+  rejectMirrorWrite = true;
+  applied = [];
+  fulfill({hidden_tabs: ['memory'], tab_order: ['chat']});
+  await settled();
+
+  assert(rejectedWrites === 1, 'the probe must reject exactly one mirror write');
+  assert(mirrorValue === JSON.stringify(['todos']),
+    'the readable mirror must still hold the previous list, got ' + mirrorValue);
+  assert(applied.length >= 1 && applied[0].join() === 'memory',
+    'the reconciliation must apply the server list first, got ' + JSON.stringify(applied));
+  // The settle path replays the tray rail sync (tray OFF -> it re-derives from
+  // _getHiddenTabs()); before the fix that re-derivation read the stale mirror
+  // and reversed the tabs the reconciliation had just applied correctly.
+  assert(applied.length >= 2,
+    'the tray-off settle path must replay the rail sync, got ' + JSON.stringify(applied));
+  assert(applied.every(function (h) { return h.join() !== 'todos'; }),
+    'no replay may restore the stale mirror, got ' + JSON.stringify(applied));
+  assert(applied[applied.length - 1].join() === 'memory',
+    'the final re-derivation must be the resolved list, got ' + applied[applied.length - 1].join());
+  assert(_getHiddenTabs().join() === 'memory',
+    'the resolved list must stay authoritative in memory, got ' + _getHiddenTabs().join());
+  assert(acceptedWrites === 0, 'no mirror write may have been accepted in this window');
+
+  // The mirror keeps working once storage accepts writes again, and an empty
+  // resolved list is authoritative too (it must not fall back to the mirror).
+  rejectMirrorWrite = false;
+  _setHiddenTabs(['notes']);
+  assert(acceptedWrites === 1 && mirrorValue === JSON.stringify(['notes']),
+    'a later accepted write must persist to the mirror');
+  _setHiddenTabs([]);
+  assert(_getHiddenTabs().length === 0,
+    'an empty resolved list must not fall back to the readable mirror');
+  console.log('ok');
+})().catch(function (e) { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def test_resolved_hidden_tabs_survive_a_rejected_mirror_write(tmp_path):
+    """Gate certificate 2026-10-13 (blocking, RED on 0ed6422d): with the tray
+    OFF, reject exactly one localStorage.setItem for the hidden-tabs mirror
+    while the profile reconciliation applies the server's CURRENT hidden_tabs.
+    _setHiddenTabs tolerates the failed write, so the readable mirror keeps the
+    previous list; the tray's rail-sync replay then read it back and reversed
+    the correctly applied tabs (server ["memory"] applied, mirror ["todos"]
+    restored).  The resolved list must stay authoritative in memory."""
+    panels = _read_static("static/panels.js")
+    ui = _read_static("static/ui.js")
+    counter, guard = _extract_reconcile_guard(panels)
+    hidden_tabs = _extract(
+        panels, "const _ALWAYS_VISIBLE_TABS = new Set", "function _getTabOrder(){"
+    )
+    assert "let _hiddenTabsResolved = null;" in hidden_tabs, (
+        "the resolved hidden_tabs must be remembered in memory"
+    )
+    assert "if(_hiddenTabsResolved) return _hiddenTabsResolved.slice();" in hidden_tabs, (
+        "_getHiddenTabs() must prefer the resolved list over the mirror"
+    )
+    assert "_hiddenTabsResolved=resolved;" in hidden_tabs, (
+        "_setHiddenTabs() must record the resolved list even when the mirror write fails"
+    )
+    reconcile = _extract(
+        panels,
+        "function _refreshProfileSwitchBackground(gen){",
+        "async function loadProfilesPanel()",
+    )
+    rail = _extract(
+        ui, "function _syncChatTodosRailVisibility(){", "let _chatTodosResizeObserver"
+    )
+    arm, handoff, _release = _extract_switch_guard_arms(panels)
+    script = (
+        _MIRROR_WRITE_FAILURE_PROBE.replace("__COUNTER__", counter)
+        .replace("__GUARD__", guard)
+        .replace("__HIDDEN_TABS__", hidden_tabs)
+        .replace("__RECONCILE__", reconcile)
+        .replace("__RAIL__", rail)
+        .replace("__ARM__", arm)
+        .replace("__HANDOFF__", handoff)
+    )
+    assert _run_node(tmp_path, "mirror_write_failure_probe.js", script).strip() == "ok"
