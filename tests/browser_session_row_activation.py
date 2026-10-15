@@ -239,6 +239,23 @@ def _focus_title(page, sid):
     }""", sid)
 
 
+RENAME_INPUT_FOCUSED_JS = "() => !!(document.activeElement && document.activeElement.matches('#sessionList .session-title-input'))"
+
+
+def _dblclick_rename(page, sid):
+    """Double-click a title to start its rename. One retry: a sidebar repaint
+    between the two clicks can replace the row, so the browser sees two single
+    clicks; a broken rename still fails both attempts."""
+    for _ in range(2):
+        title = _title(page, sid)
+        if title is not None:
+            title.dblclick()
+            if _wait_until(page, RENAME_INPUT_FOCUSED_JS, timeout_ms=2000):
+                return True
+        page.wait_for_timeout(SETTLE_MS)
+    return False
+
+
 def _open(page, sid):
     page.evaluate("(sid) => loadSession(sid)", sid)
     _wait_until(page, ACTIVE_JS, sid)
@@ -567,9 +584,7 @@ def _check_desktop(page, seed, name):
 
     # Double-click still renames (the title drops mouse focus, not the press).
     _open(page, alpha)
-    _title(page, beta).dblclick()
-    focused_input = "() => !!(document.activeElement && document.activeElement.matches('#sessionList .session-title-input'))"
-    if not _wait_until(page, focused_input, timeout_ms=2000):
+    if not _dblclick_rename(page, beta):
         fail("double-clicking a title no longer starts a rename")
     page.keyboard.press("Escape")
     if not _wait_until(page, "() => !_renamingSid && !document.querySelector('#sessionList .session-title-input')", timeout_ms=2000):
@@ -582,8 +597,7 @@ def _check_desktop(page, seed, name):
     # swallow the click until Enter or Escape. Like master, that click does not
     # also open the other conversation: committing re-renders the list.
     _open(page, alpha)
-    _title(page, beta).dblclick()
-    if not _wait_until(page, focused_input, timeout_ms=2000):
+    if not _dblclick_rename(page, beta):
         fail("double-clicking a title no longer starts a rename (rename-then-click case)")
     else:
         page.keyboard.press("End")
@@ -601,8 +615,7 @@ def _check_desktop(page, seed, name):
     # release opens the other conversation, as on master; whether it opens is
     # not asserted here.
     _open(page, alpha)
-    _title(page, beta).dblclick()
-    if not _wait_until(page, focused_input, timeout_ms=2000):
+    if not _dblclick_rename(page, beta):
         fail("double-clicking a title no longer starts a rename (unchanged-name case)")
     else:
         _title(page, gamma).click()
@@ -804,7 +817,7 @@ def _check_touch(page, ctx, seed, label, phone):
     _open(page, alpha)
     _open_drawer_if_phone(page, phone)
     page.evaluate(START_RENAME_JS, beta)
-    focused_input = "() => !!(document.activeElement && document.activeElement.matches('#sessionList .session-title-input'))"
+    focused_input = RENAME_INPUT_FOCUSED_JS
     if not _wait_until(page, focused_input, timeout_ms=2000):
         fail("could not start a rename (rename-then-tap case)")
     else:
