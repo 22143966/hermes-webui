@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import copy
+from pathlib import Path
 from types import SimpleNamespace
 
 from api import streaming
@@ -301,6 +302,88 @@ def test_session_delete_removes_dedicated_draft_file(tmp_path, monkeypatch):
     assert payload["ok"] is True
     assert not (session_dir / f"{sid}.json").exists()
     assert not (session_dir / ".drafts" / f"{sid}.json").exists()
+
+
+def test_session_delete_blocks_zero_message_owner_recaching_during_unlink(tmp_path, monkeypatch):
+    models, routes, session_dir = _build_draft_env(tmp_path, monkeypatch)
+    sid = "sid-delete-zero-message-race"
+    owner_path = (session_dir / f"{sid}.json").resolve()
+    draft_path = session_dir / ".drafts" / f"{sid}.json"
+    models.Session(session_id=sid, title="Untitled", messages=[]).save(
+        touch_updated_at=False,
+        skip_index=True,
+    )
+    routes._save_session_draft(sid, {"text": "meaningful draft", "files": []})
+    assert owner_path.exists() and draft_path.exists()
+
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda value: {})
+    monkeypatch.setattr(routes, "_is_messaging_session_id", lambda value: False)
+    monkeypatch.setattr(routes, "_session_is_subagent_view_only", lambda value: False)
+
+    monkeypatch.setattr(
+        routes, "bad",
+        lambda handler, message, status=400: routes.j(handler, {"error": message}, status=status),
+    )
+    real_unlink = Path.unlink
+    reader_attempted = threading.Event()
+    reader_finished = threading.Event()
+    reader_result = {}
+    interposed = {"owner": False, "finished_before_unlink": False}
+    reader_thread = None
+
+    def unlink_with_cold_reader(path, *args, **kwargs):
+        nonlocal reader_thread
+        if path == owner_path and not interposed["owner"]:
+            interposed["owner"] = True
+
+            def read_owner():
+                reader_attempted.set()
+                try:
+                    reader_result["owner"] = models.get_session(sid)
+                except Exception as exc:
+                    reader_result["error"] = exc
+                finally:
+                    reader_finished.set()
+
+            reader_thread = threading.Thread(target=read_owner, daemon=True)
+            reader_thread.start()
+            interposed["attempted"] = reader_attempted.wait(timeout=2)
+            interposed["finished_before_unlink"] = reader_finished.wait(timeout=0.5)
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink_with_cold_reader)
+    try:
+        delete_status, delete_payload = _post_json(
+            monkeypatch,
+            routes,
+            "/api/session/delete",
+            {"session_id": sid},
+        )
+    finally:
+        monkeypatch.setattr(Path, "unlink", real_unlink)
+        if reader_thread is not None:
+            reader_thread.join(timeout=3)
+
+    assert reader_thread is not None and not reader_thread.is_alive()
+    assert interposed["owner"] and interposed["attempted"]
+    if interposed["finished_before_unlink"]:
+        resurrected = reader_result.get("owner")
+        assert resurrected is not None
+        assert resurrected.session_id == sid and not resurrected.messages
+        assert models.SESSIONS.get(sid) is resurrected
+    else:
+        assert isinstance(reader_result.get("error"), KeyError)
+
+    assert delete_status == 200 and delete_payload["ok"] is True
+    draft_status, _ = _post_json(
+        monkeypatch,
+        routes,
+        "/api/session/draft",
+        {"session_id": sid, "text": "too late", "files": []},
+    )
+    assert draft_status == 404
+    assert not owner_path.exists()
+    assert not draft_path.exists()
 
 
 def test_route_session_delete_is_final_after_inflight_autosave(tmp_path, monkeypatch):
