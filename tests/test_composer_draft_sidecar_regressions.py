@@ -1401,6 +1401,59 @@ def test_sessions_cleanup_reports_draft_delete_failure(tmp_path, monkeypatch):
     assert (session_dir / ".drafts" / f"{sid}.json").exists()
 
 
+@pytest.mark.parametrize("zero_only", [False, True])
+def test_sessions_cleanup_retries_orphaned_draft_after_owner_delete(tmp_path, monkeypatch, zero_only):
+    models, routes, session_dir = _build_draft_env(tmp_path, monkeypatch)
+
+    victim_sid = "sid-cleanup-retry-victim"
+    live_sid = "sid-cleanup-retry-live"
+    victim_owner = session_dir / f"{victim_sid}.json"
+    victim_draft = session_dir / ".drafts" / f"{victim_sid}.json"
+    live_owner = session_dir / f"{live_sid}.json"
+    live_draft = session_dir / ".drafts" / f"{live_sid}.json"
+
+    models.Session(session_id=victim_sid, title="Untitled").save(
+        touch_updated_at=False,
+        skip_index=True,
+    )
+    models.Session(
+        session_id=live_sid,
+        title="Live control",
+        messages=[{"role": "user", "content": "keep this session"}],
+    ).save(touch_updated_at=False, skip_index=True)
+    routes._save_session_draft(victim_sid, {"text": "retry me", "files": []})
+    routes._save_session_draft(live_sid, {"text": "leave alone", "files": []})
+    live_owner_bytes = live_owner.read_bytes()
+    live_draft_bytes = live_draft.read_bytes()
+
+    real_unlink = Path.unlink
+    fail_victim_unlink = True
+
+    def unlink_with_draft_failure(path, *args, **kwargs):
+        if path == victim_draft and fail_victim_unlink:
+            raise PermissionError("draft sidecar is temporarily locked")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink_with_draft_failure)
+
+    status, _ = _cleanup_route(monkeypatch, routes, zero_only=zero_only)
+
+    assert status == 500
+    assert not victim_owner.exists()
+    assert victim_draft.exists()
+    assert live_owner.read_bytes() == live_owner_bytes
+    assert live_draft.read_bytes() == live_draft_bytes
+
+    fail_victim_unlink = False
+    status, _ = _cleanup_route(monkeypatch, routes, zero_only=zero_only)
+
+    assert status == 200
+    assert not victim_owner.exists()
+    assert not victim_draft.exists()
+    assert live_owner.read_bytes() == live_owner_bytes
+    assert live_draft.read_bytes() == live_draft_bytes
+
+
 def test_session_delete_reports_draft_delete_failure(tmp_path, monkeypatch):
     import api.routes as routes
 
