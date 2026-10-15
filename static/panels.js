@@ -7841,6 +7841,18 @@ function _setHiddenTabs(panels){
   try{localStorage.setItem(_HIDDEN_TABS_LS_KEY,JSON.stringify(resolved));}catch(e){}
 }
 
+// The mirror is ALSO shared with other tabs. A successful write from another
+// tab fires a `storage` event here, and that newer value must win over the
+// copy this page resolved - otherwise an appearance autosave in the second
+// tab posts its OLD hidden_tabs list and undoes the first tab's choice
+// (greptile P1, 2026-10-15T14:49:46Z). A write by THIS page never fires the
+// event here, so an in-page reconciliation keeps the authority it needs.
+if(typeof window!=='undefined'&&window.addEventListener){
+  window.addEventListener('storage',function(e){
+    if(e&&e.key===_HIDDEN_TABS_LS_KEY) _hiddenTabsResolved=null;
+  });
+}
+
 function _getTabOrder(){
   try{var h=localStorage.getItem(_TAB_ORDER_LS_KEY);if(h)return _sanitizeTabPanelList(JSON.parse(h));}catch(e){}
   return[];

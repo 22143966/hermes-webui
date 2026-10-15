@@ -2067,9 +2067,14 @@ _MIRROR_WRITE_FAILURE_PROBE = r"""
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
 __COUNTER__
 __GUARD__
+// The slice registers its cross-tab refresh on window, so the stub must exist
+// BEFORE it is evaluated (and must keep addEventListener).
+let storageHandlers = [];
+globalThis.window = {
+  addEventListener(type, fn) { if (type === 'storage') storageHandlers.push(fn); },
+};
 __HIDDEN_TABS__
 let _tabVisGuardHeld = false;
-globalThis.window = {};
 const S = {session: null};
 let _profileSwitchGeneration = 11;
 const _switchGen = _profileSwitchGeneration;
@@ -2149,12 +2154,29 @@ function settled() { return new Promise(function (r) { setImmediate(r); }); }
     'the resolved list must stay authoritative in memory, got ' + _getHiddenTabs().join());
   assert(acceptedWrites === 0, 'no mirror write may have been accepted in this window');
 
+  // A DIFFERENT TAB's successful write must win over the copy resolved here
+  // (greptile P1, 2026-10-15T14:49:46Z): its `storage` event clears the in-page
+  // authority, so the next read re-derives from the freshly stored value.
+  assert(storageHandlers.length === 1, 'the slice must register one storage listener');
+  mirrorValue = JSON.stringify(['memory', 'notes']);   // the sibling tab wrote it
+  storageHandlers[0]({key: _HIDDEN_TABS_LS_KEY});
+  assert(_getHiddenTabs().join() === 'memory,notes',
+    'a sibling tab must win with its stored preference, got ' + _getHiddenTabs().join());
+  // ...and an unrelated key never clears it.
+  _setHiddenTabs(['todos']);
+  assert(mirrorValue === JSON.stringify(['todos']),
+    'an accepted in-page write must still reach the mirror');
+  storageHandlers[0]({key: 'some-other-key'});
+  assert(_getHiddenTabs().join() === 'todos',
+    'an unrelated storage event must not drop the in-page authority');
+
   // The mirror keeps working once storage accepts writes again, and an empty
   // resolved list is authoritative too (it must not fall back to the mirror).
   rejectMirrorWrite = false;
   _setHiddenTabs(['notes']);
-  assert(acceptedWrites === 1 && mirrorValue === JSON.stringify(['notes']),
+  assert(mirrorValue === JSON.stringify(['notes']),
     'a later accepted write must persist to the mirror');
+  assert(acceptedWrites >= 2, 'accepted writes must be counted, got ' + acceptedWrites);
   _setHiddenTabs([]);
   assert(_getHiddenTabs().length === 0,
     'an empty resolved list must not fall back to the readable mirror');
@@ -2185,6 +2207,12 @@ def test_resolved_hidden_tabs_survive_a_rejected_mirror_write(tmp_path):
     )
     assert "_hiddenTabsResolved=resolved;" in hidden_tabs, (
         "_setHiddenTabs() must record the resolved list even when the mirror write fails"
+    )
+    assert "window.addEventListener('storage',function(e){" in hidden_tabs, (
+        "a sibling tab's successful write must refresh the in-page copy"
+    )
+    assert "if(e&&e.key===_HIDDEN_TABS_LS_KEY) _hiddenTabsResolved=null;" in hidden_tabs, (
+        "only a write to the hidden-tabs key may drop the in-page copy"
     )
     reconcile = _extract(
         panels,
