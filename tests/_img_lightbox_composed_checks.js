@@ -115,22 +115,26 @@
     }));
   }
 
-  function wheel(vp, dy, x, y) {
+  function wheel(vp, dy, x, y, mode) {
     vp.dispatchEvent(new WheelEvent("wheel", {
       bubbles: true,
       cancelable: true,
       composed: true,
-      deltaMode: 0,
+      deltaMode: mode == null ? 0 : mode,
       deltaY: dy,
       clientX: x,
       clientY: y,
     }));
   }
 
+  // `points` are {x, y} (identifier defaults to the index + 1) or
+  // {x, y, id} when a check needs stable touch identifiers across events —
+  // replacing one finger of a pinch means the remaining pair must keep ITS
+  // identifiers (see the item-5 checks).
   function touch(el, type, points) {
     var list = points.map(function (p, i) {
       return new Touch({
-        identifier: i + 1,
+        identifier: p.id == null ? i + 1 : p.id,
         target: el,
         clientX: p.x,
         clientY: p.y,
@@ -961,6 +965,9 @@
       assert_(close.right <= window.innerWidth + 0.5, "close button escapes the viewport");
       assert_(fit.left >= 0 && fit.top >= 0, "Fit button escapes the viewport");
     });
+
+    await runGate1015Touch(bucket);
+    await runGate1015Mouse(bucket);
   }
 
   async function runMobile(bucket) {
@@ -1030,6 +1037,263 @@
         if (sidebar) sidebar.classList.remove("mobile-open", "mobile-panel-drawer");
       }
     });
+
+    await runGate1015Touch(bucket);
+  }
+
+  /* ---------------------------------------------------------------------
+   * Maintainer re-gate 2026-10-15T17:54:15Z (review 5537610966): Codex drove
+   * the gesture code on desktop and iPhone (390x844) and found seven silent
+   * edge cases, each with a reproduction and a small exact fix. One browser
+   * check per item, all through the production handlers; item 5 needs touch
+   * identifiers that survive a finger being replaced, which is why `touch()`
+   * accepts an explicit `id`.
+   * ------------------------------------------------------------------- */
+
+  // 1a. static/ui.js:2795 — gestures used to overwrite freshly fitted geometry.
+  // A pinch armed while the image is still decoding kept a baseline measured
+  // against the PREVIOUS frame's fit, so the next move rescaled the new one:
+  // a 4000x3000 image jumped from its fitted 351px width to 4080px on an
+  // iPhone. Touch updates must be ignored until the image has dimensions.
+  async function fitSurvivesAGestureStartedWithoutGeometry() {
+    var box = await openBox(4000, 3000, {
+      images: [
+        { src: svgDataUrl(4000, 3000), alt: "huge" },
+        { src: "data:image/png;base64,AAAA", alt: "broken" },
+        { src: svgDataUrl(4000, 3000), alt: "huge again" },
+      ],
+      index: 0,
+    });
+    var size = vpSize(box.vp);
+    var rect = box.vp.getBoundingClientRect();
+    var cx = rect.left + size.w / 2;
+    var cy = rect.top + size.h / 2;
+    // The broken entry drops the geometry, which is the reported window.
+    key("ArrowRight");
+    for (var i = 0; i < 180 && box.z.boxW; i++) await frame();
+    assert_(box.z.boxW === 0, "fixture: the broken entry must drop the geometry");
+    var fingers = [{ x: cx - 40, y: cy }, { x: cx + 40, y: cy }];
+    touch(box.vp, "touchstart", fingers);
+    assert_(box.z.pinching === false, "a pinch must not arm before the image has dimensions");
+    // The next entry opens at ITS own fit; the fingers are still down and
+    // spread, and must not be able to overwrite that fit.
+    key("ArrowRight");
+    for (var j = 0; j < 240 && !box.z.boxW; j++) await frame();
+    for (var a = 0; a < 4; a++) await frame();
+    var fitted = box.z.scale;
+    var fittedW = box.z.boxW * box.z.scale;
+    assert_(Math.abs(fitted - box.z.fitScale) < 1e-9, "fixture: the image must open at its fit");
+    touch(box.vp, "touchmove", [{ x: cx - 80, y: cy }, { x: cx + 80, y: cy }]);
+    approx(box.z.scale, fitted, 1e-9, "a pinch armed before the fit must not overwrite it");
+    approx(box.z.boxW * box.z.scale, fittedW, 1e-6, "the fitted width must survive the gesture");
+    assert_(Math.abs(box.z.scale - box.z.fitScale) < 1e-9, "the image must still be at its fit");
+    touch(box.vp, "touchend", []);
+  }
+
+  // 1b. static/ui.js:2795 — "Fit is undone by the next finger movement": a fit
+  // must end the gesture that is in flight instead of being overwritten by it.
+  async function fitResetsAnActivePinch() {
+    var box = await openBox(IMG_W, IMG_H);
+    var size = vpSize(box.vp);
+    var rect = box.vp.getBoundingClientRect();
+    var cx = rect.left + size.w / 2;
+    var cy = rect.top + size.h / 2;
+    touch(box.vp, "touchstart", [{ x: cx - 50, y: cy }, { x: cx + 50, y: cy }]);
+    assert_(box.z.pinching === true, "fixture: two contacts must start a pinch");
+    touch(box.vp, "touchmove", [{ x: cx - 100, y: cy }, { x: cx + 100, y: cy }]);
+    assert_(box.z.scale > box.z.fitScale, "fixture: the pinch must zoom in");
+    key("f");
+    approx(box.z.scale, box.z.fitScale, 1e-6, "Fit must restore the fit scale");
+    assert_(box.z.pinching === false, "a fresh fit must end the gesture that was in flight");
+    touch(box.vp, "touchmove", [{ x: cx - 140, y: cy }, { x: cx + 140, y: cy }]);
+    approx(box.z.scale, box.z.fitScale, 1e-6, "the next finger movement must not undo Fit");
+    touch(box.vp, "touchend", []);
+  }
+
+  // 2. static/ui.js:3134 — a wheel zoom during a held pan left the drag's
+  // baseline on the pre-zoom position, so the next pointermove re-applied the
+  // whole accumulated displacement at the new scale (674px for a 1px move).
+  async function wheelZoomMidPanDoesNotSnap() {
+    var box = await openBox(IMG_W, IMG_H);
+    var size = vpSize(box.vp);
+    var rect = box.vp.getBoundingClientRect();
+    var guard = 0;
+    while (box.z.boxW * box.z.scale < size.w + 400 && guard++ < 40) key("+");
+    var cx = rect.left + size.w / 2;
+    var cy = rect.top + size.h / 2;
+    pointer(box.vp, "pointerdown", cx, cy, 1);
+    pointer(box.vp, "pointermove", cx - 20, cy, 1);
+    var scaleBefore = box.z.scale;
+    wheel(box.vp, -240, cx - 20, cy);
+    assert_(box.z.scale > scaleBefore, "fixture: the wheel must still zoom during a held pan");
+    var afterWheelX = box.z.x;
+    var scaledW = box.z.boxW * box.z.scale;
+    assert_(afterWheelX < -2 && afterWheelX > size.w - scaledW + 2,
+      "fixture: the wheel zoom must leave the pan unclamped, x=" + afterWheelX);
+    pointer(box.vp, "pointermove", cx - 21, cy, 1);
+    approx(box.z.x, afterWheelX - 1, 1.5, "a 1px move after a mid-pan wheel zoom must not snap");
+    pointer(box.vp, "pointerup", cx - 21, cy, 1);
+  }
+
+  // 3. static/ui.js:2843 — navigating between two entries that share an image
+  // source was classified as the previous frame's duplicate load, so init and
+  // recentring were skipped and pendingNav stayed armed.
+  async function sameSourceNavigationRecentres() {
+    var shared = svgDataUrl(IMG_W, IMG_H);
+    var box = await openBox(IMG_W, IMG_H, {
+      images: [
+        { src: shared, alt: "first copy" },
+        { src: shared, alt: "second copy" },
+      ],
+      index: 0,
+    });
+    var size = vpSize(box.vp);
+    var rect = box.vp.getBoundingClientRect();
+    var cx = rect.left + size.w / 2;
+    var cy = rect.top + size.h / 2;
+    key("+");
+    key("+");
+    var zoomed = box.z.scale;
+    assert_(zoomed > box.z.fitScale, "fixture: expected zoom-in before navigating");
+    // Deliberately off-centre it, so a re-centre is measurable.
+    pointer(box.vp, "pointerdown", cx, cy, 1);
+    pointer(box.vp, "pointermove", cx - 30, cy - 10, 1);
+    pointer(box.vp, "pointerup", cx - 30, cy - 10, 1);
+    var wantX = (size.w - box.z.boxW * zoomed) / 2;
+    assert_(box.z.x < wantX - 20, "fixture: the preview must be off-centre, x=" + box.z.x + " want " + wantX);
+    key("ArrowRight");
+    assert_(box.lb._navIndex === 1, "navigation must move to the second entry");
+    for (var i = 0; i < 240 && box.z.pendingNav; i++) await frame();
+    for (var j = 0; j < 4; j++) await frame();
+    assert_(box.z.pendingNav === false, "the same-source navigation must consume pendingNav");
+    assert_(box.z.boxW === IMG_W, "the same-source navigation must keep the frame's geometry");
+    approx(box.z.x, wantX, 1.5, "the same-source navigation must re-centre (x)");
+    approx(box.z.y, (size.h - box.z.boxH * zoomed) / 2, 1.5, "the same-source navigation must re-centre (y)");
+    approx(box.z.scale, zoomed, 1e-9, "the chosen zoom must survive the navigation");
+  }
+
+  // 4. static/ui.js:3145 — resizing a zoomed preview kept the old fit baseline,
+  // so zoom-out stayed clamped at 0.25 while the new fit was 0.08775.
+  async function resizeRecomputesTheZoomOutLimit() {
+    var box = await openBox(4000, 3000);
+    var size = vpSize(box.vp);
+    assert_(box.z.fitScale < 0.9, "fixture: the huge image needs a real downscale");
+    key("+");
+    key("+");
+    assert_(Math.abs(box.z.scale - box.z.fitScale) > 1e-9,
+      "fixture: the preview must be user-zoomed for the resize branch");
+    var oldLimit = Math.min(0.25, box.z.fitScale);
+    // Shrink the stage the way the phone does, then let the debounced handler
+    // run: the fit baseline belongs to the NEW size.
+    box.vp.style.width = "300px";
+    box.vp.style.height = "300px";
+    var shrunk = vpSize(box.vp);
+    assert_(shrunk.w < size.w / 2 && shrunk.h < size.h / 2, "fixture: the stage must actually shrink");
+    window.dispatchEvent(new Event("resize"));
+    for (var i = 0; i < 60; i++) await sleep(20);
+    var expectedFit = Math.min(1, shrunk.w / box.z.boxW, shrunk.h / box.z.boxH);
+    approx(box.z.fitScale, expectedFit, 1e-6, "the fit baseline must be recomputed for the new size");
+    // The user-visible symptom: zooming out must reach the new fit instead of
+    // stopping at the obsolete limit the old size produced.
+    var r = box.vp.getBoundingClientRect();
+    wheel(box.vp, 900, r.left + shrunk.w / 2, r.top + shrunk.h / 2);
+    wheel(box.vp, 900, r.left + shrunk.w / 2, r.top + shrunk.h / 2);
+    approx(box.z.scale, Math.min(0.25, expectedFit), 1e-6, "zoom-out must reach the new size's fit");
+    assert_(box.z.scale < oldLimit - 1e-9,
+      "the zoom-out limit must not stay at the old size's " + oldLimit + ", got " + box.z.scale);
+  }
+
+  // 5. static/ui.js:3088 — replacing a finger mid-pinch kept the old baseline,
+  // which belonged to a contact that was no longer down: an iPhone pinch
+  // dropped from 0.1638 to 0.1260 after a 1px move.
+  async function replacedFingerReanchorsThePinch() {
+    var box = await openBox(IMG_W, IMG_H);
+    var size = vpSize(box.vp);
+    var rect = box.vp.getBoundingClientRect();
+    var cx = rect.left + size.w / 2;
+    var cy = rect.top + size.h / 2;
+    var f1 = { x: cx - 50, y: cy, id: 1 };
+    var f2 = { x: cx + 50, y: cy, id: 2 };
+    var f3 = { x: cx, y: cy + 200, id: 3 };
+    touch(box.vp, "touchstart", [f1, f2]);
+    touch(box.vp, "touchstart", [f1, f2, f3]);
+    assert_(box.z.pinching === true, "fixture: two contacts must be pinching");
+    // Finger 2 lifts: the pair under the fingers becomes [1, 3], whose distance
+    // (206px) is nothing like the 100px baseline the pinch was armed with.
+    touch(box.vp, "touchend", [f1, f3]);
+    assert_(box.z.pinching === true, "fixture: one contact of three lifting leaves a pinch");
+    var scaleBefore = box.z.scale;
+    var xBefore = box.z.x;
+    var yBefore = box.z.y;
+    touch(box.vp, "touchmove", [f1, f3]);
+    approx(box.z.scale, scaleBefore, 1e-9, "a replaced contact pair must not change the scale");
+    approx(box.z.x, xBefore, 1.5, "a replaced contact pair must not move the image (x)");
+    approx(box.z.y, yBefore, 1.5, "a replaced contact pair must not move the image (y)");
+    // Positive control: the NEW pair pinches from its own baseline.
+    touch(box.vp, "touchmove", [{ x: cx - 100, y: cy, id: 1 }, { x: cx, y: cy + 250, id: 3 }]);
+    assert_(box.z.scale > scaleBefore * 1.1,
+      "the new pair must pinch from its own baseline: " + box.z.scale + " vs " + scaleBefore);
+    touch(box.vp, "touchend", []);
+  }
+
+  // 6. static/ui.js:2993 — reversing a drag after overshooting an edge did
+  // nothing until the whole overshoot was retraced.
+  async function overshootReversalRespondsImmediately() {
+    var box = await openBox(IMG_W, IMG_H);
+    var size = vpSize(box.vp);
+    var rect = box.vp.getBoundingClientRect();
+    var guard = 0;
+    while (box.z.boxW * box.z.scale < size.w + 400 && guard++ < 40) key("+");
+    var scaledW = box.z.boxW * box.z.scale;
+    var cx = rect.left + size.w / 2;
+    var cy = rect.top + size.h / 2;
+    pointer(box.vp, "pointerdown", cx, cy, 1);
+    pointer(box.vp, "pointermove", cx - 5000, cy, 1);
+    var clampedX = box.z.x;
+    assert_(clampedX <= size.w - scaledW + 1, "fixture: panning left must clamp at the edge");
+    // Reverse while still 4970px past the edge: the image must follow by the
+    // 30px it was reversed, not stay put until the overshoot is retraced.
+    pointer(box.vp, "pointermove", cx - 4970, cy, 1);
+    approx(box.z.x, clampedX + 30, 1.5, "a reversed drag must move the image immediately");
+    pointer(box.vp, "pointerup", cx - 4970, cy, 1);
+  }
+
+  // 7. static/ui.js:3133 — line- and page-mode wheel deltas are not pixels:
+  // treating them as pixels made a three-line tick zoom by 0.45%.
+  async function lineModeWheelZooms() {
+    var box = await openBox(IMG_W, IMG_H);
+    var rect = box.vp.getBoundingClientRect();
+    var ax = rect.left + 200;
+    var ay = rect.top + 200;
+    var before = box.z.scale;
+    wheel(box.vp, -3, ax, ay, 1);
+    approx(box.z.scale / before, Math.exp(3 * 30 * 0.0015), 0.02,
+      "a three-line tick must zoom like 90px of pixels");
+    var afterLine = box.z.scale;
+    // Control: pixel-mode deltas keep the same recipe.
+    wheel(box.vp, -90, ax, ay);
+    approx(box.z.scale / afterLine, Math.exp(90 * 0.0015), 0.02, "pixel mode must keep the same recipe");
+    var afterPixel = box.z.scale;
+    wheel(box.vp, -1, ax, ay, 2);
+    approx(box.z.scale / afterPixel, Math.exp(600 * 0.0015), 0.02,
+      "a one-page tick must zoom like 600px of pixels");
+  }
+
+  // Maintainer re-gate 2026-10-15T17:54:15Z: one browser check per reported
+  // item. The touch-driven items run in both buckets (a phone is where they
+  // bite); the mouse/wheel-driven ones only make sense on the desktop.
+  async function runGate1015Touch(bucket) {
+    await run("gate1015_fit_survives_a_gesture_started_without_geometry", bucket, fitSurvivesAGestureStartedWithoutGeometry);
+    await run("gate1015_fit_resets_an_active_pinch", bucket, fitResetsAnActivePinch);
+    await run("gate1015_replaced_finger_reanchors_the_pinch", bucket, replacedFingerReanchorsThePinch);
+    await run("gate1015_same_source_navigation_recentres", bucket, sameSourceNavigationRecentres);
+  }
+
+  async function runGate1015Mouse(bucket) {
+    await run("gate1015_wheel_zoom_mid_pan_does_not_snap", bucket, wheelZoomMidPanDoesNotSnap);
+    await run("gate1015_resize_recomputes_the_zoom_out_limit", bucket, resizeRecomputesTheZoomOutLimit);
+    await run("gate1015_overshoot_reversal_responds_immediately", bucket, overshootReversalRespondsImmediately);
+    await run("gate1015_line_mode_wheel_zooms", bucket, lineModeWheelZooms);
   }
 
   window.__composedChecks = async function (mode) {

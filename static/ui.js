@@ -2709,7 +2709,9 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     dragging: false,
     fitScale: 1,
     img,
+    navSrc: null,
     pendingNav: false,
+    pinchIds: null,
     pinchStartCX: 0,
     pinchStartCY: 0,
     pinchStartDist: 0,
@@ -2717,6 +2719,8 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     pinchStartX: 0,
     pinchStartY: 0,
     pinching: false,
+    pointerX: 0,
+    pointerY: 0,
     pressOnImage: false,
     scale: 1,
     viewport,
@@ -2793,6 +2797,15 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
   }
 
   function _fit() {
+    // A fresh fit owns the geometry, so an in-flight gesture must not be able
+    // to write over it: a pinch or pan that began while the image was still
+    // decoding held a baseline from before the fit existed, and its next
+    // update scaled the just-fitted frame with it — a 4000×3000 image jumped
+    // from the fitted 351px width to 4080px on an iPhone, Fit was undone by
+    // the next finger movement, and a resize restored stale gesture positions
+    // (maintainer re-gate 2026-10-15T17:54:15Z, static/ui.js:2795). Cancel
+    // before measuring so the fit wins.
+    _imgCancelGesture();
     const size = _imgViewportSize();
     if(!state.boxW || !state.boxH) return;
     const fitScale = _imgFitScale();
@@ -2834,15 +2847,21 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     if(!state.pendingNav && _imgInitSrc === src && _imgInitW === nw && _imgInitH === nh){
       return;
     }
-    // A navigation is armed, yet the frame that just finished loading is the
-    // one already initialized: that event cannot be the frame the navigation
-    // asked for (the src swap reports its own source), so it is the previous
-    // image's late `load`. Leave `pendingNav` armed for the real one — this
-    // event used to consume the flag, and the next load then re-fit, silently
-    // discarding the user's zoom. The natural twin of the guard above.
-    if(state.pendingNav && src && _imgInitSrc === src
-       && _imgInitW === nw && _imgInitH === nh){
-      return;
+    // A navigation is armed. The source the navigation asked for is recorded
+    // in `navSrc` by _navigateLightbox, so a load event for any OTHER source is
+    // the previous image's late `load` (it cannot be the frame that navigation
+    // asked for — the src swap reports its own source) and must not consume the
+    // flag. Comparing sources alone misread a navigation between two entries
+    // that SHARE a source as that duplicate, so the navigation's own load
+    // skipped init and recentring and the previous off-centre position was kept
+    // (maintainer re-gate 2026-10-15T17:54:15Z, static/ui.js:2843). With no
+    // recorded source (a directly armed flag) the duplicate test still applies.
+    if(state.pendingNav){
+      if(state.navSrc){
+        if(_imgSrcKey(src) !== state.navSrc) return;
+      } else if(src && _imgInitSrc === src && _imgInitW === nw && _imgInitH === nh){
+        return;
+      }
     }
     _imgInitSrc = src;
     _imgInitW = nw;
@@ -2853,6 +2872,9 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     canvas.style.height = state.boxH + 'px';
     if(state.pendingNav){
       state.pendingNav = false;
+      // The navigation this flag was armed for has now initialized its frame;
+      // drop the recorded source so it cannot classify a later load.
+      state.navSrc = null;
       // The new image has its own fit baseline. Navigation keeps the user's
       // zoom level, but a stale fitScale from the previous image would skew
       // _imgMinScale() (zoom-out clamp) and the at-fit resize comparison:
@@ -2920,6 +2942,12 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     // geometry (boxW=0) no scale math runs anyway: _fit() and _imgSetScale()
     // bail out on the missing box.
     state.pendingNav = false;
+    state.navSrc = null;
+    // A failed load cancels any gesture that is still in flight: the stage
+    // geometry is dropped below, so a pan or pinch baseline measured against it
+    // must not be re-applied to whatever loads next (maintainer re-gate
+    // 2026-10-15T17:54:15Z, static/ui.js:2795).
+    _imgCancelGesture();
     state.dragging = false;
     state.dragPointerId = null;
     state.boxW = 0;
@@ -2972,6 +3000,10 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     state.dragged = false;
     state.dragOriginX = Number(e.clientX) || 0;
     state.dragOriginY = Number(e.clientY) || 0;
+    // The owning pointer's current position is remembered so a wheel zoom can
+    // rebase this drag's baseline (see _imgRebaseDrag).
+    state.pointerX = state.dragOriginX;
+    state.pointerY = state.dragOriginY;
     state.dragPointerId = e.pointerId != null ? e.pointerId : null;
     state.dragStartX = state.x;
     state.dragStartY = state.y;
@@ -2985,12 +3017,25 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
   function _imgOnPointerMove(e) {
     if(state.pinching || !state.dragging) return;
     if(!_imgOwnsDrag(e)) return;
-    const dx = (Number(e.clientX) || 0) - state.dragOriginX;
-    const dy = (Number(e.clientY) || 0) - state.dragOriginY;
+    const px = Number(e.clientX) || 0;
+    const py = Number(e.clientY) || 0;
+    // Only the owning pointer's position counts (the guards above refuse any
+    // other pointer), and a wheel zoom reads it to rebase the drag baseline.
+    state.pointerX = px;
+    state.pointerY = py;
+    const dx = px - state.dragOriginX;
+    const dy = py - state.dragOriginY;
     if(Math.abs(dx) + Math.abs(dy) > 3) state.dragged = true;
     state.x = state.dragStartX + dx;
     state.y = state.dragStartY + dy;
     _imgApplyTransform();
+    // _imgApplyTransform() clamped the pan to the stage. The baseline must
+    // follow the CLAMPED position: leaving the clamped-away overshoot inside
+    // dx made a drag that was reversed after overshooting an edge do nothing
+    // until the overshoot was retraced (maintainer re-gate 2026-10-15T17:54:15Z,
+    // static/ui.js:2993). Identity when the clamp did not bite.
+    state.dragStartX = state.x - dx;
+    state.dragStartY = state.y - dy;
   }
 
   function _imgEndPointerDrag(e) {
@@ -3044,6 +3089,7 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     // Clearing pinching makes _imgOnTouchMove a no-op until a fresh two-finger
     // start re-anchors every pinchStart*; the selected zoom is left intact.
     state.pinching = false;
+    state.pinchIds = null;
     if(!state.dragging) return;
     state.dragging = false;
     state.dragPointerId = null;
@@ -3085,16 +3131,51 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     return Math.sqrt(dx * dx + dy * dy);
   }
 
+  // Identifiers of the two contacts a pinch baseline belongs to. A pinch is a
+  // relationship between two specific fingers, so a baseline anchored on one
+  // pair is meaningless for another: replacing a finger of an active pinch (or
+  // lifting one of three) used to keep the stale baseline, and the next move
+  // rescaled and repositioned the image — an iPhone pinch dropped from 0.1638
+  // to 0.1260 after a 1px move (maintainer re-gate 2026-10-15T17:54:15Z,
+  // static/ui.js:3088).
+  function _imgPinchPair(touches) {
+    if(!touches || touches.length < 2) return null;
+    return [touches[0].identifier, touches[1].identifier];
+  }
+
+  function _imgSamePinchPair(touches) {
+    const pair = _imgPinchPair(touches);
+    const prev = state.pinchIds;
+    return !!(pair && prev && pair[0] === prev[0] && pair[1] === prev[1]);
+  }
+
+  // Anchor (or re-anchor) the pinch baseline on the pair of contacts currently
+  // under the fingers, so the ratio and the midpoint are always measured
+  // against the fingers that are down now.
+  function _imgAnchorPinch(touches) {
+    state.pinchIds = _imgPinchPair(touches);
+    state.pinchStartDist = _imgTouchDist(touches);
+    state.pinchStartScale = state.scale;
+    state.pinchStartX = state.x;
+    state.pinchStartY = state.y;
+    const rect = viewport.getBoundingClientRect();
+    state.pinchStartCX = (touches[0].clientX + touches[1].clientX) / 2 - (rect.left || 0);
+    state.pinchStartCY = (touches[0].clientY + touches[1].clientY) / 2 - (rect.top || 0);
+  }
+
   function _imgOnTouchStart(e) {
+    // Without dimensions there is nothing to zoom: a baseline recorded before
+    // the image decoded would be applied to a frame of unknown size and the fit
+    // that follows would be overwritten by the next touch update (maintainer
+    // re-gate 2026-10-15T17:54:15Z, static/ui.js:2795).
+    if(!state.boxW || !state.boxH) return;
     if(e.touches.length === 2){
+      // A fresh pinch always anchors (pinchIds is cleared as the pinch ends);
+      // a touchstart that lands on an already-active pinch re-anchors whenever
+      // the pair under the fingers changed.
+      const keepsPair = state.pinching && _imgSamePinchPair(e.touches);
       state.pinching = true;
-      state.pinchStartDist = _imgTouchDist(e.touches);
-      state.pinchStartScale = state.scale;
-      state.pinchStartX = state.x;
-      state.pinchStartY = state.y;
-      const rect = viewport.getBoundingClientRect();
-      state.pinchStartCX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - (rect.left || 0);
-      state.pinchStartCY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - (rect.top || 0);
+      if(!keepsPair) _imgAnchorPinch(e.touches);
       _imgEndPointerDrag();
       if(e.preventDefault) e.preventDefault();
     }
@@ -3102,6 +3183,11 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
 
   function _imgOnTouchMove(e) {
     if(!state.pinching || e.touches.length < 2) return;
+    if(!state.boxW || !state.boxH) return;
+    // The pair under the fingers can change without a touchstart (one finger of
+    // three is lifted, a finger is replaced): re-anchor before the ratio math
+    // so a stale baseline cannot resize or reposition the image.
+    if(!_imgSamePinchPair(e.touches)) _imgAnchorPinch(e.touches);
     const rect = viewport.getBoundingClientRect();
     const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2 - (rect.left || 0);
     const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2 - (rect.top || 0);
@@ -3121,8 +3207,24 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
   function _imgOnTouchEnd(e) {
     if(e.touches.length < 2 && state.pinching){
       state.pinching = false;
+      state.pinchIds = null;
       state.dragged = true;
     }
+  }
+
+  // Rebase the active pan's baseline onto the geometry the wheel just produced.
+  // A wheel zoom moves the image while the drag's baseline
+  // (dragOrigin / dragStartX/Y) still describes the pre-zoom position, so the
+  // next pointermove re-applied the entire accumulated displacement at the new
+  // scale and the image snapped — a 1px move moved 674px on desktop
+  // (maintainer re-gate 2026-10-15T17:54:15Z, static/ui.js:3134). Moving the
+  // baseline to the new position minus the owning pointer's displacement keeps
+  // the pan continuous.
+  function _imgRebaseDrag() {
+    if(!state.dragging) return;
+    if(!Number.isFinite(state.pointerX) || !Number.isFinite(state.pointerY)) return;
+    state.dragStartX = state.x - (state.pointerX - state.dragOriginX);
+    state.dragStartY = state.y - (state.pointerY - state.dragOriginY);
   }
 
   function _imgZoomFromWheel(e) {
@@ -3130,18 +3232,38 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     const rect = viewport.getBoundingClientRect();
     const anchorX = Number.isFinite(e.clientX) ? e.clientX - rect.left : undefined;
     const anchorY = Number.isFinite(e.clientY) ? e.clientY - rect.top : undefined;
-    const factor = Math.exp((-(Number(e.deltaY) || 0)) * 0.0015);
+    // Normalize the delta's units before scaling them. deltaMode 1 (lines) and
+    // 2 (pages) report a delta of a few units, not pixels, so treating them as
+    // pixels made a three-line tick zoom by 0.45%; the Mermaid viewer already
+    // normalizes with these 30/600 multipliers (maintainer re-gate
+    // 2026-10-15T17:54:15Z, static/ui.js:3133).
+    const deltaMode = Number(e.deltaMode) || 0;
+    const lineScale = deltaMode === 1 ? 30 : deltaMode === 2 ? 600 : 1;
+    const factor = Math.exp((-(Number(e.deltaY) || 0)) * lineScale * 0.0015);
     _imgSetScale(state.scale * factor, anchorX, anchorY);
+    _imgRebaseDrag();
   }
 
   function _onResize() {
     if(lb._imgZoomResizeTimer && typeof clearTimeout === 'function') clearTimeout(lb._imgZoomResizeTimer);
     lb._imgZoomResizeTimer = setTimeout(() => {
       lb._imgZoomResizeTimer = null;
+      // A resize invalidates every gesture baseline (they were measured against
+      // the old viewport size), so it ends the gesture rather than restoring a
+      // stale position on the next move (maintainer re-gate
+      // 2026-10-15T17:54:15Z, static/ui.js:2795).
+      _imgCancelGesture();
       const wasAtFit = Math.abs(state.scale - state.fitScale) < 1e-9;
       if(wasAtFit || !state.boxW){
         _fit();
       } else {
+        // The fit baseline belongs to the NEW viewport too: keeping the old one
+        // left an obsolete zoom-out limit, so a preview resized from desktop to
+        // an iPhone could not zoom out past 0.25 while its new fit was 0.08775
+        // (maintainer re-gate 2026-10-15T17:54:15Z, static/ui.js:3145).
+        // Recompute the baseline and re-clamp the CHOSEN scale to it.
+        state.fitScale = _imgFitScale();
+        state.scale = Math.max(_imgMinScale(), Math.min(8, state.scale));
         _centerPan();
       }
     }, 120);
@@ -3300,6 +3422,23 @@ function _openImgLightboxWithNav(src, alt, images, index) {
   };
   document.addEventListener('keydown', lb._keyHandler);
 }
+// Resolve an image source to the form the browser reports back in
+// `img.currentSrc`/`img.src`, so a raw string from the images array and a
+// resolved URL compare equal. Used to tell which frame a navigation asked for
+// (see _navigateLightbox / _onImgLoad): the same attachment can be referenced
+// both ways and two entries can share one source.
+function _imgSrcKey(src) {
+  const s = String(src || '');
+  if(!s) return '';
+  try{
+    if(document && document.createElement){
+      const a = document.createElement('a');
+      a.href = s;
+      return a.href;
+    }
+  }catch(_){ /* fall back to the raw string */ }
+  return s;
+}
 function _navigateLightbox(lb, direction) {
   const images = lb._navImages;
   if(!images) return;
@@ -3319,6 +3458,12 @@ function _navigateLightbox(lb, direction) {
   // Keep the current zoom level when switching images (re-centre on the
   // new image once it loads) — matches native photo-gallery behaviour.
   if(lb._zoom) lb._zoom.pendingNav = true;
+  // Record WHICH source this navigation asked for. _onImgLoad uses it to tell
+  // this frame's load apart from the previous image's late load — and, the
+  // point of the record, to keep a navigation between two entries that SHARE a
+  // source an intentional re-centre instead of classifying it as that duplicate
+  // (maintainer re-gate 2026-10-15T17:54:15Z, static/ui.js:2843).
+  if(lb._zoom) lb._zoom.navSrc = _imgSrcKey(nextImg.src);
   // Update counter via stored reference — no DOM query.
   if(lb._counterEl) lb._counterEl.textContent = (newIndex+1) + ' / ' + images.length;
 }

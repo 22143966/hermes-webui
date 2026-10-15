@@ -61,13 +61,58 @@ class TestTouchPinchZoom:
     def test_pinch_state_machinery_present(self):
         src = UI.read_text(encoding="utf-8")
         for marker in (
-            "state.pinchStartDist = _imgTouchDist(e.touches);",
+            "function _imgAnchorPinch(touches) {",
+            "state.pinchStartDist = _imgTouchDist(touches);",
             "state.pinchStartScale = state.scale;",
             "state.pinchStartCX",
             "state.pinchStartCY",
             "const currDist = _imgTouchDist(e.touches);",
         ):
             assert marker in src, f"missing pinch marker: {marker}"
+
+    def test_pinch_baseline_follows_the_contact_pair(self):
+        """Maintainer re-gate 2026-10-15T17:54:15Z (static/ui.js:3088): the
+        baseline belongs to the two contacts it was measured on. Replacing one
+        finger mid-pinch (or lifting one of three) used to keep the stale
+        baseline, so the next move rescaled and repositioned the image — an
+        iPhone pinch dropped from 0.1638 to 0.1260 after a 1px move. The
+        identifiers of the pair must be tracked, and the baseline re-anchored
+        whenever that pair changes."""
+        src = UI.read_text(encoding="utf-8")
+        assert "state.pinchIds = _imgPinchPair(touches);" in src, (
+            "the anchored pair's identifiers must be recorded with the baseline"
+        )
+        assert "return [touches[0].identifier, touches[1].identifier];" in src, (
+            "the pair must be identified by touch identifier, not by index"
+        )
+        start = src.index("function _imgOnTouchMove(e) {")
+        move = src[start:src.index("function _imgOnTouchEnd(e) {", start)]
+        assert "if(!_imgSamePinchPair(e.touches)) _imgAnchorPinch(e.touches);" in move, (
+            "a changed contact pair must re-anchor the baseline before the ratio math"
+        )
+        # The stale pair must not survive the end of a pinch, or a later pinch
+        # that happens to reuse the identifiers would keep a dead baseline.
+        end = src[src.index("function _imgOnTouchEnd(e) {"):]
+        assert "state.pinchIds = null;" in end[:400], (
+            "pinch ids must be cleared when the pinch ends"
+        )
+
+    def test_touch_updates_need_geometry(self):
+        """Maintainer re-gate 2026-10-15T17:54:15Z (static/ui.js:2795): a pinch
+        that starts while the image is still decoding must not record a
+        baseline against unknown dimensions — the fit that follows would then
+        be overwritten by the next touch update (a 4000x3000 image jumped from
+        its fitted 351px width to 4080px on an iPhone)."""
+        src = UI.read_text(encoding="utf-8")
+        start = src.index("function _imgOnTouchStart(e) {")
+        body = src[start:src.index("function _imgOnTouchMove(e) {", start)]
+        assert "if(!state.boxW || !state.boxH) return;" in body, (
+            "touchstart must ignore a gesture before the image has dimensions"
+        )
+        move = src[src.index("function _imgOnTouchMove(e) {"):src.index("function _imgOnTouchEnd(e) {")]
+        assert "if(!state.boxW || !state.boxH) return;" in move, (
+            "touchmove must ignore updates before the image has dimensions"
+        )
 
     def test_two_finger_start_ends_pointer_drag(self):
         src = UI.read_text(encoding="utf-8")
@@ -108,7 +153,30 @@ class TestWheelZoom:
     def test_wheel_zooms_anchored_at_cursor(self):
         src = UI.read_text(encoding="utf-8")
         assert "viewport.onwheel = _imgZoomFromWheel;" in src
-        assert "const factor = Math.exp((-(Number(e.deltaY) || 0)) * 0.0015);" in src
+        start = src.index("function _imgZoomFromWheel(e) {")
+        wheel = src[start:src.index("function _onResize() {", start)]
+        assert "const factor = Math.exp((-(Number(e.deltaY) || 0)) * lineScale * 0.0015);" in wheel, (
+            "the wheel factor must still be anchored on the event's deltaY"
+        )
+
+    def test_wheel_delta_mode_is_normalized(self):
+        """Maintainer re-gate 2026-10-15T17:54:15Z (static/ui.js:3133): a
+        line- or page-mode wheel event reports a delta of a few units, not
+        pixels, so treating it as pixels made a three-line tick zoom by 0.45%.
+        The delta's units must be normalized first, with the same 30/600
+        multipliers the Mermaid viewer's zoom uses."""
+        src = UI.read_text(encoding="utf-8")
+        start = src.index("function _imgZoomFromWheel(e) {")
+        wheel = src[start:src.index("function _onResize() {", start)]
+        assert "const deltaMode = Number(e.deltaMode) || 0;" in wheel, (
+            "the wheel handler must read deltaMode"
+        )
+        assert "const lineScale = deltaMode === 1 ? 30 : deltaMode === 2 ? 600 : 1;" in wheel, (
+            "line/page deltas must be scaled to pixels (30/600, the Mermaid recipe)"
+        )
+        assert "* lineScale * 0.0015" in wheel, (
+            "the normalized delta must be what the zoom factor multiplies"
+        )
 
 
 class TestNavigationKeepsZoom:
@@ -370,3 +438,71 @@ class TestBackdropDismissalPreserved:
             assert "height:36px" in rule
             assert "border-radius:50%" in rule
             assert "background:rgba(0,0,0,.5)" in rule
+
+
+class TestRegate20261015:
+    """Maintainer re-gate 2026-10-15T17:54:15Z (review 5537610966): Codex drove
+    the gesture code on desktop and iPhone (390x844) and found seven silent
+    edge cases, each with a reproduction and a small exact fix. Items 3, 5 and
+    7 are pinned in the classes above; these are the pointer/resize ones. The
+    browser reproduction for EVERY item lives in
+    tests/_img_lightbox_composed_checks.js (driven by
+    tests/test_img_lightbox_gestures_composed.py) — the `gate1015_*` checks
+    fail on the pre-fix head and pass after the fix.
+    """
+
+    def test_fit_and_error_cancel_the_gesture_in_flight(self):
+        """Item 1 (static/ui.js:2795): a fresh fit owns the geometry and a
+        failed load drops it, so both must end any gesture that is in flight —
+        a pinch that outlived them rescaled the next frame with a baseline
+        measured against the previous one (a 4000x3000 image jumped from its
+        fitted 351px width to 4080px on an iPhone)."""
+        src = UI.read_text(encoding="utf-8")
+        fit = src[src.index("function _fit() {"):src.index("function _centerPan() {")]
+        assert "_imgCancelGesture();" in fit, "a fresh fit must cancel the gesture in flight"
+        err = src[src.index("function _imgOnError() {"):src.index("function _imgPointOnCanvas(")]
+        assert "_imgCancelGesture();" in err, "a failed load must cancel the gesture in flight"
+
+    def test_wheel_zoom_rebases_the_held_pan(self):
+        """Item 2 (static/ui.js:3134): a wheel zoom under a held pan must move
+        the drag baseline with the image, otherwise the next pointermove
+        re-applies the whole accumulated displacement at the new scale (674px
+        for a 1px move on desktop)."""
+        src = UI.read_text(encoding="utf-8")
+        assert "function _imgRebaseDrag() {" in src
+        assert "state.dragStartX = state.x - (state.pointerX - state.dragOriginX);" in src
+        wheel = src[src.index("function _imgZoomFromWheel(e) {"):src.index("function _onResize() {")]
+        assert "_imgRebaseDrag();" in wheel, (
+            "the wheel handler must rebase the pan it zoomed under"
+        )
+
+    def test_drag_baseline_follows_the_clamped_position(self):
+        """Item 6 (static/ui.js:2993): the pan is clamped to the stage, and the
+        baseline must follow the CLAMPED position — otherwise a drag reversed
+        after overshooting an edge does nothing until the overshoot is
+        retraced."""
+        src = UI.read_text(encoding="utf-8")
+        start = src.index("function _imgOnPointerMove(e) {")
+        move = src[start:src.index("function _imgEndPointerDrag(e) {", start)]
+        apply_idx = move.index("_imgApplyTransform();")
+        assert move.index("state.dragStartX = state.x - dx;") > apply_idx, (
+            "the baseline must be rebased AFTER the clamped transform"
+        )
+        assert "state.dragStartY = state.y - dy;" in move
+
+    def test_resize_recomputes_the_fit_baseline(self):
+        """Item 4 (static/ui.js:3145): a resize changes the fit, so the zoomed
+        branch must recompute state.fitScale before recentring — keeping the
+        old baseline left an obsolete zoom-out limit (0.25 after a desktop ->
+        iPhone resize whose real fit was 0.08775)."""
+        src = UI.read_text(encoding="utf-8")
+        start = src.index("function _onResize() {")
+        resize = src[start:src.index("viewport.onpointerdown", start)]
+        assert "_imgCancelGesture();" in resize, "a resize must end the gesture in flight"
+        branch = resize[resize.index("} else {"):]
+        fit_idx = branch.index("state.fitScale = _imgFitScale();")
+        center_idx = branch.index("_centerPan();")
+        assert fit_idx < center_idx, "the fit baseline must be recomputed before recentring"
+        assert "Math.max(_imgMinScale(), Math.min(8, state.scale))" in branch, (
+            "the chosen scale must be re-clamped to the new baseline"
+        )

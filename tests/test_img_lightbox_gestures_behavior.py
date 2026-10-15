@@ -449,7 +449,22 @@ class TestRegate20261008:
         # cannot be the frame that navigation asked for (a src swap reports its
         # own source), so it must leave pendingNav armed for the real load.
         # Consuming it made the next load re-fit and lost the zoom.
-        stale = body.index("if(state.pendingNav && src && _imgInitSrc === src")
+        #
+        # Maintainer re-gate 2026-10-15T17:54:15Z (static/ui.js:2843): the
+        # comparison is against the source the navigation RECORDED (`navSrc`),
+        # not the already-initialized frame's — navigating between two entries
+        # that share a source is an intentional re-centre, and the old
+        # src-only test classified it as this same stale duplicate. With no
+        # recorded source (a directly armed flag) the duplicate test remains.
+        stale = body.index("if(_imgSrcKey(src) !== state.navSrc) return;")
+        assert "if(state.navSrc){" in body
+        assert (
+            "} else if(src && _imgInitSrc === src && _imgInitW === nw && _imgInitH === nh){"
+            in body
+        ), "with no recorded navigation source the duplicate test must still apply"
+        assert "if(lb._zoom) lb._zoom.navSrc = _imgSrcKey(nextImg.src);" in UI.read_text(encoding="utf-8"), (
+            "_navigateLightbox must record the source it asked for"
+        )
         consume = body.index("state.pendingNav = false;", body.index("state.boxW = nw || 800;"))
         assert stale < consume, "the stale-event guard must run before pendingNav is consumed"
 
