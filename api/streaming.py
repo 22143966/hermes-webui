@@ -7066,7 +7066,11 @@ def generate_session_title_for_session(session, *, prefer_latest: bool = False, 
     return None, llm_status or 'empty_title', raw_preview
 
 
-def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
+def _preserve_pre_compression_snapshot(
+    s,
+    old_sid: str,
+    continuation_sid: str | None = None,
+) -> bool:
     """Persist old_sid as a read-only pre-compression snapshot.
 
     Context compression rotates the active WebUI session id from old_sid to the
@@ -7075,28 +7079,36 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
     """
     old_path = SESSION_DIR / f'{old_sid}.json'
     if not old_path.exists():
-        return
+        return False
     try:
         existing_text = old_path.read_text(encoding='utf-8')
         try:
             existing = json.loads(existing_text)
             existing_msgs = len(existing.get('messages') or [])
-            existing_snapshot = bool(existing.get('pre_compression_snapshot'))
         except (json.JSONDecodeError, ValueError):
             # Treat corrupt/malformed old JSON as missing history and rewrite it
             # from the in-memory pre-compression messages below. That is safer
             # than leaving an unreadable recovery snapshot behind.
             existing_msgs = -1
-            existing_snapshot = False
         if len(s.messages) > existing_msgs:
             # In-memory messages are newer than the file; save the full old
             # snapshot from the current session object while preserving its
             # pre-existing parent_session_id lineage.
             saved_sid = s.session_id
             saved_snapshot = bool(getattr(s, 'pre_compression_snapshot', False))
+            saved_continuation_sid = (
+                str(getattr(s, 'pre_compression_continuation_session_id', None) or '')
+                if getattr(s, 'pre_compression_continuation_session_id', None)
+                else None
+            )
             saved_pinned = bool(getattr(s, 'pinned', False))
             s.session_id = old_sid
             s.pre_compression_snapshot = True
+            s.pre_compression_continuation_session_id = (
+                str(continuation_sid).strip()
+                if continuation_sid
+                else None
+            )
             s.pinned = False
             # Stage-359 / PR #2295: clear runtime stream-state fields on the
             # archived snapshot so the sidebar does not reopen the parent as
@@ -7126,13 +7138,14 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
             finally:
                 s.session_id = saved_sid
                 s.pre_compression_snapshot = saved_snapshot
+                s.pre_compression_continuation_session_id = saved_continuation_sid
                 s.pinned = saved_pinned
                 s.active_stream_id = saved_active_stream_id
                 s.pending_user_message = saved_pending_user_message
                 s.pending_attachments = saved_pending_attachments
                 s.pending_started_at = saved_pending_started_at
                 s.pending_user_source = saved_pending_user_source
-            return
+            return True
         # Existing file is already at least as complete as memory; stamp only
         # the snapshot marker so index/sidebar projection can hide it without
         # rewriting a shorter messages array over a fuller transcript.
@@ -7140,6 +7153,11 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
         snapshot = Session.load(old_sid)
         if snapshot:
             snapshot.pre_compression_snapshot = True
+            snapshot.pre_compression_continuation_session_id = (
+                str(continuation_sid).strip()
+                if continuation_sid
+                else None
+            )
             snapshot.pinned = False
             # Stage-359 Opus SHOULD-FIX: clear runtime fields on the loaded
             # snapshot too. If the disk snapshot was last persisted while the
@@ -7158,10 +7176,205 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
                 "Marked pre-compression session %s as sidebar-hidden snapshot",
                 old_sid,
             )
+            return True
+        return False
     except OSError:
         logger.debug("Could not read old session file before preservation")
     except Exception:
         logger.debug("Failed to preserve pre-compression session file", exc_info=True)
+    return False
+
+
+def _migrate_compression_session_ownership(
+    s,
+    old_sid: str,
+    new_sid: str,
+    agent_lock,
+) -> bool:
+    """Atomically publish a durable compression continuation."""
+    from api import models as _models
+    from api.paths import _atomic_write_text
+
+    missing = object()
+    previous_state = (
+        s.session_id,
+        bool(getattr(s, 'pre_compression_snapshot', False)),
+        getattr(s, 'pre_compression_continuation_session_id', None),
+        getattr(s, 'parent_session_id', None),
+    )
+    old_path = SESSION_DIR / f'{old_sid}.json'
+    index_path = _models.SESSION_INDEX_FILE
+    index_row_snapshot = None
+    index_file_existed = False
+    try:
+        old_preimage = old_path.read_text(encoding='utf-8')
+        with _models._INDEX_WRITE_LOCK:
+            index_file_existed = index_path.exists()
+            if index_file_existed:
+                try:
+                    index_payload = json.loads(index_path.read_bytes())
+                except (OSError, json.JSONDecodeError):
+                    logger.debug(
+                        "Could not capture compression marker index row",
+                        exc_info=True,
+                    )
+                    return False
+                if not isinstance(index_payload, list):
+                    logger.debug(
+                        "Could not capture compression marker index row: index is not a list",
+                        exc_info=True,
+                    )
+                    return False
+                for row in index_payload:
+                    if (
+                        isinstance(row, dict)
+                        and str(row.get('session_id') or '') == old_sid
+                    ):
+                        index_row_snapshot = copy.deepcopy(row)
+                        break
+    except OSError:
+        logger.debug("Could not capture compression marker preimage", exc_info=True)
+        return False
+
+    def _restore_durable_snapshot() -> None:
+        def _updated_at_key(entry):
+            try:
+                return float((entry or {}).get('updated_at') or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        with _models._INDEX_WRITE_LOCK:
+            _atomic_write_text(old_path, old_preimage, encoding='utf-8')
+            if not index_path.exists():
+                if not index_file_existed:
+                    return
+                current_rows = []
+            else:
+                current_rows = json.loads(index_path.read_bytes())
+                if not isinstance(current_rows, list):
+                    raise ValueError("session index must be a list")
+
+            filtered = [
+                row for row in current_rows
+                if not (isinstance(row, dict) and str(row.get('session_id') or '') == old_sid)
+            ]
+            if index_row_snapshot is not None:
+                filtered.append(index_row_snapshot)
+                filtered.sort(key=_updated_at_key, reverse=True)
+            elif filtered == current_rows:
+                return
+            _payload = json.dumps(
+                filtered,
+                ensure_ascii=False,
+                indent=2,
+            )
+            _atomic_write_text(index_path, _payload, encoding='utf-8')
+
+    with LOCK:
+        if SESSIONS.get(old_sid) is not s or str(getattr(s, 'session_id', '') or '') != old_sid:
+            logger.warning(
+                "compression cache migration blocked by stale owner: old_sid=%s new_sid=%s",
+                old_sid,
+                new_sid,
+            )
+            return False
+        existing_new_session = SESSIONS.get(new_sid, missing)
+        if existing_new_session is not missing and existing_new_session is not s:
+            logger.warning(
+                "compression cache migration blocked by existing continuation owner: old_sid=%s new_sid=%s",
+                old_sid,
+                new_sid,
+            )
+            return False
+        with SESSION_AGENT_LOCKS_LOCK:
+            old_lock = SESSION_AGENT_LOCKS.get(old_sid, missing)
+            new_lock = SESSION_AGENT_LOCKS.get(new_sid, missing)
+            if old_lock is not missing and old_lock is not agent_lock:
+                logger.warning(
+                    "compression lock migration blocked by stale owner: old_sid=%s new_sid=%s",
+                    old_sid,
+                    new_sid,
+                )
+                return False
+            if new_lock is not missing and new_lock is not agent_lock:
+                logger.warning(
+                    "compression lock migration blocked by existing continuation lock: old_sid=%s new_sid=%s",
+                    old_sid,
+                    new_sid,
+                )
+                return False
+            SESSION_AGENT_LOCKS[old_sid] = agent_lock
+            SESSION_AGENT_LOCKS[new_sid] = agent_lock
+
+    if not _preserve_pre_compression_snapshot(s, old_sid, new_sid):
+        with SESSION_AGENT_LOCKS_LOCK:
+            if old_lock is missing and SESSION_AGENT_LOCKS.get(old_sid) is agent_lock:
+                SESSION_AGENT_LOCKS.pop(old_sid, None)
+            if new_lock is missing and SESSION_AGENT_LOCKS.get(new_sid) is agent_lock:
+                SESSION_AGENT_LOCKS.pop(new_sid, None)
+        return False
+
+    try:
+        with LOCK:
+            if SESSIONS.get(old_sid) is not s or str(getattr(s, 'session_id', '') or '') != old_sid:
+                raise RuntimeError("stale owner while publishing")
+            if existing_new_session is missing:
+                if SESSIONS.get(new_sid) is not None and SESSIONS.get(new_sid) is not s:
+                    raise RuntimeError("continuation owner changed during publish")
+            elif SESSIONS.get(new_sid) is not existing_new_session:
+                raise RuntimeError("continuation owner changed during publish")
+            with SESSION_AGENT_LOCKS_LOCK:
+                if SESSION_AGENT_LOCKS.get(old_sid, missing) not in (missing, agent_lock):
+                    raise RuntimeError("stale old-lock while publishing")
+                if SESSION_AGENT_LOCKS.get(new_sid) is not agent_lock:
+                    raise RuntimeError("continuation lock changed during publish")
+
+                s.session_id = new_sid
+                s.pre_compression_snapshot = False
+                s.pre_compression_continuation_session_id = None
+                s.parent_session_id = old_sid
+                SESSIONS[new_sid] = s
+                SESSIONS.move_to_end(new_sid)
+                _evict_sessions_over_cap()
+
+                if SESSIONS.get(old_sid) is s:
+                    SESSIONS.pop(old_sid, None)
+
+    except Exception:
+        try:
+            _restore_durable_snapshot()
+        except Exception:
+            logger.debug(
+                "Failed to restore compression marker durable state",
+                exc_info=True,
+            )
+        with LOCK:
+            if SESSIONS.get(new_sid) is s:
+                SESSIONS.pop(new_sid, None)
+            if existing_new_session is not missing:
+                SESSIONS[new_sid] = existing_new_session
+            if SESSIONS.get(old_sid) is None:
+                SESSIONS[old_sid] = s
+            s.session_id, s.pre_compression_snapshot, s.pre_compression_continuation_session_id, s.parent_session_id = previous_state
+            with SESSION_AGENT_LOCKS_LOCK:
+                if SESSION_AGENT_LOCKS.get(old_sid) is agent_lock:
+                    if old_lock is missing:
+                        SESSION_AGENT_LOCKS.pop(old_sid, None)
+                    else:
+                        SESSION_AGENT_LOCKS[old_sid] = old_lock
+                if SESSION_AGENT_LOCKS.get(new_sid) is agent_lock:
+                    if new_lock is missing:
+                        SESSION_AGENT_LOCKS.pop(new_sid, None)
+                    else:
+                        SESSION_AGENT_LOCKS[new_sid] = new_lock
+        logger.debug(
+            "Compression ownership migration aborted: old_sid=%s new_sid=%s",
+            old_sid,
+            new_sid,
+            exc_info=True,
+        )
+        return False
+    return True
 
 
 def _maybe_schedule_title_refresh(session, put_event, agent):
@@ -14297,7 +14510,7 @@ def _run_agent_streaming(
                     new_sid = _agent_sid
                     _compression_origin_session_id = old_sid
                     _compression_continuation_session_id = new_sid
-                    s.session_id = new_sid
+                    _pre_migration_profile = s.profile
                     # Carry profile identity across the compression boundary.
                     # Without this, s.profile stays None on the continuation
                     # session. On the next request, _run_agent_streaming calls
@@ -14314,59 +14527,11 @@ def _run_agent_streaming(
                             "Stamped profile=%r on continuation session %s after compression",
                             _resolved_profile_name, new_sid,
                         )
-                    # Preserve the original session file so the full pre-compression
-                    # history survives even when summarisation fails. The previous
-                    # implementation renamed old_sid.json → new_sid.json, which
-                    # destroyed the only persistent copy of the uncompressed history
-                    # before the new (possibly summary-only) session had been saved.
-                    # If the LLM summariser also failed, the user was left with zero
-                    # recoverable messages. (#2223)
-                    # ---
-                    # Archive the old session: write its current state to disk so
-                    # the full conversation history survives even when context
-                    # compression removes messages from the model's context. Skip
-                    # the write when the file already contains up-to-date data
-                    # (i.e. it was just saved by a checkpoint).
-                    _preserve_pre_compression_snapshot(s, old_sid)
-                    # The continuation is the live/tip session, not another archived
-                    # snapshot. If the in-memory object was itself loaded from a
-                    # pre-compression snapshot (possible on repeated compression chains
-                    # or stale-cache repair paths), _preserve_pre_compression_snapshot()
-                    # intentionally restores that old flag; clear it before saving the
-                    # new continuation so sidebar/discoverability code does not hide the
-                    # session that owns the completed turn.
-                    s.pre_compression_snapshot = False
-                    # Always link the continuation session to its immediate predecessor
-                    # (the preserved snapshot). This OVERRIDES any prior
-                    # parent_session_id because the new continuation IS the next link
-                    # in the chain: traversal walks new → old → old.parent → ... root.
-                    # Stage-353 Opus SHOULD-FIX: previous `if not s.parent_session_id`
-                    # guard skipped this stamp on fork-of-fork compressions, so a
-                    # subsequent traversal from the new continuation would jump
-                    # over the just-preserved snapshot back to the original fork
-                    # parent, losing access to the recoverable history in old_sid.json.
-                    s.parent_session_id = old_sid
-                    with LOCK:
-                        cached_old_session = SESSIONS.pop(old_sid, None)
-                        if cached_old_session is not None and cached_old_session is not s:
-                            cached_old_sid = str(getattr(cached_old_session, 'session_id', '') or '')
-                            if cached_old_sid == str(old_sid):
-                                SESSIONS[old_sid] = cached_old_session
-                            else:
-                                logger.warning(
-                                    "compression cache migration skipped stale object: old_sid=%s new_sid=%s cached_session_id=%s",
-                                    old_sid,
-                                    new_sid,
-                                    cached_old_sid or None,
-                                )
-                        SESSIONS[new_sid] = s
-                        SESSIONS.move_to_end(new_sid)
-                        _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
-                    # Migrate the per-session lock by aliasing new_sid to the
-                    # held _agent_lock reference directly. Keep old_sid aliased
-                    # too until the weak registry can reclaim both safely after
-                    # all old-ID holders and waiters release the lock.
-                    _alias_session_agent_lock(old_sid, new_sid, _agent_lock)
+                    if not _migrate_compression_session_ownership(s, old_sid, new_sid, _agent_lock):
+                        s.profile = _pre_migration_profile
+                        raise RuntimeError(
+                            f"Failed to migrate compressed-session ownership: {old_sid}->{new_sid}",
+                        )
                     # Migrate cached agent to the new session ID so the turn
                     # count survives context compression.
                     from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
@@ -14993,9 +15158,15 @@ def _run_agent_streaming(
                 cache_read_tokens = getattr(agent, 'session_cache_read_tokens', 0) or 0
                 cache_write_tokens = getattr(agent, 'session_cache_write_tokens', 0) or 0
                 prev_input_tokens = getattr(s, 'input_tokens', 0) or 0
+                prev_output_tokens = getattr(s, 'output_tokens', 0) or 0
                 prev_cache_read_tokens = getattr(s, 'cache_read_tokens', 0) or 0
+                prev_cache_write_tokens = getattr(s, 'cache_write_tokens', 0) or 0
+                prev_estimated_cost = getattr(s, 'estimated_cost', 0.0) or 0.0
                 turn_input_tokens = max(0, input_tokens - prev_input_tokens)
+                turn_output_tokens = max(0, output_tokens - prev_output_tokens)
                 turn_cache_read_tokens = max(0, cache_read_tokens - prev_cache_read_tokens)
+                turn_cache_write_tokens = max(0, cache_write_tokens - prev_cache_write_tokens)
+                turn_estimated_cost = max(0.0, (estimated_cost or 0.0) - prev_estimated_cost)
                 # Per-turn percent is computed server-side from persisted session
                 # counters so the message label uses the same denominator as the
                 # final usage payload even if the browser missed an intermediate event.
@@ -15115,6 +15286,28 @@ def _run_agent_streaming(
                                 _dm['_firstTokenMs'] = _ttft_ms
                             if _used_model:
                                 _dm['_usedModel'] = _used_model
+                            # Persist the per-turn usage snapshot next to the other
+                            # settled-turn fields above so the token/cache footer
+                            # survives a session reload. The client already
+                            # derives the same shape from the SSE ``usage``
+                            # payload (_doneUsageFallback delta in messages.js),
+                            # but that value lives only in the live browser tab:
+                            # GET /api/session never returns ``_turnUsage``, so a
+                            # reload or a second tab loses the badge. Mirror the
+                            # client's delta semantics and write it alongside
+                            # ``_turnDuration``/``_firstTokenMs`` (same guard as
+                            # the #503 client path: only stamp when the turn
+                            # actually consumed tokens).
+                            if (turn_input_tokens or turn_output_tokens
+                                    or turn_cache_read_tokens or turn_cache_write_tokens):
+                                _dm['_turnUsage'] = {
+                                    'input_tokens': turn_input_tokens,
+                                    'output_tokens': turn_output_tokens,
+                                    'estimated_cost': turn_estimated_cost,
+                                    'cache_read_tokens': turn_cache_read_tokens,
+                                    'cache_write_tokens': turn_cache_write_tokens,
+                                    'cache_hit_percent': turn_cache_hit_percent,
+                                }
                             break
                 # Persist context window data on the session so the context-ring
                 # indicator survives a page reload (#1318). Must run BEFORE
