@@ -685,8 +685,42 @@ function _cancelMessageVirtualizedRender(){
     _messageVirtualScrollRaf=0;
   }
 }
+// #7882 (gate round-7 CORE): a hidden delegation_wakeup row sits between the
+// parent's answer and the follow-up's answer in the RAW transcript. The
+// renderer only walks RENDERABLE rows, so hiding the wakeup deletes the
+// user-turn boundary: the two answers land in ONE .assistant-turn container,
+// and installing the follow-up's Worklog hides every earlier segment in that
+// container (the parent's answer ends up display:none). Turn ownership must
+// therefore be derived from the RAW messages: a user-role row is a turn
+// boundary even when it never acquires a DOM row — but ONLY for rows that
+// would otherwise be ordinary visible user turns. Compaction markers,
+// preserved task lists and recovery-control rows are skipped WITHOUT
+// resetting the container today (they `continue` before the isUser branch or
+// are filtered out entirely), so they must not bump the boundary either.
+function _rawTurnBoundaryByRawIdx(messages){
+  const out=new Map();
+  if(!Array.isArray(messages)) return out;
+  let boundary=-1;
+  let rawIdx=0;
+  for(const m of messages){
+    if(m&&m.role&&m.role!=='tool'){
+      const isUserRow=m.role==='user';
+      const skipNoReset=!isUserRow
+        ||_isContextCompactionMessage(m)
+        ||_isPreservedCompressionTaskListMessage(m)
+        ||_isRecoveryControlMessage(m);
+      if(!skipNoReset) boundary=rawIdx;
+      out.set(rawIdx,boundary);
+    }
+    rawIdx++;
+  }
+  return out;
+}
 function _messageIsRenderable(m){
   if(!m||!m.role||m.role==='tool') return false;
+  // Internal delegation handoffs remain in S.messages for model/recovery state,
+  // but never acquire a transcript row (including attachment-only rows).
+  if(m._source==='delegation_wakeup') return false;
   if(m._source === 'process_wakeup') return !!(msgContent(m)||m.attachments?.length);
   if(_isContextCompactionMessage(m)||_isPreservedCompressionTaskListMessage(m)) return false;
   if(_isRecoveryControlMessage(m)) return false;
@@ -1035,6 +1069,17 @@ function _messageRawIdxForSessionIndex(sessionIdx){
   const n=Number(sessionIdx);
   if(!Number.isFinite(n)) return null;
   return n-_messageSessionIndexBase();
+}
+// Current S.messages index of the message a rendered row shows. data-msg-idx is
+// relative to the _oldestIdx at render time and goes stale when full history
+// loads without a re-render (opening the outline does that); the row's
+// data-session-msg-idx is absolute and does not. Edit, regenerate and fork turn
+// this into an absolute keep_count (#2184), so a stale value truncated or forked
+// at the wrong turn.
+function _rowCurrentRawIdx(row, fallback){
+  const abs=row&&row.dataset?Number(row.dataset.sessionMsgIdx):NaN;
+  const raw=Number.isSafeInteger(abs)&&abs>=0?_messageRawIdxForSessionIndex(abs):null;
+  return Number.isSafeInteger(raw)&&raw>=0?raw:fallback;
 }
 function _messageVirtualScrollTopForVisibleIdx(visWithIdx, visibleIdx, container){
   const idx=Math.max(0,Number(visibleIdx)||0);
@@ -1449,7 +1494,7 @@ function _applyUserRowIntrinsicHeight(row, rawText){
   const h=Math.max(remembered, estimate);
   if(h>0) row.style.containIntrinsicSize='auto '+Math.round(h)+'px';
 }
-function _measureMessageVirtualRow(inner, entry){
+function _measureMessageVirtualRow(inner, entry, deferredWrites){
   if(!inner||!entry) return 0;
   const primary=inner.querySelector(`[data-msg-idx="${entry.rawIdx}"]`);
   if(!primary) return 0;
@@ -1470,8 +1515,18 @@ function _measureMessageVirtualRow(inner, entry){
   // extract it without this helper (they stub every collaborator by name).
   if(totalHeight>0 && primary.dataset && primary.dataset.role==='user'
      && typeof _rememberUserRowIntrinsicHeight==='function'){
+    // _rememberUserRowIntrinsicHeight below is a plain JS map write; only the
+    // contain-intrinsic-size assignment invalidates layout. Callers that measure a
+    // whole row set pass a pending buffer (#7677) so every style write lands AFTER
+    // every geometry read — the read/write interleaving this used to do made row N's
+    // getBoundingClientRect() force a fresh full-document layout after row N-1's
+    // write, i.e. N rows cost N layouts on a transcript that can be hundreds of
+    // thousands of pixels tall. No buffer (direct/legacy callers) keeps the
+    // immediate inline write.
     _rememberUserRowIntrinsicHeight(primary.dataset.sessionMsgIdx, totalHeight);
-    primary.style.containIntrinsicSize='auto '+Math.round(totalHeight)+'px';
+    const intrinsic='auto '+Math.round(totalHeight)+'px';
+    if(Array.isArray(deferredWrites)) deferredWrites.push({row:primary,intrinsic:intrinsic});
+    else primary.style.containIntrinsicSize=intrinsic;
   }
   return totalHeight;
 }
@@ -1481,10 +1536,15 @@ function _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, 
   let changed=false;
   let measuredCount=0;
   let measuredTotal=0;
+  // #7677 read/write separation: the whole measurement pass is READS FIRST
+  // (every row's getBoundingClientRect()), then one WRITE phase that flushes the
+  // deferred contain-intrinsic-size values. All the reads therefore share a
+  // single layout instead of forcing one per row.
+  const deferredWrites=[];
   for(let vi=0;vi<renderVisWithIdx.length;vi++){
     const entry=renderVisWithIdx[vi];
     if(!entry) continue;
-    const totalHeight=_measureMessageVirtualRow(inner, entry);
+    const totalHeight=_measureMessageVirtualRow(inner, entry, deferredWrites);
     if(totalHeight<=0) continue;
     const visibleIdx=Number(renderVisibleIdxs&&renderVisibleIdxs[vi]);
     if(!Number.isFinite(visibleIdx)) continue;
@@ -1494,6 +1554,10 @@ function _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, 
     }
     measuredTotal+=totalHeight;
     measuredCount++;
+  }
+  for(let wi=0;wi<deferredWrites.length;wi++){
+    const pending=deferredWrites[wi];
+    if(pending&&pending.row) pending.row.style.containIntrinsicSize=pending.intrinsic;
   }
   if(measuredCount>0){
     _messageVirtualEstimatedRowHeight=Math.max(60, Math.round(measuredTotal/measuredCount));
@@ -7327,10 +7391,36 @@ function _activityLastObservedAge(group){
   if(!Number.isFinite(stamp)||stamp<=0)return null;
   return Math.max(0,_activityNowSeconds()-stamp);
 }
+function _intlFormatter(locales, options){
+  // Shared Intl.DateTimeFormat cache for per-row timestamp labels: building a
+  // formatter per row dominated long-transcript renders. The browser's default
+  // locale/time zone can change while the page is open (OS time-zone change),
+  // so re-check it once per task (one probe per render, not per row) and drop
+  // every cached formatter when it differs.
+  const f=_intlFormatter;
+  if(!f._envChecked){
+    const o=new Intl.DateTimeFormat().resolvedOptions();
+    const env=o.locale+'|'+o.timeZone;
+    if(env!==f._env||!f._cache){ f._cache=new Map(); f._env=env; }
+    f._envChecked=true;
+    queueMicrotask(()=>{ f._envChecked=false; });
+  }
+  const key=JSON.stringify([locales,options]);
+  let fmt=f._cache.get(key);
+  if(!fmt){ fmt=new Intl.DateTimeFormat(locales,options); f._cache.set(key,fmt); }
+  return fmt;
+}
 function _activityClockLabel(ts){
   const stamp=Number(ts||_activityNowSeconds());
   if(!Number.isFinite(stamp)||stamp<=0)return'';
-  try{return new Date(stamp*1000).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});}catch(_){return'';}
+  try{
+    const d=new Date(stamp*1000);
+    // Date's locale methods return "Invalid Date", whereas Intl.format throws.
+    if(isNaN(d.getTime()))return d.toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+    const opts={hour:'numeric',minute:'2-digit'};
+    const fmt=typeof _intlFormatter==='function'?_intlFormatter([],opts):new Intl.DateTimeFormat([],opts);
+    return fmt.format(d);
+  }catch(_){return'';}
 }
 // Full date+time label for the worklog event-time tooltip (title attr). Guards the
 // same valid-Date range as _timestampSeconds so a bad epoch never yields "Invalid
@@ -7341,7 +7431,9 @@ function _activityFullClockLabel(ts){
   try{
     const d=new Date(stamp*1000);
     if(isNaN(d.getTime()))return'';
-    return d.toLocaleString([], {year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+    const opts={year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'};
+    const fmt=typeof _intlFormatter==='function'?_intlFormatter([],opts):new Intl.DateTimeFormat([],opts);
+    return fmt.format(d);
   }catch(_){return'';}
 }
 function _timestampSeconds(value){
@@ -12408,14 +12500,42 @@ function getPendingSessionMessage(session, messagesOverride=null){
       ? _sameTranscriptMessage(row,pendingCandidate)
       : String(msgContent(row)||'').trim()===text;
   };
+  const _rowIdentityMatchesPending=(row)=>{
+    if(!row) return false;
+    if(typeof _activeTurnTokenMatches==='function'&&_activeTurnTokenMatches(row,session)) return true;
+    const ts=_messageTimestampSeconds(row);
+    const startedAt=Number(session?.pending_started_at);
+    return ts!==null&&Number.isFinite(startedAt)&&startedAt>0
+      &&Math.abs(ts-startedAt)<=_PENDING_ACTIVE_TURN_TS_EPSILON;
+  };
   const _adoptExistingRow=(row)=>{
     if(attachments.length&&!row.attachments?.length) row.attachments=attachments;
+    // #quiet-delegation: a state.db copy adopted on reload may predate the
+    // _source stamp (deferred save). Carry the pending turn's provenance so
+    // the hidden-row predicate still applies to the adopted row — but ONLY on
+    // identity proof (token or exact timestamp). Text equality alone must
+    // never stamp a real earlier row hidden (#quiet-delegation gate review
+    // finding 4).
+    const pendingSource=session?.pending_user_source;
+    if(pendingSource&&row&&!row._source&&_rowIdentityMatchesPending(row)) row._source=pendingSource;
     return null;
   };
   const currentTailUser=_pendingCurrentTailUserMessage(messages);
   if(currentTailUser){
     const sameCurrentTurn=_matchesPending(currentTailUser);
-    if(sameCurrentTurn) return _adoptExistingRow(currentTailUser);
+    if(sameCurrentTurn){
+      // A wakeup-sourced pending prompt that text-matches a real row WITHOUT
+      // the pending turn's token/timestamp identity must not swallow that
+      // row: leave it alone and materialize the pending row separately, so a
+      // delegation_wakeup stamp can never hide a real user turn (gate review
+      // finding 4). Ordinary webui prompts keep text-only dedupe — their row
+      // is never hidden and the deferred-save flow relies on it.
+      const pendingSource=session?.pending_user_source;
+      const wakeupSourced=!!pendingSource&&pendingSource!=='webui';
+      if(!wakeupSourced||_rowIdentityMatchesPending(currentTailUser)){
+        return _adoptExistingRow(currentTailUser);
+      }
+    }
   }
   // Fallback: the current turn's user row is already in the transcript but the
   // strict tail scan above could not see it because this turn's assistant/tool
@@ -12466,11 +12586,16 @@ async function checkInflightOnBoot(sid) {
 
 function _topbarLoadedMessageCount(){
   const messages=Array.isArray(S.messages)?S.messages:[];
-  return messages.filter(m=>m&&m.role&&m.role!=='tool').length;
+  return messages.filter(m=>m&&m.role&&m.role!=='tool'&&m._source!=='delegation_wakeup').length;
 }
 function _topbarMessageMetaText(){
   const loadedCount=_topbarLoadedMessageCount();
-  const totalCount=Number(S.session&&S.session.message_count);
+  // #quiet-delegation: prefer the server's visible count (hidden internal
+  // rows excluded) so "N of M messages" never counts delegation handoffs.
+  // Fall back to the raw count on servers that don't send it yet.
+  const rawTotal=Number(S.session&&S.session.message_count);
+  const visibleTotal=Number(S.session&&S.session.visible_message_count);
+  const totalCount=Number.isFinite(visibleTotal)&&visibleTotal>=0?visibleTotal:rawTotal;
   const hasTotal=Number.isFinite(totalCount)&&totalCount>0;
   const isTruncated=!!(typeof _messagesTruncated!=='undefined'&&_messagesTruncated);
   if(isTruncated&&hasTotal&&totalCount>loadedCount){
@@ -12860,10 +12985,11 @@ function _assistantVisibleContentForReasoningCompare(m){
   if(_isAssistantEmptyPlaceholderContent(m, content)) return '';
   return String(content||'');
 }
-function _assistantTurnFinalVisibleContentMap(visWithIdx){
+function _assistantTurnFinalVisibleContentMap(visWithIdx, turnBoundaryByRawIdx){
   const out=new Map();
   let runIdxs=[];
   let finalVisible='';
+  let runTurnId;
   const flush=()=>{
     for(const idx of runIdxs) out.set(idx, finalVisible);
     runIdxs=[];
@@ -12871,7 +12997,19 @@ function _assistantTurnFinalVisibleContentMap(visWithIdx){
   };
   for(const entry of visWithIdx||[]){
     const m=entry&&entry.m;
-    if(m&&m.role==='assistant'){
+    // #7882 (gate round-7 CORE): a hidden delegation_wakeup row between two
+    // answers is still a turn boundary — flush the run when the raw turn
+    // owner changes even though the boundary row never renders. The entry
+    // that triggered the flush STARTS the next run (a split, not a drop).
+    const turnId=turnBoundaryByRawIdx?turnBoundaryByRawIdx.get(entry.rawIdx):undefined;
+    if(m&&m.role==='assistant'&&(!turnBoundaryByRawIdx||turnId===runTurnId||runIdxs.length===0)){
+      if(runIdxs.length===0) runTurnId=turnId;
+      runIdxs.push(entry.rawIdx);
+      const visible=_assistantVisibleContentForReasoningCompare(m);
+      if(String(visible||'').trim()) finalVisible=visible;
+    }else if(m&&m.role==='assistant'&&runIdxs.length){
+      flush();
+      runTurnId=turnId;
       runIdxs.push(entry.rawIdx);
       const visible=_assistantVisibleContentForReasoningCompare(m);
       if(String(visible||'').trim()) finalVisible=visible;
@@ -12882,10 +13020,11 @@ function _assistantTurnFinalVisibleContentMap(visWithIdx){
   flush();
   return out;
 }
-function _assistantTurnVisibleContentMap(visWithIdx){
+function _assistantTurnVisibleContentMap(visWithIdx, turnBoundaryByRawIdx){
   const out=new Map();
   let runIdxs=[];
   let visibleTexts=[];
+  let runTurnId;
   const flush=()=>{
     for(const idx of runIdxs) out.set(idx, visibleTexts.slice());
     runIdxs=[];
@@ -12893,7 +13032,15 @@ function _assistantTurnVisibleContentMap(visWithIdx){
   };
   for(const entry of visWithIdx||[]){
     const m=entry&&entry.m;
-    if(m&&m.role==='assistant'){
+    const turnId=turnBoundaryByRawIdx?turnBoundaryByRawIdx.get(entry.rawIdx):undefined;
+    if(m&&m.role==='assistant'&&(!turnBoundaryByRawIdx||turnId===runTurnId||runIdxs.length===0)){
+      if(runIdxs.length===0) runTurnId=turnId;
+      runIdxs.push(entry.rawIdx);
+      const visible=_assistantVisibleContentForReasoningCompare(m);
+      if(String(visible||'').trim()) visibleTexts.push(visible);
+    }else if(m&&m.role==='assistant'&&runIdxs.length){
+      flush();
+      runTurnId=turnId;
       runIdxs.push(entry.rawIdx);
       const visible=_assistantVisibleContentForReasoningCompare(m);
       if(String(visible||'').trim()) visibleTexts.push(visible);
@@ -16027,6 +16174,15 @@ function _computeTransparentHiddenPrefixCount(rows){
 // renderMessages({preserveScroll:true}) call and cleared after the settled-scene
 // render pass; null at all other times.
 let _keepSettledWorklogOpenForStreamId=null;
+// #7677: PRE-INIT snapshot taken by the keep-open settle render (renderMessages
+// computes `cacheHtml` before highlightCode/addCopyButtons/initTreeViews and
+// deliberately does NOT cache the forced-open DOM, #5260). When the settle chain
+// then skips the unarmed rebuild, _cacheSettledTranscriptHtml() publishes this
+// stash so the session still lands in _sessionHtmlCache. Capturing it here —
+// rather than from the live DOM afterwards — is what keeps restored controls
+// working: innerHTML cannot save onclick handlers, and addCopyButtons() /
+// initTreeViews() skip already-initialized markup on restore.
+let _settleKeepOpenCacheStash=null;
 function _shouldKeepSettledWorklogOpenForStreamSettle(streamId){
   // Round 6 scroll-jump guard: collapsing the JUST-settled live worklog into a
   // compact summary at STREAM_DONE shrinks the transcript by hundreds of px. The
@@ -16073,6 +16229,138 @@ function _assistantTurnHasVisibleRenderedSegment(turn){
   }
   return false;
 }
+// #7677 (terminal settlement). STREAM_DONE renders the just-settled turn with the
+// keep-open token armed, disarms, then collapses that turn in place — or falls back
+// to a SECOND full transcript rebuild. The in-place collapse below keys off the
+// settled-scene OWNER group, which only the NON-transparent settled renderer stamps
+// (_renderSettledAnchorSceneForMessage), so transparent streams never matched a
+// group and ALWAYS paid the second rebuild: the "~11 s of every turn" of this issue,
+// on top of an already multi-second first render.
+//
+// The only armed-keep-open effect the TRANSPARENT settled renderer honors is the
+// per-turn row-cap exemption (`justSettled` in
+// _renderSettledAnchorSceneTransparentForMessage): while the token is armed the
+// just-settled turn renders its activity rows in FULL, and the unarmed rebuild's
+// only job is to re-cap that one turn behind a "Show earlier steps" affordance. So
+// whenever the armed render left the turn within the cap slack — including the
+// common plain reply whose scene has no activity rows at all — the unarmed rebuild
+// would produce exactly the same DOM and there is nothing left to collapse.
+//
+// Fail closed in every other case: non-transparent stream, a worklog-worthy scene
+// whose rows are not in the rendered transcript (windowing / cache divergence), or
+// a turn over the cap that an unarmed rebuild WOULD re-cap. Cost is never traded
+// for correctness — the second render stays the fallback.
+// #7677 (review P1). The UNARMED rebuild's decision to re-cap a turn is taken
+// from the SCENE'S ROW LIST (`_anchorSceneRowsForRendering(...,{settled:true})`)
+// and the turn's revealed state — never from what happens to sit in the DOM.
+// Rows that render no node at all (hidden reasoning) are still in that list, so
+// counting the nodes the ARMED render left behind can read cap+slack while the
+// list is longer, and declare the second render redundant while an unarmed
+// rebuild would still re-cap the turn to its last 30 rows + a "Show earlier
+// steps" affordance. Any row source we cannot read fails CLOSED (pay the second
+// render); correctness is never traded for the saved rebuild.
+function _transparentSettledTurnWouldBeCapped(inner, scene, rawIdx){
+  if(!scene) return false;
+  if(typeof _anchorSceneRowsForRendering!=='function') return true;
+  let rows=null;
+  try{ rows=_anchorSceneRowsForRendering(scene,{settled:true}); }catch(_e){ rows=null; }
+  if(!Array.isArray(rows)) return true;
+  if(rows.length<=_TRANSPARENT_SETTLED_ROW_CAP+_TRANSPARENT_SETTLED_ROW_CAP_SLACK) return false;
+  // #5966 Codex F3: the persistent revealed set is authoritative — an already
+  // revealed turn is never re-capped by a rebuild. The DOM flag
+  // (data-transparent-earlier-revealed) is only the renderer's same-render fast
+  // path; ignoring it here fails toward the second render, i.e. the safe side.
+  if(typeof _transparentRevealKey==='function'
+     &&typeof _transparentRevealedTurns!=='undefined'
+     &&_transparentRevealedTurns&&typeof _transparentRevealedTurns.has==='function'){
+    const session=(typeof S!=='undefined'&&S)?S.session:null;
+    if(_transparentRevealedTurns.has(_transparentRevealKey(session&&session.session_id, rawIdx))) return false;
+  }
+  return true;
+}
+// #7677 (review P2 / r2 P1). STREAM_DONE's unarmed second render was also the
+// pass that wrote the settled transcript into _sessionHtmlCache (the keep-open
+// ARMED render is deliberately uncached, #5260). Skipping that rebuild therefore
+// used to leave the session uncached, so switching away and back paid a full
+// rebuild. Publish the PRE-INIT snapshot the armed render stashed — no rebuild —
+// under exactly the gates renderMessages() applies to its own cache write: the
+// stash must belong to the live session, no in-flight stream, no transient
+// compression/handoff card, and <300 KB of HTML. Reading the LIVE DOM here would
+// be wrong: by settle time it is post-init, and innerHTML cannot carry the copy
+// buttons' / tree views' onclick handlers, so restored controls would be dead.
+function _cacheSettledTranscriptHtml(){
+  try{
+    if(typeof _settleKeepOpenCacheStash==='undefined'||!_settleKeepOpenCacheStash) return false;
+    const stash=_settleKeepOpenCacheStash;
+    const sid=stash.sid;
+    const currentSid=(typeof S!=='undefined'&&S&&S.session)?S.session.session_id:null;
+    if(!sid||sid!==currentSid) return false;
+    if(typeof INFLIGHT!=='undefined'&&INFLIGHT&&INFLIGHT[sid]) return false;
+    const w=(typeof window!=='undefined')?window:null;
+    const hasTransient=!!(w&&(
+      (w._compressionUi&&(!w._compressionUi.sessionId||w._compressionUi.sessionId===sid))||
+      (w._handoffUi&&(!w._handoffUi.sessionId||w._handoffUi.sessionId===sid))
+    ));
+    if(hasTransient) return false;
+    if(!stash.html||stash.html.length>=300000) return false;
+    if(typeof _sessionHtmlCache==='undefined'||!_sessionHtmlCache||typeof _sessionHtmlCache.set!=='function') return false;
+    if(typeof _sessionHtmlCacheSid!=='undefined') _sessionHtmlCacheSid=sid;
+    _sessionHtmlCache.set(sid,{
+      html:stash.html,
+      msgCount:stash.msgCount,
+      renderWindowKey:stash.renderWindowKey,
+      signature:stash.signature,
+    });
+    if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
+    _settleKeepOpenCacheStash=null;
+    return true;
+  }catch(_e){ return false; }
+}
+function _transparentSettledTurnSecondRenderIsRedundant(streamId){
+  if(!streamId) return false;
+  if(typeof isTransparentStream!=='function'||!isTransparentStream()) return false;
+  const inner=$('msgInner');
+  if(!inner||typeof inner.querySelectorAll!=='function') return false;
+  const messages=(typeof S!=='undefined'&&S&&Array.isArray(S.messages))?S.messages:[];
+  const ownerIdxs=[];
+  const ownerScenes=[];
+  let ownerScene=null;
+  for(let i=0;i<messages.length;i++){
+    const m=messages[i];
+    if(!m||String(m._anchor_stream_id||'')!==String(streamId)) continue;
+    ownerIdxs.push(String(i));
+    ownerScenes.push(m._anchor_activity_scene||null);
+    ownerScene=m._anchor_activity_scene||ownerScene;
+  }
+  if(!ownerIdxs.length) return false;
+  // #7677 (review P1): decide with the renderer's own inputs first — if the
+  // unarmed rebuild would re-cap ANY of this stream's owner turns, the second
+  // render is not redundant no matter what the armed render left in the DOM.
+  if(typeof _transparentSettledTurnWouldBeCapped==='function'){
+    for(let k=0;k<ownerScenes.length;k++){
+      if(!ownerScenes[k]) continue;
+      if(_transparentSettledTurnWouldBeCapped(inner, ownerScenes[k], Number(ownerIdxs[k]))) return false;
+    }
+  }
+  // The transparent settled renderer stamps each row node with the owner message's
+  // RAW index (data-anchor-owner-idx); count only this stream's settled rows.
+  // This stays as the SECOND guard: it catches a turn whose scene rows are not in
+  // the rendered transcript at all (windowing / cache divergence), where the row
+  // list alone cannot prove the two renders match.
+  let renderedRows=0;
+  const nodes=inner.querySelectorAll('[data-anchor-owner-idx][data-anchor-settled-scene-row="1"]');
+  for(let i=0;i<nodes.length;i++){
+    if(ownerIdxs.indexOf(String(nodes[i]&&nodes[i].getAttribute('data-anchor-owner-idx')))>=0) renderedRows++;
+  }
+  if(!renderedRows){
+    // No settled rows rendered for this turn: a rebuild is a no-op unless the scene
+    // is worklog-worthy (its rows would appear — but then they would be here).
+    if(!ownerScene) return true;
+    if(typeof _anchorSceneSceneHasWorklogWorthyRows!=='function') return false;
+    return !_anchorSceneSceneHasWorklogWorthyRows(ownerScene);
+  }
+  return renderedRows<=(_TRANSPARENT_SETTLED_ROW_CAP+_TRANSPARENT_SETTLED_ROW_CAP_SLACK);
+}
 function _collapseJustSettledWorklogInPlace(streamId){
   // #6414: STREAM_DONE used to render the settled turn once with its Worklog
   // forced open, then immediately run a second full render only to collapse it.
@@ -16086,7 +16374,20 @@ function _collapseJustSettledWorklogInPlace(streamId){
   const group=Array.from(inner.querySelectorAll('[data-anchor-settled-scene-owner="1"]'))
     .filter(candidate=>candidate.getAttribute('data-anchor-stream-id')===String(streamId))
     .pop();
-  if(!group) return false;
+  if(!group){
+    // #7677: no settled-scene owner group means either a non-transparent miss
+    // (keep the old fail-closed fallback) or a TRANSPARENT stream, which never
+    // stamps that group at all — in which case the second STREAM_DONE render is
+    // redundant exactly when the armed settle render already matches the unarmed
+    // one. Non-transparent callers still get false from the helper below.
+    const redundant=_transparentSettledTurnSecondRenderIsRedundant(streamId);
+    // #7677 (review P2): skipping the unarmed rebuild also skips the cache write
+    // that rebuild used to perform (the armed render is deliberately uncached,
+    // #5260) — snapshot the already-settled DOM so a later switch-away/switch-back
+    // still hits _sessionHtmlCache instead of a full rebuild.
+    if(redundant&&typeof _cacheSettledTranscriptHtml==='function') _cacheSettledTranscriptHtml();
+    return redundant;
+  }
   const ownerTurn=typeof group.closest==='function'?group.closest('.assistant-turn'):null;
   const ownerHasVisibleSegment=_assistantTurnHasVisibleRenderedSegment(ownerTurn);
   if(ownerHasVisibleSegment===null) return false;
@@ -17248,6 +17549,7 @@ function clearMessageRenderCache(){
   _clearRenderCache();
   _sessionHtmlCache.clear();
   _sessionHtmlCacheSid=null;
+  _settleKeepOpenCacheStash=null;
   clearVisibleMessageRowCache();
   _clearMessageVirtualHeightCache();
 }
@@ -18881,8 +19183,13 @@ function renderMessages(options){
   // distinct turns into one run (duplicate final-answer in Worklog/Thinking,
   // or later-turn prose used as an echo-strip input). Turn context must
   // always be complete — never cut mid-run, never head+tail with a gap.
-  const assistantTurnFinalVisibleContentByRawIdx=_assistantTurnFinalVisibleContentMap(visWithIdx);
-  const assistantTurnVisibleContentByRawIdx=_assistantTurnVisibleContentMap(visWithIdx);
+  // #7882 (gate round-7 CORE): the maps also split runs at HIDDEN user-row
+  // boundaries (delegation wakeups) — a hidden wakeup between two answers
+  // still separates the turns. The boundary map derives turn ownership from
+  // the RAW messages via _rawTurnBoundaryByRawIdx().
+  const _turnBoundaryMap=_rawTurnBoundaryByRawIdx(S.messages);
+  const assistantTurnFinalVisibleContentByRawIdx=_assistantTurnFinalVisibleContentMap(visWithIdx,_turnBoundaryMap);
+  const assistantTurnVisibleContentByRawIdx=_assistantTurnVisibleContentMap(visWithIdx,_turnBoundaryMap);
   const hasServerOlder=!!(typeof _messagesTruncated!=='undefined' && _messagesTruncated && S.messages.length>0);
   const serverOlderCount=hasServerOlder&&Number.isFinite(Number(_oldestIdx))?Math.max(0,Number(_oldestIdx)):0;
   if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
@@ -18967,9 +19274,11 @@ function renderMessages(options){
   // body is empty) against the answer prose carried by a SIBLING message in the
   // same turn. A turn = the run of assistant messages between two user messages.
   // Map every assistant rawIdx in a run to the run's combined visible text.
+  // #7882 (gate round-7 CORE): runs also split at HIDDEN user-row boundaries
+  // (delegation wakeups) — see _rawTurnBoundaryByRawIdx.
   const _turnVisibleTextByRawIdx=new Map();
   {
-    let _run=[]; let _runText=[];
+    let _run=[]; let _runText=[]; let _runTurnId;
     const _flush=()=>{
       if(_run.length){
         const combined=_runText.join('\n\n');
@@ -18979,10 +19288,23 @@ function renderMessages(options){
     };
     for(const entry of renderVisWithIdx){
       const em=entry&&entry.m; const role=em&&em.role;
-      if(role==='assistant'){
+      const _turnId=_turnBoundaryMap.get(entry.rawIdx);
+      if(role==='assistant'&&(_run.length===0||_turnId===_runTurnId)){
+        if(_run.length===0) _runTurnId=_turnId;
         _run.push(entry.rawIdx);
         // Visible prose = content with any leading <think>…</think> /channel-thought
         // block stripped (the same blocks the per-message extractor removes below).
+        let vis=typeof em.content==='string'?em.content:'';
+        vis=vis.replace(/^\s*<think>[\s\S]*?<\/think>\s*/,'')
+               .replace(/^\s*<\|channel\|?>thought\n?[\s\S]*?<channel\|>\s*/,'')
+               .replace(/^\s*<\|turn\|>thinking\n[\s\S]*?<turn\|>\s*/,'').trim();
+        if(vis) _runText.push(vis);
+      }else if(role==='assistant'&&_run.length){
+        // #7882 (gate round-7 CORE): the entry that triggered the boundary
+        // flush STARTS the next run (a split, not a drop).
+        _flush();
+        _runTurnId=_turnId;
+        _run.push(entry.rawIdx);
         let vis=typeof em.content==='string'?em.content:'';
         vis=vis.replace(/^\s*<think>[\s\S]*?<\/think>\s*/,'')
                .replace(/^\s*<\|channel\|?>thought\n?[\s\S]*?<channel\|>\s*/,'')
@@ -19123,6 +19445,21 @@ function renderMessages(options){
     }
     const isProcessWakeup=m&&m._source==='process_wakeup';
     const isUser=m.role==='user';
+    // #7882 (gate round-7 CORE): a hidden delegation_wakeup row between two
+    // answers deletes the user-turn boundary from the visible projection —
+    // without this check both answers render into ONE .assistant-turn
+    // container and installing the follow-up's Worklog hides the parent's
+    // answer segment. Split the container wherever the RAW turn owner
+    // changes, so a hidden row still acts as a turn boundary. Visible user
+    // rows reset below anyway (isUser branch); compaction/recovery rows and
+    // preserved task lists never bump the boundary map, matching their
+    // skip-without-reset behavior here.
+    if(currentAssistantTurn&&vi>0){
+      const prevEntry=renderVisWithIdx[vi-1];
+      if(prevEntry&&_turnBoundaryMap.get(prevEntry.rawIdx)!==_turnBoundaryMap.get(rawIdx)){
+        currentAssistantTurn=null;
+      }
+    }
     if(!isUser&&_isMarkerOnlyAssistantCompressionMessage(m)){
       content='**Error:** No response received after context compression. Please retry.';
     }
@@ -19180,7 +19517,7 @@ function renderMessages(options){
     const branchableReadOnlySession=typeof _isBranchableReadOnlySession==='function'
       ? _isBranchableReadOnlySession(S.session)
       : false;
-    const forkBtn  = (readOnlySession&&!branchableReadOnlySession) ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1})">${li('git-branch',13)}</button>`;
+    const forkBtn  = (readOnlySession&&!branchableReadOnlySession) ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1},this)">${li('git-branch',13)}</button>`;
     const ttsBtn   = !isUser ? `<button class="msg-action-btn msg-tts-btn" title="${t('tts_listen')||'Listen'}" onclick="speakMessage(this)">${li('volume-2',13)}</button>` : '';
     const tsVal=m._ts||m.timestamp;
     // _formatInServerTz handles fractional-hour offsets (India +0530 etc.)
@@ -20391,6 +20728,26 @@ function renderMessages(options){
       _sessionHtmlCache.set(sid,{html:_html,msgCount,renderWindowKey,signature:renderSignature});
       if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
     }
+    // #7677: an unarmed render supersedes any pending settle stash.
+    _settleKeepOpenCacheStash=null;
+  }else if(sid&&_keepOpenArmed){
+    // #7677: still no cache WRITE here (#5260 — the forced-open DOM must never be
+    // persisted), but stash the pre-init snapshot this render already computed.
+    // `cacheHtml` is taken BEFORE highlightCode/addCopyButtons/initTreeViews run,
+    // so it is exactly what the normal cache path would have stored. When the
+    // settle chain then skips the unarmed rebuild, _cacheSettledTranscriptHtml()
+    // publishes this stash — reading it back from the live DOM instead would save
+    // copy buttons and JSON/YAML trees WITHOUT their onclick handlers, leaving
+    // dead controls after a session switch (#7677 review r2 P1).
+    _settleKeepOpenCacheStash=(cacheHtml&&cacheHtml.length<300_000)
+      ? {
+        sid,
+        msgCount,
+        renderWindowKey,
+        html:cacheHtml,
+        signature:cachedRenderSignature===null?_messageRenderCacheSignature():cachedRenderSignature,
+      }
+      : null;
   }
   _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
   // Kill the pinned/tail-follower mid-stream jitter. Schedule the re-anchor in a MICROTASK,
@@ -21451,7 +21808,7 @@ function editMessage(btn) {
   if(S.busy) return;
   const row = btn.closest('[data-msg-idx]');
   if(!row) return;
-  const msgIdx = parseInt(row.dataset.msgIdx, 10);
+  let msgIdx = parseInt(row.dataset.msgIdx, 10);
   const originalText = row.dataset.rawText || '';
   const body = row.querySelector('.msg-body');
   if(!body || row.dataset.editing) return;
@@ -21475,6 +21832,9 @@ function editMessage(btn) {
   bar.querySelector('.msg-edit-send').onclick = async () => {
     const newText = ta.value.trim();
     if(!newText) return;
+    // Re-read the row's index at send time: history can load (e.g. the outline
+    // opening) after the edit opened, which re-bases data-msg-idx (#2184).
+    if(typeof _rowCurrentRawIdx==='function') msgIdx = _rowCurrentRawIdx(row, msgIdx);
     await submitEdit(msgIdx, newText);
   };
   bar.querySelector('.msg-edit-cancel').onclick = () => cancelEdit(row, originalText, body);
@@ -21563,7 +21923,8 @@ async function regenerateResponse(btn) {
   if(!S.session || S.busy) return;
   const row=btn&&btn.closest&&btn.closest('[data-msg-idx]');
   if(!row)return;
-  const clickedAbsoluteIndex=_oldestIdx+parseInt(row.dataset.msgIdx,10);
+  const clickedRowIdx=parseInt(row.dataset.msgIdx,10);
+  const clickedAbsoluteIndex=_oldestIdx+(typeof _rowCurrentRawIdx==='function'?_rowCurrentRawIdx(row,clickedRowIdx):clickedRowIdx);
   const initialSid = S.session.session_id;
   if(typeof _ensureAllMessagesLoaded==='function'){
     await _ensureAllMessagesLoaded();
