@@ -114,10 +114,10 @@ class TestIssue5127CustomProviderBareSuffixRepair:
         assert mock_catalog.call_count == 0
         assert result == ("@custom:local-lab:new-live-c", "custom:local-lab", False)
 
-    def test_repairs_removed_qualified_model_from_global_config(self, monkeypatch):
-        """Sessions without a profile config repair against the active config."""
+    def test_no_profile_config_never_repairs_from_shared_cfg(self, monkeypatch):
+        """The shared cfg may belong to another profile, so it can't drive a rewrite."""
         import api.config as config
-        from api.routes import _resolve_compatible_session_model_state
+        from api.routes import _repair_removed_qualified_custom_provider_model
 
         monkeypatch.setattr(
             config,
@@ -129,15 +129,73 @@ class TestIssue5127CustomProviderBareSuffixRepair:
             },
         )
 
-        with patch("api.routes.get_available_models") as mock_catalog:
-            result = _resolve_compatible_session_model_state(
+        assert (
+            _repair_removed_qualified_custom_provider_model(
                 "@custom:local-lab:chat-old",
                 "custom:local-lab",
+                config_obj=None,
+            )
+            is None
+        )
+
+    def test_repair_replacement_stays_inside_pinned_allowlist(self):
+        """A singular default outside the pinned list is not a valid replacement."""
+        from api.routes import _repair_removed_qualified_custom_provider_model
+
+        profile_cfg = {
+            "custom_providers": [
+                {"name": "local-lab", "model": "chat-default", "models": ["chat-a"]}
+            ]
+        }
+
+        assert (
+            _repair_removed_qualified_custom_provider_model(
+                "@custom:local-lab:chat-old",
+                "custom:local-lab",
+                config_obj=profile_cfg,
+            )
+            == "@custom:local-lab:chat-a"
+        )
+
+    def test_repair_fails_closed_on_colliding_slugs(self):
+        """Two entries normalising to one slug must not pick a winner."""
+        from api.routes import _repair_removed_qualified_custom_provider_model
+
+        profile_cfg = {
+            "custom_providers": [
+                {"name": "Local Lab", "model": "chat-a", "models": ["chat-a"]},
+                {"name": "local-lab", "model": "chat-old", "models": ["chat-old"]},
+            ]
+        }
+
+        assert (
+            _repair_removed_qualified_custom_provider_model(
+                "@custom:local-lab:chat-old",
+                "custom:local-lab",
+                config_obj=profile_cfg,
+            )
+            is None
+        )
+
+    def test_fast_path_rejects_longer_parsed_qualifier(self):
+        """The parsed qualifier must equal the session provider to skip the catalog."""
+        from api.routes import _resolve_compatible_session_model_state
+
+        profile_cfg = {
+            "custom_providers": [
+                {"name": "host.example", "model": "m", "models": ["m"]}
+            ]
+        }
+
+        with patch("api.routes.get_available_models", return_value={"groups": []}) as mock_catalog:
+            _resolve_compatible_session_model_state(
+                "@custom:host.example:8080:m",
+                "custom:host.example",
+                profile_config=profile_cfg,
                 prefer_cached_catalog=True,
             )
 
-        assert mock_catalog.call_count == 0
-        assert result == ("@custom:local-lab:chat-new", "custom:local-lab", True)
+        assert mock_catalog.call_count == 1
 
     def test_removed_custom_provider_is_not_kept_by_unrelated_entry(self, monkeypatch):
         """Another configured custom provider must not keep a removed one routable."""

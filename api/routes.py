@@ -8531,28 +8531,43 @@ def _repair_removed_qualified_custom_provider_model(
 
     Only a pinned allowlist (``_custom_provider_allowlist_ids``) can prove a
     model was removed: a discovered catalog snapshot or dict-shaped metadata
-    may omit models the live probe still serves. ``config_obj=None`` reads
-    the active global config.
+    may omit models the live probe still serves. Needs the session's own
+    profile config; ``None`` is ambiguous (no profile, unreadable profile, or
+    a caller that doesn't pass one) and the shared ``cfg`` may belong to
+    another profile, so it never repairs from it. Colliding slugs fail closed.
     """
     prov = _clean_session_model_provider(provider)
     bare_model, qualified_provider = _split_provider_qualified_model(model)
-    if not prov or not prov.startswith("custom:") or qualified_provider != prov:
+    if (
+        not isinstance(config_obj, dict)
+        or not prov
+        or not prov.startswith("custom:")
+        or qualified_provider != prov
+    ):
         return None
 
-    from api.config import _custom_provider_entries, _custom_provider_slug_from_name
+    from api.config import (
+        AmbiguousCustomProviderError,
+        _custom_provider_slug_key,
+        _unique_custom_provider_entry,
+    )
 
-    provider_slug = prov.removeprefix("custom:")
-    for entry in _custom_provider_entries(config_obj):
-        slug = _custom_provider_slug_from_name(entry.get("name")).removeprefix("custom:")
-        if slug != provider_slug:
-            continue
-        pinned = _custom_provider_allowlist_ids(entry)
-        pinned_bare = {_split_provider_qualified_model(item)[0] for item in pinned}
-        if not pinned or bare_model in pinned_bare:
-            return None
-        replacement = str(entry.get("model") or pinned[0]).strip()
-        return f"@{prov}:{_split_provider_qualified_model(replacement)[0]}"
-    return None
+    try:
+        entry = _unique_custom_provider_entry(
+            config_obj.get("custom_providers"),
+            _custom_provider_slug_key(prov),
+        )
+    except AmbiguousCustomProviderError:
+        return None
+    if not entry:
+        return None
+    pinned = _custom_provider_allowlist_ids(entry)
+    pinned_bare = [_split_provider_qualified_model(item)[0] for item in pinned]
+    if not pinned or bare_model in pinned_bare:
+        return None
+    default_bare = _split_provider_qualified_model(str(entry.get("model") or "").strip())[0]
+    replacement = default_bare if default_bare in pinned_bare else pinned_bare[0]
+    return f"@{prov}:{replacement}"
 
 
 def _moa_fast_path_model_state(model: str) -> tuple[str, str, bool]:
@@ -8625,7 +8640,11 @@ def _resolve_compatible_session_model_state(
         )
         if repaired_model:
             return repaired_model, requested_provider, True
-        if requested_provider.startswith("custom:"):
+        if (
+            requested_provider.startswith("custom:")
+            and isinstance(profile_config, dict)
+            and _split_provider_qualified_model(model)[1] == requested_provider
+        ):
             from api.config import _named_custom_provider_slug_for_provider
 
             if _named_custom_provider_slug_for_provider(requested_provider, profile_config):
