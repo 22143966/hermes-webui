@@ -36,7 +36,8 @@ builds are installed and launch; WebKit needs its system libraries)
   touch (Chromium, 390x844, drawer open)
   - a tap still opens the conversation exactly once;
   - tapping another title during a rename commits and ends the rename;
-  - a tap on a title moves focus out of the search box.
+  - a tap on a title moves focus out of the search box (1440x1000 only);
+  - a long press opens the action menu and leaves focus in it.
 
   --screenshots DIR writes the sidebar at 1440x900 and 390x844 (drawer open)
   after pressing Tab from the conversation filter until focus reaches the
@@ -628,6 +629,10 @@ def _open_drawer_if_phone(page, phone):
     page.wait_for_timeout(400)
 
 
+# SESSION_LONG_PRESS_DELAY_MS in static/sessions.js is 400 ms; hold well past it.
+LONG_PRESS_HOLD_MS = 700
+
+
 def _native_short_swipe(cdp, box, dx=30, steps=3):
     """A horizontal touch drag through Chromium's native input pipeline (not
     dispatchEvent), shorter than the archive/delete thresholds: trusted
@@ -637,6 +642,16 @@ def _native_short_swipe(cdp, box, dx=30, steps=3):
     cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]})
     for i in range(1, steps + 1):
         cdp.send("Input.dispatchTouchEvent", {"type": "touchMove", "touchPoints": [{"x": x + dx * i / steps, "y": y}]})
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+
+
+def _native_long_press(cdp, box, hold_ms=LONG_PRESS_HOLD_MS):
+    """Hold a touch on a row through Chromium's native input pipeline, longer
+    than the app's long-press delay, then lift it."""
+    x = box["x"] + min(20, box["width"] / 3)
+    y = box["y"] + box["height"] / 2
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]})
+    time.sleep(hold_ms / 1000)
     cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
 
 
@@ -728,35 +743,34 @@ def _check_touch(page, ctx, seed, label, phone):
 
     # A tap moves focus out of a focused editor, as on master: the search box
     # here, so the on-screen keyboard closes (other editors save on that blur).
-    # The tap's compatibility mousedown, which did that, is cancelled. Only the
-    # wide run tells: on a phone the opened conversation closes the drawer,
-    # which moves focus out of the search box anyway.
-    _open(page, alpha)
-    _open_drawer_if_phone(page, phone)
-    page.evaluate("() => document.getElementById('sessionSearch').focus()")
-    _title(page, gamma).tap()
-    if not _wait_until(page, ACTIVE_JS, gamma):
-        fail("a tap with the search box focused did not open the conversation")
-    page.wait_for_timeout(SETTLE_MS)
-    if page.evaluate("() => document.activeElement === document.getElementById('sessionSearch')"):
-        fail("a tap on a title left focus (and the on-screen keyboard) in the search box")
+    # The tap's compatibility mousedown, which did that, is cancelled. Not on a
+    # phone: there the opened conversation closes the drawer, which moves focus
+    # out of the search box anyway, so the check would prove nothing.
+    if not phone:
+        _open(page, alpha)
+        page.evaluate("() => document.getElementById('sessionSearch').focus()")
+        _title(page, gamma).tap()
+        if not _wait_until(page, ACTIVE_JS, gamma):
+            fail("a tap with the search box focused did not open the conversation")
+        page.wait_for_timeout(SETTLE_MS)
+        if page.evaluate("() => document.activeElement === document.getElementById('sessionSearch')"):
+            fail("a tap on a title left focus (and the on-screen keyboard) in the search box")
 
     # A long press opens the row's action menu with focus on its first item;
     # releasing the finger must leave focus there (touchend releases focus only
     # for a tap).
     _open(page, alpha)
     _open_drawer_if_phone(page, phone)
-    box = _title(page, beta).bounding_box()
-    point = {"x": box["x"] + min(20, box["width"] / 3), "y": box["y"] + box["height"] / 2}
-    cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
-    page.wait_for_timeout(700)
-    cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+    _native_long_press(cdp, _title(page, beta).bounding_box())
     page.wait_for_timeout(300)
     if not page.evaluate("() => !!document.querySelector('.session-action-menu')"):
         fail("a long press did not open the action menu")
-    elif not page.evaluate("() => !!document.activeElement && !!document.activeElement.closest('.session-action-menu')"):
-        fail("releasing a long press took focus out of the action menu")
-    page.keyboard.press("Escape")
+    else:
+        if not page.evaluate("() => !!document.activeElement && !!document.activeElement.closest('.session-action-menu')"):
+            fail("releasing a long press took focus out of the action menu")
+        page.keyboard.press("Escape")
+        if not _wait_until(page, "() => !document.querySelector('.session-action-menu')", timeout_ms=2000):
+            fail("Escape did not close the action menu opened by a long press")
     page.evaluate("() => typeof closeSessionActionMenu === 'function' && closeSessionActionMenu()")
     page.wait_for_timeout(300)
 

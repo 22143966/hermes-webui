@@ -272,7 +272,13 @@ a short horizontal swipe (no compatibility click) the first Enter, or a screen
 reader's activate command, about 200 ms later must open another conversation,
 and so must Enter right after a tap or a mouse click. Enter on the row's
 ⋮ trigger must open its menu, not the conversation; and in selection mode the
-title must not be a link. The checks run in Chromium, and also in Firefox and
+title must not be a link. A click or tap on another title during a rename must
+commit and end the rename; with the name unchanged, the tap must not also open
+the other conversation (as on master). Clicking a title during a project rename
+must save the project name, and on the 1440x1000 touch run a tap on a title must
+move focus out of the focused search box. A long press must open the row's
+action menu with focus on its first item, and releasing the finger must leave
+focus there. The checks run in Chromium, and also in Firefox and
 WebKit when their Playwright builds are installed and launch
 (`python -m playwright install --with-deps firefox webkit`); a missing or
 unlaunchable engine is reported as skipped.
