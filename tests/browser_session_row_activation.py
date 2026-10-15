@@ -207,10 +207,8 @@ START_PROJECT_RENAME_JS = """async () => {
   return proj.project_id;
 }"""
 
-DELETE_GATE_PROJECTS_JS = """async () => {
-  for (const project of (_allProjects || []).filter(p => p.name.startsWith('Gate project'))) {
-    await api('/api/projects/delete', {method: 'POST', body: JSON.stringify({project_id: project.project_id})});
-  }
+DELETE_GATE_PROJECT_JS = """async (projectId) => {
+  await api('/api/projects/delete', {method: 'POST', body: JSON.stringify({project_id: projectId})});
   await renderSessionList({deferWhileInteracting: false});
 }"""
 
@@ -556,9 +554,9 @@ def _check_desktop(page, seed, name):
 
     # A press on the title that already has focus (a screen reader's activate
     # command starts with mousedown) must leave focus there, as a native press
-    # on a focusable element would; otherwise an activation that then opens
-    # nothing (an open action menu only closes) drops the reading position to
-    # <body>.
+    # on a focusable element would. Otherwise an activation that then opens
+    # nothing would drop the reading position to <body>. This pins the
+    # mousedown step only.
     _open(page, alpha)
     _focus_title(page, beta)
     page.evaluate("""(el) => el.dispatchEvent(new MouseEvent('mousedown',
@@ -628,9 +626,10 @@ def _check_desktop(page, seed, name):
         if not _wait_until(page, PROJECT_RENAMED_JS, [project_id, suffix], timeout_ms=3000):
             fail("clicking a conversation title during a project rename did not save the new project name")
         # Let the app's own refresh after the rename land before going on.
-        _wait_until(page, "(suffix) => Array.from(document.querySelectorAll('.project-chip')).some(c => c.textContent.includes(suffix))", suffix, timeout_ms=3000)
-    # Remove the project so later runs and screenshots show the usual sidebar.
-    page.evaluate(DELETE_GATE_PROJECTS_JS)
+        elif not _wait_until(page, "(suffix) => Array.from(document.querySelectorAll('.project-chip')).some(c => c.textContent.includes(suffix))", suffix, timeout_ms=3000):
+            fail("the sidebar did not show the renamed project")
+        # Remove the project so later runs and screenshots show the usual sidebar.
+        page.evaluate(DELETE_GATE_PROJECT_JS, project_id)
     page.wait_for_timeout(300)
 
     page.evaluate("() => toggleSessionSelectMode()")

@@ -9669,9 +9669,10 @@ function renderSessionListFromCache(){
         // path, never through a click a gesture could be mistaken for.
         if(!e.repeat) _activateRowWithoutPointer(title);
       };
-      // Keyboard focus only: a mouse press must not park focus on the title,
+      // Keyboard focus only: a mouse press must not move focus onto the title,
       // or the list stays :focus-within and deferred refreshes never apply.
-      // Click, double-click rename and assistive activation are unaffected.
+      // A title that already has focus keeps it. Click, double-click rename
+      // and assistive activation are unaffected.
       title.onmousedown=(e)=>{
         if(e.button!==0) return;
         e.preventDefault();
@@ -10623,7 +10624,7 @@ function renderSessionListFromCache(){
         // gets no mousedown either). During a rename this commits it, and it
         // must come after _finishSessionGesture: an unchanged rename ends at
         // once, and the gesture must still see it active and open nothing.
-        if(!_longPressMenuOpened) _releaseFocusLikeRowPress(el.querySelector('.session-title'));
+        if(!_longPressMenuOpened) _releaseFocusLikeRowPress(e.target&&e.target.closest&&e.target.closest('.session-title'));
       }
     },{passive:false});
     return el;
