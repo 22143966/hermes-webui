@@ -1380,12 +1380,48 @@
     touch(box.vp, "touchend", []);
   }
 
+  // Greptile P2 on the merge-only head c69de101 (2026-10-15T23:15:55Z,
+  // static/ui.js:3213, "Reversing fingers leaves images stuck"): the pinch
+  // recomputed its position from a baseline that still held the clamped-away
+  // overshoot, so a gesture reversed after pushing past an edge did nothing
+  // until the whole overshoot was retraced - the pan half of this family was
+  // fixed long ago, the pinch half was not.
+  async function pinchReversalRespondsImmediately() {
+    var box = await openBox(IMG_W, IMG_H);
+    var size = vpSize(box.vp);
+    var rect = box.vp.getBoundingClientRect();
+    var cx = rect.left + size.w / 2;
+    var cy = rect.top + size.h / 2;
+    // Zoom in well past the viewport width so the x axis really clamps.
+    var guard = 0;
+    while (box.z.boxW * box.z.scale < size.w + 400 && guard++ < 40) key("+");
+    // Two contacts at a constant spread: the ratio stays 1, so x follows the
+    // midpoint one-for-one and the assertion below is exact.
+    var d = 50;
+    touch(box.vp, "touchstart", [{ x: cx - d, y: cy, id: 1 }, { x: cx + d, y: cy, id: 2 }]);
+    var overshoot = size.w;
+    touch(box.vp, "touchmove", [
+      { x: cx - d + overshoot, y: cy, id: 1 },
+      { x: cx + d + overshoot, y: cy, id: 2 },
+    ]);
+    approx(box.z.x, 0, 1.5, "fixture: the overshoot must clamp x at its maximum");
+    // The reversal: 10px back must move the image 10px, not wait for the whole
+    // overshoot to be retraced.
+    touch(box.vp, "touchmove", [
+      { x: cx - d + overshoot - 10, y: cy, id: 1 },
+      { x: cx + d + overshoot - 10, y: cy, id: 2 },
+    ]);
+    approx(box.z.x, -10, 2.5, "a reversed pinch must move the image immediately");
+    touch(box.vp, "touchend", []);
+  }
+
   async function runGate1015Touch(bucket) {
     await run("gate1015_fit_survives_a_gesture_started_without_geometry", bucket, fitSurvivesAGestureStartedWithoutGeometry);
     await run("gate1015_fit_resets_an_active_pinch", bucket, fitResetsAnActivePinch);
     await run("gate1015_replaced_finger_reanchors_the_pinch", bucket, replacedFingerReanchorsThePinch);
     await run("gate1015_keyboard_zoom_mid_pinch_is_not_undone", bucket, keyboardZoomMidPinchIsNotUndone);
     await run("gate1015_wheel_zoom_mid_pinch_is_not_undone", bucket, wheelZoomMidPinchIsNotUndone);
+    await run("gate1015_pinch_reversal_responds_immediately", bucket, pinchReversalRespondsImmediately);
     await run("gate1015_same_source_navigation_recentres", bucket, sameSourceNavigationRecentres);
   }
 

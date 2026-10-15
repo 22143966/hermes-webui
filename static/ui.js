@@ -3211,6 +3211,15 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
       state.x = cx - (state.pinchStartCX - state.pinchStartX) * ratio;
       state.y = cy - (state.pinchStartCY - state.pinchStartY) * ratio;
       _imgApplyTransform();
+      // The clamp may have pulled the image back inside the stage. Move the
+      // pinch's positional baseline to the CLAMPED position, exactly as the pan
+      // path does for a reversed drag: leaving the clamped-away overshoot inside
+      // the baseline made a gesture reversed after overshooting an edge do
+      // nothing until the whole overshoot was retraced (greptile P2,
+      // 2026-10-15T23:15:55Z, static/ui.js:3213). Identity when the clamp did
+      // not bite.
+      state.pinchStartX = state.x - (cx - state.pinchStartCX) * ratio;
+      state.pinchStartY = state.y - (cy - state.pinchStartCY) * ratio;
     }
     if(e.preventDefault) e.preventDefault();
   }

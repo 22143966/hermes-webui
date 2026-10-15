@@ -341,6 +341,22 @@ class TestComposedGreptileWheelZoomPinch20261015:
         _check(composed.mobile, "gate1015_wheel_zoom_mid_pinch_is_not_undone")
 
 
+class TestComposedGreptilePinchReversal20261015:
+    """Greptile P2 on the merge-only head c69de101 (2026-10-15T23:15:55Z,
+    static/ui.js:3213, "Reversing fingers leaves images stuck"): the pinch kept
+    the clamped-away overshoot inside its positional baseline, so a gesture
+    reversed after pushing past an edge did nothing until the overshoot was
+    retraced - the pan path already rebased onto the clamped position, the pinch
+    path did not.
+    """
+
+    def test_a_reversed_pinch_moves_the_image_immediately(self, composed):
+        _check(composed.desktop, "gate1015_pinch_reversal_responds_immediately")
+
+    def test_a_reversed_pinch_moves_the_image_immediately_mobile(self, composed):
+        _check(composed.mobile, "gate1015_pinch_reversal_responds_immediately")
+
+
 # Trusted-input regressions for the 2026-10-06 maintainer gate certificate.
 # These use Playwright's own input pipeline (real mouse/keyboard events), which
 # is the only way to exercise the browser's click retargeting under pointer
