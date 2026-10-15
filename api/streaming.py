@@ -91,6 +91,7 @@ from api.models import (
     _message_exact_timestamp_details,
     _message_private_identity_compatible,
     _recovered_pending_timestamp,
+    _stable_message_identity_details,
     _state_db_row_identity_details,
     _validated_webui_pending_user_timestamp_identity,
     _evict_sessions_over_cap,
@@ -7743,7 +7744,20 @@ def _sanitize_messages_for_api(
                 # or float clock is exactly the round-5/6 cancelled-history
                 # pair that the outbound snapshot MUST merge (the installed
                 # Agent merges it, the durable side keeps it addressable).
-                if msg.get('_partial') is True or msg.get('_error') is True:
+                # ``_stopped_db_successor`` is the durable discriminator the
+                # reconcile stamps on assistant rows it admits from state.db
+                # beyond the selected context while a terminal partial/error
+                # carrier exists without proven ownership (#7237 [False]
+                # maintainer-call resolution): those ARE stopped-context
+                # successors and must stay individually addressable, while a
+                # hand-built plain float-clock pair (round-5/6 tests) carries
+                # no stamp and still merges. Stripped before the wire payload
+                # returns.
+                if (
+                    msg.get('_partial') is True
+                    or msg.get('_error') is True
+                    or msg.get('_stopped_db_successor') is True
+                ):
                     _clocked['_replay_stop'] = True
                 clean.append(_clocked)
             else:
@@ -8053,10 +8067,20 @@ def _agent_replay_settle_projection(sent_history):
     returned prefix diverges from the snapshot and the settle fails closed,
     dropping the current turn's output. For every other history the sent form
     and the unconditional merge are identical, so this is a no-op there.
+
+    #7237 round 7 finding 1 (nesquena-hermes 2026-10-14): the fold models ALL
+    native repair passes, not only the assistant pass. Removing rows in the
+    sanitizer (an empty partial between two users) can leave adjacent plain
+    user rows that the pipeline never re-folded — the user merge deliberately
+    runs BEFORE the sanitizer. The installed Agent folds those into one row
+    joined with a literal blank line, so the settle projection must model that
+    fold too, or prefix ownership refuses the genuine suffix and the current
+    exchange is lost from the model-facing context.
     """
-    return _merge_agent_replay_bare_assistant_rows(
+    projected = _merge_agent_replay_bare_assistant_rows(
         copy.deepcopy(sent_history), preserve_splices=False
     )
+    return _merge_agent_replay_bare_user_rows(projected)
 
 
 def _replay_pair_is_cancelled_history_splice(messages, idx):
@@ -8529,6 +8553,10 @@ def _deduplicate_context_messages(messages, protected_rows=None):
     seen = set()
     deduped = []
     user_exact_index = {}
+    # Registry of the durable stable ids kept per replay key (#7237 round 7
+    # finding 2): lets a content collision distinguish a replayed duplicate
+    # from an independently owned occurrence that repeats content verbatim.
+    seen_stable_by_key = {}
     for msg in messages:
         if _is_context_compression_marker(msg):
             marker_key = (
@@ -8579,9 +8607,35 @@ def _deduplicate_context_messages(messages, protected_rows=None):
                 continue
             user_exact_index[user_exact_key] = len(deduped)
         if key is not None and key in seen:
-            continue
-        if key is not None:
+            # #7237 round 7 finding 2 (nesquena-hermes 2026-10-14): a content
+            # collision is a replay of an already-kept row UNLESS this row and
+            # every kept same-key occurrence carry valid, DISTINCT durable
+            # stable ids. Independently settled occurrences (a re-asked
+            # question answered again) repeat content verbatim; the admitting
+            # settle kept them via the call-scoped ``protected_rows`` and a
+            # later build's content-only collapse deleted the second
+            # occurrence from the outbound history and from the cold
+            # ``context_messages``. Distinct durable ids prove the rows are
+            # different turns; a missing/matching id stays conservative and
+            # collapses exactly like before.
+            stable_id, stable_valid = _stable_message_identity_details(msg)
+            kept_ids = seen_stable_by_key.get(key) or [None]
+            if not (
+                stable_valid
+                and stable_id is not None
+                and all(
+                    other is not None and other != stable_id
+                    for other in kept_ids
+                )
+            ):
+                continue
+            kept_ids.append(stable_id)
+        if key is not None and key not in seen:
             seen.add(key)
+            stable_id, stable_valid = _stable_message_identity_details(msg)
+            seen_stable_by_key[key] = [
+                stable_id if (stable_valid and stable_id is not None) else None
+            ]
         deduped.append(msg)
     return deduped
 
