@@ -3273,6 +3273,12 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     const factor = Math.exp((-(Number(e.deltaY) || 0)) * lineScale * 0.0015);
     _imgSetScale(state.scale * factor, anchorX, anchorY);
     _imgRebaseDrag();
+    // A wheel tick under two held contacts is the same hazard as a keyboard
+    // zoom: it moves the image but the pinch keeps its own baselines (see
+    // _imgRebasePinch), so the next touchmove rescaled from the OLD scale and
+    // undid the wheel zoom (greptile P2 on the merge-only head 25684d89,
+    // 2026-10-15T22:36:41Z, static/ui.js:3275). Re-anchor the pinch too.
+    _imgRebasePinch();
   }
 
   function _onResize() {

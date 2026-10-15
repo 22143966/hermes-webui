@@ -1342,11 +1342,50 @@
     touch(box.vp, "touchend", []);
   }
 
+  // Greptile P2 on the merge-only head 25684d89 (2026-10-15T22:36:41Z,
+  // static/ui.js:3275, "Wheel zoom gets undone"): the wheel path re-anchored
+  // the pan (`_imgRebaseDrag`) but not the pinch, so a wheel tick under two
+  // held contacts left pinchStartScale (and the anchor midpoint) on the
+  // pre-tick geometry and the next touchmove restored the OLD zoom. Runs in
+  // both buckets: the wheel is the desktop's whole zoom gesture but a phone
+  // with a mouse still dispatches it.
+  async function wheelZoomMidPinchIsNotUndone() {
+    var box = await openBox(IMG_W, IMG_H);
+    var size = vpSize(box.vp);
+    var rect = box.vp.getBoundingClientRect();
+    var cx = rect.left + size.w / 2;
+    var cy = rect.top + size.h / 2;
+    var f1 = { x: cx - 50, y: cy, id: 1 };
+    var f2 = { x: cx + 50, y: cy, id: 2 };
+    touch(box.vp, "touchstart", [f1, f2]);
+    touch(box.vp, "touchmove", [{ x: cx - 100, y: cy, id: 1 }, { x: cx + 100, y: cy, id: 2 }]);
+    assert_(box.z.pinching === true, "fixture: two contacts must be pinching");
+    assert_(box.z.scale > box.z.fitScale, "fixture: the pinch must zoom in");
+    // Measure the wheel alone: the pinch above already scaled the image, so
+    // comparing against fitScale would pass even if the wheel did nothing.
+    var scaleBeforeWheel = box.z.scale;
+    wheel(box.vp, -240, cx, cy);
+    var zoomed = box.z.scale;
+    var xAfterWheel = box.z.x;
+    assert_(zoomed > scaleBeforeWheel, "fixture: the wheel must zoom in during the pinch");
+    // The fingers do not move: the pinch baseline was re-anchored onto these
+    // contacts, so neither the scale nor the position may change.
+    touch(box.vp, "touchmove", [{ x: cx - 100, y: cy, id: 1 }, { x: cx + 100, y: cy, id: 2 }]);
+    approx(box.z.scale, zoomed, 1e-9, "a wheel zoom mid-pinch must survive the next touchmove");
+    approx(box.z.x, xAfterWheel, 1.5, "the pinch must not snap the image back after a wheel zoom (x)");
+    // Positive control: the pinch keeps pinching from the re-anchored baseline.
+    touch(box.vp, "touchmove", [{ x: cx - 150, y: cy, id: 1 }, { x: cx + 150, y: cy, id: 2 }]);
+    assert_(box.z.scale > zoomed * 1.1,
+      "the pinch must keep zooming from its re-anchored baseline: " + box.z.scale + " vs " + zoomed);
+    touch(box.vp, "touchend", []);
+  }
+
   async function runGate1015Touch(bucket) {
     await run("gate1015_fit_survives_a_gesture_started_without_geometry", bucket, fitSurvivesAGestureStartedWithoutGeometry);
     await run("gate1015_fit_resets_an_active_pinch", bucket, fitResetsAnActivePinch);
     await run("gate1015_replaced_finger_reanchors_the_pinch", bucket, replacedFingerReanchorsThePinch);
     await run("gate1015_keyboard_zoom_mid_pinch_is_not_undone", bucket, keyboardZoomMidPinchIsNotUndone);
+    await run("gate1015_wheel_zoom_mid_pinch_is_not_undone", bucket, wheelZoomMidPinchIsNotUndone);
     await run("gate1015_same_source_navigation_recentres", bucket, sameSourceNavigationRecentres);
   }
 

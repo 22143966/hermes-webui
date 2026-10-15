@@ -36,6 +36,12 @@ held pan must not snap the next pointermove, and one during an active pinch must
 not be undone by the next touchmove. Both are ``gate1015_keyboard_*`` checks,
 asserted by ``TestComposedGreptileKeyboardZoom20261015``.
 
+The 2026-10-15T22:36:41Z greptile P2 ("Wheel zoom gets undone", reported against
+the merge-only head 25684d89) added one more: a wheel tick during an active
+pinch must not be undone by the next touchmove either —
+``gate1015_wheel_zoom_mid_pinch_is_not_undone``, asserted by
+``TestComposedGreptileWheelZoomPinch20261015``.
+
 The per-check script lives in ``_img_lightbox_composed_checks.js`` and is
 injected into the page; there is no DOM emulation layer and no third-party JS
 package involved. Chromium is provisioned by the CI test job
@@ -317,6 +323,22 @@ class TestComposedGreptileKeyboardZoom20261015:
 
     def test_a_keyboard_zoom_mid_pinch_is_not_undone_mobile(self, composed):
         _check(composed.mobile, "gate1015_keyboard_zoom_mid_pinch_is_not_undone")
+
+
+class TestComposedGreptileWheelZoomPinch20261015:
+    """Greptile P2 on the merge-only head 25684d89 (2026-10-15T22:36:41Z,
+    static/ui.js:3275, "Wheel zoom gets undone"): ``_imgZoomFromWheel`` moved the
+    image through ``_imgSetScale`` and re-anchored the held pan, but left the
+    pinch's ``pinchStartScale``/anchor midpoint on the pre-tick geometry, so the
+    next touchmove restored the old zoom. Driven on the real handlers in both
+    buckets (the wheel is the desktop's zoom gesture; a phone may have a mouse).
+    """
+
+    def test_a_wheel_zoom_mid_pinch_is_not_undone(self, composed):
+        _check(composed.desktop, "gate1015_wheel_zoom_mid_pinch_is_not_undone")
+
+    def test_a_wheel_zoom_mid_pinch_is_not_undone_mobile(self, composed):
+        _check(composed.mobile, "gate1015_wheel_zoom_mid_pinch_is_not_undone")
 
 
 # Trusted-input regressions for the 2026-10-06 maintainer gate certificate.
