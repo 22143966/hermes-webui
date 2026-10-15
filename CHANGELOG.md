@@ -68,6 +68,12 @@
 
 ### Fixed
 
+- **Gateway turns use the session's own profile endpoint and key.** A fresh or restarted Gateway turn resolved the
+  Gateway URL and key from whichever profile the process had active, so a profile with its own Gateway was routed to the
+  shared one with the launcher key, and with a root `.env` alias a cloned profile sent a copied key while a sparse
+  profile sent none. Each turn now resolves both from the session's profile; the launcher's exported key still wins on
+  the shared URL. Thanks @conradmicallef. (#7983)
+
 - **Per-turn token usage survives a reload.** The usage badge on an assistant reply ("1.2k in · 800 out") was
   computed client-side at the end of a stream and lost on reload; it's now persisted on the settled assistant
   message. Thanks @cxk1993. (#8258)
