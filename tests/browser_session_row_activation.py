@@ -30,9 +30,11 @@ builds are installed and launch; WebKit needs its system libraries)
   - a real mouse click still opens the conversation exactly once;
   - Enter on a row's actions trigger opens its menu and does not open the
     conversation;
-  - in selection mode the title is not a link (the row checkbox is the control).
+  - in selection mode the title is not a link (the row checkbox is the control);
+  - clicking another title during a rename commits and ends the rename.
   touch (Chromium, 390x844, drawer open)
-  - a tap still opens the conversation exactly once.
+  - a tap still opens the conversation exactly once;
+  - tapping another title during a rename commits and ends the rename.
 
   --screenshots DIR writes the sidebar at 1440x900 and 390x844 (drawer open)
   after pressing Tab from the conversation filter until focus reaches the
@@ -169,6 +171,23 @@ ACTIONS_TRIGGER_JS = """(sid) => {
   const row = Array.from(document.querySelectorAll('#sessionList .session-item[data-sid]'))
     .find(node => node.dataset.sid === sid);
   return row ? row.querySelector('.session-actions-trigger') : null;
+}"""
+
+RENAME_ENDED_JS = "() => !_renamingSid && !document.querySelector('#sessionList .session-title-input')"
+
+# The seed is shared by every browser run, so each rename case types its own
+# suffix and checks for that one.
+RENAMED_JS = """([sid, suffix]) => Array.from(document.querySelectorAll('#sessionList .session-item[data-sid]'))
+  .some(row => row.dataset.sid === sid && ((row.querySelector('.session-title') || {}).textContent || '').endsWith(suffix))"""
+
+
+def _rename_suffix():
+    return f" renamed-{time.monotonic_ns() % 10**9}"
+
+START_RENAME_JS = """(sid) => {
+  const row = Array.from(document.querySelectorAll('#sessionList .session-item[data-sid]'))
+    .find(node => node.dataset.sid === sid);
+  if (row && typeof row._startRename === 'function') row._startRename();
 }"""
 
 FOCUS_IN_LIST_JS = "() => !!document.querySelector('#sessionList:focus-within')"
@@ -514,6 +533,26 @@ def _check_desktop(page, seed, name):
         fail("Escape did not end the rename started by double-click")
     page.wait_for_timeout(300)
 
+    # A press on another title while a rename is active must still commit and
+    # end the rename. The title's mousedown prevents the default (so it doesn't
+    # take focus), which would otherwise also keep focus in the rename input and
+    # swallow the click until Enter or Escape. Like master, that click does not
+    # also open the other conversation: committing re-renders the list.
+    _open(page, alpha)
+    _title(page, beta).dblclick()
+    if not _wait_until(page, focused_input, timeout_ms=2000):
+        fail("double-clicking a title no longer starts a rename (rename-then-click case)")
+    else:
+        page.keyboard.press("End")
+        suffix = _rename_suffix()
+        page.keyboard.type(suffix)
+        _title(page, gamma).click()
+        if not _wait_until(page, RENAME_ENDED_JS, timeout_ms=2000):
+            fail("clicking another title during a rename left the rename active")
+        if not _wait_until(page, RENAMED_JS, [beta, suffix], timeout_ms=3000):
+            fail("clicking another title during a rename did not commit the rename")
+    page.wait_for_timeout(300)
+
     page.evaluate("() => toggleSessionSelectMode()")
     page.wait_for_timeout(300)
     roles = [t["role"] for t in page.evaluate(TITLES_JS)]
@@ -625,6 +664,27 @@ def _check_touch(page, ctx, seed, label, phone):
     page.wait_for_timeout(SETTLE_MS)
     if _opens(page) != [gamma]:
         fail(f"short swipe then assistive activation opened {_opens(page)}, expected exactly [gamma]")
+
+    # A tap on another title while a rename is active must commit and end the
+    # rename, as on master. The gesture refuses to open a row during a rename,
+    # so it must not cancel touchend either: that would also suppress the
+    # compatibility mousedown that blurs (and so commits) the rename input.
+    _open(page, alpha)
+    _open_drawer_if_phone(page, phone)
+    page.evaluate(START_RENAME_JS, beta)
+    focused_input = "() => !!(document.activeElement && document.activeElement.matches('#sessionList .session-title-input'))"
+    if not _wait_until(page, focused_input, timeout_ms=2000):
+        fail("could not start a rename (rename-then-tap case)")
+    else:
+        page.keyboard.press("End")
+        suffix = _rename_suffix()
+        page.keyboard.type(suffix)
+        _title(page, gamma).tap()
+        if not _wait_until(page, RENAME_ENDED_JS, timeout_ms=2000):
+            fail("tapping another title during a rename left the rename active")
+        if not _wait_until(page, RENAMED_JS, [beta, suffix], timeout_ms=3000):
+            fail("tapping another title during a rename did not commit the rename")
+    page.wait_for_timeout(300)
     return failures
 
 

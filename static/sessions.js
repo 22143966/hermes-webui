@@ -9660,7 +9660,17 @@ function renderSessionListFromCache(){
       // Keyboard focus only: a mouse press must not park focus on the title,
       // or the list stays :focus-within and deferred refreshes never apply.
       // Click, double-click rename and assistive activation are unaffected.
-      title.onmousedown=(e)=>{if(e.button===0) e.preventDefault();};
+      title.onmousedown=(e)=>{
+        if(e.button!==0) return;
+        e.preventDefault();
+        // The prevented default also leaves focus where it was. An active
+        // rename commits on blur, so release it here as a press on any
+        // non-focusable part of a row would have.
+        if(_renamingSid){
+          const active=document.activeElement;
+          if(active&&active.classList&&active.classList.contains('session-title-input')) active.blur();
+        }
+      };
     }
     const tsMs=_sessionTimestampMs(s);
     const ts=document.createElement('span');
@@ -10594,8 +10604,10 @@ function renderSessionListFromCache(){
       // A tap (or long press) on the row itself is fully handled by the
       // gesture machine; cancel the browser's compatibility click so it cannot
       // act on the row a second time. Drags and swipes produce no click, and
-      // nested controls keep theirs.
-      const tapHandledHere=_gestureState==='pressing'&&!_swipeTracking
+      // nested controls keep theirs. During a rename the gesture opens
+      // nothing, so the compatibility mousedown must still blur (and commit)
+      // the rename input.
+      const tapHandledHere=!_renamingSid&&_gestureState==='pressing'&&!_swipeTracking
         &&!_isSessionActionTarget(e.target)
         &&!(e.target&&e.target.closest&&e.target.closest(SESSION_ROW_NESTED_CONTROL_SELECTOR));
       if(_finishSessionGesture(touch.clientX,touch.clientY,e.target,'touch')) e.stopPropagation();
