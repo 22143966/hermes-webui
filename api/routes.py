@@ -8571,10 +8571,20 @@ def _repair_removed_qualified_custom_provider_model(
         # Serialized list that failed to decode: not proof of anything.
         # A plain single-model string is still a valid one-model allowlist.
         return None
-    pinned_bare = [_split_provider_qualified_model(item)[0] for item in pinned]
+    default_raw = str(entry.get("model") or "").strip()
+    if any("${" in item for item in [*pinned, default_raw]):
+        # Unresolved env reference: the raw profile YAML isn't the real ID.
+        return None
+
+    def _own_bare(item: str) -> str:
+        # Unwrap only this provider's own wrapper; ``@safe:x`` is a real ID.
+        bare, item_provider = _split_provider_qualified_model(item)
+        return bare if item_provider == prov else item
+
+    pinned_bare = [_own_bare(item) for item in pinned]
     if not pinned or bare_model in pinned_bare:
         return None
-    default_bare = _split_provider_qualified_model(str(entry.get("model") or "").strip())[0]
+    default_bare = _own_bare(default_raw)
     replacement = default_bare if default_bare in pinned_bare else pinned_bare[0]
     return f"@{prov}:{replacement}"
 
@@ -8642,7 +8652,8 @@ def _resolve_compatible_session_model_state(
     if model and requested_provider == "moa":
         return _moa_fast_path_model_state(model)
     if model and requested_provider and model.startswith(f"@{requested_provider}:"):
-        repaired_model = _repair_removed_qualified_custom_provider_model(
+        # A fresh explicit pick is never second-guessed as stale.
+        repaired_model = None if explicit_model_pick else _repair_removed_qualified_custom_provider_model(
             model,
             requested_provider,
             config_obj=profile_config,

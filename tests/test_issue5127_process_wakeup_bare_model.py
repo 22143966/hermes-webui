@@ -73,7 +73,7 @@ class TestIssue5127CustomProviderBareSuffixRepair:
                 "@custom:local-lab:local-chat-35b-q4",
                 "custom:local-lab",
                 profile_config=profile_cfg,
-                explicit_model_pick=True,
+                explicit_model_pick=False,
                 prefer_cached_catalog=True,
             )
 
@@ -107,12 +107,167 @@ class TestIssue5127CustomProviderBareSuffixRepair:
                 "@custom:local-lab:new-live-c",
                 "custom:local-lab",
                 profile_config=profile_cfg,
-                explicit_model_pick=True,
+                explicit_model_pick=False,
                 prefer_cached_catalog=True,
             )
 
         assert mock_catalog.call_count == 0
         assert result == ("@custom:local-lab:new-live-c", "custom:local-lab", False)
+
+    def test_explicit_pick_is_not_replaced_as_stale(self, monkeypatch):
+        """A fresh explicit pick stays put; the endpoint reports a bad model."""
+        import api.config as config
+        from api.routes import _resolve_compatible_session_model_state
+
+        profile_cfg = {
+            "custom_providers": [
+                {
+                    "name": "lab",
+                    "base_url": "http://lab.invalid/v1",
+                    "model": "saved-a",
+                    "models": ["saved-a"],
+                }
+            ]
+        }
+        monkeypatch.setattr(config, "cfg", profile_cfg)
+
+        with patch("api.routes.get_available_models") as mock_catalog:
+            model, provider, normalized = _resolve_compatible_session_model_state(
+                "@custom:lab:live-b",
+                "custom:lab",
+                profile_config=profile_cfg,
+                explicit_model_pick=True,
+                prefer_cached_catalog=True,
+            )
+
+        assert mock_catalog.call_count == 0
+        assert (model, provider, normalized) == ("@custom:lab:live-b", "custom:lab", False)
+        assert config.resolve_model_provider(model, explicitly_picked=True)[0] == "live-b"
+
+    @pytest.mark.parametrize("explicit", [False, True])
+    def test_namespaced_upstream_id_is_kept_verbatim(self, monkeypatch, explicit):
+        """``@safe:`` in a configured ID is part of the upstream ID, not a wrapper."""
+        import api.config as config
+        from api.routes import _resolve_compatible_session_model_state
+
+        profile_cfg = {
+            "custom_providers": [
+                {
+                    "name": "Lab",
+                    "base_url": "http://lab.invalid/v1",
+                    "model": "@safe:gpt-4o-mini",
+                    "models": ["@safe:gpt-4o-mini"],
+                }
+            ]
+        }
+        monkeypatch.setattr(config, "cfg", profile_cfg)
+
+        with patch("api.routes.get_available_models") as mock_catalog:
+            model, provider, normalized = _resolve_compatible_session_model_state(
+                "@custom:lab:@safe:gpt-4o-mini",
+                "custom:lab",
+                profile_config=profile_cfg,
+                explicit_model_pick=explicit,
+                prefer_cached_catalog=True,
+            )
+
+        assert mock_catalog.call_count == 0
+        assert (model, provider, normalized) == (
+            "@custom:lab:@safe:gpt-4o-mini",
+            "custom:lab",
+            False,
+        )
+        assert (
+            config.resolve_model_provider(model, explicitly_picked=explicit)[0]
+            == "@safe:gpt-4o-mini"
+        )
+
+    def test_removed_model_repairs_to_namespaced_default_verbatim(self, monkeypatch):
+        """Repair to the default keeps its real ``@namespace:`` prefix."""
+        import api.config as config
+        from api.routes import _resolve_compatible_session_model_state
+
+        profile_cfg = {
+            "custom_providers": [
+                {
+                    "name": "Lab",
+                    "base_url": "http://lab.invalid/v1",
+                    "model": "@safe:gpt-4o-mini",
+                    "models": ["@safe:gpt-4o-mini"],
+                }
+            ]
+        }
+        monkeypatch.setattr(config, "cfg", profile_cfg)
+
+        model, provider, normalized = _resolve_compatible_session_model_state(
+            "@custom:lab:retired-model",
+            "custom:lab",
+            profile_config=profile_cfg,
+            prefer_cached_catalog=True,
+        )
+
+        assert (model, provider, normalized) == (
+            "@custom:lab:@safe:gpt-4o-mini",
+            "custom:lab",
+            True,
+        )
+        assert config.resolve_model_provider(model)[0] == "@safe:gpt-4o-mini"
+
+    def test_own_provider_wrapper_in_allowlist_is_unwrapped(self):
+        """A pinned ``@custom:<slug>:x`` spelling still counts as ``x``."""
+        from api.routes import _repair_removed_qualified_custom_provider_model
+
+        profile_cfg = {
+            "custom_providers": [
+                {
+                    "name": "lab",
+                    "model": "@custom:lab:chat-a",
+                    "models": ["@custom:lab:chat-a"],
+                }
+            ]
+        }
+
+        assert (
+            _repair_removed_qualified_custom_provider_model(
+                "@custom:lab:chat-a", "custom:lab", config_obj=profile_cfg
+            )
+            is None
+        )
+        assert (
+            _repair_removed_qualified_custom_provider_model(
+                "@custom:lab:chat-old", "custom:lab", config_obj=profile_cfg
+            )
+            == "@custom:lab:chat-a"
+        )
+
+    def test_unresolved_env_reference_does_not_drive_repair(self, monkeypatch):
+        """Raw profile YAML may hold ``${VAR}``; that is not the real model ID."""
+        import api.config as config
+        from api.routes import _resolve_compatible_session_model_state
+
+        profile_cfg = {
+            "custom_providers": [
+                {
+                    "name": "lab",
+                    "base_url": "http://lab.invalid/v1",
+                    "model": "${LAB_MODEL}",
+                    "models": ["${LAB_MODEL}"],
+                }
+            ]
+        }
+        monkeypatch.setattr(config, "cfg", profile_cfg)
+
+        with patch("api.routes.get_available_models") as mock_catalog:
+            model, provider, normalized = _resolve_compatible_session_model_state(
+                "@custom:lab:saved-a",
+                "custom:lab",
+                profile_config=profile_cfg,
+                prefer_cached_catalog=True,
+            )
+
+        assert mock_catalog.call_count == 0
+        assert (model, provider, normalized) == ("@custom:lab:saved-a", "custom:lab", False)
+        assert config.resolve_model_provider(model)[0] == "saved-a"
 
     def test_no_profile_config_never_repairs_from_shared_cfg(self, monkeypatch):
         """The shared cfg may belong to another profile, so it can't drive a rewrite."""
