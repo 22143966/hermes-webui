@@ -7,6 +7,8 @@ qualified ID for named custom providers.
 """
 from unittest.mock import patch
 
+import pytest
+
 
 class TestIssue5127CustomProviderBareSuffixRepair:
     def test_profile_scoped_qualified_model_survives_cold_reload(self, monkeypatch):
@@ -80,6 +82,100 @@ class TestIssue5127CustomProviderBareSuffixRepair:
             "@custom:local-lab:local-chat-35b-q6",
             "custom:local-lab",
             True,
+        )
+
+    @pytest.mark.parametrize(
+        "entry_extra",
+        [
+            {"models": {"saved-a": {}}, "models_discovered": True},
+            {"models": {"saved-a": {"context_length": 128000}}},
+        ],
+        ids=["discovered-snapshot", "dict-metadata"],
+    )
+    def test_unpinned_models_mapping_does_not_repair_live_pick(self, entry_extra):
+        """A discovery snapshot or metadata dict cannot prove a model was removed."""
+        from api.routes import _resolve_compatible_session_model_state
+
+        profile_cfg = {
+            "custom_providers": [
+                {"name": "local-lab", "model": "saved-a", **entry_extra}
+            ]
+        }
+
+        with patch("api.routes.get_available_models") as mock_catalog:
+            result = _resolve_compatible_session_model_state(
+                "@custom:local-lab:new-live-c",
+                "custom:local-lab",
+                profile_config=profile_cfg,
+                explicit_model_pick=True,
+                prefer_cached_catalog=True,
+            )
+
+        assert mock_catalog.call_count == 0
+        assert result == ("@custom:local-lab:new-live-c", "custom:local-lab", False)
+
+    def test_repairs_removed_qualified_model_from_global_config(self, monkeypatch):
+        """Sessions without a profile config repair against the active config."""
+        import api.config as config
+        from api.routes import _resolve_compatible_session_model_state
+
+        monkeypatch.setattr(
+            config,
+            "cfg",
+            {
+                "custom_providers": [
+                    {"name": "local-lab", "model": "chat-new", "models": ["chat-new"]}
+                ]
+            },
+        )
+
+        with patch("api.routes.get_available_models") as mock_catalog:
+            result = _resolve_compatible_session_model_state(
+                "@custom:local-lab:chat-old",
+                "custom:local-lab",
+                prefer_cached_catalog=True,
+            )
+
+        assert mock_catalog.call_count == 0
+        assert result == ("@custom:local-lab:chat-new", "custom:local-lab", True)
+
+    def test_removed_custom_provider_is_not_kept_by_unrelated_entry(self, monkeypatch):
+        """Another configured custom provider must not keep a removed one routable."""
+        import api.config as config
+        from api.routes import _resolve_compatible_session_model_state
+
+        profile_cfg = {
+            "custom_providers": [
+                {"name": "other-lab", "model": "other-chat", "models": ["other-chat"]}
+            ]
+        }
+        monkeypatch.setattr(config, "cfg", {"model": {"provider": "openai-codex"}})
+        monkeypatch.setattr(
+            "api.routes.get_available_models",
+            lambda **_kwargs: {
+                "active_provider": "openai-codex",
+                "default_model": "gpt-5.6-luna",
+                "groups": [
+                    {
+                        "provider": "OpenAI Codex",
+                        "provider_id": "openai-codex",
+                        "models": [{"id": "gpt-5.6-luna", "label": "Luna"}],
+                    }
+                ],
+            },
+        )
+
+        result = _resolve_compatible_session_model_state(
+            "@custom:local-lab:local-chat-35b-q6",
+            "custom:local-lab",
+            profile_config=profile_cfg,
+            prefer_cached_catalog=True,
+        )
+
+        assert result != (
+            "@custom:local-lab:local-chat-35b-q6",
+            "custom:local-lab",
+            False,
         )
 
     def test_fast_path_repairs_bare_suffix_to_profile_default(self):

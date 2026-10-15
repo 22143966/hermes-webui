@@ -8377,6 +8377,88 @@ def _ordered_custom_provider_model_ids(entry: dict) -> list[str]:
     return ordered
 
 
+def _custom_provider_allowlist_ids(_cp: dict) -> list[str]:
+    """Plural ``models`` list only — the explicit allowlist signal.
+
+    The singular ``model`` field is sticky/default metadata, NOT an
+    allowlist: it must not gate live-catalog filtering, otherwise a
+    provider configured with only ``model: assistant`` (no ``models``
+    list) would be collapsed to a single model.  Only an explicit
+    ``models`` allowlist expresses "show exactly these models".
+
+    An auto-discovered catalog is NOT an allowlist: when Hermes
+    persisted discovery results back into config (``models: {...}``
+    plus ``models_discovered: true``), that mapping is a snapshot
+    of what the gateway exposed at discovery time.  Gating on it
+    would permanently pin the live catalog to the first-discovery
+    set, silently dropping any model the user pulls in later
+    (LM Studio / Ollama).  ``_provider_models_are_discovered_catalog()``
+    is the shared predicate the ``/api/models`` path already uses;
+    when it says "discovered", return no allowlist and let the
+    live probe win.  An explicit ``discover_models: false`` opt-out
+    re-pins the catalog (the predicate accounts for it), so a
+    hand-pinned discovered catalog still filters.
+
+    A dict-shaped ``models`` mapping that is NOT marked discovered is
+    *per-model metadata* written by the Hermes Agent setup flow
+    (``hermes_cli/model_switch.py::_save_custom_provider`` and the
+    setup wizard) — e.g. ``{chat-a: {context_length: 128000}}``.  It is
+    not a catalog narrow: treating its keys as an allowlist would
+    collapse the live picker to the single saved default (keyless
+    Ollama) while the CLI live-probe shows the full catalog.  Only an
+    explicit ``discover_models: false`` opts into treating the dict
+    keys as a pinned allowlist.  List/JSON-array-string/Python-literal
+    shapes remain plain allowlists.
+
+    The plural value is decoded through ``_parse_config_string_list()``
+    because ``hermes config set`` / JSON-mode editor saves persist
+    lists as quoted JSON-array strings (``'["chat-a","chat-b"]'``) or
+    Python literals (``"['chat-a']"``).  Handling only ``dict``/``list``
+    made a serialized allowlist fall through to ``[]``, which the
+    caller reads as "no allowlist configured" and floods the picker
+    with the full upstream catalog — the same class of bug as the
+    ``skills.disabled`` regression (#7120 / #7134).
+    """
+    from api.config import (
+        _provider_discover_allowed,
+        _provider_models_are_discovered_catalog,
+    )
+
+    if _provider_models_are_discovered_catalog(_cp):
+        return []
+    _ids = []
+    _models = _cp.get("models")
+    # Serialized shapes only: ``hermes config set`` / JSON-mode
+    # editor saves persist lists as quoted JSON-array strings
+    # (``'["chat-a","chat-b"]'``) or Python literals
+    # (``"['chat-a']"``).  Decode those through the shared helper so
+    # they are honored; native dict/list values are walked below so
+    # dict *entries* keep their id|model|name metadata (the decoder
+    # str()-ifies list members, which would mangle them).
+    if isinstance(_models, str):
+        _models = _parse_config_string_list(_models)
+    if isinstance(_models, dict):
+        # A dict-shaped ``models`` is per-model metadata written by
+        # the Hermes Agent setup flow, NOT a catalog narrow.  Only a
+        # ``discover_models: false`` opt-out treats the dict keys as a
+        # pinned allowlist; otherwise return the empty allowlist so the
+        # live probe returns the full catalog.
+        if _provider_discover_allowed(_cp):
+            return []
+        for _mid in _models:
+            if isinstance(_mid, str) and _mid.strip():
+                _ids.append(_mid.strip())
+    elif isinstance(_models, (list, tuple)):
+        for _item in _models:
+            if isinstance(_item, str) and _item.strip():
+                _ids.append(_item.strip())
+            elif isinstance(_item, dict):
+                _mid = _item.get("id") or _item.get("model") or _item.get("name")
+                if _mid and str(_mid).strip():
+                    _ids.append(str(_mid).strip())
+    return _ids
+
+
 def _repair_bare_custom_provider_model(
     bare_model: str,
     provider: str | None,
@@ -8445,15 +8527,16 @@ def _repair_removed_qualified_custom_provider_model(
     *,
     config_obj: dict | None,
 ) -> str | None:
-    """Move a removed named-custom model to that provider's configured default."""
+    """Move a removed named-custom model to that provider's configured default.
+
+    Only a pinned allowlist (``_custom_provider_allowlist_ids``) can prove a
+    model was removed: a discovered catalog snapshot or dict-shaped metadata
+    may omit models the live probe still serves. ``config_obj=None`` reads
+    the active global config.
+    """
     prov = _clean_session_model_provider(provider)
     bare_model, qualified_provider = _split_provider_qualified_model(model)
-    if (
-        not isinstance(config_obj, dict)
-        or not prov
-        or not prov.startswith("custom:")
-        or qualified_provider != prov
-    ):
+    if not prov or not prov.startswith("custom:") or qualified_provider != prov:
         return None
 
     from api.config import _custom_provider_entries, _custom_provider_slug_from_name
@@ -8463,14 +8546,11 @@ def _repair_removed_qualified_custom_provider_model(
         slug = _custom_provider_slug_from_name(entry.get("name")).removeprefix("custom:")
         if slug != provider_slug:
             continue
-        models_cfg = entry.get("models")
-        if not isinstance(models_cfg, (dict, list)):
+        pinned = _custom_provider_allowlist_ids(entry)
+        pinned_bare = {_split_provider_qualified_model(item)[0] for item in pinned}
+        if not pinned or bare_model in pinned_bare:
             return None
-        configured = _ordered_custom_provider_model_ids(entry)
-        configured_bare = {_split_provider_qualified_model(item)[0] for item in configured}
-        if bare_model in configured_bare or not configured:
-            return None
-        replacement = str(entry.get("model") or configured[0]).strip()
+        replacement = str(entry.get("model") or pinned[0]).strip()
         return f"@{prov}:{_split_provider_qualified_model(replacement)[0]}"
     return None
 
@@ -8545,11 +8625,11 @@ def _resolve_compatible_session_model_state(
         )
         if repaired_model:
             return repaired_model, requested_provider, True
-        if requested_provider.startswith("custom:") and _provider_is_known_or_configured(
-            requested_provider,
-            profile_config,
-        ):
-            return model, requested_provider, False
+        if requested_provider.startswith("custom:"):
+            from api.config import _named_custom_provider_slug_for_provider
+
+            if _named_custom_provider_slug_for_provider(requested_provider, profile_config):
+                return model, requested_provider, False
         try:
             from api.config import cfg as _active_cfg
 
@@ -23959,99 +24039,6 @@ def _handle_live_models(handler, parsed):
                         return _key
                 _env = str(_cp.get("key_env") or "").strip()
                 return os.getenv(_env, "").strip() if _env else ""
-
-            def _custom_provider_models_discover_is_false(_cp):
-                """True when ``discover_models`` is an explicit ``false`` opt-out.
-
-                Mirrors ``api.config._provider_discover_allowed`` / Hermes
-                Agent ``model_switch_providers._discover_flag``: ``discover_models``
-                defaults to True, and the string forms ``"false"``/``"no"``/``"0"``
-                (case-insensitive) mean False.  Used to decide whether a
-                dict-shaped ``models`` mapping is a hand-pinned allowlist (only
-                when discovery is off) rather than per-model metadata.
-                """
-                _discover = _cp.get("discover_models", True) if isinstance(_cp, dict) else True
-                if isinstance(_discover, str):
-                    return _discover.strip().lower() in {"false", "no", "0"}
-                return not bool(_discover)
-
-            def _custom_provider_allowlist_ids(_cp):
-                """Plural ``models`` list only — the explicit allowlist signal.
-
-                The singular ``model`` field is sticky/default metadata, NOT an
-                allowlist: it must not gate live-catalog filtering, otherwise a
-                provider configured with only ``model: assistant`` (no ``models``
-                list) would be collapsed to a single model.  Only an explicit
-                ``models`` allowlist expresses "show exactly these models".
-
-                An auto-discovered catalog is NOT an allowlist: when Hermes
-                persisted discovery results back into config (``models: {...}``
-                plus ``models_discovered: true``), that mapping is a snapshot
-                of what the gateway exposed at discovery time.  Gating on it
-                would permanently pin the live catalog to the first-discovery
-                set, silently dropping any model the user pulls in later
-                (LM Studio / Ollama).  ``_provider_models_are_discovered_catalog()``
-                is the shared predicate the ``/api/models`` path already uses;
-                when it says "discovered", return no allowlist and let the
-                live probe win.  An explicit ``discover_models: false`` opt-out
-                re-pins the catalog (the predicate accounts for it), so a
-                hand-pinned discovered catalog still filters.
-
-                A dict-shaped ``models`` mapping that is NOT marked discovered is
-                *per-model metadata* written by the Hermes Agent setup flow
-                (``hermes_cli/model_switch.py::_save_custom_provider`` and the
-                setup wizard) — e.g. ``{chat-a: {context_length: 128000}}``.  It is
-                not a catalog narrow: treating its keys as an allowlist would
-                collapse the live picker to the single saved default (keyless
-                Ollama) while the CLI live-probe shows the full catalog.  Only an
-                explicit ``discover_models: false`` opts into treating the dict
-                keys as a pinned allowlist.  List/JSON-array-string/Python-literal
-                shapes remain plain allowlists.
-
-                The plural value is decoded through ``_parse_config_string_list()``
-                because ``hermes config set`` / JSON-mode editor saves persist
-                lists as quoted JSON-array strings (``'["chat-a","chat-b"]'``) or
-                Python literals (``"['chat-a']"``).  Handling only ``dict``/``list``
-                made a serialized allowlist fall through to ``[]``, which the
-                caller reads as "no allowlist configured" and floods the picker
-                with the full upstream catalog — the same class of bug as the
-                ``skills.disabled`` regression (#7120 / #7134).
-                """
-                from api.config import _provider_models_are_discovered_catalog
-
-                if _provider_models_are_discovered_catalog(_cp):
-                    return []
-                _ids = []
-                _models = _cp.get("models")
-                # Serialized shapes only: ``hermes config set`` / JSON-mode
-                # editor saves persist lists as quoted JSON-array strings
-                # (``'["chat-a","chat-b"]'``) or Python literals
-                # (``"['chat-a']"``).  Decode those through the shared helper so
-                # they are honored; native dict/list values are walked below so
-                # dict *entries* keep their id|model|name metadata (the decoder
-                # str()-ifies list members, which would mangle them).
-                if isinstance(_models, str):
-                    _models = _parse_config_string_list(_models)
-                if isinstance(_models, dict):
-                    # A dict-shaped ``models`` is per-model metadata written by
-                    # the Hermes Agent setup flow, NOT a catalog narrow.  Only a
-                    # ``discover_models: false`` opt-out treats the dict keys as a
-                    # pinned allowlist; otherwise return the empty allowlist so the
-                    # live probe returns the full catalog.
-                    if not _custom_provider_models_discover_is_false(_cp):
-                        return []
-                    for _mid in _models:
-                        if isinstance(_mid, str) and _mid.strip():
-                            _ids.append(_mid.strip())
-                elif isinstance(_models, (list, tuple)):
-                    for _item in _models:
-                        if isinstance(_item, str) and _item.strip():
-                            _ids.append(_item.strip())
-                        elif isinstance(_item, dict):
-                            _mid = _item.get("id") or _item.get("model") or _item.get("name")
-                            if _mid and str(_mid).strip():
-                                _ids.append(str(_mid).strip())
-                return _ids
 
             # For 'custom' and 'custom:*' providers, provider_model_ids()
             # returns [] because they aren't real hermes_cli endpoints.
