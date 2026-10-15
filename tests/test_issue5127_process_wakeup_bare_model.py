@@ -138,6 +138,59 @@ class TestIssue5127CustomProviderBareSuffixRepair:
             is None
         )
 
+    def test_no_profile_session_keeps_valid_pick_from_active_config(self, monkeypatch):
+        """Without a profile config, a valid pick stays on its provider (no rewrite)."""
+        import api.config as config
+        from api.routes import _resolve_compatible_session_model_state
+
+        monkeypatch.setattr(
+            config,
+            "cfg",
+            {
+                "model": {"provider": "openai-codex"},
+                "custom_providers": [
+                    {
+                        "name": "local-lab",
+                        "model": "local-chat-35b-q6",
+                        "models": ["local-chat-35b-q6"],
+                    }
+                ],
+            },
+        )
+
+        with patch("api.routes.get_available_models") as mock_catalog:
+            result = _resolve_compatible_session_model_state(
+                "@custom:local-lab:local-chat-35b-q6",
+                "custom:local-lab",
+                prefer_cached_catalog=True,
+            )
+
+        assert mock_catalog.call_count == 0
+        assert result == (
+            "@custom:local-lab:local-chat-35b-q6",
+            "custom:local-lab",
+            False,
+        )
+
+    def test_repair_ignores_undecodable_serialized_allowlist(self):
+        """A serialized list that fails to parse can't prove a model was removed."""
+        from api.routes import _repair_removed_qualified_custom_provider_model
+
+        profile_cfg = {
+            "custom_providers": [
+                {"name": "local-lab", "model": "chat-a", "models": '["chat-a", "chat-b"'}
+            ]
+        }
+
+        assert (
+            _repair_removed_qualified_custom_provider_model(
+                "@custom:local-lab:chat-a",
+                "custom:local-lab",
+                config_obj=profile_cfg,
+            )
+            is None
+        )
+
     def test_repair_replacement_stays_inside_pinned_allowlist(self):
         """A singular default outside the pinned list is not a valid replacement."""
         from api.routes import _repair_removed_qualified_custom_provider_model

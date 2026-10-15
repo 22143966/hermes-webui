@@ -8562,6 +8562,10 @@ def _repair_removed_qualified_custom_provider_model(
     if not entry:
         return None
     pinned = _custom_provider_allowlist_ids(entry)
+    raw_models = entry.get("models")
+    if isinstance(raw_models, str) and pinned == [raw_models.strip()]:
+        # Serialized list that failed to decode: not proof of anything.
+        return None
     pinned_bare = [_split_provider_qualified_model(item)[0] for item in pinned]
     if not pinned or bare_model in pinned_bare:
         return None
@@ -8642,9 +8646,10 @@ def _resolve_compatible_session_model_state(
             return repaired_model, requested_provider, True
         if (
             requested_provider.startswith("custom:")
-            and isinstance(profile_config, dict)
             and _split_provider_qualified_model(model)[1] == requested_provider
         ):
+            # Keeping a pick rewrites nothing, so a session without a profile
+            # config may check the active config (repair above may not).
             from api.config import _named_custom_provider_slug_for_provider
 
             if _named_custom_provider_slug_for_provider(requested_provider, profile_config):
