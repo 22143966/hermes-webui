@@ -1421,7 +1421,11 @@ def test_readme_documents_the_in_chat_task_list_and_its_todos_panel_effect():
     lives, and how the other Todos views come back."""
     readme = _read_static("README.md")
     assert "Task list in chat toggle (off by default)" in readme
-    assert "Settings -> Preferences" in readme
+    # UX re-gate 2026-10-15T19:15:11Z: the toggle lives on the Appearance settings
+    # pane (#settingsChatTodosInChat sits inside #settingsPaneAppearance and the
+    # Appearance tab carries it), not Preferences.
+    assert "Settings -> Appearance" in readme
+    assert "Settings -> Preferences to restore the sidebar panel" not in readme
     assert "sidebar **Todos** panel is hidden" in readme
     # The Panels index names the same effect, so the choice is discoverable from
     # the panel it hides.
@@ -1433,12 +1437,24 @@ def test_readme_documents_the_in_chat_task_list_and_its_todos_panel_effect():
 
 def test_chat_todos_overflow_cue_is_strong_enough():
     """Ask 2: the 22px fade landed on a cancelled row that is already
-    half-opacity and struck through, so it read as row styling; ~40px."""
+    half-opacity and struck through, so it read as row styling; ~40px.
+
+    UX re-gate 2026-10-15T19:15:11Z: the cue must also be CAPPED to the space it
+    actually has. A flat 40px climbed over the header on short screens, where the
+    tray body is capped below 40px (27.5px at 844x390, 37.5px at 1440x420), and
+    washed out the only visible row. The height is a min(40px,50%) cap, so it can
+    never exceed half of the wrapper it fades."""
     css = _read_static("static/style.css")
-    assert (
-        ".chat-todos-scroll-cue{position:absolute;left:0;right:0;bottom:0;height:40px;" in css
-    )
     assert "height:22px;pointer-events:none" not in css
+    cue = re.search(r"\.chat-todos-scroll-cue\{([^}]*)\}", css)
+    assert cue, "the .chat-todos-scroll-cue rule must exist"
+    height = re.search(r"(?:^|;)\s*height:\s*([^;]+)", cue.group(1))
+    assert height, "the cue must declare a height"
+    # Compare the VALUE, not a source spelling: `height: 40px` (spaces), a
+    # percentage or a px-only value all have to fail this pin.
+    assert height.group(1).strip() == "min(40px,50%)", (
+        "the overflow cue must be capped to half the wrapper, got: " + height.group(1).strip()
+    )
 
 
 # The exact tail sentence the disabled workspace-todos card carried in each

@@ -2393,7 +2393,7 @@
     .chat-todos-body-wrap{min-height:0;display:flex;flex-direction:column;}
     .chat-todos-body{min-height:0;}
     .chat-todos-body-wrap{position:relative;}
-    .chat-todos-scroll-cue{position:absolute;left:0;right:0;bottom:0;height:40px;pointer-events:none;opacity:0;transition:opacity .15s ease;background:linear-gradient(to bottom,rgba(0,0,0,0),var(--surface));}
+    .chat-todos-scroll-cue{position:absolute;left:0;right:0;bottom:0;height:min(40px,50%);pointer-events:none;opacity:0;transition:opacity .15s ease;background:linear-gradient(to bottom,rgba(0,0,0,0),var(--surface));}
     .chat-todos:not(.open) .chat-todos-scroll-cue{display:none;}
     .chat-todos-body-wrap.chat-todos-overflowing .chat-todos-scroll-cue{opacity:1;}
     /* The floating Start jump pill is anchored to the shell's top-right; when
