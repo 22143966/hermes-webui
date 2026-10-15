@@ -2079,3 +2079,23 @@ def test_gateway_endpoint_the_shared_key_is_never_sent_to_a_different_gateway(tm
     _shared_gateway(monkeypatch, launcher_key="launcher-key")
 
     assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/p/beta", "")
+
+
+def test_gateway_endpoint_the_launcher_alias_still_outranks_a_profiles_api_server_key_on_the_shared_url(tmp_path, monkeypatch):
+    """On the SHARED URL the launcher's explicit alias is the key for that Gateway (docs: HERMES_WEBUI_GATEWAY_API_KEY
+    first, API_SERVER_KEY as the fallback); a profile's own API_SERVER_KEY is the key of ITS OWN Gateway and must
+    not replace it there. This includes the default profile, i.e. the single-profile deployment."""
+    envs = {"beta": {"API_SERVER_KEY": "beta-local-key"}, "default": {"API_SERVER_KEY": "local-key"}}
+    _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    _shared_gateway(monkeypatch, launcher_key="launcher-key")
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local:8642", "launcher-key")
+    assert gateway_chat._gateway_endpoint_for_profile("default") == ("http://gw.local:8642", "launcher-key")
+
+
+def test_gateway_endpoint_a_profiles_own_alias_still_wins_on_the_shared_url(tmp_path, monkeypatch):
+    envs = {"beta": {"HERMES_WEBUI_GATEWAY_API_KEY": "beta-alias", "API_SERVER_KEY": "beta-local-key"}}
+    _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    _shared_gateway(monkeypatch, launcher_key="launcher-key")
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local:8642", "beta-alias")

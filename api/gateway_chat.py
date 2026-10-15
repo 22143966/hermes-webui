@@ -1023,10 +1023,10 @@ def _gateway_endpoint_for_profile(profile_name) -> tuple[str, str]:
     - URL: its own HERMES_WEBUI_GATEWAY_BASE_URL in its .env, or webui_gateway_base_url in its config.yaml
       (${VAR} expanded from that profile's .env, read fresh from the file, never from the process environment or
       the cached ambient config); without one it keeps the shared URL.
-    - Key: its own HERMES_WEBUI_GATEWAY_API_KEY or API_SERVER_KEY (either alias, its own first, so the
-      launcher's alias is never sent to a Gateway the profile points at itself); without one it keeps the
-      shared key, but only while the resolved URL is the shared URL, so the shared key is never sent to a
-      different Gateway.
+    - Key, on a URL that is not the shared one: the profile's own HERMES_WEBUI_GATEWAY_API_KEY or API_SERVER_KEY,
+      or none; the launcher's and the shared key are never sent to another Gateway.
+    - Key, on the shared URL: the profile's own HERMES_WEBUI_GATEWAY_API_KEY, then the launcher's explicit
+      alias, then the profile's API_SERVER_KEY (the key of its own Gateway), then the shared key.
     """
     from api import profiles as _profiles
     from api.config import _expand_env_vars, _load_yaml_config_file_raw, _thread_ctx, get_config
@@ -1038,7 +1038,15 @@ def _gateway_endpoint_for_profile(profile_name) -> tuple[str, str]:
     raw_cfg = _load_yaml_config_file_raw(_profile_config_path(home), _copy=False)
     own_url_cfg = raw_cfg.get("webui_gateway_base_url") if isinstance(raw_cfg, dict) else None
     own_url_env = str(own_env.get(_WEBUI_GATEWAY_BASE_URL_ENV) or "").strip()
-    own_key = str(own_env.get(_WEBUI_GATEWAY_API_KEY_ENV) or own_env.get("API_SERVER_KEY") or "").strip()
+    own_alias = str(own_env.get(_WEBUI_GATEWAY_API_KEY_ENV) or "").strip()
+    own_key = own_alias or str(own_env.get("API_SERVER_KEY") or "").strip()
+    # The launcher's explicit WebUI alias (an export, not a value mirrored from a profile's .env) is the key
+    # for the shared URL: there it keeps outranking a profile's API_SERVER_KEY, which is the key of that
+    # profile's OWN Gateway (docs: HERMES_WEBUI_GATEWAY_API_KEY first, API_SERVER_KEY as the fallback).
+    launcher_alias = (
+        "" if _WEBUI_GATEWAY_API_KEY_ENV in _profiles._loaded_profile_env_keys
+        else str(os.environ.get(_WEBUI_GATEWAY_API_KEY_ENV) or "").strip()
+    )
 
     if not (own_url_env or own_url_cfg or own_key):
         return shared_url, shared_key
@@ -1065,7 +1073,9 @@ def _gateway_endpoint_for_profile(profile_name) -> tuple[str, str]:
                 f"gateway URL for profile {profile_name or 'default'!r} still contains an unresolved variable "
                 f"({url}); set it in that profile's .env"
             )
-    return url, (own_key or (shared_key if url == shared_url else ""))
+    if url != shared_url:
+        return url, own_key  # the profile's own Gateway: its own key or none, never the shared one
+    return url, (own_alias or launcher_alias or own_key or shared_key)
 
 
 def _resume_gateway_run_for_session(session) -> bool:
