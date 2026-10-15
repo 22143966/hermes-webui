@@ -728,7 +728,9 @@ def _check_touch(page, ctx, seed, label, phone):
 
     # A tap moves focus out of a focused editor, as on master: the search box
     # here, so the on-screen keyboard closes (other editors save on that blur).
-    # The tap's compatibility mousedown, which did that, is cancelled.
+    # The tap's compatibility mousedown, which did that, is cancelled. Only the
+    # wide run tells: on a phone the opened conversation closes the drawer,
+    # which moves focus out of the search box anyway.
     _open(page, alpha)
     _open_drawer_if_phone(page, phone)
     page.evaluate("() => document.getElementById('sessionSearch').focus()")
@@ -739,10 +741,29 @@ def _check_touch(page, ctx, seed, label, phone):
     if page.evaluate("() => document.activeElement === document.getElementById('sessionSearch')"):
         fail("a tap on a title left focus (and the on-screen keyboard) in the search box")
 
+    # A long press opens the row's action menu with focus on its first item;
+    # releasing the finger must leave focus there (touchend releases focus only
+    # for a tap).
+    _open(page, alpha)
+    _open_drawer_if_phone(page, phone)
+    box = _title(page, beta).bounding_box()
+    point = {"x": box["x"] + min(20, box["width"] / 3), "y": box["y"] + box["height"] / 2}
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
+    page.wait_for_timeout(700)
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+    page.wait_for_timeout(300)
+    if not page.evaluate("() => !!document.querySelector('.session-action-menu')"):
+        fail("a long press did not open the action menu")
+    elif not page.evaluate("() => !!document.activeElement && !!document.activeElement.closest('.session-action-menu')"):
+        fail("releasing a long press took focus out of the action menu")
+    page.keyboard.press("Escape")
+    page.evaluate("() => typeof closeSessionActionMenu === 'function' && closeSessionActionMenu()")
+    page.wait_for_timeout(300)
+
     # A tap on another title while a rename is active must commit and end the
-    # rename, as on master. The gesture refuses to open a row during a rename,
-    # so it must not cancel touchend either: that would also suppress the
-    # compatibility mousedown that blurs (and so commits) the rename input.
+    # rename, as on master. The gesture refuses to open a row during a rename;
+    # touchend cancels the tap (and so its compatibility mousedown) and
+    # releases focus itself, which blurs (and so commits) the rename input.
     _open(page, alpha)
     _open_drawer_if_phone(page, phone)
     page.evaluate(START_RENAME_JS, beta)

@@ -10617,8 +10617,9 @@ function renderSessionListFromCache(){
         e.preventDefault();
         // Cancelling also drops the compatibility mousedown that would move
         // focus. Release it here instead (a long press that opened the menu
-        // gets no mousedown either). During a rename this commits it; the tap
-        // opens nothing, as the gesture refuses to open a row then.
+        // gets no mousedown either). During a rename this commits it, and it
+        // must come after _finishSessionGesture: an unchanged rename ends at
+        // once, and the gesture must still see it active and open nothing.
         if(!_longPressMenuOpened) _releaseFocusLikeRowPress();
       }
     },{passive:false});
