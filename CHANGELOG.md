@@ -68,6 +68,12 @@
 
 ### Fixed
 
+- **A rename or archive is no longer silently undone by a concurrent session load.** When a session was loaded from
+  disk at the same moment another request saved it, the cache could keep the copy read before the save. A metadata-only
+  change (a new title, the archive flag, a model pick) then went unnoticed, and the next save of the session wrote the
+  old value back. Saves now bump a per-session write counter, and a cold load re-reads instead of caching a copy that
+  overlapped a save. Thanks @TowardInfinity. (#8269, fixes #8267)
+
 - **Login keeps your destination behind a subpath mount.** Behind a prefix such as `/hermes/`, the reverse proxy strips
   the prefix from `next=`, so signing in sent you to the site root instead of the page you asked for. The login page now
   remaps a prefix-stripped `next=` onto the app root, and validates the remapped result so a protocol-relative target
