@@ -73,6 +73,30 @@ def test_true_duplicate_is_still_skipped():
     assert [f[0] for f in out] == ["image.jpg"]
 
 
+def test_renamed_alias_does_not_swallow_a_genuinely_different_file():
+    # Maintainer review, row 1: A image.jpg (3B,1) -> B image.jpg (4B,2) -> C image-2.jpg (4B,2).
+    # B is kept as the alias image-2.jpg; C is a different file that happens to
+    # carry that name, so identity must use B's ORIGINAL name (image.jpg), not C's.
+    out = _run('[[["image.jpg","aaa",1]],[["image.jpg","bbbb",2]],[["image-2.jpg","bbbb",2]]]')
+    assert [f[1] for f in out] == [3, 4, 4]
+    assert len(out) == 3
+    assert len({f[0] for f in out}) == 3  # all staged names are distinct
+
+
+def test_re_adding_a_renamed_photo_is_a_true_duplicate():
+    # Maintainer review, row 2: A -> B -> re-add B. B must not be added a second time.
+    out = _run('[[["image.jpg","aaa",1]],[["image.jpg","bbbb",2]],[["image.jpg","bbbb",2]]]')
+    assert [f[0] for f in out] == ["image.jpg", "image-2.jpg"]
+
+
+def test_compound_archive_extension_is_kept_whole():
+    # Greptile P1: archive.tar-2.gz would stop matching _ARCHIVE_EXTS and skip extraction.
+    out = _run('[[["archive.tar.gz","aaa",1],["archive.tar.gz","bbbb",2],["a.tar.bz2","x",1],["a.tar.bz2","yy",2],["a.tar.xz","x",1],["a.tar.xz","yy",2]]]')
+    assert [f[0] for f in out] == [
+        "archive.tar.gz", "archive-2.tar.gz", "a.tar.bz2", "a-2.tar.bz2", "a.tar.xz", "a-2.tar.xz",
+    ]
+
+
 def test_name_without_extension_and_dotfile():
     out = _run('[[["photo","a",1],["photo","bb",2],[".hidden","a",1],[".hidden","bb",2]]]')
     assert [f[0] for f in out] == ["photo", "photo-2", ".hidden", ".hidden-2"]

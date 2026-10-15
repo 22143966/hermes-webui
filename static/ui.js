@@ -23988,7 +23988,10 @@ function _showUploadTooLarge(file){
 function _pendingFileUniqueName(name){
   const taken=new Set((S.pendingFiles||[]).map(p=>p&&p.name));
   if(!taken.has(name))return name;
-  const dot=name.lastIndexOf('.');
+  // Keep compound archive extensions whole (.tar.gz etc.) so the renamed copy
+  // still matches _ARCHIVE_EXTS and is extracted rather than uploaded as-is.
+  const compound=/\.tar\.(gz|bz2|xz)$/i.exec(name);
+  const dot=compound?compound.index:name.lastIndexOf('.');
   const stem=dot>0?name.slice(0,dot):name;
   const ext=dot>0?name.slice(dot):'';
   for(let i=2;;i++){
@@ -23996,13 +23999,18 @@ function _pendingFileUniqueName(name){
     if(!taken.has(candidate))return candidate;
   }
 }
+// A pending file's identity is its ORIGINAL name (before any collision rename).
+function _pendingFileOrigName(p){return (p&&p._origName)||(p&&p.name);}
 function addFiles(files){
   for(const f of files){
     if(f&&f.size>MAX_UPLOAD_BYTES){_showUploadTooLarge(f);continue;}
-    const clash=S.pendingFiles.find(p=>p.name===f.name);
-    if(clash){
-      if(clash.size===f.size&&clash.lastModified===f.lastModified)continue;
-      S.pendingFiles.push(new File([f],_pendingFileUniqueName(f.name),{type:f.type,lastModified:f.lastModified}));
+    // True duplicate: same original name, size and mtime as ANY pending file,
+    // including one already renamed to a collision-free alias.
+    if(S.pendingFiles.some(p=>_pendingFileOrigName(p)===f.name&&p.size===f.size&&p.lastModified===f.lastModified))continue;
+    if(S.pendingFiles.some(p=>p.name===f.name)){
+      const copy=new File([f],_pendingFileUniqueName(f.name),{type:f.type,lastModified:f.lastModified});
+      try{Object.defineProperty(copy,'_origName',{value:f.name});}catch(_){}
+      S.pendingFiles.push(copy);
       continue;
     }
     S.pendingFiles.push(f);
