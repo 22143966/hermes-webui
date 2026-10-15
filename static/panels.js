@@ -2032,7 +2032,8 @@ function cancelCronForm(){
   if (_cronPreFormDetail) {
     const snap = _cronPreFormDetail;
     _cronPreFormDetail = null;
-    _renderCronDetail(snap);
+    const accepted = _cronList.find(job => _cronJobKey(job) === _cronJobKey(snap));
+    _renderCronDetail(accepted || snap);
     return;
   }
   _cronPreFormDetail = null;
@@ -2128,6 +2129,10 @@ async function saveCronForm(){
       if (!latestSettlement || latestSettlement === waitedFor) break;
       waitedFor = latestSettlement;
       await latestSettlement;
+    }
+    if (_cronAcceptedLoadGeneration > recoveryGeneration) {
+      const job = savedJob();
+      if (job) return job;
     }
     // The write already succeeded. Do not leave Create/Edit available for a
     // duplicate submission when bounded list reconciliation could not settle it.

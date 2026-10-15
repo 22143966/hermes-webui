@@ -293,6 +293,33 @@ assert.equal(writes.length,1);
 
 
 @pytest.mark.parametrize("editing", [False, True])
+def test_current_save_adopts_saved_job_from_fourth_awaited_reader(editing):
+    prefix = "_cronMode=" + json.dumps("edit" if editing else "create") + ";" + ("_editingCronId='saved';" if editing else "")
+    saved = "[{id:'existing',name:'Existing'},{id:'saved',name:'Accepted saved'}]"
+    run_js(prefix + """
+const save=saveCronForm();await waitRequests(1); // save-owned list read A
+const firstPoll=loadCrons(false,{background:true});await waitRequests(2); // B supersedes A
+pending[1].resolve({jobs:[{id:'existing',name:'Existing'}]});await firstPoll;
+pending[0].resolve({jobs:""" + saved + """});await waitRequests(3); // recovery C
+const readers=[];
+readers.push(loadCrons(false,{background:true}));await waitRequests(4); // D supersedes C
+pending[2].resolve({jobs:""" + saved + """});
+for(let index=3;index<6;index++){
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(clears,0);assert.equal(opened,null);
+  readers.push(loadCrons(false,{background:true}));await waitRequests(index+2);
+  pending[index].resolve({jobs:[{id:'existing',name:'Existing'}]});
+}
+await new Promise(resolve=>setImmediate(resolve));
+assert.equal(clears,0);assert.equal(opened,null);
+pending[6].resolve({jobs:""" + saved + """}); // G is fourth awaited reader
+await Promise.all(readers);await save;
+assert.equal(opened.id,'saved');assert.equal(opened.name,'Accepted saved');
+assert.equal(clears,0);assert.equal(writes.length,1);
+""")
+
+
+@pytest.mark.parametrize("editing", [False, True])
 def test_successful_write_closes_form_after_bounded_reconciliation_failure(editing):
     prefix = "_cronMode=" + json.dumps("edit" if editing else "create") + ";" + ("_editingCronId='saved';" if editing else "")
     run_js(prefix + """
@@ -446,6 +473,28 @@ assert.equal(!!(loadOptions&&loadOptions.background),false);
 assert.equal(_currentCronDetail.name,'Renamed');
 assert(fields.taskDetailBody.innerHTML.includes('New prompt'));
 assert.equal(fields.btnPauseTaskDetail.style.display,'');
+""", setup=REAL_DETAIL)
+
+
+def test_edit_cancel_uses_row_from_accepted_completion_refresh():
+    run_js("""
+const saved={id:'saved',name:'Existing',state:'active',prompt:'Old prompt'};
+_cronList=[saved];_renderCronDetail(saved);
+_cronMode='edit';_editingCronId='saved';_cronPreFormDetail=saved;
+let settleWrite;
+const originalApi=api;
+api=function(url,opts){if(opts){writes.push(url);return new Promise(resolve=>{settleWrite=resolve;});}return originalApi(url,opts);};
+const save=saveCronForm();
+settleWrite({id:'saved'});await waitRequests(1); // save-owned list read
+const poll=loadCrons(false,{background:true});await waitRequests(2);
+const renamed={...saved,name:'Renamed',prompt:'New prompt'};
+pending[1].resolve({jobs:[renamed]});await poll;
+assert.equal(_cronList[0].name,'Renamed');assert.equal(_cronMode,'edit');
+cancelCronForm();
+pending[0].resolve({jobs:[renamed]});await save;
+assert.equal(_currentCronDetail.name,'Renamed');
+assert(fields.taskDetailBody.innerHTML.includes('New prompt'));
+assert.equal(writes.length,1);
 """, setup=REAL_DETAIL)
 
 
