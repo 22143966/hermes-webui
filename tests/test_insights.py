@@ -1531,8 +1531,9 @@ def test_insights_period_change_preserves_custom_range_and_seeds_default_only_wh
     period_fn = _function_body(PANELS_JS, "insightsPeriodChange")
     assert "!startEl.value && !endEl.value" in period_fn, "must guard seeding on both inputs empty"
     assert "Math.ceil(len / 52)" in PANELS_JS, "panels.js must use Math.ceil(len/52) for >365"
-    assert 'min-width:106px' in STYLE_CSS, "date inputs must have min-width:106px to wrap before clipping"
-    assert '#insightsCustomRange input[type="date"]{' in STYLE_CSS
+    # r1 UX (2026-10-13): the row no longer wraps side by side, so the
+    # wrap-before-clipping min-width floor is gone - each input is full width.
+    assert '#insightsCustomRange input[type="date"]{width:100%;min-width:0;' in STYLE_CSS
     assert "insights_footer_range" in PANELS_JS
     assert "t('insights_footer_range')" in PANELS_JS
     node = shutil.which("node")
@@ -1547,11 +1548,14 @@ def test_insights_period_change_preserves_custom_range_and_seeds_default_only_wh
         let endVal = '';
         let loadCalls = 0;
         let customWrap = {style:{display:'none'}};
+        // Stable handles: the r1 fix also writes .max on both date inputs.
+        let startObj = {get value(){return startVal;}, set value(v){startVal=v;}, max:''};
+        let endObj = {get value(){return endVal;}, set value(v){endVal=v;}, max:''};
         global.$ = (id)=>{
           if(id==='insightsPeriod') return {value: periodVal};
           if(id==='insightsCustomRange') return customWrap;
-          if(id==='insightsStart') return {get value(){return startVal;}, set value(v){startVal=v;}};
-          if(id==='insightsEnd') return {get value(){return endVal;}, set value(v){endVal=v;}};
+          if(id==='insightsStart') return startObj;
+          if(id==='insightsEnd') return endObj;
           return null;
         };
         global.loadInsights = ()=>{loadCalls++;};
@@ -1565,6 +1569,7 @@ def test_insights_period_change_preserves_custom_range_and_seeds_default_only_wh
         const diff = Math.round((e - s)/86400000)+1;
         if(diff!==30) throw new Error('seeded window must be 30 days, got '+diff);
         if(customWrap.style.display!=='flex') throw new Error('custom wrap must be flex');
+        if(startObj.max !== today || endObj.max !== today) throw new Error('r1: both date inputs must be capped at today, got '+startObj.max+'/'+endObj.max);
         startVal='2026-01-10'; endVal='2026-02-20';
         periodVal='30'; insightsPeriodChange();
         if(customWrap.style.display!=='none') throw new Error('preset must hide custom wrap');
@@ -1977,8 +1982,7 @@ def test_insights_range_bar_layout_lives_in_stylesheet():
     assert '<div id="insightsCustomRange">' in INDEX_HTML
     for rule in (
         ".insights-range-bar{display:flex;flex-direction:column;gap:8px;padding:12px 12px 6px;}",
-        "#insightsCustomRange{display:none;align-items:center;gap:6px;flex-wrap:wrap;}",
-        ".insights-range-arrow{color:var(--muted);font-size:12px;}",
+        "#insightsCustomRange{display:none;flex-direction:column;gap:6px;}",
     ):
         assert rule in STYLE_CSS, f"missing stylesheet rule: {rule}"
     assert '#insightsCustomRange input[type="date"]{' in STYLE_CSS
@@ -2428,3 +2432,123 @@ def test_architecture_doc_states_cli_rows_are_independent_of_sync_to_insights():
     assert "it does not control whether this endpoint includes CLI rows" in body, body
     # The old, misleading phrasing must not come back.
     assert "CLI `state.db` rows the optional `sync_to_insights` setting mirrors in" not in body, body
+# ── PR #6970 UX re-gate r1 (2026-10-13): stacked date row + fall-back note ──
+
+
+def test_insights_custom_range_row_always_stacks_full_width():
+    """UX r1 item 1: the side-by-side date row only rendered correctly for
+    sidebar widths of roughly 266-420px (real Chromium, both trees):
+
+    - tablet touch: the coarse-pointer 16px font needs ~174px per input while
+      the row handed out 126px, so the leading digit was clipped;
+    - desktop sidebars of 258-265px: the same clipping;
+    - 180-257px and the phone drawer (390px / 320px): unequal 207px / 223px
+      inputs with the arrow dangling at the end of row 1.
+
+    The row now always stacks full width and matches the period select.
+    """
+    for rule in (
+        "#insightsCustomRange{display:none;flex-direction:column;gap:6px;}",
+        '#insightsCustomRange input[type="date"]{width:100%;min-width:0;background:var(--input-bg);'
+        'color:var(--text);border:1px solid var(--border2);border-radius:6px;padding:5px 10px;font-size:12px;}',
+        '#insightsCustomRange input[type="date"]:focus{outline:none;border-color:var(--accent);'
+        'box-shadow:0 0 0 2px var(--accent-bg);}',
+    ):
+        assert rule in STYLE_CSS, f"missing stylesheet rule: {rule}"
+    # The side-by-side row, its arrow span and its horizontal row rules are gone.
+    assert ".insights-range-arrow" not in STYLE_CSS
+    assert 'class="insights-range-arrow"' not in INDEX_HTML
+    assert "\u2192" not in INDEX_HTML
+    assert "#insightsCustomRange{display:none;align-items:center;gap:6px;flex-wrap:wrap;}" not in STYLE_CSS
+    assert "flex:1;min-width:106px" not in STYLE_CSS
+    # The dimmer --border + 8px inset variant must not come back on the row.
+    assert '#insightsCustomRange input[type="date"]{flex:1' not in STYLE_CSS
+
+
+def test_insights_unavailable_custom_range_discloses_the_fall_back():
+    """UX r1 item 2: entering 01/01/2027 -> 03/01/2027 kept the 2027 dates in
+    the inputs while the cards showed the last 30 days, and the only
+    disclosure was the footer below the fold.  The client now writes a
+    role=status note directly under the inputs and marks both inputs invalid.
+    """
+    note = _open_tag_source(INDEX_HTML, "insightsRangeNote")
+    assert 'class="insights-range-note"' in note
+    assert 'role="status"' in note
+    body = INDEX_HTML.split('<div id="insightsCustomRange">', 1)[1]
+    assert body.index('id="insightsEnd"') < body.index('id="insightsRangeNote"'), \
+        "the note must sit after the end input"
+    for rule in (
+        ".insights-range-note{display:none;font-size:11px;color:var(--muted);line-height:1.35;}",
+        ".insights-range-note.is-visible{display:block;}",
+    ):
+        assert rule in STYLE_CSS, f"missing stylesheet rule: {rule}"
+    # The disclosure is computed from what the server actually served, not from
+    # the selector alone.
+    assert "const fellBack = !!(periodSel && periodSel.value === 'custom' && d.mode !== 'custom');" in PANELS_JS
+    assert "t('insights_range_fallback').replace('{days}', d.period_days)" in PANELS_JS
+    assert "rangeNoteEl.classList.toggle('is-visible', fellBack)" in PANELS_JS
+    assert "dateEl.setAttribute('aria-invalid', 'true')" in PANELS_JS
+    assert "dateEl.removeAttribute('aria-invalid')" in PANELS_JS
+
+
+def test_insights_date_inputs_are_capped_at_today():
+    """UX r1 item 2 (client defense): the custom-range controls cannot offer a
+    date after today, so the platform picker stops suggesting windows the
+    server rejects (the server-side check stays authoritative)."""
+    assert "if (startEl && endEl) startEl.max = endEl.max = _toDateLocal(new Date());" in PANELS_JS
+
+
+def test_insights_range_fallback_note_is_localized_at_runtime():
+    """The new disclosure key must resolve to a NATIVE string with exactly one
+    {days} placeholder in all 15 bundles - source presence alone false-greens,
+    because the 14 non-English bundles have carried English literals before.
+    """
+    import shutil as _shutil
+    import subprocess
+
+    node = _shutil.which("node")
+    if not node:  # pragma: no cover
+        pytest.skip("node not available")
+
+    harness = """
+        const fs = require('fs');
+        const vm = require('vm');
+        const src = fs.readFileSync(process.env.I18N_JS, 'utf8');
+        const sandbox = {
+          localStorage: { getItem() { return null; }, setItem() {} },
+          navigator: { language: 'en', languages: ['en'] },
+          document: { documentElement: {}, querySelectorAll() { return []; } },
+          console,
+        };
+        sandbox.window = sandbox;
+        const probe = src + ";globalThis.__probe = (() => {"
+          + "const out = {};"
+          + "for (const loc of Object.keys(LOCALES)) {"
+          + "  setLocale(loc);"
+          + "  out[loc] = {lang: document.documentElement.lang, val: t('insights_range_fallback')};"
+          + "}"
+          + "return JSON.stringify(out);"
+          + "})();";
+        vm.runInNewContext(probe, sandbox);
+        console.log(sandbox.__probe);
+    """
+
+    import os
+    env = dict(os.environ)
+    env["I18N_JS"] = str(pathlib.Path(__file__).parent.parent / "static" / "i18n.js")
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True,
+                          timeout=60, check=False, env=env)
+    assert proc.returncode == 0, f"node harness failed:\n{proc.stdout}\n{proc.stderr}"
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert len(out) == 15, sorted(out)
+    english = out["en"]["val"]
+    assert english == "That range isn\u2019t available. Showing the last {days} days."
+    for loc in sorted(l for l in out if l != "en"):
+        assert out[loc]["lang"], f"{loc} did not resolve a document lang (setLocale failed)"
+        val = out[loc]["val"]
+        assert val != "insights_range_fallback", f"{loc} fell back to the key itself"
+        assert val != english, f"{loc} is still the English literal"
+    for loc, rec in sorted(out.items()):
+        assert rec["val"].count("{days}") == 1, \
+            f"{loc} must carry exactly one {{days}} placeholder: {rec['val']!r}"

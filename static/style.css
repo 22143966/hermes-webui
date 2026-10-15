@@ -6801,9 +6801,13 @@ main.main.showing-insights > #mainInsights{display:flex;overflow-y:auto;}
    `appearance:none` remains, which left the control looking like static text. */
 .insights-range-bar{display:flex;flex-direction:column;gap:8px;padding:12px 12px 6px;}
 .insights-range-bar .insights-period-select{width:100%;}
-#insightsCustomRange{display:none;align-items:center;gap:6px;flex-wrap:wrap;}
-#insightsCustomRange input[type="date"]{flex:1;min-width:106px;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 8px;font-size:12px;}
-.insights-range-arrow{color:var(--muted);font-size:12px;}
+#insightsCustomRange{display:none;flex-direction:column;gap:6px;}
+#insightsCustomRange input[type="date"]{width:100%;min-width:0;background:var(--input-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;padding:5px 10px;font-size:12px;}
+#insightsCustomRange input[type="date"]:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-bg);}
+/* Selective-fall-back disclosure (#6970 UX r1): shown only when the selector
+   is "custom" but the server served a trailing window instead. */
+.insights-range-note{display:none;font-size:11px;color:var(--muted);line-height:1.35;}
+.insights-range-note.is-visible{display:block;}
 /* Usage row (Token Breakdown + Models): 25/75 split so the Models table gets
    more of the row and long model IDs (e.g. "vendor/org/model:quant") are
    ellipsized less — allocation, not a full-name guarantee (very long IDs

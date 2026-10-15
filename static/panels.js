@@ -4599,6 +4599,9 @@ function insightsPeriodChange() {
     // Custom still shows A/B instead of silently erasing it.
     const startEl = $('insightsStart');
     const endEl = $('insightsEnd');
+    // A future bound is not a servable window: cap both controls at today so
+    // the platform picker cannot offer dates the server will reject (#6970).
+    if (startEl && endEl) startEl.max = endEl.max = _toDateLocal(new Date());
     if (startEl && endEl && !startEl.value && !endEl.value) {
       const end = new Date();
       const start = new Date();
@@ -4991,6 +4994,23 @@ function _renderInsights(d, box, wikiStatus, skillUsage) {
   // selector/inputs for a range that the server rejected and replaced - that
   // would render a future/invalid range while the cards/chart show the
   // trailing query (Greptile P1: 'custom range normalizes to trailing').
+  // Selective fall-back disclosure (#6970 UX r1): the selector says "custom"
+  // but the server served a trailing window instead (an all-future or
+  // fully-invalid range).  Say so right next to the inputs - the footer that
+  // carries the served window sits below the fold.
+  const fellBack = !!(periodSel && periodSel.value === 'custom' && d.mode !== 'custom');
+  const rangeNoteEl = $('insightsRangeNote');
+  if (rangeNoteEl) {
+    rangeNoteEl.textContent = fellBack
+      ? t('insights_range_fallback').replace('{days}', d.period_days)
+      : '';
+    rangeNoteEl.classList.toggle('is-visible', fellBack);
+  }
+  for (const dateEl of [$('insightsStart'), $('insightsEnd')]) {
+    if (!dateEl) continue;
+    if (fellBack) dateEl.setAttribute('aria-invalid', 'true');
+    else dateEl.removeAttribute('aria-invalid');
+  }
   const isCustomRange = periodSel && periodSel.value === 'custom' && d.mode === 'custom';
   // The server reports the EFFECTIVE calendar window it actually queried
   // (after swap, DST alignment, and the 5-year cap).  Use it verbatim; the
