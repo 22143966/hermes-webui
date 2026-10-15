@@ -30,6 +30,12 @@ keeping a dead pinch baseline, a reversed drag waiting out its overshoot, and
 line/page wheel deltas treated as pixels. Each has its own ``gate1015_*``
 check below, asserted by ``TestComposedMaintainerRegate20261015``.
 
+The 2026-10-15T19:09:46Z greptile P2 ("Zoom keys make gestures jump", reported
+against the merge-only head 860c0e85) added two more: a keyboard zoom during a
+held pan must not snap the next pointermove, and one during an active pinch must
+not be undone by the next touchmove. Both are ``gate1015_keyboard_*`` checks,
+asserted by ``TestComposedGreptileKeyboardZoom20261015``.
+
 The per-check script lives in ``_img_lightbox_composed_checks.js`` and is
 injected into the page; there is no DOM emulation layer and no third-party JS
 package involved. Chromium is provisioned by the CI test job
@@ -293,6 +299,24 @@ class TestComposedMaintainerRegate20261015:
         """Item 7 (static/ui.js:3133): a three-line tick zoomed by 0.45% because
         deltaMode was ignored."""
         _check(composed.desktop, "gate1015_line_mode_wheel_zooms")
+
+
+class TestComposedGreptileKeyboardZoom20261015:
+    """Greptile P2 on head 860c0e85 (2026-10-15T19:09:46Z, static/ui.js:3293,
+    "Zoom keys make gestures jump"): pressing + / - moved the image through
+    ``zoomBy`` but left the held pan's baseline (and the pinch's
+    ``pinchStartScale``/anchor midpoint) on the pre-zoom geometry, so the next
+    pointermove snapped the image back and the next touchmove undid the keyboard
+    zoom. Both halves are driven here on the real handlers."""
+
+    def test_a_keyboard_zoom_mid_pan_does_not_snap_the_next_move(self, composed):
+        _check(composed.desktop, "gate1015_keyboard_zoom_mid_pan_does_not_snap")
+
+    def test_a_keyboard_zoom_mid_pinch_is_not_undone(self, composed):
+        _check(composed.desktop, "gate1015_keyboard_zoom_mid_pinch_is_not_undone")
+
+    def test_a_keyboard_zoom_mid_pinch_is_not_undone_mobile(self, composed):
+        _check(composed.mobile, "gate1015_keyboard_zoom_mid_pinch_is_not_undone")
 
 
 # Trusted-input regressions for the 2026-10-06 maintainer gate certificate.

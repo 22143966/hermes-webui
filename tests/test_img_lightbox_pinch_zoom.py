@@ -476,6 +476,33 @@ class TestRegate20261015:
             "the wheel handler must rebase the pan it zoomed under"
         )
 
+    def test_keyboard_zoom_rebases_the_held_pan_and_the_pinch(self):
+        """Greptile P2 on head 860c0e85 (2026-10-15T19:09:46Z, static/ui.js:3293,
+        "Zoom keys make gestures jump"): the +/- keys zoom through
+        ``state.zoomBy``, which is a zoom like the wheel's, so an in-flight pan or
+        pinch holds a baseline measured against the pre-zoom geometry. Rebase
+        BOTH: a pinch keeps ``pinchStartScale``, so without the pinch rebase the
+        next touchmove rescaled from the old scale and undid the keyboard zoom."""
+        src = UI.read_text(encoding="utf-8")
+        assert "function _imgRebasePinch() {" in src
+        pinch = src[src.index("function _imgRebasePinch() {"):src.index("function _imgZoomFromWheel(e) {")]
+        assert "state.pinchStartScale = state.scale;" in pinch
+        assert "state.pinchStartDist = state.pinchDist;" in pinch
+        assert "state.pinchStartCX = state.pinchCX;" in pinch
+        assert "state.pinchStartCY = state.pinchCY;" in pinch
+        zoom = src[src.index("state.zoomBy = function(factor){"):src.index("state.cancelGesture = _imgCancelGesture;")]
+        assert "_imgRebaseDrag();" in zoom, "the keyboard zoom must rebase a held pan"
+        assert "_imgRebasePinch();" in zoom, "the keyboard zoom must re-anchor an active pinch"
+        # The re-anchor needs the LIVE contact geometry, so both handlers record
+        # it (the anchor on a fresh pinch, every move afterwards).
+        anchor = src[src.index("function _imgAnchorPinch(touches) {"):src.index("function _imgOnTouchStart(e) {")]
+        assert "state.pinchDist = state.pinchStartDist;" in anchor
+        assert "state.pinchCX = state.pinchStartCX;" in anchor
+        move = src[src.index("function _imgOnTouchMove(e) {"):src.index("function _imgOnTouchEnd(e) {")]
+        assert "state.pinchCX = cx;" in move
+        assert "state.pinchCY = cy;" in move
+        assert "state.pinchDist = currDist;" in move
+
     def test_drag_baseline_follows_the_clamped_position(self):
         """Item 6 (static/ui.js:2993): the pan is clamped to the stage, and the
         baseline must follow the CLAMPED position — otherwise a drag reversed

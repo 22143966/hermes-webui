@@ -2711,6 +2711,9 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     img,
     navSrc: null,
     pendingNav: false,
+    pinchCX: 0,
+    pinchCY: 0,
+    pinchDist: 0,
     pinchIds: null,
     pinchStartCX: 0,
     pinchStartCY: 0,
@@ -3161,6 +3164,11 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     const rect = viewport.getBoundingClientRect();
     state.pinchStartCX = (touches[0].clientX + touches[1].clientX) / 2 - (rect.left || 0);
     state.pinchStartCY = (touches[0].clientY + touches[1].clientY) / 2 - (rect.top || 0);
+    // The geometry the contacts have RIGHT NOW, which is what a keyboard zoom
+    // re-anchors onto (see _imgRebasePinch).
+    state.pinchCX = state.pinchStartCX;
+    state.pinchCY = state.pinchStartCY;
+    state.pinchDist = state.pinchStartDist;
   }
 
   function _imgOnTouchStart(e) {
@@ -3192,6 +3200,9 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2 - (rect.left || 0);
     const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2 - (rect.top || 0);
     const currDist = _imgTouchDist(e.touches);
+    state.pinchCX = cx;
+    state.pinchCY = cy;
+    state.pinchDist = currDist;
     if(state.pinchStartDist > 0 && state.pinchStartScale > 0){
       const rawScale = state.pinchStartScale * (currDist / state.pinchStartDist);
       const boundedScale = Math.max(_imgMinScale(), Math.min(8, rawScale));
@@ -3225,6 +3236,26 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     if(!Number.isFinite(state.pointerX) || !Number.isFinite(state.pointerY)) return;
     state.dragStartX = state.x - (state.pointerX - state.dragOriginX);
     state.dragStartY = state.y - (state.pointerY - state.dragOriginY);
+  }
+
+  // The keyboard zoom (`state.zoomBy`) can land while a pinch is in flight, and
+  // a pinch holds its own baselines (pinchStartScale / pinchStartX,Y and the
+  // anchor midpoint). Refreshing only the pan left them measured against the
+  // pre-zoom geometry, so the next touchmove rescaled from the OLD scale and
+  // undid the keyboard zoom, and re-applied the old midpoint (greptile P2 on
+  // 860c0e85, 2026-10-15T19:09:46Z, static/ui.js:3293). Re-anchor on the
+  // contacts that are down now - exactly what a fresh two-finger start does - so
+  // the ongoing pinch continues from the new scale instead of reverting it.
+  function _imgRebasePinch() {
+    if(!state.pinching) return;
+    if(!(state.pinchDist > 0)) return;
+    if(!Number.isFinite(state.pinchCX) || !Number.isFinite(state.pinchCY)) return;
+    state.pinchStartScale = state.scale;
+    state.pinchStartX = state.x;
+    state.pinchStartY = state.y;
+    state.pinchStartDist = state.pinchDist;
+    state.pinchStartCX = state.pinchCX;
+    state.pinchStartCY = state.pinchCY;
   }
 
   function _imgZoomFromWheel(e) {
@@ -3290,6 +3321,12 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
   state.fit = _fit;
   state.zoomBy = function(factor){
     _imgSetScale(state.scale * factor);
+    // A keyboard zoom is a zoom like the wheel's: whatever gesture is in flight
+    // keeps its baseline measured against the geometry it produced, so the next
+    // pointermove/touchmove must not snap the image back (greptile P2 on
+    // 860c0e85, 2026-10-15T19:09:46Z, static/ui.js:3293).
+    _imgRebaseDrag();
+    _imgRebasePinch();
   };
   // Used by _navigateLightbox (and by the pendingNav re-centre in
   // _onImgLoad) to drop a pan that belongs to the image being replaced.

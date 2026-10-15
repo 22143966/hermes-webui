@@ -1282,15 +1282,74 @@
   // Maintainer re-gate 2026-10-15T17:54:15Z: one browser check per reported
   // item. The touch-driven items run in both buckets (a phone is where they
   // bite); the mouse/wheel-driven ones only make sense on the desktop.
+  // Greptile P2 on head 860c0e85 (2026-10-15T19:09:46Z, static/ui.js:3293,
+  // "Zoom keys make gestures jump"): the keyboard zoom moved the image but left
+  // the held pan's baseline (dragStartX/Y) on the pre-zoom geometry, so the next
+  // pointermove re-applied the accumulated displacement and the image jumped.
+  async function keyboardZoomMidPanDoesNotSnap() {
+    var box = await openBox(IMG_W, IMG_H);
+    var size = vpSize(box.vp);
+    var rect = box.vp.getBoundingClientRect();
+    var guard = 0;
+    while (box.z.boxW * box.z.scale < size.w + 400 && guard++ < 40) key("+");
+    var cx = rect.left + size.w / 2;
+    var cy = rect.top + size.h / 2;
+    pointer(box.vp, "pointerdown", cx, cy, 1);
+    pointer(box.vp, "pointermove", cx - 20, cy, 1);
+    var scaleBefore = box.z.scale;
+    key("+");
+    assert_(box.z.scale > scaleBefore, "fixture: the keyboard zoom must zoom during a held pan");
+    var afterZoomX = box.z.x;
+    var scaledW = box.z.boxW * box.z.scale;
+    assert_(afterZoomX > size.w - scaledW + 2 && afterZoomX < -2,
+      "fixture: the keyboard zoom must leave the pan strictly inside the clamp range, x=" + afterZoomX);
+    pointer(box.vp, "pointermove", cx - 21, cy, 1);
+    approx(box.z.x, afterZoomX - 1, 1.5, "a 1px move after a mid-pan keyboard zoom must not snap");
+    pointer(box.vp, "pointerup", cx - 21, cy, 1);
+  }
+
+  // Same greptile P2, pinch half: a keyboard zoom during an active pinch left
+  // pinchStartScale (and the anchor midpoint) on the pre-zoom geometry, so the
+  // next touchmove rescaled from the OLD scale and undid the keyboard zoom.
+  async function keyboardZoomMidPinchIsNotUndone() {
+    var box = await openBox(IMG_W, IMG_H);
+    var size = vpSize(box.vp);
+    var rect = box.vp.getBoundingClientRect();
+    var cx = rect.left + size.w / 2;
+    var cy = rect.top + size.h / 2;
+    var f1 = { x: cx - 50, y: cy, id: 1 };
+    var f2 = { x: cx + 50, y: cy, id: 2 };
+    touch(box.vp, "touchstart", [f1, f2]);
+    touch(box.vp, "touchmove", [{ x: cx - 100, y: cy, id: 1 }, { x: cx + 100, y: cy, id: 2 }]);
+    assert_(box.z.pinching === true, "fixture: two contacts must be pinching");
+    assert_(box.z.scale > box.z.fitScale, "fixture: the pinch must zoom in");
+    key("+");
+    var zoomed = box.z.scale;
+    var xAfterZoom = box.z.x;
+    assert_(zoomed > box.z.fitScale * 1.2, "fixture: the keyboard zoom must zoom in during the pinch");
+    // The fingers do not move: the pinch baseline was re-anchored onto these
+    // contacts, so neither the scale nor the position may change.
+    touch(box.vp, "touchmove", [{ x: cx - 100, y: cy, id: 1 }, { x: cx + 100, y: cy, id: 2 }]);
+    approx(box.z.scale, zoomed, 1e-9, "a keyboard zoom mid-pinch must survive the next touchmove");
+    approx(box.z.x, xAfterZoom, 1.5, "the pinch must not snap the image back (x)");
+    // Positive control: the pinch keeps pinching from the re-anchored baseline.
+    touch(box.vp, "touchmove", [{ x: cx - 150, y: cy, id: 1 }, { x: cx + 150, y: cy, id: 2 }]);
+    assert_(box.z.scale > zoomed * 1.1,
+      "the pinch must keep zooming from its re-anchored baseline: " + box.z.scale + " vs " + zoomed);
+    touch(box.vp, "touchend", []);
+  }
+
   async function runGate1015Touch(bucket) {
     await run("gate1015_fit_survives_a_gesture_started_without_geometry", bucket, fitSurvivesAGestureStartedWithoutGeometry);
     await run("gate1015_fit_resets_an_active_pinch", bucket, fitResetsAnActivePinch);
     await run("gate1015_replaced_finger_reanchors_the_pinch", bucket, replacedFingerReanchorsThePinch);
+    await run("gate1015_keyboard_zoom_mid_pinch_is_not_undone", bucket, keyboardZoomMidPinchIsNotUndone);
     await run("gate1015_same_source_navigation_recentres", bucket, sameSourceNavigationRecentres);
   }
 
   async function runGate1015Mouse(bucket) {
     await run("gate1015_wheel_zoom_mid_pan_does_not_snap", bucket, wheelZoomMidPanDoesNotSnap);
+    await run("gate1015_keyboard_zoom_mid_pan_does_not_snap", bucket, keyboardZoomMidPanDoesNotSnap);
     await run("gate1015_resize_recomputes_the_zoom_out_limit", bucket, resizeRecomputesTheZoomOutLimit);
     await run("gate1015_overshoot_reversal_responds_immediately", bucket, overshootReversalRespondsImmediately);
     await run("gate1015_line_mode_wheel_zooms", bucket, lineModeWheelZooms);
