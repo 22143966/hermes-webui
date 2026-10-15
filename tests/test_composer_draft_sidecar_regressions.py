@@ -507,11 +507,50 @@ def test_draft_post_for_stale_pre_compression_snapshot_profile_mismatch_rejected
 
         assert status == 409
         assert payload["ok"] is False
-        assert payload["error"] == "Session moved"
-        assert payload["code"] == "session_moved"
-        assert payload["session_id"] == continuation_sid
+        assert payload["error"] == "Draft authority could not be confirmed"
+        assert payload["code"] == "draft_authority_unconfirmed"
+        assert "session_id" not in payload
         assert not (session_dir / ".drafts" / f"{old_sid}.json").exists()
         assert not (session_dir / ".drafts" / f"{continuation_sid}.json").exists()
+    finally:
+        with streaming.SESSION_AGENT_LOCKS_LOCK:
+            streaming.SESSION_AGENT_LOCKS.pop(old_sid, None)
+            streaming.SESSION_AGENT_LOCKS.pop(continuation_sid, None)
+
+
+def test_draft_post_does_not_redirect_to_child_without_parent_authority(tmp_path, monkeypatch):
+    models, routes, session_dir, old_sid, continuation_sid, _fork_sid = (
+        _build_pre_compression_migration_state(tmp_path, monkeypatch)
+    )
+    continuation = models.get_session(continuation_sid)
+    continuation.parent_session_id = None
+    continuation.save(touch_updated_at=False, skip_index=True)
+    newer_draft = {
+        "text": "newer child draft",
+        "files": [{"name": "newer.txt"}],
+    }
+    models._save_session_draft(continuation_sid, newer_draft)
+    continuation.composer_draft = newer_draft
+    draft_path = models._session_draft_path(continuation_sid)
+    durable_before = draft_path.read_bytes()
+
+    try:
+        status, payload = _post_json(
+            monkeypatch,
+            routes,
+            "/api/session/draft",
+            {
+                "session_id": old_sid,
+                "text": "stale parent autosave",
+                "files": [],
+            },
+        )
+
+        assert status == 409
+        assert payload["code"] == "draft_authority_unconfirmed"
+        assert "session_id" not in payload
+        assert draft_path.read_bytes() == durable_before
+        assert models._load_session_draft(continuation_sid) == newer_draft
     finally:
         with streaming.SESSION_AGENT_LOCKS_LOCK:
             streaming.SESSION_AGENT_LOCKS.pop(old_sid, None)
@@ -617,9 +656,9 @@ def test_draft_post_for_stale_pre_compression_snapshot_cycles_rejected(tmp_path,
 
         assert status == 409
         assert payload["ok"] is False
-        assert payload["error"] == "Session moved"
-        assert payload["code"] == "session_moved"
-        assert payload["session_id"] == old_sid
+        assert payload["error"] == "Draft authority could not be confirmed"
+        assert payload["code"] == "draft_authority_unconfirmed"
+        assert "session_id" not in payload
         assert not (session_dir / ".drafts" / f"{old_sid}.json").exists()
     finally:
         with streaming.SESSION_AGENT_LOCKS_LOCK:
@@ -1022,9 +1061,9 @@ def test_draft_post_for_stale_pre_compression_snapshot_hops_exhausted_rejected(t
 
         assert status == 409
         assert payload["ok"] is False
-        assert payload["error"] == "Session moved"
-        assert payload["code"] == "session_moved"
-        assert payload["session_id"] == chain_sid
+        assert payload["error"] == "Draft authority could not be confirmed"
+        assert payload["code"] == "draft_authority_unconfirmed"
+        assert "session_id" not in payload
         assert not (session_dir / ".drafts" / f"{old_sid}.json").exists()
     finally:
         with streaming.SESSION_AGENT_LOCKS_LOCK:

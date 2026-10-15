@@ -17781,36 +17781,30 @@ def handle_post(handler, parsed) -> bool:
         _MAX_DRAFT_AUTHORITY_HOPS = 4
         _seen_authority_sids = {authoritative_sid}
         resolved_once = False
+
+        def _draft_authority_unconfirmed():
+            return j(
+                handler,
+                {
+                    "ok": False,
+                    "error": "Draft authority could not be confirmed",
+                    "code": "draft_authority_unconfirmed",
+                },
+                status=409,
+            )
+
         for _hop in range(_MAX_DRAFT_AUTHORITY_HOPS):
             with _get_session_agent_lock(authoritative_sid):
                 _draft_mark("acquired_lock")
                 if _hop == 0 and request_session is not None:
                     resolved_sid = str(getattr(request_session, "session_id", "") or "").strip()
                     if not resolved_sid or not is_safe_session_id(resolved_sid):
-                        return j(
-                            handler,
-                            {
-                                "ok": False,
-                                "error": "Session moved",
-                                "session_id": request_sid,
-                                "code": "session_moved",
-                            },
-                            status=409,
-                        )
+                        return _draft_authority_unconfirmed()
                     if resolved_sid != authoritative_sid:
                         with LOCK:
                             if SESSIONS.get(resolved_sid) is request_session:
                                 if resolved_sid in _seen_authority_sids:
-                                    return j(
-                                        handler,
-                                        {
-                                            "ok": False,
-                                            "error": "Session moved",
-                                            "session_id": resolved_sid,
-                                            "code": "session_moved",
-                                        },
-                                        status=409,
-                                    )
+                                    return _draft_authority_unconfirmed()
                                 _seen_authority_sids.add(resolved_sid)
                                 authoritative_sid = resolved_sid
                                 continue
@@ -17829,40 +17823,13 @@ def handle_post(handler, parsed) -> bool:
 
                 resolved_sid = str(getattr(request_session, "session_id", "") or "").strip()
                 if not resolved_sid or not is_safe_session_id(resolved_sid):
-                    return j(
-                        handler,
-                        {
-                            "ok": False,
-                            "error": "Session moved",
-                            "session_id": authoritative_sid,
-                            "code": "session_moved",
-                        },
-                        status=409,
-                    )
+                    return _draft_authority_unconfirmed()
                 if not _profiles_match(getattr(request_session, "profile", None), request_profile):
-                    return j(
-                        handler,
-                        {
-                            "ok": False,
-                            "error": "Session moved",
-                            "session_id": authoritative_sid,
-                            "code": "session_moved",
-                        },
-                        status=409,
-                    )
+                    return _draft_authority_unconfirmed()
 
                 if resolved_sid != authoritative_sid:
                     if resolved_sid in _seen_authority_sids:
-                        return j(
-                            handler,
-                            {
-                                "ok": False,
-                                "error": "Session moved",
-                                "session_id": resolved_sid,
-                                "code": "session_moved",
-                            },
-                            status=409,
-                        )
+                        return _draft_authority_unconfirmed()
                     _seen_authority_sids.add(resolved_sid)
                     authoritative_sid = resolved_sid
                     continue
@@ -17877,16 +17844,7 @@ def handle_post(handler, parsed) -> bool:
                         )
                     )
                     if not continuation_session:
-                        return j(
-                            handler,
-                            {
-                                "ok": False,
-                                "error": "Session moved",
-                                "session_id": continuation_sid or authoritative_sid,
-                                "code": "session_moved",
-                            },
-                            status=409,
-                        )
+                        return _draft_authority_unconfirmed()
                     request_session = continuation_session
                     _seen_authority_sids.add(continuation_sid)
                     authoritative_sid = continuation_sid
@@ -17954,16 +17912,9 @@ def handle_post(handler, parsed) -> bool:
                 resolved_once = True
                 break
         if not resolved_once:
-            return j(
-                handler,
-                {
-                    "ok": False,
-                    "error": "Session moved",
-                    "session_id": authoritative_sid,
-                    "code": "session_moved",
-                },
-                status=409,
-            )
+            # A bounded walk can stop on another snapshot whose own continuation
+            # authority has not yet been checked; keep that SID out of client replay.
+            return _draft_authority_unconfirmed()
         _draft_mark("released_lock")
         payload = {"ok": True, "draft": saved_draft}
         if unchanged:

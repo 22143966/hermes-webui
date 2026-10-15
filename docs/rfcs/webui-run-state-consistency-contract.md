@@ -383,6 +383,12 @@ parent's workspace binding. Clients without this handling must reload the
 session before retrying. Server wakeups, regeneration semantics and Gateway
 routing are not silently retargeted by this recovery path.
 
+Composer draft writes follow a marked compression snapshot only when the child
+profile and `parent_session_id` confirm that transition. Unconfirmed, cyclic or
+over-limit lineage returns a non-retryable draft-authority error without a
+child session target. A failed pre-switch draft save reports the captured text
+and files while the current, generation-guarded session navigation continues.
+
 ## Goals
 
 - Define the state layers involved in active and recovered WebUI turns.

@@ -2572,7 +2572,13 @@ async function loadSession(sid){
   if (currentSid && currentSid !== sid) {
     if(typeof window._clearPendingSelections==='function') window._clearPendingSelections();
     if(typeof _clearQueueCardDisplay==='function') _clearQueueCardDisplay(currentSid);
-    await _saveComposerDraftNow(currentSid, ($('msg') || {}).value || '', S.pendingFiles ? [...S.pendingFiles] : []);
+    const draftText = ($('msg') || {}).value || '';
+    const draftFiles = S.pendingFiles ? [...S.pendingFiles] : [];
+    try {
+      await _saveComposerDraftNow(currentSid, draftText, draftFiles);
+    } catch (error) {
+      _handleComposerDraftPostFailure(error, currentSid, draftText, draftFiles);
+    }
     // The awaited draft save above yields the event loop. If another
     // loadSession() started for a different session while we were waiting
     // (rapid switch B→C), _loadingSessionId now points at that newer load —

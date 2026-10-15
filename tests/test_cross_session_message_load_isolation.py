@@ -92,6 +92,22 @@ ENSURE_MESSAGES_LOADED_SRC = _extract_function(SESSIONS_SRC, "_ensureMessagesLoa
 INFLIGHT_HAS_VISIBLE_STATE_SRC = _extract_function(SESSIONS_SRC, "_inflightHasVisibleLiveState")
 SELECT_LIVE_RECOVERY_INFLIGHT_SRC = _extract_function(SESSIONS_SRC, "_selectLiveRecoveryInflight")
 MERGE_PENDING_SESSION_MESSAGE_SRC = _extract_function(SESSIONS_SRC, "_mergePendingSessionMessage")
+COMPOSER_DRAFT_HELPERS_SRC = "\n".join(
+    _extract_function(SESSIONS_SRC, name)
+    for name in (
+        "_composerDraftFilesForPersist",
+        "_clearComposerDraftRestoreSuppression",
+        "_safeDraftSessionId",
+        "_parseSessionMovedDraftError",
+        "_composerDraftResponseSessionId",
+        "_handleComposerDraftPostFailure",
+        "_postComposerDraftPayload",
+        "_composerDraftHasPayload",
+        "_sessionComposerDraftHasPayload",
+        "_rememberComposerDraftPayloadState",
+        "_saveComposerDraftNow",
+    )
+)
 
 
 def _normalise_ws(s: str) -> str:
@@ -143,6 +159,8 @@ def test_ensure_messages_loaded_ownership_guard_pre_and_post_await():
 
 
 _NODE_SCRIPT_TEMPLATE = r'''
+import assert from 'node:assert/strict';
+
 function makeHarness() {
   const apiCalls = [];
   const queue = [];
@@ -346,6 +364,11 @@ let toolSyncCalls = 0;
 let toastCalls = [];
 
 // Source under test
+let _draftSaveTimer = null;
+const _DRAFT_SAVE_DELAY_MS = 400;
+const _composerDraftKnownPayloadSessions = new Set();
+const _composerDraftRestoreSuppressedUntilBySid = new Map();
+__COMPOSER_DRAFT_HELPERS_SRC__
 __INFLIGHT_HAS_VISIBLE_STATE_SRC__
 __SELECT_LIVE_RECOVERY_INFLIGHT_SRC__
 __MERGE_PENDING_SESSION_MESSAGE_SRC__
@@ -560,11 +583,90 @@ async function runStaleRejectedIdleCatch() {
   };
 }
 
+async function runDraftSaveFailureNavigation() {
+  createEnvironment();
+  _composerDraftKnownPayloadSessions.clear();
+  _composerDraftRestoreSuppressedUntilBySid.clear();
+  const sourceSession = { session_id: 'sid-source', message_count: 1, composer_draft: null };
+  S.session = sourceSession;
+  S.pendingFiles = [{name: 'old.txt', size: 12, type: 'text/plain'}];
+  $('msg').value = 'captured old draft';
+  const draftRequests = [];
+  const apiCalls = [];
+  const streamCalls = [];
+  const failureReports = [];
+  const realFailureHandler = _handleComposerDraftPostFailure;
+  _handleComposerDraftPostFailure = (error, sid, text, files) => {
+    failureReports.push({sid, text, files});
+    return realFailureHandler(error, sid, text, files);
+  };
+  globalThis.startSessionStream = (sid) => streamCalls.push(sid);
+  globalThis.api = (path, options={}) => {
+    apiCalls.push(String(path));
+    if (path === '/api/session/draft') {
+      const body = JSON.parse(options.body);
+      return new Promise((resolve, reject) => draftRequests.push({body, resolve, reject}));
+    }
+    const query = new URL(path, 'http://example.test').searchParams;
+    const sid = query.get('session_id');
+    if (query.get('messages') === '0') {
+      return Promise.resolve({session: {session_id:sid, message_count:1, active_stream_id:null}});
+    }
+    if (query.get('messages') === '1') {
+      return Promise.resolve({session: {
+        session_id:sid,
+        messages:[{role:'user', content:'destination transcript'}],
+        message_count:1,
+        _messages_truncated:false,
+        _messages_offset:0,
+        tool_calls:[],
+      }});
+    }
+    throw new Error('Unexpected API call: ' + path);
+  };
+  const observed = (promise) => promise.then(
+    () => ({error:null}),
+    (error) => ({error:String(error && error.message || error)}),
+  );
+  const first = observed(loadSession('sid-stale-destination'));
+  assert.strictEqual(draftRequests.length, 1);
+  $('msg').value = 'newer composer draft';
+  S.pendingFiles = [{name:'newer.txt', size:14, type:'text/plain'}];
+  const second = observed(loadSession('sid-live-destination'));
+  assert.strictEqual(draftRequests.length, 2);
+  const staleError = new Error('stale draft POST rejected');
+  staleError.status = 503;
+  draftRequests[0].reject(staleError);
+  const firstResult = await first;
+  const afterStale = {
+    loadingSid:_loadingSessionId,
+    activeSid:S.session && S.session.session_id,
+    sourceDraft:sourceSession.composer_draft,
+  };
+  const currentError = new Error('current draft POST rejected');
+  currentError.status = 503;
+  draftRequests[1].reject(currentError);
+  const secondResult = await second;
+  return {
+    firstError:firstResult.error,
+    secondError:secondResult.error,
+    afterStale,
+    activeSid:S.session && S.session.session_id,
+    loadingSid:_loadingSessionId,
+    streamCalls,
+    apiCalls,
+    draftRequests:draftRequests.map((entry) => entry.body),
+    failureReports,
+    sourceDraft:sourceSession.composer_draft,
+  };
+}
+
 async function runAll() {
   return {
     crossSessionOrdering: await runCrossSessionOrdering(),
     observedIdleCrossSessionOrdering: await runObservedIdleCrossSessionOrdering(),
     staleIdleCatch: await runStaleRejectedIdleCatch(),
+    draftSaveFailureNavigation: await runDraftSaveFailureNavigation(),
   };
 }
 
@@ -607,6 +709,7 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior(tmp_path):
         .replace(
             "__MERGE_PENDING_SESSION_MESSAGE_SRC__", MERGE_PENDING_SESSION_MESSAGE_SRC
         )
+        .replace("__COMPOSER_DRAFT_HELPERS_SRC__", COMPOSER_DRAFT_HELPERS_SRC)
         .replace("__LOAD_SESSION_SRC__", LOAD_SESSION_SRC)
         .replace("__ENSURE_MESSAGES_LOADED_SRC__", ENSURE_MESSAGES_LOADED_SRC)
     )
@@ -683,3 +786,30 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior(tmp_path):
 
     assert cross["loadingSid"] is None, "load marker should be cleared after successful completion"
     assert stale["loadingSid"] is None, "load marker should be cleared after stale reject + re-owner completion"
+
+    superseded = body["draftSaveFailureNavigation"]
+    assert superseded["firstError"] is None
+    assert superseded["secondError"] is None, "a failed draft POST must not reject the current destination load"
+    assert superseded["afterStale"] == {
+        "loadingSid":"sid-live-destination",
+        "activeSid":"sid-source",
+        "sourceDraft":{
+            "text":"captured old draft",
+            "files":[{"name":"old.txt", "size":12, "type":"text/plain"}],
+        },
+    }, "rejected stale navigation must retain its exact snapshot and leave the newer load owned"
+    assert superseded["activeSid"] == "sid-live-destination"
+    assert superseded["loadingSid"] is None
+    assert superseded["streamCalls"] == ["sid-live-destination"]
+    assert superseded["failureReports"] == [
+        {
+            "sid":"sid-source",
+            "text":"captured old draft",
+            "files":[{"name":"old.txt", "size":12, "type":"text/plain"}],
+        },
+        {
+            "sid":"sid-source",
+            "text":"newer composer draft",
+            "files":[{"name":"newer.txt", "size":14, "type":"text/plain"}],
+        },
+    ]
