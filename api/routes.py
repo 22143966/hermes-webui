@@ -11886,6 +11886,7 @@ from api.models import (
     _session_messages_have_prefix,
     _session_message_visible_key,
     _message_timestamp_as_float,
+    _persisted_session_meta_prefix,
     _is_empty_partial_activity_message,
     _hide_from_default_sidebar,
     prune_session_from_index,
@@ -12090,11 +12091,28 @@ def _pre_compression_continuation_session_id(session) -> str | None:
     return _resolve_from_rows(rows)
 
 
+def _draft_compression_edge_is_authorized(snapshot_sid, continuation_sid, request_profile) -> bool:
+    """Confirm one bounded compression edge from current on-disk metadata."""
+    snapshot_meta = _persisted_session_meta_prefix(snapshot_sid)
+    continuation_meta = _persisted_session_meta_prefix(continuation_sid)
+    return bool(
+        snapshot_meta
+        and continuation_meta
+        and _profiles_match(snapshot_meta.get("profile"), request_profile)
+        and snapshot_meta.get("pre_compression_snapshot")
+        and _safe_first(snapshot_meta.get("pre_compression_continuation_session_id"))
+        == continuation_sid
+        and _profiles_match(continuation_meta.get("profile"), request_profile)
+        and _safe_first(continuation_meta.get("parent_session_id")) == snapshot_sid
+    )
+
+
 def _draft_pre_compression_continuation_session_authority(
     session,
     *,
     request_profile,
     seen_authority_sids: set[str],
+    validated_edges: list[tuple[str, str]] | None = None,
 ) -> tuple[str | None, str]:
     """Validate one authoritative compression transition from a snapshot.
 
@@ -12114,6 +12132,13 @@ def _draft_pre_compression_continuation_session_authority(
     if continuation_sid in seen_authority_sids:
         return None, continuation_sid
 
+    # Cached session freshness is message-count based and can miss a
+    # profile- or parent-only edit. Check only the bounded metadata prefixes.
+    if not _draft_compression_edge_is_authorized(
+        snapshot_sid, continuation_sid, request_profile
+    ):
+        return None, continuation_sid
+
     try:
         continuation_session = get_session(continuation_sid)
     except KeyError:
@@ -12127,7 +12152,18 @@ def _draft_pre_compression_continuation_session_authority(
     if _safe_first(getattr(continuation_session, "parent_session_id", None)) != snapshot_sid:
         return None, continuation_sid
 
+    if validated_edges is not None:
+        validated_edges.append((snapshot_sid, continuation_sid))
+
     return continuation_session, continuation_sid
+
+
+def _draft_compression_edges_still_authorized(edges, request_profile) -> bool:
+    """Recheck each bounded lineage edge after acquiring the final target lock."""
+    return all(
+        _draft_compression_edge_is_authorized(snapshot_sid, continuation_sid, request_profile)
+        for snapshot_sid, continuation_sid in edges
+    )
 
 from api.workspace import (
     load_workspaces,
@@ -17780,6 +17816,7 @@ def handle_post(handler, parsed) -> bool:
         authoritative_sid = request_sid
         _MAX_DRAFT_AUTHORITY_HOPS = 4
         _seen_authority_sids = {authoritative_sid}
+        _validated_compression_edges = []
         resolved_once = False
 
         def _draft_authority_unconfirmed():
@@ -17796,6 +17833,13 @@ def handle_post(handler, parsed) -> bool:
         for _hop in range(_MAX_DRAFT_AUTHORITY_HOPS):
             with _get_session_agent_lock(authoritative_sid):
                 _draft_mark("acquired_lock")
+                # A successful parent check releases that lock before this hop
+                # acquires the child lock. Revalidate every traversed edge here
+                # so a cleared/deleted snapshot cannot authorize the write.
+                if _validated_compression_edges and not _draft_compression_edges_still_authorized(
+                    _validated_compression_edges, request_profile
+                ):
+                    return _draft_authority_unconfirmed()
                 if _hop == 0 and request_session is not None:
                     resolved_sid = str(getattr(request_session, "session_id", "") or "").strip()
                     if not resolved_sid or not is_safe_session_id(resolved_sid):
@@ -17841,6 +17885,7 @@ def handle_post(handler, parsed) -> bool:
                             request_session,
                             request_profile=request_profile,
                             seen_authority_sids=_seen_authority_sids,
+                            validated_edges=_validated_compression_edges,
                         )
                     )
                     if not continuation_session:
@@ -17903,6 +17948,10 @@ def handle_post(handler, parsed) -> bool:
                     # here makes the active-session external-refresh poll force-reload the
                     # current chat every few seconds while the user is typing, and that
                     # delayed reload can restore an older draft over newer local input.
+                    if _validated_compression_edges and not _draft_compression_edges_still_authorized(
+                        _validated_compression_edges, request_profile
+                    ):
+                        return _draft_authority_unconfirmed()
                     _draft_mark("before_save")
                     _save_session_draft(authoritative_sid, next_draft)
                     _draft_mark("after_save")

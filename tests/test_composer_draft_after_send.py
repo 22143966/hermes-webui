@@ -173,7 +173,7 @@ def test_draft_save_paths_use_authoritative_session_id_after_rotation(caller, sc
                     "session_id": "sid_authoritative",
                 },
             },
-            {"status": 200, "response": {"ok": True, "session_id": "sid_authoritative"}},
+            {"status": 200, "response": {"ok": True}},
         ]
 
     out = _run_draft_save_helper(caller, responses)

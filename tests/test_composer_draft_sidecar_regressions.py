@@ -3,6 +3,7 @@
 import json
 import sqlite3
 import threading
+import copy
 from types import SimpleNamespace
 
 from api import streaming
@@ -550,6 +551,102 @@ def test_draft_post_does_not_redirect_to_child_without_parent_authority(tmp_path
         assert payload["code"] == "draft_authority_unconfirmed"
         assert "session_id" not in payload
         assert draft_path.read_bytes() == durable_before
+        assert models._load_session_draft(continuation_sid) == newer_draft
+    finally:
+        with streaming.SESSION_AGENT_LOCKS_LOCK:
+            streaming.SESSION_AGENT_LOCKS.pop(old_sid, None)
+            streaming.SESSION_AGENT_LOCKS.pop(continuation_sid, None)
+
+
+def test_draft_post_rejects_warm_child_with_stale_durable_parent(tmp_path, monkeypatch):
+    models, routes, session_dir, old_sid, continuation_sid, _fork_sid = (
+        _build_pre_compression_migration_state(tmp_path, monkeypatch)
+    )
+    cached_child = models.get_session(continuation_sid)
+    newer_draft = {"text": "newer child draft", "files": [{"name": "newer.txt"}]}
+    models._save_session_draft(continuation_sid, newer_draft)
+    cached_child.composer_draft = newer_draft
+    durable_before = models._session_draft_path(continuation_sid).read_bytes()
+
+    # Save the parent-only edit through a second object, leaving the warm cache
+    # and message count unchanged so cached-session freshness cannot notice it.
+    edited_child = copy.copy(cached_child)
+    edited_child.parent_session_id = None
+    edited_child.save(touch_updated_at=False, skip_index=True)
+    assert models.get_session(continuation_sid) is cached_child
+    assert len(cached_child.messages) == len(edited_child.messages)
+
+    try:
+        status, payload = _post_json(
+            monkeypatch, routes, "/api/session/draft",
+            {"session_id": old_sid, "text": "stale parent autosave", "files": []},
+        )
+        assert status == 409
+        assert payload["code"] == "draft_authority_unconfirmed"
+        assert "session_id" not in payload
+        assert models._session_draft_path(continuation_sid).read_bytes() == durable_before
+        assert models._load_session_draft(continuation_sid) == newer_draft
+    finally:
+        with streaming.SESSION_AGENT_LOCKS_LOCK:
+            streaming.SESSION_AGENT_LOCKS.pop(old_sid, None)
+            streaming.SESSION_AGENT_LOCKS.pop(continuation_sid, None)
+
+
+def test_draft_post_revalidates_compression_edge_after_target_lock(tmp_path, monkeypatch):
+    models, routes, session_dir, old_sid, continuation_sid, _fork_sid = (
+        _build_pre_compression_migration_state(tmp_path, monkeypatch)
+    )
+    child = models.get_session(continuation_sid)
+    newer_draft = {"text": "newer child draft", "files": []}
+    models._save_session_draft(continuation_sid, newer_draft)
+    child.composer_draft = newer_draft
+    durable_before = models._session_draft_path(continuation_sid).read_bytes()
+    parent_path = session_dir / f"{old_sid}.json"
+    target_locked = threading.Event()
+    resume = threading.Event()
+    result = {}
+    base_get_lock = routes._get_session_agent_lock
+
+    class _PauseAtTargetLock:
+        def __init__(self, lock):
+            self.lock = lock
+
+        def __enter__(self):
+            self.lock.acquire()
+            target_locked.set()
+            assert resume.wait(timeout=5), "target-lock pause timed out"
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.lock.release()
+
+    def _get_lock(sid):
+        lock = base_get_lock(sid)
+        return _PauseAtTargetLock(lock) if sid == continuation_sid else lock
+
+    monkeypatch.setattr(routes, "_get_session_agent_lock", _get_lock)
+
+    def _post():
+        result["response"] = _post_json(
+            monkeypatch, routes, "/api/session/draft",
+            {"session_id": old_sid, "text": "stale parent autosave", "files": []},
+        )
+
+    thread = threading.Thread(target=_post)
+    thread.start()
+    try:
+        assert target_locked.wait(timeout=5), "draft did not reach the child authority lock"
+        parent_path.unlink()
+    finally:
+        resume.set()
+        thread.join(timeout=5)
+    try:
+        assert not thread.is_alive()
+        status, payload = result["response"]
+        assert status == 409
+        assert payload["code"] == "draft_authority_unconfirmed"
+        assert "session_id" not in payload
+        assert models._session_draft_path(continuation_sid).read_bytes() == durable_before
         assert models._load_session_draft(continuation_sid) == newer_draft
     finally:
         with streaming.SESSION_AGENT_LOCKS_LOCK:

@@ -37,7 +37,52 @@ def _extract_function(source: str, name: str) -> str:
         start = source.find(marker)
     assert start >= 0, f"{name} not found in sessions.js"
 
-    brace_start = source.find("{", start)
+    signature_start = source.find("(", start)
+    assert signature_start >= 0, f"function {name} is missing its parameter list"
+    paren_depth = 0
+    in_string = None
+    escaped = False
+    in_line_comment = False
+    in_block_comment = False
+    signature_end = None
+    for index in range(signature_start, len(source)):
+        ch = source[index]
+        nxt = source[index + 1] if index + 1 < len(source) else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_string:
+                in_string = None
+            continue
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            continue
+        if ch in ('\'', '"', "`"):
+            in_string = ch
+            continue
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            paren_depth -= 1
+            if paren_depth == 0:
+                signature_end = index + 1
+                break
+    assert signature_end is not None, f"function {name} has an unterminated parameter list"
+
+    brace_start = source.find("{", signature_end)
     assert brace_start >= 0, f"function {name} is missing '{{'"
 
     depth = 0
@@ -97,15 +142,20 @@ COMPOSER_DRAFT_HELPERS_SRC = "\n".join(
     for name in (
         "_composerDraftFilesForPersist",
         "_clearComposerDraftRestoreSuppression",
+        "_isComposerDraftRestoreSuppressed",
         "_safeDraftSessionId",
         "_parseSessionMovedDraftError",
         "_composerDraftResponseSessionId",
+        "_setComposerDraftLocalIntent",
+        "_forgetComposerDraftLocalFallback",
+        "_forgetComposerDraftFallbacksOutsideProfile",
         "_handleComposerDraftPostFailure",
         "_postComposerDraftPayload",
         "_composerDraftHasPayload",
         "_sessionComposerDraftHasPayload",
         "_rememberComposerDraftPayloadState",
         "_saveComposerDraftNow",
+        "_restoreComposerDraft",
     )
 )
 
@@ -368,6 +418,7 @@ let _draftSaveTimer = null;
 const _DRAFT_SAVE_DELAY_MS = 400;
 const _composerDraftKnownPayloadSessions = new Set();
 const _composerDraftRestoreSuppressedUntilBySid = new Map();
+const _composerDraftLocalFallbackBySid = new Map();
 __COMPOSER_DRAFT_HELPERS_SRC__
 __INFLIGHT_HAS_VISIBLE_STATE_SRC__
 __SELECT_LIVE_RECOVERY_INFLIGHT_SRC__
@@ -587,9 +638,15 @@ async function runDraftSaveFailureNavigation() {
   createEnvironment();
   _composerDraftKnownPayloadSessions.clear();
   _composerDraftRestoreSuppressedUntilBySid.clear();
+  _composerDraftLocalFallbackBySid.clear();
   const sourceSession = { session_id: 'sid-source', message_count: 1, composer_draft: null };
   S.session = sourceSession;
-  S.pendingFiles = [{name: 'old.txt', size: 12, type: 'text/plain'}];
+  const makeFile = (name, size, type) => typeof File === 'function'
+    ? new File([new Uint8Array(size)], name, {type}) : {name, size, type};
+  const oldFile = makeFile('old.txt', 12, 'text/plain');
+  const newerFile = makeFile('newer.txt', 14, 'text/plain');
+  const backgroundFile = makeFile('steer.txt', 16, 'text/plain');
+  S.pendingFiles = [oldFile];
   $('msg').value = 'captured old draft';
   const draftRequests = [];
   const apiCalls = [];
@@ -597,7 +654,7 @@ async function runDraftSaveFailureNavigation() {
   const failureReports = [];
   const realFailureHandler = _handleComposerDraftPostFailure;
   _handleComposerDraftPostFailure = (error, sid, text, files) => {
-    failureReports.push({sid, text, files});
+    failureReports.push({sid, text, files:files.map((file)=>({name:file.name,size:file.size,type:file.type}))});
     return realFailureHandler(error, sid, text, files);
   };
   globalThis.startSessionStream = (sid) => streamCalls.push(sid);
@@ -610,7 +667,12 @@ async function runDraftSaveFailureNavigation() {
     const query = new URL(path, 'http://example.test').searchParams;
     const sid = query.get('session_id');
     if (query.get('messages') === '0') {
-      return Promise.resolve({session: {session_id:sid, message_count:1, active_stream_id:null}});
+      const composer_draft = sid === 'sid-source'
+        ? {text:'stale server draft', files:[{name:'server-stale.txt'}]}
+        : sid === 'sid-background'
+          ? {text:'stale background server draft', files:[]}
+          : {text:'', files:[]};
+      return Promise.resolve({session: {session_id:sid, message_count:1, active_stream_id:null, composer_draft}});
     }
     if (query.get('messages') === '1') {
       return Promise.resolve({session: {
@@ -631,7 +693,7 @@ async function runDraftSaveFailureNavigation() {
   const first = observed(loadSession('sid-stale-destination'));
   assert.strictEqual(draftRequests.length, 1);
   $('msg').value = 'newer composer draft';
-  S.pendingFiles = [{name:'newer.txt', size:14, type:'text/plain'}];
+  S.pendingFiles = [newerFile];
   const second = observed(loadSession('sid-live-destination'));
   assert.strictEqual(draftRequests.length, 2);
   const staleError = new Error('stale draft POST rejected');
@@ -642,22 +704,136 @@ async function runDraftSaveFailureNavigation() {
     loadingSid:_loadingSessionId,
     activeSid:S.session && S.session.session_id,
     sourceDraft:sourceSession.composer_draft,
+    pendingDraft:(() => { const d=_composerDraftLocalFallbackBySid.get('sid-source'); return d&&{text:d.text,files:d.files.map((file)=>({name:file.name,size:file.size,type:file.type})),sameFile:d.files[0]===newerFile}; })(),
   };
   const currentError = new Error('current draft POST rejected');
   currentError.status = 503;
   draftRequests[1].reject(currentError);
   const secondResult = await second;
+  const destinationNavigation = {
+    activeSid:S.session && S.session.session_id,
+    loadingSid:_loadingSessionId,
+    streamCalls:streamCalls.slice(),
+  };
+  const returnedToSource = observed(loadSession('sid-source'));
+  const returnResult = await returnedToSource;
+  const sourceRestored = {
+    text:$('msg').value,
+    files:S.pendingFiles.map((file)=>({name:file.name,size:file.size,type:file.type})),
+    sameFile:S.pendingFiles[0]===newerFile,
+  };
+  const backgroundWrite = observed(_saveComposerDraftNow(
+    'sid-background', 'background steer draft', [backgroundFile],
+  ).catch((error) => _handleComposerDraftPostFailure(
+    error, 'sid-background', 'background steer draft', [backgroundFile],
+  )));
+  assert.strictEqual(draftRequests.length, 3);
+  draftRequests[2].reject(new Error('background steer draft rejected'));
+  const backgroundWriteResult = await backgroundWrite;
+  const backgroundLoad = observed(loadSession('sid-background'));
+  assert.strictEqual(draftRequests.length, 4);
+  draftRequests[3].resolve({session_id:'sid-source'});
+  const backgroundResult = await backgroundLoad;
+  const backgroundRestored = {
+    text:$('msg').value,
+    files:S.pendingFiles.map((file)=>({name:file.name,size:file.size,type:file.type})),
+    sameFile:S.pendingFiles[0]===backgroundFile,
+  };
+  const completedNavigation = {
+    activeSid:S.session && S.session.session_id,
+    loadingSid:_loadingSessionId,
+    streamCalls:streamCalls.slice(),
+  };
+  const supersedingFailureReports = failureReports.slice();
+
+  // A single failed outgoing save must survive a real A→B→A navigation even
+  // when A's server response still carries an older draft.
+  _handleComposerDraftPostFailure = realFailureHandler;
+  createEnvironment();
+  _composerDraftKnownPayloadSessions.clear();
+  _composerDraftRestoreSuppressedUntilBySid.clear();
+  _composerDraftLocalFallbackBySid.clear();
+  const revisitFile = makeFile('revisit.txt', 21, 'text/plain');
+  const revisitRequests = [];
+  S.session = {session_id:'sid-revisit-owner', message_count:1, profile:'default', composer_draft:null};
+  S.pendingFiles = [revisitFile];
+  $('msg').value = 'failed outgoing exact draft';
+  globalThis.api = (path, options={}) => {
+    if (path === '/api/session/draft') {
+      const body = JSON.parse(options.body);
+      return new Promise((resolve, reject) => {
+        const request = {body, resolve, reject};
+        revisitRequests.push(request);
+        if (revisitRequests.length > 1) resolve({session_id:body.session_id});
+      });
+    }
+    const query = new URL(path, 'http://example.test').searchParams;
+    const sid = query.get('session_id');
+    if (query.get('messages') === '0') return Promise.resolve({session:{
+      session_id:sid, message_count:1, active_stream_id:null,
+      composer_draft:sid==='sid-revisit-owner'
+        ? {text:'older server draft',files:[{name:'old-server.txt'}]} : {text:'',files:[]},
+    }});
+    if (query.get('messages') === '1') return Promise.resolve({session:{
+      session_id:sid, messages:[{role:'user',content:'transcript'}], message_count:1,
+      _messages_truncated:false, _messages_offset:0, tool_calls:[],
+    }});
+    throw new Error('Unexpected API call: ' + path);
+  };
+  const failedOutgoing = observed(loadSession('sid-revisit-destination'));
+  assert.strictEqual(revisitRequests.length, 1);
+  revisitRequests[0].reject(new Error('outgoing save rejected'));
+  const failedOutgoingResult = await failedOutgoing;
+  const revisitResult = await observed(loadSession('sid-revisit-owner'));
+  const revisitedDraft = {
+    error:revisitResult.error,
+    text:$('msg').value,
+    files:S.pendingFiles.map((file)=>({name:file.name,size:file.size,type:file.type})),
+    sameFile:S.pendingFiles[0]===revisitFile,
+  };
+
+  createEnvironment();
+  _composerDraftLocalFallbackBySid.clear();
+  _composerDraftRestoreSuppressedUntilBySid.clear();
+  S.session = {session_id:'sid-empty-local-clear', message_count:1};
+  $('msg').value = 'stale server draft';
+  _setComposerDraftLocalIntent('sid-empty-local-clear', '', []);
+  _restoreComposerDraft(
+    {text:'stale server draft', files:[]}, 'sid-empty-local-clear',
+  );
+  const emptyLocalDraftRestored = $('msg').value;
+
+  createEnvironment();
+  _composerDraftLocalFallbackBySid.clear();
+  const activeRefreshFile = makeFile('active-refresh.txt', 19, 'text/plain');
+  S.session = {session_id:'sid-file-only-refresh', message_count:1};
+  S.pendingFiles = [activeRefreshFile];
+  _restoreComposerDraft(
+    {text:'', files:[]}, 'sid-file-only-refresh', {preserveActiveInput:true},
+  );
+  const fileOnlyRefreshRetained = S.pendingFiles[0] === activeRefreshFile;
   return {
     firstError:firstResult.error,
     secondError:secondResult.error,
+    destinationNavigation,
     afterStale,
-    activeSid:S.session && S.session.session_id,
-    loadingSid:_loadingSessionId,
-    streamCalls,
+    activeSid:completedNavigation.activeSid,
+    loadingSid:completedNavigation.loadingSid,
+    streamCalls:completedNavigation.streamCalls,
     apiCalls,
     draftRequests:draftRequests.map((entry) => entry.body),
     failureReports,
     sourceDraft:sourceSession.composer_draft,
+    returnError:returnResult.error,
+    sourceRestored,
+    backgroundWriteError:backgroundWriteResult.error,
+    backgroundError:backgroundResult.error,
+    backgroundRestored,
+    failedOutgoingError:failedOutgoingResult.error,
+    revisitedDraft,
+    emptyLocalDraftRestored,
+    fileOnlyRefreshRetained,
+    supersedingFailureReports,
   };
 }
 
@@ -793,14 +969,21 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior(tmp_path):
     assert superseded["afterStale"] == {
         "loadingSid":"sid-live-destination",
         "activeSid":"sid-source",
-        "sourceDraft":{
-            "text":"captured old draft",
-            "files":[{"name":"old.txt", "size":12, "type":"text/plain"}],
+        "sourceDraft":None,
+        "pendingDraft":{
+            "text":"newer composer draft",
+            "files":[{"name":"newer.txt", "size":14, "type":"text/plain"}],
+            "sameFile":True,
         },
     }, "rejected stale navigation must retain its exact snapshot and leave the newer load owned"
-    assert superseded["activeSid"] == "sid-live-destination"
+    assert superseded["destinationNavigation"] == {
+        "activeSid":"sid-live-destination",
+        "loadingSid":None,
+        "streamCalls":["sid-live-destination"],
+    }, "a failed outgoing draft POST must still load and attach the destination stream"
+    assert superseded["activeSid"] == "sid-background"
     assert superseded["loadingSid"] is None
-    assert superseded["streamCalls"] == ["sid-live-destination"]
+    assert superseded["streamCalls"] == ["sid-live-destination", "sid-source", "sid-background"]
     assert superseded["failureReports"] == [
         {
             "sid":"sid-source",
@@ -812,4 +995,35 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior(tmp_path):
             "text":"newer composer draft",
             "files":[{"name":"newer.txt", "size":14, "type":"text/plain"}],
         },
+        {
+            "sid":"sid-background",
+            "text":"background steer draft",
+            "files":[{"name":"steer.txt", "size":16, "type":"text/plain"}],
+        },
     ]
+    assert superseded["returnError"] is None
+    assert superseded["sourceRestored"] == {
+        "text":"newer composer draft",
+        "files":[{"name":"newer.txt", "size":14, "type":"text/plain"}],
+        "sameFile":True,
+    }, "failed local draft must override stale server text and retain the original File reference on revisit"
+    assert superseded["backgroundError"] is None
+    assert superseded["backgroundWriteError"] is None
+    assert superseded["backgroundRestored"] == {
+        "text":"background steer draft",
+        "files":[{"name":"steer.txt", "size":16, "type":"text/plain"}],
+        "sameFile":True,
+    }, "the shared failure handler must retain background send/steer files for their owning session"
+    assert superseded["failedOutgoingError"] is None
+    assert superseded["revisitedDraft"] == {
+        "error":None,
+        "text":"failed outgoing exact draft",
+        "files":[{"name":"revisit.txt", "size":21, "type":"text/plain"}],
+        "sameFile":True,
+    }, "A→B→A must restore the exact failed local text and original File over stale server state"
+    assert superseded["emptyLocalDraftRestored"] == "", (
+        "an empty failed local clear must override stale server draft text"
+    )
+    assert superseded["fileOnlyRefreshRetained"] is True, (
+        "same-session force refresh must retain the exact active File reference"
+    )
