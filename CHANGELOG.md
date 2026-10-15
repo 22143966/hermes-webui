@@ -16,6 +16,10 @@
 
 ### Performance
 
+- **Opening a session reuses a recent model catalog for up to an hour.** The session-visit freshness window for the
+  disk-backed models catalog is 1 h instead of 5 min, so installs with many or slow providers stop rebuilding the full
+  catalog on most session visits. Thanks @cxk1993. (#8261)
+
 - **Fork a scheduled-job (cron) conversation into your own editable chat.** Cron-run sessions are read-only (the scheduler owns them), so you couldn't continue one. You can now branch/fork a cron session into a new WebUI-owned conversation — the original read-only session is never modified, and the fork picks up its history so you can carry on. Only genuine cron sessions qualify (verified by the server-side source, not a guessable id), and every other read-only session stays unbranchable. Thanks @rodboev. (#5555, #5477)
 
 - **Pick the exact time and day for scheduled jobs — no cron syntax needed.** The Tasks "New job" form now builds the schedule as a plain sentence: choose a frequency (Hourly / Daily / Weekdays / Weekly / Monthly / Custom) and it shows just the controls that matter — a time picker, a day-of-week dropdown, or a day-of-month dropdown — e.g. "Weekly on Monday at 09:00." The generated cron expression is previewed inline, and the raw cron field now appears only under "Custom." Thanks @rodboev. (#5554, #5552)
@@ -57,6 +61,10 @@
   exactly as before. Thanks @ybai08. (#8138, fixes #8126)
 
 ### Fixed
+
+- **Per-turn token usage survives a reload.** The usage badge on an assistant reply ("1.2k in · 800 out") was
+  computed client-side at the end of a stream and lost on reload; it's now persisted on the settled assistant
+  message. Thanks @cxk1993. (#8258)
 
 - **Stopping a Gateway chat now carries the interrupted turn into the model's next context.** The cancelled prompt and its
   partial answer are reconciled into context exactly once (also for empty-context sessions, eager-save mode, forks,
