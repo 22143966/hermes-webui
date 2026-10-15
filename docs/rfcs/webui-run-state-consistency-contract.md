@@ -390,7 +390,11 @@ the browser replays that exact payload once to the child. The server does not
 write to the child during the parent request. Unconfirmed, cyclic or over-limit
 lineage returns a non-redirecting draft-authority error without a child target.
 A failed pre-switch draft save reports the captured text and files while the
-current, generation-guarded session navigation continues.
+current, generation-guarded session navigation continues. Unsent local drafts
+retain their browser File references by session ID until saved or cleared;
+this fallback lasts only for the current page. Draft POSTs to the same target
+are serialized, including continuation replays and clears, while different
+session targets can save concurrently.
 
 ## Goals
 

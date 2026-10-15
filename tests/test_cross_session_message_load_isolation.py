@@ -268,6 +268,7 @@ function snapshotState() {
 }
 
 function createEnvironment() {
+  _composerDraftPostPromisesBySid.clear();
   globalThis.INFLIGHT = {};
   globalThis.S = {
     session: { session_id: 'sid-init', message_count: 0 },
@@ -428,6 +429,7 @@ const _composerDraftKnownPayloadSessions = new Set();
 const _composerDraftRestoreSuppressedUntilBySid = new Map();
 const _composerDraftLocalFallbackBySid = new Map();
 const _composerDraftLatestIntentSequenceBySid = new Map();
+const _composerDraftPostPromisesBySid = new Map();
 let _composerDraftIntentSequence = 0;
 __COMPOSER_DRAFT_HELPERS_SRC__
 __INFLIGHT_HAS_VISIBLE_STATE_SRC__
@@ -709,11 +711,11 @@ async function runDraftSaveFailureNavigation() {
   $('msg').value = 'newer composer draft';
   S.pendingFiles = [newerFile];
   const second = observed(loadSession('sid-live-destination'));
-  assert.strictEqual(draftRequests.length, 2);
   const staleError = new Error('stale draft POST rejected');
   staleError.status = 503;
   draftRequests[0].reject(staleError);
   const firstResult = await first;
+  assert.strictEqual(draftRequests.length, 2);
   const afterStale = {
     loadingSid:_loadingSessionId,
     activeSid:S.session && S.session.session_id,
@@ -890,7 +892,7 @@ async function runDraftSaveFailureNavigation() {
   clearMoved.status = 409;
   clearMoved.body = JSON.stringify({code:'session_moved',session_id:'sid-clear-target'});
   clearRequests[0].reject(clearMoved);
-  await Promise.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
   assert.strictEqual(clearRequests.length, 2);
   clearRequests[1].resolve({session_id:'sid-clear-target'});
   await clearSave;
@@ -899,6 +901,41 @@ async function runDraftSaveFailureNavigation() {
     payload:clearRequests[1].body,
     targetDraft:S.session.composer_draft,
   };
+
+  createEnvironment();
+  _composerDraftLocalFallbackBySid.clear();
+  _composerDraftLatestIntentSequenceBySid.clear();
+  S.session = {session_id:'sid-serialized-target', message_count:1};
+  const serializedRequests = [];
+  let durableDraft = null;
+  globalThis.api = (_path, options) => {
+    const body = JSON.parse(options.body);
+    durableDraft = body;
+    return new Promise((resolve, reject) => serializedRequests.push({body, resolve, reject}));
+  };
+  const staleSave = _saveComposerDraftNow('sid-serialized-parent', 'stale parent draft', []);
+  const staleOutcome = staleSave.catch((error) => error);
+  assert.strictEqual(serializedRequests.length, 1);
+  const serializedMoved = new Error('Session moved');
+  serializedMoved.status = 409;
+  serializedMoved.body = JSON.stringify({code:'session_moved',session_id:'sid-serialized-target'});
+  serializedRequests[0].reject(serializedMoved);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(serializedRequests.length, 2);
+  const newerSave = _saveComposerDraftNow('sid-serialized-target', 'newer target draft', []);
+  const callsBeforeReplaySettles = serializedRequests.length;
+  serializedRequests[1].resolve({session_id:'sid-serialized-target'});
+  await new Promise((resolve) => setImmediate(resolve));
+  const callsAfterReplaySettles = serializedRequests.length;
+  if (serializedRequests[2]) serializedRequests[2].resolve({session_id:'sid-serialized-target'});
+  await Promise.all([staleOutcome, newerSave]);
+  const serializedReplayOrdering = {
+    calls:serializedRequests.map((request)=>request.body),
+    callsBeforeReplaySettles,
+    callsAfterReplaySettles,
+    durableDraft,
+  };
+
   return {
     firstError:firstResult.error,
     secondError:secondResult.error,
@@ -924,6 +961,7 @@ async function runDraftSaveFailureNavigation() {
     newerTargetDraftWins,
     newerTargetClearWins,
     clearReplay,
+    serializedReplayOrdering,
     supersedingFailureReports,
   };
 }
@@ -1138,3 +1176,12 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior(tmp_path):
         "session_id":"sid-clear-target", "text":"", "files":[],
     }
     assert superseded["clearReplay"]["targetDraft"] == {"text":"", "files":[]}
+    replay_order = superseded["serializedReplayOrdering"]
+    assert replay_order["callsBeforeReplaySettles"] == 2
+    assert replay_order["callsAfterReplaySettles"] == 3
+    assert [(call["session_id"], call["text"]) for call in replay_order["calls"]] == [
+        ("sid-serialized-parent", "stale parent draft"),
+        ("sid-serialized-target", "stale parent draft"),
+        ("sid-serialized-target", "newer target draft"),
+    ]
+    assert replay_order["durableDraft"]["text"] == "newer target draft"

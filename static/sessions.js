@@ -42,6 +42,7 @@ const _composerDraftKnownPayloadSessions = new Set();
 const _composerDraftRestoreSuppressedUntilBySid = new Map();
 const _composerDraftLocalFallbackBySid = new Map();
 const _composerDraftLatestIntentSequenceBySid = new Map();
+const _composerDraftPostPromisesBySid = new Map();
 let _composerDraftIntentSequence = 0;
 const _COMPOSER_DRAFT_RESTORE_SUPPRESS_MS = 30000;
 
@@ -321,15 +322,36 @@ function _postComposerDraftPayload(sid, draft, intent=null) {
   if (!requestSid) return Promise.resolve();
   const normalizedText = String((draft && draft.text) || '');
   const normalizedFiles = Array.isArray(draft && draft.files) ? draft.files.filter(Boolean) : [];
-  const bodyPayload = { text: normalizedText, files: normalizedFiles };
-  const post = (targetSid) => api('/api/session/draft', {
-    method: 'POST',
-    body: JSON.stringify({
-      session_id: targetSid,
-      text: bodyPayload.text,
-      files: bodyPayload.files,
-    }),
-  });
+  const bodyPayload = JSON.parse(JSON.stringify({ text: normalizedText, files: normalizedFiles }));
+  const post = (targetSid, beforeDispatch) => {
+    const previous = _composerDraftPostPromisesBySid.get(targetSid);
+    let resolveWrite;
+    let rejectWrite;
+    const write = new Promise((resolve, reject) => {
+      resolveWrite = resolve;
+      rejectWrite = reject;
+    });
+    const pending = write.finally(() => {
+      if (_composerDraftPostPromisesBySid.get(targetSid) === pending) {
+        _composerDraftPostPromisesBySid.delete(targetSid);
+      }
+    });
+    _composerDraftPostPromisesBySid.set(targetSid, pending);
+    const dispatch = () => {
+      try {
+        if (beforeDispatch) beforeDispatch();
+        resolveWrite(api('/api/session/draft', {
+          method: 'POST',
+          body: JSON.stringify({ session_id: targetSid, ...bodyPayload }),
+        }));
+      } catch (error) {
+        rejectWrite(error);
+      }
+    };
+    if (previous) Promise.resolve(previous).then(dispatch, dispatch);
+    else dispatch();
+    return pending;
+  };
   const remember = (responseSid) => {
     if (responseSid !== requestSid) {
       _composerDraftKnownPayloadSessions.delete(requestSid);
@@ -351,7 +373,12 @@ function _postComposerDraftPayload(sid, draft, intent=null) {
       throw error;
     }
     postedSid = movedSid;
-    return post(movedSid);
+    return post(movedSid, () => {
+      if (intent && _composerDraftLocalFallbackBySid.get(requestSid) !== intent) throw error;
+      if (intent && (_composerDraftLatestIntentSequenceBySid.get(movedSid) || 0) > intent.sequence) {
+        throw error;
+      }
+    });
   });
   return request.then((response) => {
     if (intent && _composerDraftLocalFallbackBySid.get(requestSid) !== intent) return response;
