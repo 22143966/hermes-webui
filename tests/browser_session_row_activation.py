@@ -553,6 +553,21 @@ def _check_desktop(page, seed, name):
             fail("clicking another title during a rename did not commit the rename")
     page.wait_for_timeout(300)
 
+    # The same with the name left unchanged: the click still ends the rename.
+    # Committing then needs no save, so the rename ends on the press and the
+    # release opens the other conversation, as on master; whether it opens is
+    # not asserted here.
+    _open(page, alpha)
+    _title(page, beta).dblclick()
+    if not _wait_until(page, focused_input, timeout_ms=2000):
+        fail("double-clicking a title no longer starts a rename (unchanged-name case)")
+    else:
+        _title(page, gamma).click()
+        if not _wait_until(page, RENAME_ENDED_JS, timeout_ms=2000):
+            fail("clicking another title during an unchanged rename left the rename active")
+        page.wait_for_timeout(SETTLE_MS)
+    page.wait_for_timeout(300)
+
     page.evaluate("() => toggleSessionSelectMode()")
     page.wait_for_timeout(300)
     roles = [t["role"] for t in page.evaluate(TITLES_JS)]
@@ -685,6 +700,26 @@ def _check_touch(page, ctx, seed, label, phone):
         if not _wait_until(page, RENAMED_JS, [beta, suffix], timeout_ms=3000):
             fail("tapping another title during a rename did not commit the rename")
     page.wait_for_timeout(300)
+
+    # The same with the name left unchanged: the tap ends the rename and does
+    # not also open the other conversation (as on master). Committing then
+    # needs no save, so nothing else is still blocking the tap's compatibility
+    # click from the row's assistive-activation listener.
+    _open(page, alpha)
+    _open_drawer_if_phone(page, phone)
+    page.evaluate(START_RENAME_JS, beta)
+    if not _wait_until(page, focused_input, timeout_ms=2000):
+        fail("could not start a rename (unchanged-name tap case)")
+    else:
+        page.evaluate(COUNT_OPENS_JS)
+        _title(page, gamma).tap()
+        if not _wait_until(page, RENAME_ENDED_JS, timeout_ms=2000):
+            fail("tapping another title during an unchanged rename left the rename active")
+        page.wait_for_timeout(SETTLE_MS)
+        if _opens(page) or not page.evaluate(ACTIVE_JS, alpha):
+            fail(f"tapping another title during an unchanged rename opened {_opens(page)}")
+    page.wait_for_timeout(300)
+
     return failures
 
 
