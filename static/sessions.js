@@ -5720,13 +5720,13 @@ function _findSessionRenameRow(sessionId){
   return document.querySelector('.session-item[data-sid="'+sid+'"], .session-child-session[data-sid="'+sid+'"]');
 }
 
-// An active rename commits on blur. The row's touchend, which cancels the
-// tap that would have moved focus out of the rename input, releases it with
-// this instead.
-function _commitActiveSessionRename(){
-  if(!_renamingSid) return;
+// A press on a non-focusable part of a row moves focus out of whatever had
+// it, so editors that save on blur (a session or project rename, a queued
+// message) commit and the on-screen keyboard closes. Row handlers that cancel
+// that press (the title's mousedown, the row's touchend) do it with this.
+function _releaseFocusLikeRowPress(){
   const active=document.activeElement;
-  if(active&&active.classList&&active.classList.contains('session-title-input')) active.blur();
+  if(active&&active!==document.body&&typeof active.blur==='function') active.blur();
 }
 
 function _buildSessionRenameStarter(session, displayEl, renderDisplay){
@@ -9672,12 +9672,8 @@ function renderSessionListFromCache(){
       title.onmousedown=(e)=>{
         if(e.button!==0) return;
         e.preventDefault();
-        // The prevented default also leaves focus where it was. Release it
-        // as a press on any non-focusable part of a row would, so editors that
-        // save on blur (a session or project rename, a queued message) commit
-        // before the open rebuilds the page around them.
-        const active=document.activeElement;
-        if(active&&active!==document.body&&typeof active.blur==='function') active.blur();
+        // The prevented default also leaves focus where it was.
+        _releaseFocusLikeRowPress();
       };
     }
     const tsMs=_sessionTimestampMs(s);
@@ -10619,10 +10615,11 @@ function renderSessionListFromCache(){
       if(_finishSessionGesture(touch.clientX,touch.clientY,e.target,'touch')) e.stopPropagation();
       if(tapHandledHere&&e.cancelable){
         e.preventDefault();
-        // Cancelling also drops the compatibility mousedown that would blur an
-        // active rename. Commit it here instead; the tap opens nothing, as the
-        // gesture refuses to open a row during a rename.
-        _commitActiveSessionRename();
+        // Cancelling also drops the compatibility mousedown that would move
+        // focus. Release it here instead (a long press that opened the menu
+        // gets no mousedown either). During a rename this commits it; the tap
+        // opens nothing, as the gesture refuses to open a row then.
+        if(!_longPressMenuOpened) _releaseFocusLikeRowPress();
       }
     },{passive:false});
     return el;

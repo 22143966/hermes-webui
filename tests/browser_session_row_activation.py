@@ -35,7 +35,8 @@ builds are installed and launch; WebKit needs its system libraries)
     clicking a title during a project rename saves the project name.
   touch (Chromium, 390x844, drawer open)
   - a tap still opens the conversation exactly once;
-  - tapping another title during a rename commits and ends the rename.
+  - tapping another title during a rename commits and ends the rename;
+  - a tap on a title moves focus out of the search box.
 
   --screenshots DIR writes the sidebar at 1440x900 and 390x844 (drawer open)
   after pressing Tab from the conversation filter until focus reaches the
@@ -661,6 +662,12 @@ def _check_touch(page, ctx, seed, label, phone):
     def fail(message):
         failures.append(f"  [{label}] {message}")
 
+    # A fresh context may still be loading the list; wait for the seeded rows.
+    page.evaluate("() => renderSessionList({deferWhileInteracting: false})")
+    if not _wait_until(page, "(sids) => sids.every(sid => document.querySelector('#sessionList .session-item[data-sid=\"' + sid + '\"]'))", [alpha, beta, gamma], timeout_ms=10000):
+        fail("the seeded conversations did not appear in the sidebar")
+        return failures
+
     # An ordinary tap opens exactly once.
     _open(page, alpha)
     _open_drawer_if_phone(page, phone)
@@ -718,6 +725,19 @@ def _check_touch(page, ctx, seed, label, phone):
     page.wait_for_timeout(SETTLE_MS)
     if _opens(page) != [gamma]:
         fail(f"short swipe then assistive activation opened {_opens(page)}, expected exactly [gamma]")
+
+    # A tap moves focus out of a focused editor, as on master: the search box
+    # here, so the on-screen keyboard closes (other editors save on that blur).
+    # The tap's compatibility mousedown, which did that, is cancelled.
+    _open(page, alpha)
+    _open_drawer_if_phone(page, phone)
+    page.evaluate("() => document.getElementById('sessionSearch').focus()")
+    _title(page, gamma).tap()
+    if not _wait_until(page, ACTIVE_JS, gamma):
+        fail("a tap with the search box focused did not open the conversation")
+    page.wait_for_timeout(SETTLE_MS)
+    if page.evaluate("() => document.activeElement === document.getElementById('sessionSearch')"):
+        fail("a tap on a title left focus (and the on-screen keyboard) in the search box")
 
     # A tap on another title while a rename is active must commit and end the
     # rename, as on master. The gesture refuses to open a row during a rename,
