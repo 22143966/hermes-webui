@@ -191,6 +191,25 @@ class TestIssue5127CustomProviderBareSuffixRepair:
             is None
         )
 
+    def test_repair_honours_single_model_string_allowlist(self):
+        """A plain ``models: chat-new`` string is a one-model allowlist."""
+        from api.routes import _repair_removed_qualified_custom_provider_model
+
+        profile_cfg = {
+            "custom_providers": [
+                {"name": "local-lab", "model": "chat-new", "models": "chat-new"}
+            ]
+        }
+
+        assert (
+            _repair_removed_qualified_custom_provider_model(
+                "@custom:local-lab:chat-old",
+                "custom:local-lab",
+                config_obj=profile_cfg,
+            )
+            == "@custom:local-lab:chat-new"
+        )
+
     def test_repair_replacement_stays_inside_pinned_allowlist(self):
         """A singular default outside the pinned list is not a valid replacement."""
         from api.routes import _repair_removed_qualified_custom_provider_model
