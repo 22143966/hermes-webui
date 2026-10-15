@@ -31,7 +31,8 @@ builds are installed and launch; WebKit needs its system libraries)
   - Enter on a row's actions trigger opens its menu and does not open the
     conversation;
   - in selection mode the title is not a link (the row checkbox is the control);
-  - clicking another title during a rename commits and ends the rename.
+  - clicking another title during a rename commits and ends the rename, and
+    clicking a title during a project rename saves the project name.
   touch (Chromium, 390x844, drawer open)
   - a tap still opens the conversation exactly once;
   - tapping another title during a rename commits and ends the rename.
@@ -188,6 +189,28 @@ START_RENAME_JS = """(sid) => {
   const row = Array.from(document.querySelectorAll('#sessionList .session-item[data-sid]'))
     .find(node => node.dataset.sid === sid);
   if (row && typeof row._startRename === 'function') row._startRename();
+}"""
+
+# Start renaming a project chip, creating the project first if needed.
+START_PROJECT_RENAME_JS = """async () => {
+  const find = () => (_allProjects || []).find(p => p.name.startsWith('Gate project'));
+  if (!find()) {
+    await api('/api/projects/create', {method: 'POST', body: JSON.stringify({name: 'Gate project', color: '#888888'})});
+    await renderSessionList({deferWhileInteracting: false});
+  }
+  const proj = find();
+  const chip = proj && Array.from(document.querySelectorAll('.project-chip')).find(c => c.textContent.includes(proj.name));
+  if (!chip) return 'no project chip';
+  _startProjectRename(proj, chip);
+  return proj.project_id;
+}"""
+
+PROJECT_INPUT_FOCUSED_JS = "() => !!(document.activeElement && document.activeElement.classList.contains('project-create-input'))"
+
+PROJECT_RENAMED_JS = """async ([projectId, suffix]) => {
+  const data = await api('/api/projects', {timeoutToast: false});
+  const project = (data.projects || []).find(p => p.project_id === projectId);
+  return !!(project && project.name.endsWith(suffix));
 }"""
 
 FOCUS_IN_LIST_JS = "() => !!document.querySelector('#sessionList:focus-within')"
@@ -566,6 +589,22 @@ def _check_desktop(page, seed, name):
         if not _wait_until(page, RENAME_ENDED_JS, timeout_ms=2000):
             fail("clicking another title during an unchanged rename left the rename active")
         page.wait_for_timeout(SETTLE_MS)
+    page.wait_for_timeout(300)
+
+    # The same for other editors that save on blur, here a project rename:
+    # the press on a title must still move focus out of it, so the new name is
+    # saved before opening the conversation rebuilds the sidebar.
+    _open(page, alpha)
+    suffix = _rename_suffix()
+    project_id = page.evaluate(START_PROJECT_RENAME_JS)
+    if not _wait_until(page, PROJECT_INPUT_FOCUSED_JS, timeout_ms=2000):
+        fail(f"could not start a project rename ({project_id})")
+    else:
+        page.keyboard.press("End")
+        page.keyboard.type(suffix)
+        _title(page, gamma).click()
+        if not _wait_until(page, PROJECT_RENAMED_JS, [project_id, suffix], timeout_ms=3000):
+            fail("clicking a conversation title during a project rename did not save the new project name")
     page.wait_for_timeout(300)
 
     page.evaluate("() => toggleSessionSelectMode()")

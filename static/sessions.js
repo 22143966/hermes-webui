@@ -5720,8 +5720,9 @@ function _findSessionRenameRow(sessionId){
   return document.querySelector('.session-item[data-sid="'+sid+'"], .session-child-session[data-sid="'+sid+'"]');
 }
 
-// An active rename commits on blur. Handlers that cancel the press that would
-// have moved focus out of the rename input release it with this instead.
+// An active rename commits on blur. The row's touchend, which cancels the
+// tap that would have moved focus out of the rename input, releases it with
+// this instead.
 function _commitActiveSessionRename(){
   if(!_renamingSid) return;
   const active=document.activeElement;
@@ -9671,9 +9672,12 @@ function renderSessionListFromCache(){
       title.onmousedown=(e)=>{
         if(e.button!==0) return;
         e.preventDefault();
-        // The prevented default also leaves focus where it was, so release
-        // an active rename as a press on any non-focusable part of a row would.
-        _commitActiveSessionRename();
+        // The prevented default also leaves focus where it was. Release it
+        // as a press on any non-focusable part of a row would, so editors that
+        // save on blur (a session or project rename, a queued message) commit
+        // before the open rebuilds the page around them.
+        const active=document.activeElement;
+        if(active&&active!==document.body&&typeof active.blur==='function') active.blur();
       };
     }
     const tsMs=_sessionTimestampMs(s);
