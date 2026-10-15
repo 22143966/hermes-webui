@@ -1052,6 +1052,11 @@ def _check_webui_published_release_update(channel=DEFAULT_UPDATE_CHANNEL):
         'release_based': True,
         'current_version': current_version,
         'latest_version': latest_version,
+        # Same field as the git paths: on the no-git/Docker payload the
+        # frontend's "Latest tag:" suffix would otherwise fall back to the
+        # Agent's tag (e.g. "Latest tag: v2026.9.24" while trailing a WebUI
+        # release). Maintainer fold, PR #6859 round 3.
+        'latest_tag': latest_version,
         'compare_url': _build_compare_url(repo_url, current_ref, latest_ref),
         'manual_update': True,
         'channel': channel,

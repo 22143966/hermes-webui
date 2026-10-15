@@ -210,6 +210,46 @@ def test_check_repo_reports_manual_update_for_baked_webui_version(tmp_path, monk
     assert seen['timeout'] == 3.0
 
 
+def test_published_release_payload_carries_latest_tag(tmp_path, monkeypatch):
+    """No-git/Docker payload (trailing a WebUI release) must carry latest_tag.
+
+    Maintainer fold, PR #6859 round 3: this payload shape had latest_version
+    but no latest_tag, so checkUpdatesNow's tagInfo chain fell through the
+    WebUI payload entirely and labeled the status line with the AGENT's tag
+    (e.g. "Up to date · Latest tag: v2026.9.24" while trailing v0.51.833).
+    """
+
+    class FakeResponse:
+        def __init__(self, body):
+            self._body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return self._body
+
+    payload = [
+        {'name': 'v0.51.833', 'commit': {'sha': 'current-sha'}},
+        {'name': 'v0.51.914', 'commit': {'sha': 'stable-sha'}},
+    ]
+
+    def fake_urlopen(request, timeout=0):
+        return FakeResponse(json.dumps(payload).encode('utf-8'))
+
+    monkeypatch.setattr(updates.urllib.request, 'urlopen', fake_urlopen)
+    monkeypatch.setattr(updates, 'WEBUI_VERSION', 'v0.51.833')
+
+    info = updates._check_webui_published_release_update(channel='stable')
+
+    assert info is not None
+    assert info['latest_version'] == 'v0.51.914'
+    assert info['latest_tag'] == 'v0.51.914'
+
+
 def test_check_repo_webui_no_git_falls_back_to_old_payload_on_tags_failure(tmp_path, monkeypatch):
     """If GitHub tags cannot be read, the Docker path must stay on can't-check."""
 
