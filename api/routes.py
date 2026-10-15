@@ -50,6 +50,7 @@ from api.agent_sessions import (
     read_session_lineage_report,
 )
 from api.compression_anchor import visible_messages_for_anchor
+from api.process_event_utils import is_hidden_transcript_row
 from api.compression_recovery import (
     COMPRESSION_RECOVERY_ACTION_START_FOCUSED,
     clear_compression_recovery,
@@ -6783,6 +6784,71 @@ def _check_csrf(handler) -> bool:
 _EXTENSION_SIDECAR_PROXY_RE = _re.compile(
     r"^/api/extensions/(?P<extension_id>[^/]+)/sidecar(?:/(?P<proxy_path>.*))?$"
 )
+_EXTENSION_SIDECAR_PROXY_RE_IC = _re.compile(
+    r"^/api/extensions/(?P<extension_id>[^/]+)/sidecar(?:/(?P<proxy_path>.*))?$",
+    _re.IGNORECASE,
+)
+
+
+def _original_api_path(handler, parsed):
+    """Return the request path exactly as received by the server.
+
+    server.py case-folds ``/api/*`` paths for case-insensitive route matching
+    and retains the original-case path on the handler (``_raw_api_path``).
+    Dynamic path captures — share tokens, MCP server names, sidecar proxy
+    paths, opaque IDs — are case-sensitive and must be extracted from the
+    original path, never from the folded matching path. Falls back to
+    ``parsed.path`` when the request did not pass through server.py's
+    normalization (e.g. direct unit-test calls).
+    """
+    raw = getattr(handler, "_raw_api_path", None)
+    return raw if isinstance(raw, str) else parsed.path
+
+
+def _match_api_segments(handler, parsed, template):
+    """Match a fixed-shape /api/ route case-insensitively and return the
+    dynamic capture sliced from the ORIGINAL-case path (#6589 re-gate).
+
+    ``template`` lists every server-owned segment, with ``None`` marking the
+    single dynamic slot that is a case-sensitive capture (session id, board
+    id, …): e.g. ``("api", "sessions", None, "events")``. Static segments are
+    compared case-insensitively, so ``/API/Sessions/AbC/events`` matches the
+    template while still returning ``AbC`` (never the case-folded ``abc``).
+    Returns None when the path shape does not match.
+    """
+    raw = _original_api_path(handler, parsed) or ""
+    parts = raw.strip("/").split("/")
+    if len(parts) != len(template):
+        return None
+    capture = None
+    for i, expected in enumerate(template):
+        if expected is None:
+            capture = parts[i]
+            continue
+        if parts[i].casefold() != str(expected).casefold():
+            return None
+    return capture or None
+
+
+def fold_api_path(handler, parsed):
+    """Case-fold ``/api/*`` paths for route matching; retain the original on the handler.
+
+    Only the *matching* path is folded (``/API/Settings`` dispatches like
+    ``/api/settings``). The original-case path is kept as ``handler._raw_api_path``
+    so handlers slice case-sensitive dynamic values (share tokens, MCP server
+    names, session ids) via ``_original_api_path`` / ``_match_api_segments``.
+    The handler instance is reused across HTTP/1.1 keep-alive requests, so the
+    retained path is reset for EVERY request: a non-API request must never see
+    a stale ``_raw_api_path`` left by an earlier /api/ request (#6589).
+    """
+    handler._raw_api_path = None
+    raw_path = parsed.path
+    if raw_path.casefold().startswith("/api/"):
+        handler._raw_api_path = raw_path
+        return parsed._replace(path=raw_path.casefold())
+    return parsed
+
+
 _HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -6949,6 +7015,12 @@ def _handle_extension_sidecar_proxy(
     matched = _match_extension_sidecar_proxy_path(parsed.path)
     if matched is None:
         return False
+    # The sidecar extension id and proxy path are case-sensitive dynamic
+    # values: re-extract them from the original-case request path (see
+    # _original_api_path) instead of the case-folded matching path.
+    raw_matched = _EXTENSION_SIDECAR_PROXY_RE_IC.match(_original_api_path(handler, parsed) or "")
+    if raw_matched:
+        matched = (raw_matched.group("extension_id"), raw_matched.group("proxy_path") or "")
     # Require same-origin browser provenance on EVERY proxied method, not just
     # GET. Browser extensions (the only legitimate caller) always send Origin/
     # Referer/Sec-Fetch-Site, so this costs nothing on the real path while
@@ -9918,8 +9990,14 @@ def _message_counts_as_renderable_for_window(message) -> bool:
     to keep thinking/tool details inspectable, but they are not reply text. A
     tail page containing only transient metadata makes the frontend open to
     collapsed activity while newer real replies sit behind "load older messages".
+    Hidden internal rows (``delegation_wakeup``) are retained in storage for
+    model/recovery state but are never renderable, so they cannot consume the
+    visible-row budget — otherwise the 30-row restore window can be all-hidden
+    and the transcript opens blank (#quiet-delegation gate review).
     """
     if not isinstance(message, dict):
+        return False
+    if is_hidden_transcript_row(message):
         return False
     if _is_empty_partial_activity_message(message):
         return False
@@ -10310,6 +10388,13 @@ def _limited_webui_messages_for_display_with_sidecar(
             owner_positions.update(sidecar_owners)
         return sidecar_messages
     state_db_messages = _suppress_native_image_display_mirrors(
+        session,
+        state_db_messages,
+    )
+    # #quiet-delegation: stamp pending-turn provenance here too, so the
+    # paginated (msg_limit) load path matches the full-load path's behaviour
+    # during the deferred-save window.
+    state_db_messages = _stamp_pending_source_for_display(
         session,
         state_db_messages,
     )
@@ -11791,6 +11876,7 @@ from api.models import (
     _reindex_tool_owners_after_message_reorder,
     _project_native_image_payload_conflicts_for_display,
     _suppress_native_image_display_mirrors,
+    _stamp_pending_source_for_display,
     _reconcile_api_content_sidecars,
     _enrich_sidebar_lineage_metadata,
     _active_stream_ids,
@@ -14593,6 +14679,14 @@ def _handle_session_get(handler, parsed) -> bool:
                     s,
                     state_db_messages,
                 )
+                # #quiet-delegation: stamp the pending turn's _source onto the
+                # freshly-read state.db rows BEFORE merge/projection, so a
+                # reload during the deferred-save window cannot adopt the
+                # hidden handoff as a visible user row.
+                state_db_messages = _stamp_pending_source_for_display(
+                    s,
+                    state_db_messages,
+                )
                 lineage_owners = {}
                 sidecar_messages = _webui_sidecar_lineage_messages_for_display(
                     s, owner_positions=lineage_owners,
@@ -14848,6 +14942,16 @@ def _handle_session_get(handler, parsed) -> bool:
             # keep the raw count available as ``actual_message_count`` but
             # do not let it make the frontend expect phantom messages.
             raw["message_count"] = _merged_message_count
+        if load_messages and _all_msgs:
+            # #quiet-delegation gate review finding 3: after state.db has
+            # grown past the sidecar, compact()'s visible total can be stale
+            # (it trusts the sidecar prefix / metadata counts). On message
+            # loads the merged display transcript is the authority — derive
+            # the visible total from it.
+            raw["visible_message_count"] = sum(
+                1 for m in _all_msgs
+                if isinstance(m, dict) and not is_hidden_transcript_row(m)
+            )
         # Signal to the frontend that older messages were omitted. The
         # message window cursor already reflects visible-row pagination and
         # avoids false positives when raw hidden tool rows exceed msg_limit.
@@ -15269,7 +15373,10 @@ def handle_get(handler, parsed) -> bool:
         return j(handler, payload)
 
     if parsed.path.startswith("/api/share/"):
-        token = parsed.path[len("/api/share/"):].strip()
+        # Share tokens are case-sensitive (secrets.token_urlsafe), so the
+        # capture must come from the original-case path, not the folded
+        # matching path (server.py normalizes /api/ paths for matching).
+        token = _original_api_path(handler, parsed)[len("/api/share/"):].strip()
         share = load_share(token)
         if not share:
             return bad(handler, "Shared conversation not found", 404)
@@ -16057,7 +16164,9 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == '/api/sessions/events':
         return _handle_session_events_stream(handler)
 
-    session_events_session_id = _session_events_path_session_id(parsed.path)
+    session_events_session_id = _match_api_segments(
+        handler, parsed, ("api", "sessions", None, "events")
+    )
     if session_events_session_id is not None:
         return _handle_session_sse_stream_for_session(handler, parsed, session_events_session_id)
 
@@ -16406,6 +16515,12 @@ def handle_get(handler, parsed) -> bool:
 
     # ── Plugin static assets ──
     if parsed.path.startswith("/dashboard-plugins/"):
+        # Plugin names and asset paths are case-sensitive (config keys + disk
+        # paths). This route is NOT API-folded (server.py folds only /api/*),
+        # so parsed.path already carries the original case — and it must come
+        # from the CURRENT request: the handler is reused across keep-alive
+        # requests, so an API-only retained path (_raw_api_path) from an
+        # earlier request would be stale here (#6589 re-gate).
         parts = parsed.path.split("/", 3)
         if len(parts) >= 3:
             plugin_name = parts[2]
@@ -19915,7 +20030,9 @@ def handle_patch(handler, parsed) -> bool:
     if not _guard_request_session_visibility(handler, parsed, body=body, method="PATCH"):
         return True
     if parsed.path.startswith("/api/mcp/servers/"):
-        name = parsed.path[len("/api/mcp/servers/"):]
+        # MCP server names are case-sensitive config keys: capture from the
+        # original-case path, not the folded matching path.
+        name = _original_api_path(handler, parsed)[len("/api/mcp/servers/"):]
         return _handle_mcp_server_toggle(handler, name, body)
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_patch
@@ -19947,7 +20064,9 @@ def handle_delete(handler, parsed) -> bool:
     if not _guard_request_session_visibility(handler, parsed, body=body, method="DELETE"):
         return True
     if parsed.path.startswith("/api/mcp/servers/"):
-        name = parsed.path[len("/api/mcp/servers/"):]
+        # MCP server names are case-sensitive config keys: capture from the
+        # original-case path, not the folded matching path.
+        name = _original_api_path(handler, parsed)[len("/api/mcp/servers/"):]
         return _handle_mcp_server_delete(handler, name)
     if parsed.path == "/api/prompts":
         pid = str(body.get("id") or "").strip()
@@ -19987,7 +20106,9 @@ def handle_put(handler, parsed) -> bool:
     if not _guard_request_session_visibility(handler, parsed, body=body, method="PUT"):
         return True
     if parsed.path.startswith("/api/mcp/servers/"):
-        name = parsed.path[len("/api/mcp/servers/"):]
+        # MCP server names are case-sensitive config keys: capture from the
+        # original-case path, not the folded matching path.
+        name = _original_api_path(handler, parsed)[len("/api/mcp/servers/"):]
         return _handle_mcp_server_update(handler, name, body)
     return False
 
@@ -20032,8 +20153,13 @@ _STATIC_CACHE_LOCK = threading.Lock()
 
 def _serve_static(handler, parsed):
     static_root = api_config.get_static_root().resolve()
-    # Strip the leading '/static/' prefix, then resolve and sandbox
-    rel = parsed.path[len("/static/") :]
+    # Strip the leading '/static/' prefix, then resolve and sandbox. The
+    # server-owned prefix is matched case-insensitively upstream, but the file
+    # path is case-sensitive on disk. This route is NOT API-folded (server.py
+    # folds only /api/*), so parsed.path is the CURRENT request's original-case
+    # path — never an API-only retained path left behind by an earlier
+    # keep-alive request (#6589 re-gate).
+    rel = parsed.path[len("/static/"):]
     static_file = (static_root / rel).resolve()
     try:
         static_file.relative_to(static_root)
@@ -20285,7 +20411,13 @@ def _handle_sessions_search(handler, parsed):
                 sess = get_session_for_scan(s["session_id"])
                 if sess is None:
                     continue
-                msgs = sess.messages[:depth] if depth else sess.messages
+                # Hidden internal rows neither match nor consume the search
+                # depth budget (#quiet-delegation gate review).
+                scan_pool = [
+                    m for m in (sess.messages or [])
+                    if not is_hidden_transcript_row(m)
+                ]
+                msgs = scan_pool[:depth] if depth else scan_pool
                 for m in msgs:
                     c = _session_search_message_text(m)
                     if q in str(c).lower():
@@ -25076,25 +25208,54 @@ def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, st
     """
     if not msg:
         return
+    # Fork-internal delegation wakeup: the row's _source stays
+    # delegation_wakeup (the hidden-row predicate keys on it), but the
+    # fork-ownership proof regeneration authorization reads rides on
+    # _fork_child_turn. The deferred producer stamps that proof at
+    # settlement (streaming.py _materialize_active_turn_user /
+    # _settle_current_turn_boundary); the eager checkpoint must carry it
+    # from chat-start too, or a regeneration after an async delegation in
+    # a fork hits regeneration_read_only (403) for every turn saved before
+    # settlement (#7882 re-gate must-fix, eager mode).
+    _checkpoint_source = str(source or "").strip().lower()
+    _fork_owned_wakeup = _checkpoint_source == "delegation_wakeup" and (
+        str(getattr(s, "session_source", None) or "").strip().lower() == "fork"
+    )
     existing = list(getattr(s, "messages", None) or [])
+    from api.process_event_utils import build_active_turn_token, stamp_message_source
+
     if existing:
         latest = existing[-1]
         if isinstance(latest, dict) and latest.get("role") == "user":
             latest_text = " ".join(str(latest.get("content") or "").split())
             msg_text = " ".join(str(msg or "").split())
             if latest_text == msg_text:
-                if str(source or "").strip().lower() == "fork":
+                if _checkpoint_source == "fork" or _fork_owned_wakeup:
+                    # Fork turns keep the copied-row identity: the branch
+                    # route copies transcript rows up to the fork point and
+                    # the re-sent prompt rides the copied row; the
+                    # `_fork_child_turn` marker stamps it (unchanged).
                     latest["_fork_child_turn"] = s.session_id
-                return
+                    return
+                # Text alone is not turn ownership (re-gate 2026-10-06 item
+                # 3): a second interrupt of the same prompt inside one second
+                # carries a DIFFERENT stream token and must checkpoint its
+                # own row instead of collapsing into the previous turn's.
+                # Token-less rows (legacy data) keep the established
+                # content check.
+                current_token = build_active_turn_token(
+                    getattr(s, "active_stream_id", None), started_at,
+                )
+                latest_token = latest.get("_active_turn_token")
+                if not (latest_token and current_token and latest_token != current_token):
+                    return
     user_msg = {"role": "user", "content": msg}
-    from api.process_event_utils import build_active_turn_token, stamp_message_source
-
     stamp_message_source(
         user_msg,
         source,
         active_turn_token=build_active_turn_token(getattr(s, "active_stream_id", None), started_at),
     )
-    if str(source or "").strip().lower() == "fork":
+    if _checkpoint_source == "fork" or _fork_owned_wakeup:
         user_msg["_fork_child_turn"] = s.session_id
     if isinstance(started_at, (int, float)) and started_at > 0:
         user_msg["timestamp"] = float(started_at)
@@ -25356,9 +25517,19 @@ def _prepare_chat_start_session_for_stream(
     a normal session message. Empty sessions are never saved here because this
     helper only runs after a non-empty message is validated.
     """
+    # The internal delegation producer's explicit ``delegation_wakeup`` stamp
+    # is ROW provenance: the hidden-row predicate keys on it, so a fork
+    # session's ``session_source`` ownership override must never clobber it —
+    # otherwise the handoff renders as a human bubble in a fork (#7882 gate
+    # review, finding 3). Ordinary fork-human rows keep the fork identity via
+    # ``_fork_child_turn``, which is stamped from ``session_source`` below.
+    _prompt_is_delegation_wakeup = str(source or "").strip().lower() == "delegation_wakeup"
     effective_source = (
         "fork"
-        if str(getattr(s, "session_source", None) or "").strip().lower() == "fork"
+        if (
+            str(getattr(s, "session_source", None) or "").strip().lower() == "fork"
+            and not _prompt_is_delegation_wakeup
+        )
         else source
     )
     s.workspace = workspace
@@ -25418,7 +25589,14 @@ def _prepare_chat_start_session_for_stream(
                     context_row["_fork_child_turn"] = s.session_id
                 break
     current_title = getattr(s, "title", None)
-    if retained_user is None and _is_default_or_empty_session_title(current_title):
+    # A delegation_wakeup handoff is not a human prompt: never let it name an
+    # untitled session (#quiet-delegation gate review).
+    _prompt_is_hidden_row = effective_source == "delegation_wakeup"
+    if (
+        retained_user is None
+        and not _prompt_is_hidden_row
+        and _is_default_or_empty_session_title(current_title)
+    ):
         provisional_title = _provisional_title_from_prompt(msg, current_title or "Untitled")
         if provisional_title and not _is_default_or_empty_session_title(provisional_title):
             s.title = provisional_title
@@ -26879,7 +27057,7 @@ def start_session_turn(
                     session_id,
                     exc_info=True,
                 )
-        if turn_source == "process_wakeup":
+        if turn_source in ("process_wakeup", "delegation_wakeup"):
             _credential_state_changed = False
             try:
                 _credential_state_changed = process_wakeup_pause_credential_state_changed(s)
