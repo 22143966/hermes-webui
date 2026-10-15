@@ -1849,7 +1849,7 @@ const LOCALES = {
     outline_title: 'Outline',
     outline_empty: 'No questions yet.',
     outline_loading: 'Loading…',
-        img_lightbox_fit: 'Fit',
+    img_lightbox_fit: 'Fit',
     img_lightbox_fit_title: 'Reset zoom to fit (F)',
     pb_bindings_title: 'Project settings — {0}',
     pb_bindings_menu: 'Project settings…',
