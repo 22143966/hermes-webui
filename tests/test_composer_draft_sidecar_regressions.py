@@ -429,14 +429,14 @@ def test_draft_post_for_stale_request_sid_does_not_write_under_old_sid(tmp_path,
         {"session_id": sid, "text": "rotating", "files": []},
     )
 
-    assert status == 200
-    assert payload["session_id"] == rotated_sid
-    assert payload["draft"] == {"text": "rotating", "files": []}
-    assert s.composer_draft == {"text": "rotating", "files": []}
+    assert status == 409
+    assert payload["error"] == "Session no longer active"
+    assert payload["session_id"] == sid
+    assert s.composer_draft == {"text": "original", "files": []}
     assert not (session_dir / f"{sid}.json").exists()
-    assert (session_dir / f"{rotated_sid}.json").exists()
+    assert not (session_dir / f"{rotated_sid}.json").exists()
     assert not (session_dir / ".drafts" / f"{sid}.json").exists()
-    assert (session_dir / ".drafts" / f"{rotated_sid}.json").exists()
+    assert not (session_dir / ".drafts" / f"{rotated_sid}.json").exists()
 
 
 def test_draft_post_for_stale_pre_compression_snapshot_writes_to_continuation(tmp_path, monkeypatch):
@@ -451,6 +451,25 @@ def test_draft_post_for_stale_pre_compression_snapshot_writes_to_continuation(tm
             "/api/session/draft",
             {
                 "session_id": old_sid,
+                "text": "recover from archived snapshot",
+                "files": [{"name": "proof.txt"}],
+            },
+        )
+
+        assert status == 409
+        assert payload == {
+            "ok": False,
+            "code": "session_moved",
+            "session_id": continuation_sid,
+            "error": "Session moved",
+        }
+        assert not (session_dir / ".drafts" / f"{continuation_sid}.json").exists()
+        status, payload = _post_json(
+            monkeypatch,
+            routes,
+            "/api/session/draft",
+            {
+                "session_id": continuation_sid,
                 "text": "recover from archived snapshot",
                 "files": [{"name": "proof.txt"}],
             },
@@ -723,8 +742,21 @@ def test_draft_post_waits_for_rotation_while_lock_waits_for_authority(tmp_path, 
             streaming.SESSION_AGENT_LOCKS.pop(old_sid, None)
             streaming.SESSION_AGENT_LOCKS.pop(continuation_sid, None)
 
-    assert result["status"] == 200
-    assert result["payload"]["session_id"] == continuation_sid
+    assert result["status"] == 409
+    assert result["payload"] == {
+        "ok": False,
+        "code": "session_moved",
+        "session_id": continuation_sid,
+        "error": "Session moved",
+    }
+    replay_status, replay_payload = _post_json(
+        monkeypatch,
+        routes,
+        "/api/session/draft",
+        {"session_id": continuation_sid, "text": "rotating while waiting", "files": []},
+    )
+    assert replay_status == 200
+    assert replay_payload["session_id"] == continuation_sid
     models.SESSIONS.clear()
     loaded = models.Session.load(continuation_sid)
     assert loaded.composer_draft == {"text": "rotating while waiting", "files": []}

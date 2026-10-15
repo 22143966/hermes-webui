@@ -141,14 +141,18 @@ COMPOSER_DRAFT_HELPERS_SRC = "\n".join(
     _extract_function(SESSIONS_SRC, name)
     for name in (
         "_composerDraftFilesForPersist",
+        "_composerDraftFileSignature",
+        "_composerDraftPayloadSignature",
+        "_composerDraftPayloadSignatureForSid",
         "_clearComposerDraftRestoreSuppression",
         "_isComposerDraftRestoreSuppressed",
+        "_suppressComposerDraftRestoreAfterSubmit",
+        "_clearRememberedNewChatDraftSession",
         "_safeDraftSessionId",
         "_parseSessionMovedDraftError",
         "_composerDraftResponseSessionId",
         "_setComposerDraftLocalIntent",
         "_forgetComposerDraftLocalFallback",
-        "_forgetComposerDraftFallbacksOutsideProfile",
         "_handleComposerDraftPostFailure",
         "_postComposerDraftPayload",
         "_composerDraftHasPayload",
@@ -156,6 +160,8 @@ COMPOSER_DRAFT_HELPERS_SRC = "\n".join(
         "_rememberComposerDraftPayloadState",
         "_saveComposerDraftNow",
         "_restoreComposerDraft",
+        "_switchProfileForSessionLoad",
+        "_clearComposerDraft",
     )
 )
 
@@ -416,9 +422,13 @@ let toastCalls = [];
 // Source under test
 let _draftSaveTimer = null;
 const _DRAFT_SAVE_DELAY_MS = 400;
+const NEW_CHAT_DRAFT_SESSION_KEY = 'hermes-new-chat-draft-session';
+const _COMPOSER_DRAFT_RESTORE_SUPPRESS_MS = 30000;
 const _composerDraftKnownPayloadSessions = new Set();
 const _composerDraftRestoreSuppressedUntilBySid = new Map();
 const _composerDraftLocalFallbackBySid = new Map();
+const _composerDraftLatestIntentSequenceBySid = new Map();
+let _composerDraftIntentSequence = 0;
 __COMPOSER_DRAFT_HELPERS_SRC__
 __INFLIGHT_HAS_VISIBLE_STATE_SRC__
 __SELECT_LIVE_RECOVERY_INFLIGHT_SRC__
@@ -660,6 +670,10 @@ async function runDraftSaveFailureNavigation() {
   globalThis.startSessionStream = (sid) => streamCalls.push(sid);
   globalThis.api = (path, options={}) => {
     apiCalls.push(String(path));
+    if (path === '/api/profile/switch') {
+      const body = JSON.parse(options.body);
+      return Promise.resolve({active:body.name, is_default:body.name==='default'});
+    }
     if (path === '/api/session/draft') {
       const body = JSON.parse(options.body);
       return new Promise((resolve, reject) => draftRequests.push({body, resolve, reject}));
@@ -730,6 +744,12 @@ async function runDraftSaveFailureNavigation() {
   assert.strictEqual(draftRequests.length, 3);
   draftRequests[2].reject(new Error('background steer draft rejected'));
   const backgroundWriteResult = await backgroundWrite;
+  await _switchProfileForSessionLoad('alternate');
+  const backgroundFallbackAcrossProfile = (() => {
+    const draft = _composerDraftLocalFallbackBySid.get('sid-background');
+    return !!draft && draft.files[0] === backgroundFile;
+  })();
+  await _switchProfileForSessionLoad('default');
   const backgroundLoad = observed(loadSession('sid-background'));
   assert.strictEqual(draftRequests.length, 4);
   draftRequests[3].resolve({session_id:'sid-source'});
@@ -812,6 +832,73 @@ async function runDraftSaveFailureNavigation() {
     {text:'', files:[]}, 'sid-file-only-refresh', {preserveActiveInput:true},
   );
   const fileOnlyRefreshRetained = S.pendingFiles[0] === activeRefreshFile;
+
+  async function newerTargetBlocksReplay(newerText) {
+    createEnvironment();
+    _composerDraftLocalFallbackBySid.clear();
+    _composerDraftLatestIntentSequenceBySid.clear();
+    _composerDraftKnownPayloadSessions.clear();
+    const targetFile = makeFile('target.txt', 22, 'text/plain');
+    const isClear = newerText === '';
+    S.session = {
+      session_id:'sid-target', message_count:1,
+      composer_draft:isClear ? {text:'older target draft',files:[]} : null,
+    };
+    if (isClear) _composerDraftKnownPayloadSessions.add('sid-target');
+    const requests = [];
+    globalThis.api = (_path, options) => {
+      const body = JSON.parse(options.body);
+      return new Promise((resolve, reject) => requests.push({body, resolve, reject}));
+    };
+    const oldSave = _saveComposerDraftNow('sid-parent', 'older parent draft', []);
+    const oldOutcome = oldSave.catch((error) => error);
+    const targetFiles = isClear ? [] : [targetFile];
+    const targetSave = _saveComposerDraftNow('sid-target', newerText, targetFiles);
+    assert.strictEqual(requests.length, 2);
+    const moved = new Error('Session moved');
+    moved.status = 409;
+    moved.body = JSON.stringify({code:'session_moved',session_id:'sid-target'});
+    requests[0].reject(moved);
+    const staleOutcome = await oldOutcome;
+    const targetIntent = _composerDraftLocalFallbackBySid.get('sid-target');
+    const sameFile = isClear || targetIntent.files[0] === targetFile;
+    requests[1].resolve({session_id:'sid-target'});
+    await targetSave;
+    return {
+      calls:requests.map((request)=>request.body),
+      staleStatus:Number(staleOutcome && staleOutcome.status),
+      targetDraft:S.session.composer_draft,
+      sameFile,
+    };
+  }
+  const newerTargetDraftWins = await newerTargetBlocksReplay('newer target draft');
+  const newerTargetClearWins = await newerTargetBlocksReplay('');
+
+  createEnvironment();
+  _composerDraftLocalFallbackBySid.clear();
+  _composerDraftLatestIntentSequenceBySid.clear();
+  _composerDraftRestoreSuppressedUntilBySid.clear();
+  S.session = {session_id:'sid-clear-target', message_count:1, composer_draft:{text:'old',files:[]}};
+  const clearRequests = [];
+  globalThis.api = (_path, options) => {
+    const body = JSON.parse(options.body);
+    return new Promise((resolve, reject) => clearRequests.push({body, resolve, reject}));
+  };
+  const clearSave = _clearComposerDraft('sid-clear-parent', 'submitted text', []);
+  assert.strictEqual(clearRequests.length, 1);
+  const clearMoved = new Error('Session moved');
+  clearMoved.status = 409;
+  clearMoved.body = JSON.stringify({code:'session_moved',session_id:'sid-clear-target'});
+  clearRequests[0].reject(clearMoved);
+  await Promise.resolve();
+  assert.strictEqual(clearRequests.length, 2);
+  clearRequests[1].resolve({session_id:'sid-clear-target'});
+  await clearSave;
+  const clearReplay = {
+    sids:clearRequests.map((request)=>request.body.session_id),
+    payload:clearRequests[1].body,
+    targetDraft:S.session.composer_draft,
+  };
   return {
     firstError:firstResult.error,
     secondError:secondResult.error,
@@ -828,11 +915,15 @@ async function runDraftSaveFailureNavigation() {
     sourceRestored,
     backgroundWriteError:backgroundWriteResult.error,
     backgroundError:backgroundResult.error,
+    backgroundFallbackAcrossProfile,
     backgroundRestored,
     failedOutgoingError:failedOutgoingResult.error,
     revisitedDraft,
     emptyLocalDraftRestored,
     fileOnlyRefreshRetained,
+    newerTargetDraftWins,
+    newerTargetClearWins,
+    clearReplay,
     supersedingFailureReports,
   };
 }
@@ -1009,6 +1100,7 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior(tmp_path):
     }, "failed local draft must override stale server text and retain the original File reference on revisit"
     assert superseded["backgroundError"] is None
     assert superseded["backgroundWriteError"] is None
+    assert superseded["backgroundFallbackAcrossProfile"] is True
     assert superseded["backgroundRestored"] == {
         "text":"background steer draft",
         "files":[{"name":"steer.txt", "size":16, "type":"text/plain"}],
@@ -1027,3 +1119,22 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior(tmp_path):
     assert superseded["fileOnlyRefreshRetained"] is True, (
         "same-session force refresh must retain the exact active File reference"
     )
+    assert len(superseded["newerTargetDraftWins"]["calls"]) == 2
+    assert superseded["newerTargetDraftWins"]["calls"][0]["session_id"] == "sid-parent"
+    assert superseded["newerTargetDraftWins"]["calls"][1]["session_id"] == "sid-target"
+    assert superseded["newerTargetDraftWins"]["calls"][1]["text"] == "newer target draft"
+    assert superseded["newerTargetDraftWins"]["staleStatus"] == 409
+    assert superseded["newerTargetDraftWins"]["targetDraft"]["text"] == "newer target draft"
+    assert superseded["newerTargetDraftWins"]["sameFile"] is True
+    assert len(superseded["newerTargetClearWins"]["calls"]) == 2
+    assert superseded["newerTargetClearWins"]["calls"][0]["session_id"] == "sid-parent"
+    assert superseded["newerTargetClearWins"]["calls"][1] == {
+        "session_id":"sid-target", "text":"", "files":[],
+    }
+    assert superseded["newerTargetClearWins"]["staleStatus"] == 409
+    assert superseded["newerTargetClearWins"]["targetDraft"] == {"text":"", "files":[]}
+    assert superseded["clearReplay"]["sids"] == ["sid-clear-parent", "sid-clear-target"]
+    assert superseded["clearReplay"]["payload"] == {
+        "session_id":"sid-clear-target", "text":"", "files":[],
+    }
+    assert superseded["clearReplay"]["targetDraft"] == {"text":"", "files":[]}

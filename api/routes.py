@@ -17840,18 +17840,6 @@ def handle_post(handler, parsed) -> bool:
                     _validated_compression_edges, request_profile
                 ):
                     return _draft_authority_unconfirmed()
-                if _hop == 0 and request_session is not None:
-                    resolved_sid = str(getattr(request_session, "session_id", "") or "").strip()
-                    if not resolved_sid or not is_safe_session_id(resolved_sid):
-                        return _draft_authority_unconfirmed()
-                    if resolved_sid != authoritative_sid:
-                        with LOCK:
-                            if SESSIONS.get(resolved_sid) is request_session:
-                                if resolved_sid in _seen_authority_sids:
-                                    return _draft_authority_unconfirmed()
-                                _seen_authority_sids.add(resolved_sid)
-                                authoritative_sid = resolved_sid
-                                continue
                 try:
                     request_session = get_session(authoritative_sid)
                 except KeyError:
@@ -17894,6 +17882,25 @@ def handle_post(handler, parsed) -> bool:
                     _seen_authority_sids.add(continuation_sid)
                     authoritative_sid = continuation_sid
                     continue
+
+                if authoritative_sid != request_sid:
+                    if (
+                        not _validated_compression_edges
+                        or not _draft_compression_edges_still_authorized(
+                            _validated_compression_edges, request_profile
+                        )
+                    ):
+                        return _draft_authority_unconfirmed()
+                    return j(
+                        handler,
+                        {
+                            "ok": False,
+                            "code": "session_moved",
+                            "session_id": authoritative_sid,
+                            "error": "Session moved",
+                        },
+                        status=409,
+                    )
 
                 current_draft = dict(getattr(request_session, "composer_draft", {}) or {})
                 next_draft = dict(current_draft)

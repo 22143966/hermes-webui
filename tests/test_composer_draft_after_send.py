@@ -300,7 +300,7 @@ def test_clear_composer_draft_suppresses_same_session_stale_restore():
     assert "function _suppressComposerDraftRestoreAfterSubmit(sid, text, files)" in SESSIONS_JS
     clear_body = _block(SESSIONS_JS, "function _clearComposerDraft(sid, text, files)", "const SESSION_VIEWED_COUNTS_KEY")
     suppress_idx = clear_body.index("_suppressComposerDraftRestoreAfterSubmit(sid, text, files);")
-    post_idx = clear_body.index("api('/api/session/draft'")
+    post_idx = clear_body.index("_postComposerDraftPayload(sid, { text: '', files: [] }, intent)")
     assert suppress_idx < post_idx, "restore suppression must be local and immediate before async POST"
 
 

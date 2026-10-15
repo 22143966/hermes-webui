@@ -41,30 +41,24 @@ const NEW_CHAT_DRAFT_SESSION_KEY = 'hermes-new-chat-draft-session';
 const _composerDraftKnownPayloadSessions = new Set();
 const _composerDraftRestoreSuppressedUntilBySid = new Map();
 const _composerDraftLocalFallbackBySid = new Map();
+const _composerDraftLatestIntentSequenceBySid = new Map();
+let _composerDraftIntentSequence = 0;
 const _COMPOSER_DRAFT_RESTORE_SUPPRESS_MS = 30000;
 
 function _setComposerDraftLocalIntent(sid, text, files) {
   const intent = Object.freeze({
     text: String(text || ''),
     files: Object.freeze(Array.isArray(files) ? files.filter(Boolean).slice() : []),
-    profile: S.session && S.session.session_id === sid
-      ? (S.session.profile || S.activeProfile || 'default') : (S.activeProfile || 'default'),
+    sequence: ++_composerDraftIntentSequence,
   });
   _composerDraftLocalFallbackBySid.set(sid, intent);
+  _composerDraftLatestIntentSequenceBySid.set(sid, intent.sequence);
   return intent;
 }
 
 function _forgetComposerDraftLocalFallback(sid) {
+  _composerDraftLatestIntentSequenceBySid.set(sid, ++_composerDraftIntentSequence);
   _composerDraftLocalFallbackBySid.delete(sid);
-}
-
-function _forgetComposerDraftFallbacksOutsideProfile(profile) {
-  clearTimeout(_draftSaveTimer);
-  _draftSaveTimer = null;
-  const active = String(profile || 'default');
-  for (const [sid, entry] of _composerDraftLocalFallbackBySid) {
-    if (!_profileMatchesActiveProfile(entry.profile, active)) _forgetComposerDraftLocalFallback(sid);
-  }
 }
 
 function _composerDraftFileSignature(file) {
@@ -353,12 +347,19 @@ function _postComposerDraftPayload(sid, draft, intent=null) {
       throw error;
     }
     if (intent && _composerDraftLocalFallbackBySid.get(requestSid) !== intent) throw error;
+    if (intent && (_composerDraftLatestIntentSequenceBySid.get(movedSid) || 0) > intent.sequence) {
+      throw error;
+    }
     postedSid = movedSid;
     return post(movedSid);
   });
   return request.then((response) => {
     if (intent && _composerDraftLocalFallbackBySid.get(requestSid) !== intent) return response;
     const responseSid = _composerDraftResponseSessionId(response, postedSid);
+    if (intent && responseSid !== requestSid
+        && (_composerDraftLatestIntentSequenceBySid.get(responseSid) || 0) > intent.sequence) {
+      return response;
+    }
     if (intent) _composerDraftLocalFallbackBySid.delete(requestSid);
     remember(responseSid);
     return response;
@@ -488,16 +489,7 @@ function _clearComposerDraft(sid, text, files) {
   if (arguments.length >= 2) _suppressComposerDraftRestoreAfterSubmit(sid, text, files);
   else _suppressComposerDraftRestoreAfterSubmit(sid);
   const intent = _setComposerDraftLocalIntent(sid, '', []);
-  return api('/api/session/draft', {
-    method: 'POST',
-    body: JSON.stringify({ session_id: sid, text: '' }),
-  }).then((response) => {
-    if (_composerDraftLocalFallbackBySid.get(sid) === intent) {
-      _composerDraftLocalFallbackBySid.delete(sid);
-      _rememberComposerDraftPayloadState(sid, '', []);
-    }
-    return response;
-  }).catch(() => {
+  return _postComposerDraftPayload(sid, { text: '', files: [] }, intent).catch(() => {
     if (_composerDraftLocalFallbackBySid.get(sid) === intent) {
       _composerDraftLocalFallbackBySid.delete(sid);
     }
@@ -2512,7 +2504,6 @@ async function _switchProfileForSessionLoad(profile){
     const data=await api('/api/profile/switch',{method:'POST',body:JSON.stringify({name}),timeoutToast:false});
     S.activeProfile=data.active||name;
     S.activeProfileIsDefault=!!data.is_default;
-    _forgetComposerDraftFallbacksOutsideProfile(S.activeProfile);
     if(typeof _resetCronUnreadForProfileSwitch==='function'){
       _resetCronUnreadForProfileSwitch();
     }
