@@ -289,8 +289,14 @@
           <option value="custom" data-i18n="insights_custom_range">Custom range…</option>
         </select>
         <div id="insightsCustomRange">
-          <input type="date" id="insightsStart" min="1970-01-01" aria-label="Start date" data-i18n-aria-label="insights_start_date" onfocus="_insightsSyncDateLimits()" onchange="insightsRangeInputs()">
-          <input type="date" id="insightsEnd" min="1970-01-01" aria-label="End date" data-i18n-aria-label="insights_end_date" onfocus="_insightsSyncDateLimits()" onchange="insightsRangeInputs()">
+          <label class="insights-range-field" for="insightsStart">
+            <span class="insights-range-field-label" data-i18n="insights_start_date">Start date</span>
+            <input type="date" id="insightsStart" min="1970-01-01" aria-label="Start date" data-i18n-aria-label="insights_start_date" onfocus="_insightsSyncDateLimits()" onchange="insightsRangeInputs()">
+          </label>
+          <label class="insights-range-field" for="insightsEnd">
+            <span class="insights-range-field-label" data-i18n="insights_end_date">End date</span>
+            <input type="date" id="insightsEnd" min="1970-01-01" aria-label="End date" data-i18n-aria-label="insights_end_date" onfocus="_insightsSyncDateLimits()" onchange="insightsRangeInputs()">
+          </label>
           <div id="insightsRangeNote" class="insights-range-note" role="status"></div>
         </div>
       </div>

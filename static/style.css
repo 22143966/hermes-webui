@@ -6912,6 +6912,8 @@ main.main.showing-insights > #mainInsights{display:flex;overflow-y:auto;}
 #insightsCustomRange{display:none;flex-direction:column;gap:6px;}
 #insightsCustomRange input[type="date"]{width:100%;min-width:0;background:var(--input-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;padding:5px 10px;font-size:12px;}
 #insightsCustomRange input[type="date"]:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-bg);}
+.insights-range-field{display:flex;flex-direction:column;gap:3px;min-width:0;}
+.insights-range-field-label{font-size:11px;color:var(--muted);}
 /* Selective-fall-back disclosure (#6970 UX r1): shown only when the selector
    is "custom" but the server served a trailing window instead. */
 .insights-range-note{display:none;font-size:11px;color:var(--muted);line-height:1.35;}

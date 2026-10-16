@@ -2096,6 +2096,60 @@ def test_insights_date_inputs_have_platform_min_bound():
         assert 'min="1970-01-01"' in tag, f"#{eid} must carry min=1970-01-01"
 
 
+def _label_source_for(html, element_id):
+    """Return (open_tag, start_offset) of the <label ...> whose `for` points at
+    `element_id`, so a visible-text assertion cannot be satisfied by a sibling."""
+    at = html.find(f'for="{element_id}"')
+    assert at != -1, f'no <label for="{element_id}"> in static/index.html'
+    start = html.rfind("<label", 0, at)
+    assert start != -1, f'malformed <label for="{element_id}">'
+    end = html.find(">", at)
+    assert end != -1, f'malformed <label for="{element_id}">'
+    return html[start:end + 1], start
+
+
+def test_insights_custom_range_inputs_have_visible_translated_labels():
+    """Greptile P2 on 6970 (2026-10-16T07:56:53Z, static/index.html:293, "Date
+    fields lack visible labels"): both Custom-range pickers carried only
+    aria-labels, so a sighted user saw two identical controls - worst when one
+    field is cleared or the dates are reversed, since the server accepts either
+    order. Each picker is now wrapped in a <label> whose visible text comes from
+    the SAME translated key as its aria-label, so the two can never disagree,
+    and clicking the text opens the picker.
+
+    Boundary: the wrapping must not move the picker's own attributes - the
+    shared stylesheet still owns the layout (gate must-fix 3).
+    """
+    custom_range_at = INDEX_HTML.index('<div id="insightsCustomRange">')
+    note_at = INDEX_HTML.index('id="insightsRangeNote"')
+    for eid, key in (("insightsStart", "insights_start_date"), ("insightsEnd", "insights_end_date")):
+        input_at = INDEX_HTML.index(f'id="{eid}"')
+        tag = _open_tag_source(INDEX_HTML, eid)
+        # the accessible name stays (screen readers) ...
+        assert f'data-i18n-aria-label="{key}"' in tag, f"#{eid} lost its translated aria-label"
+        assert "style=" not in tag, f"#{eid} must carry no inline style; got: {tag}"
+        # ... and a sighted user now gets that same string as visible text.
+        label_tag, label_at = _label_source_for(INDEX_HTML, eid)
+        assert custom_range_at < label_at < note_at, \
+            f"#{eid} label must live inside the custom-range row"
+        assert INDEX_HTML.find("</label>", label_at) > input_at, \
+            f"#{eid} must be wrapped by its label, not merely preceded by one"
+        assert 'class="insights-range-field"' in label_tag, \
+            f"#{eid} label must use the shared class; got: {label_tag}"
+        assert "style=" not in label_tag, f"#{eid} label must carry no inline style; got: {label_tag}"
+        assert f'data-i18n="{key}"' in INDEX_HTML[label_at:input_at], \
+            f"#{eid} visible text must be bound to the {key} key"
+    for rule in (
+        ".insights-range-field{display:flex;flex-direction:column;gap:3px;min-width:0;}",
+        ".insights-range-field-label{font-size:11px;color:var(--muted);}",
+        "#insightsCustomRange{display:none;flex-direction:column;gap:6px;}",
+    ):
+        assert rule in STYLE_CSS, f"missing stylesheet rule: {rule}"
+    # The one visible-text class in the row is the label span - a bare text node
+    # or an unclassed wrapper would drift from the stylesheet contract.
+    assert 'class="insights-range-field-label"' in INDEX_HTML
+
+
 INSIGHTS_RANGE_KEYS = ("insights_custom_range", "insights_start_date", "insights_end_date")
 
 
