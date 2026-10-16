@@ -977,3 +977,45 @@ def test_5305_subagent_of_sidecarless_webui_parent_outside_slice_stays_reachable
         r.setdefault("profile", "a")
     out = _render_tabs(json.dumps(rows, default=str))
     assert [r for r in out["webui"] + out["cli"] if r["sid"] == "leaf"] == [{"sid": "leaf", "orphan": True}], out
+
+
+def test_7771_cross_profile_parent_does_not_stamp_or_hide_child(monkeypatch):
+    """A flag-less child in profile A whose parent sidecar is in profile B: the parent-tab
+    stamp must not cross profiles (review 5488966899), so the child stays listed in A."""
+    import api.routes as routes
+
+    parent = {
+        "session_id": "p", "title": "WebUI session", "source": "webui", "raw_source": "webui",
+        "source_tag": "webui", "session_source": "webui", "is_cli_session": False, "profile": "other",
+        "message_count": 5, "actual_message_count": 5, "actual_user_message_count": 2,
+        "updated_at": 100, "last_message_at": 100,
+    }
+    child = {
+        "session_id": "sub", "title": "Subagent Session", "parent_session_id": "p",
+        "relationship_type": "child_session", "source": "subagent",
+        "raw_source": "subagent", "source_tag": "subagent", "session_source": "other",
+        "profile": "default", "message_count": 3, "updated_at": 101, "last_message_at": 101,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [dict(parent), dict(child)])
+    monkeypatch.setattr(routes, "get_cli_sessions", lambda source_filter=None, all_profiles=False: [])
+    monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _s: False)
+    monkeypatch.setattr(routes, "_prune_orphaned_webui_zero_message_sessions", lambda rows, **_k: rows)
+    payload = routes._build_session_list_cache_payload(
+        active_profile="default", all_profiles=False, show_cli_sessions=True,
+        show_previous_messaging_sessions=False, show_cron_sessions=False, sidebar_source="webui",
+    )
+    rows = routes._session_list_payload_to_response(payload)["sessions"]
+    assert [r["session_id"] for r in rows] == ["sub"], rows
+    assert "parent_is_cli_session" not in rows[0], rows[0]
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = _preamble(js) + f"""
+global._activeProject = null;
+global._showArchived = false;
+global.window = {{ _showCliSessions: true }};
+global._sessionSourceFilter = 'webui';
+const allMatched = {json.dumps(rows, default=str)};
+const part = _partitionSidebarSessionRows(allMatched, null);
+const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.webuiReferenceRaw, part.rowsById);
+console.log(JSON.stringify(rows.map(r=>r.session_id)));
+"""
+    assert json.loads(_run_node(source)) == ["sub"]
