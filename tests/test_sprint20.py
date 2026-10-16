@@ -350,7 +350,7 @@ def test_boot_js_media_recorder_fallback_posts_to_transcribe_api():
 def test_boot_js_prefers_server_side_stt_by_default():
     """Default mic capture should prefer server STT only after the server confirms support."""
     js, _ = get_text("/static/boot.js")
-    assert "const _micForceMediaRecorderStored=localStorage.getItem(_micForceMediaRecorderKey);" in js
+    assert "const _micForceMediaRecorderStored=_getMicForceMediaRecorderStored();" in js
     assert "let _serverSttAvailable=false" in js
     assert "_micForceMediaRecorderStored===null?(_serverSttAvailable&&_canRecordAudio):" in js
     assert "fetch('api/transcribe/capability'" in js
@@ -372,7 +372,7 @@ def test_boot_js_falls_back_to_browser_stt_when_server_transcribe_unavailable():
     js, _ = get_text("/static/boot.js")
     assert "function _isServerSttUnavailable(err)" in js
     assert "function _allowBrowserSttFallback()" in js
-    assert "localStorage.setItem(_micForceMediaRecorderKey,'0')" in js
+    assert "_setMicForceMediaRecorder('0')" in js
     assert "_forceMediaRecorder=false" in js
     assert "recognition=_ensureSpeechRecognition()" in js
 
@@ -380,7 +380,18 @@ def test_boot_js_falls_back_to_browser_stt_when_server_transcribe_unavailable():
 def test_boot_js_keeps_explicit_server_stt_preference_on_transcribe_failure():
     """An explicit mic_force_mediarecorder='1' preference must not be silently overwritten."""
     js, _ = get_text("/static/boot.js")
-    assert "localStorage.getItem(_micForceMediaRecorderKey)!=='1'" in js
+    assert "_getMicForceMediaRecorderStored()!=='1'" in js
+
+
+def test_boot_js_mic_force_mediarecorder_ttl():
+    """A persisted mic_force_mediarecorder preference expires after 24h."""
+    js, _ = get_text("/static/boot.js")
+    assert "const _MIC_FORCE_MR_TTL_MS=24*60*60*1000" in js
+    assert "const _micForceMediaRecorderExpiryKey='mic_force_mediarecorder_expires'" in js
+    assert "function _getMicForceMediaRecorderStored()" in js
+    assert "function _setMicForceMediaRecorder(value)" in js
+    assert "_setMicForceMediaRecorder('0')" in js
+    assert "_setMicForceMediaRecorder('1')" in js
 
 
 def test_routes_define_transcribe_endpoint():
