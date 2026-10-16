@@ -8431,12 +8431,28 @@ def _custom_provider_allowlist_ids(_cp: dict) -> list[str]:
     # Serialized shapes only: ``hermes config set`` / JSON-mode
     # editor saves persist lists as quoted JSON-array strings
     # (``'["chat-a","chat-b"]'``) or Python literals
-    # (``"['chat-a']"``).  Decode those through the shared helper so
-    # they are honored; native dict/list values are walked below so
-    # dict *entries* keep their id|model|name metadata (the decoder
-    # str()-ifies list members, which would mangle them).
+    # (``"['chat-a']"``).  Decode the array itself (JSON first, then a
+    # Python literal) and walk it below, so mapping members keep their
+    # id|model|name metadata; the shared decoder str()-ifies members
+    # (``"{'id': 'a'}"``).  Anything else goes through
+    # ``_parse_config_string_list()`` as before.
     if isinstance(_models, str):
-        _models = _parse_config_string_list(_models)
+        import ast
+
+        _decoded = None
+        _stripped = _models.strip()
+        if _stripped.startswith("["):
+            try:
+                _decoded = json.loads(_stripped)
+            except ValueError:
+                try:
+                    _decoded = ast.literal_eval(_stripped)
+                except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                    _decoded = None
+        if isinstance(_decoded, list):
+            _models = _decoded
+        else:
+            _models = _parse_config_string_list(_models)
     if isinstance(_models, dict):
         # A dict-shaped ``models`` is per-model metadata written by
         # the Hermes Agent setup flow, NOT a catalog narrow.  Only a
@@ -8446,6 +8462,10 @@ def _custom_provider_allowlist_ids(_cp: dict) -> list[str]:
         if _provider_discover_allowed(_cp):
             return []
         for _mid in _models:
+            # Pre-fix Hermes wrote these sentinels inside the mapping;
+            # skip them like the Agent's ``_declared_model_ids``.
+            if _mid in ("__explicit_model_allowlist__", "__discovered_model_catalog__"):
+                continue
             if isinstance(_mid, str) and _mid.strip():
                 _ids.append(_mid.strip())
     elif isinstance(_models, (list, tuple)):
@@ -8582,9 +8602,10 @@ def _repair_removed_qualified_custom_provider_model(
         return bare if item_provider == prov else item
 
     pinned_bare = [_own_bare(item) for item in pinned]
-    if not pinned or bare_model in pinned_bare:
-        return None
     default_bare = _own_bare(default_raw)
+    # The singular default stays a picker entry even outside ``models``.
+    if not pinned or bare_model in pinned_bare or bare_model == default_bare:
+        return None
     replacement = default_bare if default_bare in pinned_bare else pinned_bare[0]
     return f"@{prov}:{replacement}"
 

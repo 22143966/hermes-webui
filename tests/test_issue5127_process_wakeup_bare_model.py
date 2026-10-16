@@ -296,6 +296,106 @@ class TestIssue5127CustomProviderBareSuffixRepair:
         assert (model, provider, normalized) == ("@custom:lab:chat-new", "custom:lab", True)
         assert config.resolve_model_provider(model)[0] == "chat-new"
 
+    @pytest.mark.parametrize(
+        "serialized",
+        [
+            '[{"id": "saved-a"}, {"id": "live-b"}]',
+            "[{'id': 'saved-a'}, {'model': 'live-b'}]",
+        ],
+    )
+    def test_serialized_mapping_allowlist_keeps_member_ids(self, monkeypatch, serialized):
+        """A serialized list of mappings resolves through id/model/name, not str()."""
+        import api.config as config
+        from api.routes import _resolve_compatible_session_model_state
+
+        profile_cfg = {
+            "custom_providers": [
+                {
+                    "name": "lab",
+                    "base_url": "http://lab.invalid/v1",
+                    "model": "saved-a",
+                    "models": serialized,
+                }
+            ]
+        }
+        monkeypatch.setattr(config, "cfg", profile_cfg)
+
+        kept = _resolve_compatible_session_model_state(
+            "@custom:lab:live-b",
+            "custom:lab",
+            profile_config=profile_cfg,
+            prefer_cached_catalog=True,
+        )
+        assert kept == ("@custom:lab:live-b", "custom:lab", False)
+        assert config.resolve_model_provider(kept[0])[0] == "live-b"
+
+        repaired = _resolve_compatible_session_model_state(
+            "@custom:lab:removed-x",
+            "custom:lab",
+            profile_config=profile_cfg,
+            prefer_cached_catalog=True,
+        )
+        assert repaired == ("@custom:lab:saved-a", "custom:lab", True)
+        assert config.resolve_model_provider(repaired[0])[0] == "saved-a"
+
+    def test_configured_default_outside_pinned_list_is_kept(self, monkeypatch):
+        """The singular ``model`` is still a picker entry, so it isn't stale."""
+        import api.config as config
+        from api.routes import _resolve_compatible_session_model_state
+
+        profile_cfg = {
+            "custom_providers": [
+                {
+                    "name": "lab",
+                    "base_url": "http://lab.invalid/v1",
+                    "model": "live-b",
+                    "models": ["saved-a"],
+                }
+            ]
+        }
+        monkeypatch.setattr(config, "cfg", profile_cfg)
+
+        model, provider, normalized = _resolve_compatible_session_model_state(
+            "@custom:lab:live-b",
+            "custom:lab",
+            profile_config=profile_cfg,
+            prefer_cached_catalog=True,
+        )
+
+        assert (model, provider, normalized) == ("@custom:lab:live-b", "custom:lab", False)
+        assert config.resolve_model_provider(model)[0] == "live-b"
+
+    @pytest.mark.parametrize(
+        "sentinel", ["__discovered_model_catalog__", "__explicit_model_allowlist__"]
+    )
+    def test_legacy_sentinel_keys_are_not_model_ids(self, monkeypatch, sentinel):
+        """Pre-fix sentinels inside a pinned mapping never become the repair target."""
+        import api.config as config
+        from api.routes import _resolve_compatible_session_model_state
+
+        profile_cfg = {
+            "custom_providers": [
+                {
+                    "name": "lab",
+                    "base_url": "http://lab.invalid/v1",
+                    "discover_models": False,
+                    "model": "gone-default",
+                    "models": {sentinel: True, "real-a": {}},
+                }
+            ]
+        }
+        monkeypatch.setattr(config, "cfg", profile_cfg)
+
+        model, provider, normalized = _resolve_compatible_session_model_state(
+            "@custom:lab:removed-x",
+            "custom:lab",
+            profile_config=profile_cfg,
+            prefer_cached_catalog=True,
+        )
+
+        assert (model, provider, normalized) == ("@custom:lab:real-a", "custom:lab", True)
+        assert config.resolve_model_provider(model)[0] == "real-a"
+
     def test_no_profile_config_never_repairs_from_shared_cfg(self, monkeypatch):
         """The shared cfg may belong to another profile, so it can't drive a rewrite."""
         import api.config as config
