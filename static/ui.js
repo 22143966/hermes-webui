@@ -2726,6 +2726,12 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
     pointerY: 0,
     pressOnImage: false,
     scale: 1,
+    // The pointerIds of the touch contacts currently down, in press order. The
+    // pointer events carry the id, the touch events do not, and the pan has to
+    // be re-armed from the contact still down when a pinch ends (see
+    // _imgArmDragFromRemainingTouch), so the two streams are tied together
+    // here (greptile P2 on 6f462d82, 2026-10-16T01:39:15Z, static/ui.js:3235).
+    touchPointerIds: [],
     viewport,
     x: 0,
     y: 0,
@@ -2986,6 +2992,7 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
   }
 
   function _imgOnPointerDown(e) {
+    if(e.pointerType === 'touch' && e.pointerId != null) _imgTrackTouchPointer(e.pointerId, true);
     if(state.pinching) return;
     if(e.button != null && e.button !== 0) return;
     if(state.dragging) return;
@@ -3042,6 +3049,11 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
   }
 
   function _imgEndPointerDrag(e) {
+    // A touch contact that ends (up / cancel) leaves the tracked set before the
+    // guards below: this handler early-returns whenever the pinch already
+    // cleared `dragging`, so a lost id would leave the set stale (see
+    // _imgTrackTouchPointer).
+    if(e && e.pointerType === 'touch' && e.pointerId != null) _imgTrackTouchPointer(e.pointerId, false);
     if(!state.dragging) return;
     // A non-owning pointer's release (or leave/cancel) must not kill the
     // active pan while its owner is still down.
@@ -3233,6 +3245,59 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
       state.pinching = false;
       state.pinchIds = null;
       state.dragged = true;
+      // Lifting one finger of a pinch must leave the contact still down able to
+      // pan, as it can on master: the pinch ended the pointer drag
+      // (_imgOnTouchStart calls _imgEndPointerDrag) and the remaining contact
+      // gets no new pointerdown, so every pointermove of it was dropped until
+      // the user lifted and pressed again (greptile P2 on 6f462d82,
+      // 2026-10-16T01:39:15Z, static/ui.js:3235). Re-arm the pan from the
+      // contact that is still there, anchored on its CURRENT geometry so the
+      // first move continues from the frame the pinch produced instead of
+      // jumping to a stale origin.
+      _imgArmDragFromRemainingTouch(e.touches);
+    }
+  }
+
+  // The touch stream carries no pointer id, so the contacts that are down are
+  // tracked from the pointer events (`down` starts a contact, otherwise it
+  // ended). Only touch pointers are tracked: a mouse press is not part of a
+  // pinch and must not be resurrected as one. Idempotent, so the duplicate
+  // pointerup/pointerleave a touch release delivers is harmless.
+  function _imgTrackTouchPointer(pointerId, down) {
+    if(!Array.isArray(state.touchPointerIds)) state.touchPointerIds = [];
+    const at = state.touchPointerIds.indexOf(pointerId);
+    if(down){
+      if(at === -1) state.touchPointerIds.push(pointerId);
+    } else if(at !== -1){
+      state.touchPointerIds.splice(at, 1);
+    }
+  }
+
+  function _imgArmDragFromRemainingTouch(touches) {
+    if(!touches || touches.length !== 1) return;
+    // A drag that survived the pinch keeps its own baseline.
+    if(state.dragging) return;
+    const contact = touches[0];
+    const ids = Array.isArray(state.touchPointerIds) ? state.touchPointerIds : [];
+    state.dragging = true;
+    // Exactly one tracked contact is expected here (the lifted one has already
+    // reported its pointerup). With anything else the drag stays ownerless
+    // rather than being handed to a pointer that may be gone; _imgOwnsDrag
+    // accepts any pointer while dragPointerId is null, and a second contact
+    // can only arrive through a touchstart, which ends this drag again.
+    state.dragPointerId = ids.length === 1 ? ids[0] : null;
+    state.dragOriginX = Number(contact.clientX) || 0;
+    state.dragOriginY = Number(contact.clientY) || 0;
+    state.pointerX = state.dragOriginX;
+    state.pointerY = state.dragOriginY;
+    state.dragStartX = state.x;
+    state.dragStartY = state.y;
+    // `dragged` stays true (set by the pinch) so the tap-dismiss guards keep
+    // treating this sequence as a gesture rather than a letterbox tap, and
+    // `pressOnImage` keeps the value of the press that started it.
+    viewport.classList.add('is-panning');
+    if(state.dragPointerId != null && viewport.setPointerCapture){
+      try{ viewport.setPointerCapture(state.dragPointerId); }catch(_){}
     }
   }
 

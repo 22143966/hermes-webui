@@ -42,6 +42,14 @@ pinch must not be undone by the next touchmove either —
 ``gate1015_wheel_zoom_mid_pinch_is_not_undone``, asserted by
 ``TestComposedGreptileWheelZoomPinch20261015``.
 
+The 2026-10-16T01:39:15Z greptile P2 ("Dragging stops after pinching", reported
+against the merge-only head 6f462d82) added one more: lifting one finger of a
+pinch must leave the contact still down able to pan —
+``gate1015_pinch_end_keeps_the_remaining_finger_panning``, asserted by
+``TestComposedGreptilePinchEndDrag20261016``. It is the only check that drives
+BOTH event streams of a touch gesture (pointer events carry the pointerId, touch
+events carry the contacts), because the re-armed pan looks the contact up by id.
+
 The per-check script lives in ``_img_lightbox_composed_checks.js`` and is
 injected into the page; there is no DOM emulation layer and no third-party JS
 package involved. Chromium is provisioned by the CI test job
@@ -366,6 +374,31 @@ class TestComposedGreptilePinchReversal20261015:
 
     def test_a_spread_sequence_is_path_independent_mobile(self, composed):
         _check(composed.mobile, "gate1015_pinch_spread_is_path_independent")
+
+
+class TestComposedGreptilePinchEndDrag20261016:
+    """Greptile P2 on the merge-only head 6f462d82 (2026-10-16T01:39:15Z,
+    static/ui.js:3235, "Dragging stops after pinching"): ``_imgOnTouchStart``
+    ends the pointer drag when the pinch arms, and ``_imgOnTouchEnd`` only
+    cleared ``pinching`` — the contact still down got no new ``pointerdown``,
+    so every one of its moves was dropped until the user lifted and pressed
+    again. The pan is now re-armed from that contact, anchored on its current
+    geometry, and driven here on the real handlers with BOTH event streams (as
+    a browser delivers them: the ids on the pointer events, the contacts on the
+    touch events).
+    """
+
+    def test_the_remaining_finger_keeps_panning_after_a_pinch(self, composed):
+        _check(
+            composed.desktop,
+            "gate1015_pinch_end_keeps_the_remaining_finger_panning",
+        )
+
+    def test_the_remaining_finger_keeps_panning_after_a_pinch_mobile(self, composed):
+        _check(
+            composed.mobile,
+            "gate1015_pinch_end_keeps_the_remaining_finger_panning",
+        )
 
 
 # Trusted-input regressions for the 2026-10-06 maintainer gate certificate.

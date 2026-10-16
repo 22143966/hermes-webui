@@ -99,14 +99,17 @@
     return { w: Math.max(1, r.width), h: Math.max(1, r.height) };
   }
 
-  function pointer(vp, type, x, y, id) {
+  // `pointerType` defaults to "mouse" for the pointer-only checks; a gesture
+  // that must thread the real touch stream passes "touch", because the pan
+  // re-armed after a pinch looks the contact up by the id carried here.
+  function pointer(vp, type, x, y, id, pointerType) {
     var pid = id == null ? 1 : id;
     vp.dispatchEvent(new PointerEvent(type, {
       bubbles: true,
       cancelable: true,
       composed: true,
       pointerId: pid,
-      pointerType: "mouse",
+      pointerType: pointerType || "mouse",
       isPrimary: pid === 1,
       button: 0,
       buttons: type === "pointerup" ? 0 : 1,
@@ -1469,10 +1472,64 @@
     touch(box.vp, "touchend", []);
   }
 
+  // Greptile P2 on the merge-only head 6f462d82 (2026-10-16T01:39:15Z,
+  // static/ui.js:3235, "Dragging stops after pinching"): a pinch ends the
+  // pointer drag (_imgOnTouchStart calls _imgEndPointerDrag) and the contact
+  // that is still down never receives a new pointerdown, so its moves were
+  // dropped until the user lifted and pressed again. The pan must be re-armed
+  // from that contact, anchored on the geometry it has NOW, so the first move
+  // after the pinch continues the frame instead of jumping to a stale origin.
+  // The gesture drives BOTH streams, as a real touch does (the ids only exist
+  // on the pointer events, the contacts only on the touch events).
+  async function pinchEndKeepsTheRemainingFingerPanning() {
+    var box = await openBox(IMG_W, IMG_H);
+    var size = vpSize(box.vp);
+    var rect = box.vp.getBoundingClientRect();
+    var cx = rect.left + size.w / 2;
+    var cy = rect.top + size.h / 2;
+    // Zoom past the viewport on BOTH axes: a fitting axis is force-centred by
+    // _imgClampPan, and a centred axis moves with any pan (it is re-centred),
+    // so only an overflowing pair makes the displacement below observable.
+    var guard = 0;
+    while ((box.z.boxW * box.z.scale < size.w + 400 ||
+            box.z.boxH * box.z.scale < size.h + 400) && guard++ < 80) key("+");
+    pointer(box.vp, "pointerdown", cx - 40, cy, 11, "touch");
+    pointer(box.vp, "pointerdown", cx + 40, cy, 12, "touch");
+    touch(box.vp, "touchstart", [{ x: cx - 40, y: cy, id: 1 }, { x: cx + 40, y: cy, id: 2 }]);
+    touch(box.vp, "touchmove", [{ x: cx - 60, y: cy, id: 1 }, { x: cx + 60, y: cy, id: 2 }]);
+    assert_(box.z.pinching, "fixture: two contacts must arm the pinch");
+    var scaleAfterPinch = box.z.scale;
+    assert_(box.z.scale !== 0, "fixture: the pinch must produce a frame");
+    // Lift the second contact. Its pointerup arrives before the touchend that
+    // reports the single remaining contact, exactly as a browser delivers it.
+    pointer(box.vp, "pointerup", cx + 60, cy, 12, "touch");
+    touch(box.vp, "touchend", [{ x: cx - 60, y: cy, id: 1 }]);
+    assert_(!box.z.pinching, "fixture: the pinch must have ended");
+    var xBefore = box.z.x;
+    var yBefore = box.z.y;
+    var minX = size.w - box.z.boxW * box.z.scale;
+    var minY = size.h - box.z.boxH * box.z.scale;
+    var diag = " [x=" + xBefore + " y=" + yBefore + " scale=" + box.z.scale +
+      " minX=" + minX + " minY=" + minY + " vw=" + size.w + " vh=" + size.h + "]";
+    assert_(xBefore < -5 && xBefore > minX + 5,
+      "fixture: the pan must not start on a horizontal clamp edge" + diag);
+    assert_(yBefore < -5 && yBefore > minY + 5,
+      "fixture: the pan must not start on a vertical clamp edge" + diag);
+    // No new press: this single move of the contact still down is the whole
+    // regression. 40px right and 24px down must be a 1:1 continuation.
+    pointer(box.vp, "pointermove", cx - 20, cy + 24, 11, "touch");
+    approx(box.z.x, xBefore + 40, 2.5, "the remaining contact must pan the image" + diag);
+    approx(box.z.y, yBefore + 24, 2.5, "the remaining contact must pan on both axes" + diag);
+    approx(box.z.scale, scaleAfterPinch, 1e-9, "a pan must not change the zoom" + diag);
+    pointer(box.vp, "pointerup", cx - 20, cy + 24, 11, "touch");
+    touch(box.vp, "touchend", []);
+  }
+
   async function runGate1015Touch(bucket) {
     await run("gate1015_fit_survives_a_gesture_started_without_geometry", bucket, fitSurvivesAGestureStartedWithoutGeometry);
     await run("gate1015_fit_resets_an_active_pinch", bucket, fitResetsAnActivePinch);
     await run("gate1015_replaced_finger_reanchors_the_pinch", bucket, replacedFingerReanchorsThePinch);
+    await run("gate1015_pinch_end_keeps_the_remaining_finger_panning", bucket, pinchEndKeepsTheRemainingFingerPanning);
     await run("gate1015_keyboard_zoom_mid_pinch_is_not_undone", bucket, keyboardZoomMidPinchIsNotUndone);
     await run("gate1015_wheel_zoom_mid_pinch_is_not_undone", bucket, wheelZoomMidPinchIsNotUndone);
     await run("gate1015_pinch_reversal_responds_immediately", bucket, pinchReversalRespondsImmediately);

@@ -533,3 +533,50 @@ class TestRegate20261015:
         assert "Math.max(_imgMinScale(), Math.min(8, state.scale))" in branch, (
             "the chosen scale must be re-clamped to the new baseline"
         )
+
+
+class TestGreptilePinchEndDrag20261016:
+    """Greptile P2 on the merge-only head 6f462d82 (2026-10-16T01:39:15Z,
+    static/ui.js:3235, "Dragging stops after pinching"): lifting one finger of a
+    pinch left the contact still down unable to pan, because the pinch had ended
+    the pointer drag and that contact never receives a new pointerdown. The pan
+    must be re-armed from it, which needs the touch contacts tied to the pointer
+    ids (the touch stream carries no id), and the id bookkeeping must not sit
+    behind the early returns of ``_imgEndPointerDrag``.
+    """
+
+    def test_the_pan_is_re_armed_from_the_remaining_contact(self):
+        src = UI.read_text(encoding="utf-8")
+        assert "touchPointerIds" in src, (
+            "the touch contacts must be tied to their pointer ids"
+        )
+        end = src[src.index("function _imgOnTouchEnd(e) {"):]
+        body = end[: end.index("function _imgTrackTouchPointer(")]
+        assert "_imgArmDragFromRemainingTouch(e.touches);" in body, (
+            "the pinch end must hand the pan to the contact still down"
+        )
+        arm = src[src.index("function _imgArmDragFromRemainingTouch(touches) {"):]
+        arm = arm[: arm.index("function _imgRebaseDrag() {")]
+        assert "if(state.dragging) return;" in arm, (
+            "a drag that survived the pinch keeps its own baseline"
+        )
+        assert "state.dragStartX = state.x;" in arm and "state.dragStartY = state.y;" in arm, (
+            "the re-armed pan must be anchored on the frame the pinch produced"
+        )
+
+    def test_the_contact_bookkeeping_precedes_the_drag_guards(self):
+        """`_imgEndPointerDrag` early-returns when the pinch already cleared
+        `dragging`, so the id must leave the tracked set before those guards —
+        otherwise the set goes stale and the wrong contact owns the pan."""
+        src = UI.read_text(encoding="utf-8")
+        body = src[src.index("function _imgEndPointerDrag(e) {"):]
+        body = body[: body.index("function _imgCancelGesture() {")]
+        track = body.index("_imgTrackTouchPointer(e.pointerId, false);")
+        assert track < body.index("if(!state.dragging) return;"), (
+            "the tracking must run before the drag guards"
+        )
+        down = src[src.index("function _imgOnPointerDown(e) {"):]
+        down = down[: down.index("function _imgOnPointerMove(e) {")]
+        assert down.index("_imgTrackTouchPointer(e.pointerId, true);") < down.index(
+            "if(state.pinching) return;"
+        ), "the tracking must run before the pinch guard"
