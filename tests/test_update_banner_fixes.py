@@ -2470,25 +2470,31 @@ function _showUpdateBanner() {{}}
         assert 'overflow-wrap:anywhere' in global_compact
         assert 'min-width:0' in global_compact
 
-        media = re.search(
+        # Search every 768px block: master has other (nested) 768px blocks earlier in the file, e.g. the #6978
+        # todo tray, so the first match is not necessarily the one carrying this override.
+        medias = list(re.finditer(
             r'@media\s*\(\s*max-width\s*:\s*768px\s*\)\s*\{',
             css,
-        )
-        assert media, '@media (max-width: 768px) missing'
-        open_brace = media.end() - 1
-        depth = 0
-        end = None
-        for idx in range(open_brace, len(css)):
-            if css[idx] == '{':
-                depth += 1
-            elif css[idx] == '}':
-                depth -= 1
-                if depth == 0:
-                    end = idx
-                    break
-        assert end is not None
-        mobile_block = css[open_brace:end + 1]
-        mobile_rule = re.search(r'#checkUpdatesStatus\{[^}]*\}', mobile_block)
+        ))
+        assert medias, '@media (max-width: 768px) missing'
+        mobile_rule = None
+        for media in medias:
+            open_brace = media.end() - 1
+            depth = 0
+            end = None
+            for idx in range(open_brace, len(css)):
+                if css[idx] == '{':
+                    depth += 1
+                elif css[idx] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = idx
+                        break
+            assert end is not None
+            mobile_block = css[open_brace:end + 1]
+            mobile_rule = re.search(r'#checkUpdatesStatus\{[^}]*\}', mobile_block)
+            if mobile_rule:
+                break
         assert mobile_rule, (
             '#checkUpdatesStatus wrap override missing from the 768px block'
         )
