@@ -2249,3 +2249,81 @@ def test_resolved_hidden_tabs_survive_a_rejected_mirror_write(tmp_path):
         .replace("__HANDOFF__", handoff)
     )
     assert _run_node(tmp_path, "mirror_write_failure_probe.js", script).strip() == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Greptile P1 (2026-10-15T23:18:37Z) — a conversation deleted elsewhere must
+# not leave its tasks in the tray
+# ---------------------------------------------------------------------------
+
+_SEND_404_TODOS_PROBE = """
+const S = {todos: [], todoStateMeta: null, messages: [], session: null};
+const INFLIGHT = {};
+let _refreshCalls = 0;
+function _resetTodosRenderCache() {}
+function scheduleTodosRefresh() { _refreshCalls += 1; }
+__HYDRATE__
+__CURRENT__
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const activeSid = 's_deleted_elsewhere';
+S.session = {session_id: activeSid};
+S.todos = [{id: 'old', content: 'stale task', status: 'pending'}];
+S.todoStateMeta = {ts: 7, source: 'sse', version: 1};
+INFLIGHT[activeSid] = {todos: S.todos.slice(), todoStateMeta: S.todoStateMeta};
+
+// (1) The pre-fix shape: /api/chat/start answers 404, the recovery path drops
+// the session and the transcript, but S.todos + the todoStateMeta sentinel stay
+// behind, so the tray keeps rendering the dead conversation's tasks.
+S.session = null;
+S.messages = [];
+let stale = _currentTodos();
+assert(stale.length === 1 && stale[0].id === 'old',
+  'the stale snapshot is what the tray renders until it is reset');
+
+// (2) The full recovery sequence: the in-flight payload is dropped, then the
+// null hydration (same helper clearConversation/deleteSession use) empties the
+// tray and reschedules its paint.
+delete INFLIGHT[activeSid];
+S.session = null;
+S.messages = [];
+_hydrateTodosFromSession(null);
+assert(S.todoStateMeta === null, 'the snapshot sentinel must reset to null');
+assert(S.todos.length === 0, 'the deleted session tasks must be gone, got ' + S.todos.length);
+assert(_currentTodos().length === 0, 'the tray must render no tasks');
+assert(_refreshCalls >= 1, 'a tray refresh must be scheduled');
+console.log('ok');
+"""
+
+
+def test_deleted_elsewhere_session_drops_the_tray_tasks(tmp_path):
+    """Greptile P1 (2026-10-15T23:18:37Z): when /api/chat/start answers 404 the
+    session was deleted server-side; the recovery path cleared S.session and the
+    transcript but not S.todos/S.todoStateMeta, so the tray kept the deleted
+    conversation's list (rendered from the sentinel by _currentTodos)."""
+    messages = _read_static("static/messages.js")
+    ui = _read_static("static/ui.js")
+    recovery = _extract(
+        messages,
+        "// If /api/chat/start returns 404, the session was deleted server-side",
+        "if(await _recoverCompressedSend(e,activeSid",
+    )
+    assert "delete INFLIGHT[activeSid];" in recovery, recovery
+    assert "S.session=null;S.messages=[];" in recovery, recovery
+    reset_at = recovery.find("_hydrateTodosFromSession(null)")
+    clear_at = recovery.find("S.session=null;S.messages=[];")
+    assert reset_at != -1, "the 404 recovery must reset the tray snapshot"
+    assert reset_at > clear_at, (
+        "the tray reset must follow the session + transcript clear"
+    )
+    hydrate = _extract(
+        ui,
+        "function _hydrateTodosFromSession(session){",
+        "function snapshotLiveTurnHtmlForSession(sid){",
+    )
+    current = _extract(ui, "function _currentTodos(){", "function _chatTodosSummary(")
+    script = (
+        _SEND_404_TODOS_PROBE.replace("__HYDRATE__", hydrate)
+        .replace("__CURRENT__", current)
+    )
+    assert _run_node(tmp_path, "send_404_todos_probe.js", script).strip() == "ok"
