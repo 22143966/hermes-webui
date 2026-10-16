@@ -145,13 +145,19 @@ def _agent_checkout_importable(monkeypatch):
     ``repair_message_sequence``'s pass-3 lazily imports sibling Agent modules
     (``agent.conversation_loop`` → ``hermes_logging``), and the installed
     ``is_compaction_summary_message`` runs from the same checkout. The suite's
-    sys.path isolation guard restores an earlier snapshot mid-run, so prepend
-    the checkout for every test — the proven ``test_gateway_sync`` remedy.
+    sys.path isolation guard restores an earlier snapshot mid-run (shard-order
+    dependent — the same hazard ``test_gateway_sync`` documents), so prepend
+    the checkout BEFORE importing anything from it.
     """
-    hermes_state = pytest.importorskip("hermes_state")
-    import pathlib
+    from api import config as config_mod
 
-    monkeypatch.syspath_prepend(str(pathlib.Path(hermes_state.__file__).resolve().parent))
+    agent_dir = getattr(config_mod, "_AGENT_DIR", None)
+    if agent_dir is not None:
+        monkeypatch.syspath_prepend(str(agent_dir))
+    pytest.importorskip(
+        "agent.agent_runtime_helpers",
+        reason="hermes-agent modules not importable",
+    )
 
 
 def _sanitize(messages, **kwargs):
@@ -384,8 +390,64 @@ def test_settle_projection_proves_the_current_turn_suffix(shape):
     assert answer in proven_texts, f"{shape}: answer not in proven suffix {proven_texts}"
 
 
-# ── End-to-end: real streaming worker + cold reload ──────────────────────────
+# ── Regression: folding survives an unimportable recognizer ──────────────────
 
+
+def test_user_fold_survives_an_unimportable_recognizer():
+    """CI-shard regression (round-8 re-gate): the suite's sys.path isolation
+    guard can make the agent checkout unimportable mid-shard. The settle
+    projection must then still fold adjacent plain user rows and still refuse
+    the literal carrier shapes — the recognizer's fallback is a content
+    mirror, never a blanket refusal to fold (which regressed every user-fold
+    consumer in shard order: round-4's two-successive-sends and round-7's
+    fold guard went red on CI while passing in isolation)."""
+    import sys
+
+    from api import config as config_mod
+    from api.streaming import _agent_replay_settle_projection
+
+    agent_dir = str(getattr(config_mod, "_AGENT_DIR", "") or "")
+    saved_modules = {
+        name: module
+        for name, module in list(sys.modules.items())
+        if name == "agent"
+        or name.startswith("agent.")
+        or name in ("hermes_state", "hermes_state_local")
+    }
+    saved_path = list(sys.path)
+    try:
+        for name in saved_modules:
+            sys.modules.pop(name, None)
+        if agent_dir:
+            sys.path[:] = [entry for entry in sys.path if entry != agent_dir]
+        folded = _agent_replay_settle_projection(
+            [
+                {"role": "user", "content": "U1"},
+                {"role": "user", "content": "U2"},
+                {"role": "assistant", "content": "A2"},
+            ]
+        )
+        assert [r.get("content") for r in folded] == ["U1\n\nU2", "A2"], (
+            f"plain user rows must still fold without the recognizer; got {folded}"
+        )
+        carrier = _agent_replay_settle_projection(
+            [
+                {"role": "user", "content": "[CONTEXT SUMMARY]: prior compacted handoff"},
+                {"role": "user", "content": "U2"},
+                {"role": "assistant", "content": "A2"},
+            ]
+        )
+        assert [r.get("content") for r in carrier] == [
+            "[CONTEXT SUMMARY]: prior compacted handoff",
+            "U2",
+            "A2",
+        ], f"literal carriers must still refuse the fold without the recognizer; got {carrier}"
+    finally:
+        sys.modules.update(saved_modules)
+        sys.path[:] = saved_path
+
+
+# ── End-to-end: real streaming worker + cold reload ──────────────────────────
 
 @pytest.mark.parametrize("shape", ALL_SHAPES)
 def test_streaming_worker_keeps_prompt_and_answer(shape, tmp_path, monkeypatch):

@@ -8103,16 +8103,40 @@ def _replay_user_row_is_compaction_carrier(row):
     and the settle's strict-prefix proof then refused the changed prefix.
 
     When the installed recognizer cannot even be imported (broken agent
-    checkout), this helper reports "carrier" for every row: without the real
-    predicate the guard must refuse to weld user rows at all — never mutate
-    durable rows on an unverified guess.
+    checkout — e.g. the suite's sys.path isolation guard mid-run), this helper
+    degrades to a content-level mirror of the carrier shapes (the webui marker
+    prefixes, the legacy ``[CONTEXT SUMMARY]:`` handoff and the merged
+    delimiter) so ordinary user rows still fold exactly as before; only the
+    metadata-flag carrier shape is invisible on that last-resort path. Folding
+    must never be blanket-disabled by an unimportable recognizer — that
+    regressed every user-fold consumer in CI-shard order.
     """
     try:
         from agent.context_compressor import is_compaction_summary_message
     except Exception:
-        return True
+        return _replay_user_row_looks_like_summary_carrier(row)
+    try:
+        return bool(is_compaction_summary_message(row))
+    except Exception:
+        return _replay_user_row_looks_like_summary_carrier(row)
 
-    return bool(is_compaction_summary_message(row))
+
+def _replay_user_row_looks_like_summary_carrier(row):
+    """Last-resort content mirror of the compaction-carrier shapes.
+
+    Used only when the installed ``is_compaction_summary_message`` is
+    unreachable; see ``_replay_user_row_is_compaction_carrier``.
+    """
+    if not isinstance(row, dict):
+        return False
+    content = row.get('content')
+    if not isinstance(content, str):
+        return False
+    return bool(
+        _is_context_compression_marker(row)
+        or content.lstrip().startswith('[CONTEXT SUMMARY]:')
+        or '[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]' in content
+    )
 
 
 def _replay_user_row_is_plain_mergeable(row):
