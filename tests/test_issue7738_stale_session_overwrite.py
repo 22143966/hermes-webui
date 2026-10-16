@@ -68,6 +68,12 @@ class _FakeHandler:
     def end_headers(self):  # noqa: D401 — protocol stub
         pass
 
+    def _safe_webui_print(self, *args, **kwargs):  # noqa: D401 — protocol stub
+        # The real handler's journal print. /api/session/draft calls it for a
+        # request over 200 ms; a draft whose lock window runs a nested pick
+        # crosses that on a slow runner (CI 3.13 shard 2, PR #8253).
+        pass
+
 
 def _capture_post(monkeypatch, body):
     """Wire up the standard ``handle_post`` bypass shims and return a recorder.
@@ -1768,8 +1774,14 @@ def test_session_writer_does_not_undo_effort_pick_saved_after_eviction(
 
 @pytest.mark.parametrize("lane", ["draft", "reasoning"])
 def test_unsaved_shell_evicted_before_lock_is_kept(tmp_path, monkeypatch, lane):
-    """A cache-only shell has no sidecar to clobber, so the handler keeps the
-    outside-resolved object instead of answering 404 and losing the chat.
+    """A cache-only shell has no sidecar to clobber, so the effort pick keeps
+    the outside-resolved object instead of answering 404 and losing the chat.
+
+    The draft lane follows master's draft lifecycle instead: a draft is only
+    persisted for the live cached owner (deletion must not race first-draft
+    ownership), so a shell gone from the cache under the lock is refused with
+    409 ``Session no longer active`` and the client keeps its local fallback.
+    Nothing is written for it either way.
     """
     session_dir = _isolate_session_store(tmp_path, monkeypatch)
     sid = "unsaved-shell"
@@ -1792,14 +1804,18 @@ def test_unsaved_shell_evicted_before_lock_is_kept(tmp_path, monkeypatch, lane):
     handler.command = "POST"
     routes.handle_post(handler, SimpleNamespace(path=path))
 
+    if lane == "draft":
+        assert captured["status"] == 409, f"expected 409, got {captured}"
+        assert captured["payload"].get("error") == "Session no longer active"
+        assert sid not in SESSIONS
+        assert not (session_dir / f"{sid}.json").exists()
+        assert not (session_dir / ".drafts" / f"{sid}.json").exists()
+        return
     assert captured["status"] == 200, f"expected 200, got {captured}"
     assert SESSIONS.get(sid) is shell, "the shell must be republished to the cache"
     cold = Session.load(sid)
     assert cold is not None
-    if lane == "draft":
-        assert cold.composer_draft == {"text": "first words"}
-    else:
-        assert cold.reasoning_effort == "high"
+    assert cold.reasoning_effort == "high"
 
 
 def test_shell_fallback_refuses_object_with_messages(tmp_path, monkeypatch):
@@ -1869,7 +1885,14 @@ def test_empty_session_deleted_before_lock_is_not_resurrected(tmp_path, monkeypa
     routes.handle_post(handler, SimpleNamespace(path=path))
 
     assert delete_captured.get("status") == 200, f"delete failed: {delete_captured}"
-    assert captured["status"] == 404, f"expected 404, got {captured}"
+    if lane == "draft":
+        # Master's draft lifecycle answers a session gone under the lock with
+        # 409 ``Session no longer active`` (the client keeps a local fallback).
+        assert captured["status"] == 409, f"expected 409, got {captured}"
+        assert captured["payload"].get("error") == "Session no longer active"
+        assert not (session_dir / ".drafts" / f"{sid}.json").exists()
+    else:
+        assert captured["status"] == 404, f"expected 404, got {captured}"
     assert sid not in SESSIONS
     assert not (session_dir / f"{sid}.json").exists()
 

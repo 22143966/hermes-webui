@@ -65,6 +65,9 @@ class _FakeHandler:
     def end_headers(self):
         pass
 
+    def _safe_webui_print(self, *args, **kwargs):  # /api/session/draft's [SLOW] log
+        pass
+
 
 def _isolate_session_store(tmp_path, monkeypatch):
     session_dir = tmp_path / "sessions"
@@ -426,17 +429,21 @@ _CLI_IDENTITY = {
 }
 
 # Writers that re-resolve under the session lock without their own CLI lookup.
+# /api/session/draft is not one of them since master's draft lifecycle: it
+# writes the dedicated .drafts/<sid>.json sidecar and never rewrites the
+# session sidecar, so it cannot persist an identity at all. Its lock-held
+# reload still carries the identity in memory, see
+# tests/test_session_effort_master_compose.py::test_draft_lock_held_reload_carries_cli_source_identity.
 _CLI_WRITERS = [
     ("/api/session/toolsets", {"toolsets": ["web"]}, lambda s: s.enabled_toolsets == ["web"]),
     ("/api/personality/set", {"name": ""}, lambda s: s.personality is None),
-    ("/api/session/draft", {"text": "new draft"}, lambda s: (s.composer_draft or {}).get("text") == "new draft"),
     ("/api/session/truncate", {"keep_count": 1}, lambda s: len(s.messages) == 1),
     ("/api/session/pin", {"pinned": True}, lambda s: s.pinned is True),
 ]
 
 
 @pytest.mark.parametrize(
-    "path,extra,check", _CLI_WRITERS, ids=["toolsets", "personality", "draft", "truncate", "pin"],
+    "path,extra,check", _CLI_WRITERS, ids=["toolsets", "personality", "truncate", "pin"],
 )
 def test_lock_held_reload_keeps_cli_source_identity(tmp_path, monkeypatch, path, extra, check):
     """Greptile P1 (e71fd219, "CLI chats lose their source"): materialization

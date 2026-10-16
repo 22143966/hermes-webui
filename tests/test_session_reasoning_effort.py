@@ -641,10 +641,18 @@ def test_root_gateway_turn_honors_external_config_while_named_profile_active(
     )
 
     url, authorization, endpoint, payload = captured[0]
-    assert url.startswith("http://external-root:8650/")
-    assert authorization == "Bearer root-test-key"
-    assert endpoint == ("http://external-root:8650", "root-test-key")
+    # The effort follows the isolated root config: the external override is
+    # root's while a named profile is sticky-active (this PR's rule).
     assert payload["reasoning_effort"] == "xhigh"
+    # The endpoint follows master's #7983 resolver unchanged: the active
+    # profile owns an external HERMES_CONFIG_PATH, so root uses its own
+    # config.yaml URL when it has one and otherwise keeps the shared
+    # (ambient) URL; on either URL root sends its own .env alias.
+    expected_url = "http://root-file:8650" if root_config_exists else "http://external-root:8650"
+    assert url.startswith(expected_url + "/")
+    assert authorization == "Bearer root-test-key"
+    assert endpoint == (expected_url, "root-test-key")
+    assert endpoint == gateway_chat._gateway_endpoint_for_profile("default")
 
 
 @pytest.mark.parametrize("active", ["work", "default"])
