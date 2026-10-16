@@ -8546,10 +8546,14 @@ def _repair_removed_qualified_custom_provider_model(
     provider: str | None,
     *,
     config_obj: dict | None,
+    profile: str | None = None,
 ) -> str | None:
-    """Move a removed named-custom model to that provider's configured default.
+    """Move a removed named-custom model to that provider's pinned list.
 
-    Only a pinned allowlist (``_custom_provider_allowlist_ids``) can prove a
+    The target is the configured default when it's in the pinned list,
+    otherwise the first pinned model. A session on the configured default
+    (``${VAR}`` expanded with ``profile``'s env) is kept even outside the
+    list, since the picker still offers it. Only a pinned allowlist (``_custom_provider_allowlist_ids``) can prove a
     model was removed: a discovered catalog snapshot or dict-shaped metadata
     may omit models the live probe still serves. Needs the session's own
     profile config; ``None`` is ambiguous (no profile, unreadable profile, or
@@ -8595,6 +8599,14 @@ def _repair_removed_qualified_custom_provider_model(
         # Unresolved env reference: the raw profile YAML isn't the real ID.
         return None
     default_raw = str(entry.get("model") or "").strip()
+    if "${" in default_raw:
+        # Expand with the session profile's env (read-only, fail-closed);
+        # left unresolved, it falls back to the pinned list below.
+        from api.config import _expand_env_vars
+        from api.profiles import profile_env_for_thread_readonly
+
+        with profile_env_for_thread_readonly(profile or "", "custom provider default"):
+            default_raw = _expand_env_vars(default_raw).strip()
 
     def _own_bare(item: str) -> str:
         # Unwrap only this provider's own wrapper; ``@safe:x`` is a real ID.
@@ -8636,6 +8648,7 @@ def _resolve_compatible_session_model_state(
     profile_config: dict | None = None,
     explicit_model_pick: bool = False,
     prefer_cached_catalog: bool = False,
+    profile: str | None = None,
 ) -> tuple[str, str | None, bool]:
     """Return (effective_model, effective_provider, model_was_normalized).
 
@@ -8678,6 +8691,7 @@ def _resolve_compatible_session_model_state(
             model,
             requested_provider,
             config_obj=profile_config,
+            profile=profile,
         )
         if repaired_model:
             return repaired_model, requested_provider, True
@@ -9106,6 +9120,7 @@ def _resolve_effective_session_model_for_display(session) -> str:
         profile_provider=_pp_provider,
         profile_default_model=_pp_default,
         profile_config=_pp_cfg,
+        profile=getattr(session, "profile", None),
         # GET /api/session is a hot, side-effect-free per-tab/per-poll path.
         # It must never pay the cold live provider-catalog rebuild (a
         # botocore IMDS probe that cannot resolve on a non-AWS / WSL / corp
@@ -9130,6 +9145,7 @@ def _resolve_effective_session_model_provider_for_display(session) -> str | None
         profile_provider=_pp_provider,
         profile_default_model=_pp_default,
         profile_config=_pp_cfg,
+        profile=getattr(session, "profile", None),
         # See _resolve_effective_session_model_for_display: same hot
         # side-effect-free GET /api/session path; must not trigger the cold
         # live rebuild. prefer_cached_catalog resolves from warm/disk cache
@@ -26953,6 +26969,7 @@ def start_session_turn(
         profile_provider=_pp_provider,
         profile_default_model=_pp_default,
         profile_config=_pp_cfg,
+        profile=getattr(s, "profile", None),
         prefer_cached_catalog=True,
     )
     _paused_wakeup_response = None
@@ -27387,6 +27404,7 @@ def _handle_goal_command(handler, body):
             profile_provider=_pp_provider,
             profile_default_model=_pp_default,
             profile_config=_pp_cfg,
+            profile=getattr(s, "profile", None),
             explicit_model_pick=explicit_model_pick,
         )
         alias_refusal = _external_model_alias_lane_response(
@@ -27498,6 +27516,7 @@ def _handle_goal_command(handler, body):
                 profile_provider=_pp_provider,
                 profile_default_model=_pp_default,
                 profile_config=_pp_cfg,
+                profile=getattr(s, "profile", None),
                 explicit_model_pick=explicit_model_pick,
             )
             # #6703 parity: same explicit-pick signature stamping on the
@@ -27801,6 +27820,7 @@ def _handle_chat_start(handler, body, diag=None):
             profile_provider=_pp_provider,
             profile_default_model=_pp_default,
             profile_config=_pp_cfg,
+            profile=getattr(s, "profile", None),
             explicit_model_pick=explicit_model_pick,
         )
         from api.runtime_adapter import runtime_adapter_runner_enabled
@@ -28072,6 +28092,7 @@ def _handle_chat_sync(handler, body):
             profile_provider=_pp_provider,
             profile_default_model=_pp_default,
             profile_config=_pp_cfg,
+            profile=getattr(s, "profile", None),
         )[:2]
         s.model = model
         s.model_provider = model_provider
