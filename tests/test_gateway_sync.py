@@ -1450,6 +1450,99 @@ def test_cross_source_parent_child_is_not_collapsed_into_root_metadata(cleanup_t
             pass
 
 
+def test_messaging_reset_successor_stays_toplevel(cleanup_test_sessions):
+    """A Telegram session_reset successor is its own top-level sidebar row.
+
+    The new DM segment keeps parent_session_id for lineage, but it must not be
+    nested as a child_session under the reset parent — that sorts it by the
+    parent's old timestamp, so today's chat disappears from the top. A different
+    Telegram key and a WebUI continuation of the same parent stay nested.
+    """
+    from api.agent_sessions import read_importable_agent_session_rows, read_session_lineage_metadata
+
+    conn = _ensure_state_db()
+    parent_sid = 'tg_reset_parent_001'
+    child_sid = 'tg_reset_child_001'
+    other_sid = 'tg_reset_other_key_001'
+    webui_sid = 'webui_reset_child_001'
+    now = time.time()
+    key = 'agent:main:telegram:dm:264339801'
+    cleanup_test_sessions.extend([parent_sid, child_sid, other_sid, webui_sid])
+    try:
+        _insert_agent_session_row(
+            conn,
+            session_id=parent_sid,
+            source='telegram',
+            title='Earlier DM Segment',
+            started_at=now - 50,
+            ended_at=now - 20,
+            end_reason='session_reset',
+            messages=2,
+        )
+        _insert_agent_session_row(
+            conn,
+            session_id=child_sid,
+            source='telegram',
+            title='Today DM Segment',
+            started_at=now - 10,
+            parent_session_id=parent_sid,
+            messages=2,
+        )
+        _insert_agent_session_row(
+            conn,
+            session_id=other_sid,
+            source='telegram',
+            title='Other Telegram Chat',
+            started_at=now - 9,
+            parent_session_id=parent_sid,
+            messages=2,
+        )
+        _insert_agent_session_row(
+            conn,
+            session_id=webui_sid,
+            source='webui',
+            title='WebUI Continuation',
+            started_at=now - 8,
+            parent_session_id=parent_sid,
+            messages=2,
+        )
+        conn.execute(
+            "UPDATE sessions SET session_key = ?, user_id = ?, chat_id = ? WHERE id IN (?, ?)",
+            (key, '264339801', '264339801', parent_sid, child_sid),
+        )
+        conn.execute(
+            "UPDATE sessions SET session_key = ?, user_id = ?, chat_id = ? WHERE id = ?",
+            ('agent:main:telegram:dm:other', '999', '999', other_sid),
+        )
+        conn.commit()
+
+        rows = read_importable_agent_session_rows(_get_state_db_path(), exclude_sources=None)
+        by_id = {row['id']: row for row in rows}
+
+        child = by_id[child_sid]
+        assert child.get('title') == 'Today DM Segment'
+        assert child.get('source') == 'telegram'
+        assert child.get('relationship_type') != 'child_session'
+        assert by_id[other_sid].get('relationship_type') == 'child_session'
+        # Cross-surface continuation must never be collapsed by this rule.
+        assert by_id[webui_sid].get('relationship_type') == 'child_session'
+        assert by_id[webui_sid].get('title') == 'WebUI Continuation'
+
+        lineage = read_session_lineage_metadata(
+            _get_state_db_path(),
+            [parent_sid, child_sid, other_sid, webui_sid],
+        )
+        assert lineage.get(child_sid, {}).get('relationship_type') != 'child_session'
+        assert lineage.get(other_sid, {}).get('relationship_type') == 'child_session'
+        assert lineage.get(webui_sid, {}).get('relationship_type') == 'child_session'
+    finally:
+        try:
+            _remove_test_sessions(conn, parent_sid, child_sid, other_sid, webui_sid)
+            conn.close()
+        except Exception:
+            pass
+
+
 def test_gateway_watcher_uses_normalized_source_metadata(monkeypatch):
     """SSE snapshots use the same normalized source contract as /api/sessions."""
     conn = _ensure_state_db()
