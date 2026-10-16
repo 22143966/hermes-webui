@@ -1359,22 +1359,36 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
   // session-switch save path already persisted this session's composer).
   if(sid&&typeof _saveComposerDraftNow==='function'){
     const _persist=()=>{
-      try{
-        const stillVisible=(S.session&&S.session.session_id)===sid;
-        if(stillVisible){
-          const inp=$('msg');
-          const liveText=inp?String(inp.value||''):restore;
-          _saveComposerDraftNow(sid, liveText, S.pendingFiles?[...S.pendingFiles]:[]);
-        } else if(!restoredVisible){
-          // Background failure (sid was never the visible session): no live
-          // composer to read, so persist the captured snapshot — it's the only copy.
-          _saveComposerDraftNow(sid, restore, files);
-        }
-        // else: restored the visible composer, then the user switched away — the
+      let persistedText=restore;
+      let persistedFiles=files;
+      const stillVisible=(S.session&&S.session.session_id)===sid;
+      if(stillVisible){
+        const inp=$('msg');
+        const liveText=inp?String(inp.value||''):restore;
+        persistedText=liveText;
+        persistedFiles=S.pendingFiles?[...S.pendingFiles]:files;
+      } else if(!restoredVisible){
+        // Background failure (sid was never the visible session): no live
+        // composer to read, so persist the captured snapshot — it's the only copy.
+        persistedText=restore;
+        persistedFiles=files;
+      } else {
+        // Restored the visible composer, then user switched away — the
         // session-switch save path already saved sid's composer; skip stale write.
-      }catch(_){ }
+        return;
+      }
+      try{
+        const result=_saveComposerDraftNow(sid,persistedText,persistedFiles);
+        if(result&&typeof result.catch==='function'){
+          return result.catch((error)=>_handleComposerDraftPostFailure(error,sid,persistedText,persistedFiles));
+        }
+        return result;
+      }catch(error){
+        _handleComposerDraftPostFailure(error,sid,persistedText,persistedFiles);
+        return;
+      }
     };
-    if(clearPromise&&typeof clearPromise.then==='function') clearPromise.then(_persist,_persist);
+    if(clearPromise&&typeof clearPromise.then==='function') clearPromise.then(_persist,_persist).catch(()=>{});
     else _persist();
   }
 
@@ -1874,6 +1888,13 @@ async function send(){
       if(!_clarifySessionId || _clarifySessionId===activeSid) hideClarifyCard(true, 'terminal');
       removeThinking();
       S.session=null;S.messages=[];
+      // The tray renders from S.todos whenever the todoStateMeta sentinel is
+      // present (_currentTodos in ui.js), so clearing the session alone left the
+      // deleted conversation's tasks on screen over an empty transcript. Drop
+      // the snapshot exactly like the other session-clearing paths do
+      // (clearConversation, deleteSession): hydrate against a null session,
+      // which resets S.todos/S.todoStateMeta and reschedules the tray paint.
+      if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(null);
       setBusy(false);setComposerStatus('');
       if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(activeSid);
       if(typeof renderMessages==='function') renderMessages();

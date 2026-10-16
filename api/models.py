@@ -261,6 +261,191 @@ def _safe_replace(src: Path, dst: Path) -> None:
             delay *= 2  # 50 -> 100 -> 200 -> 400 -> 800 ms
 
 
+# In-process write generation per session sidecar (#8267). A cold
+# get_session() reads the sidecar and then publishes that object into
+# SESSIONS. If another writer replaces the sidecar in between, publishing
+# would hide that write behind the pre-write object, and the next
+# whole-session save of the cached object would undo it on disk. Stat
+# signatures cannot see two same-size saves inside one clock tick, so writers
+# count instead: once before and once after the replace, which makes any read
+# that overlaps a replace observe a change.
+_SIDECAR_WRITE_GENERATIONS: dict[str, int] = {}
+_SIDECAR_WRITE_GENERATIONS_LOCK = threading.Lock()
+_SIDECAR_WRITE_LOCAL = threading.local()
+
+
+def _note_sidecar_write(session_id) -> None:
+    sid = str(session_id or '')
+    if not sid:
+        return
+    with _SIDECAR_WRITE_GENERATIONS_LOCK:
+        _SIDECAR_WRITE_GENERATIONS[sid] = _SIDECAR_WRITE_GENERATIONS.get(sid, 0) + 1
+    own = getattr(_SIDECAR_WRITE_LOCAL, 'counts', None)
+    if own is None:
+        own = _SIDECAR_WRITE_LOCAL.counts = {}
+    own[sid] = own.get(sid, 0) + 1
+
+
+def _sidecar_write_generation(session_id) -> tuple[int, int]:
+    """Return (all writers, this thread's writes) for ``session_id``.
+
+    A loader compares the difference of the two before and after its read, so
+    its own self-heal save inside ``Session.load`` does not count as a
+    concurrent write.
+    """
+    sid = str(session_id or '')
+    with _SIDECAR_WRITE_GENERATIONS_LOCK:
+        total = _SIDECAR_WRITE_GENERATIONS.get(sid, 0)
+    own = (getattr(_SIDECAR_WRITE_LOCAL, 'counts', None) or {}).get(sid, 0)
+    return total, own
+
+
+def _replace_session_sidecar(tmp: Path, path: Path, session_id) -> None:
+    _note_sidecar_write(session_id)
+    try:
+        _safe_replace(tmp, path)
+    finally:
+        _note_sidecar_write(session_id)
+
+
+_DRAFT_LIFECYCLE_LOCK_STRIPES: "tuple[threading.Lock, ...]" = tuple(
+    threading.Lock() for _ in range(64)
+)
+_DRAFT_LIFECYCLE_LOCK_STRIPE_COUNT = len(_DRAFT_LIFECYCLE_LOCK_STRIPES)
+
+
+def _draft_lifecycle_lock_for_session_id(session_id: str) -> threading.Lock:
+    """Return the per-session lock that serializes draft save/delete operations."""
+    sid = _normalize_session_id_for_path(session_id)
+    if not sid:
+        raise ValueError(f"Unsafe session_id {session_id!r}; refusing to lock draft lifecycle")
+    sid_index = int(hashlib.sha256(sid.encode("utf-8")).hexdigest(), 16)
+    lock_index = sid_index % _DRAFT_LIFECYCLE_LOCK_STRIPE_COUNT
+    # Fixed lock striping bounds registry growth. Rare hash collisions only
+    # serialize small draft operations; increase the stripe count if measured
+    # contention warrants it.
+    return _DRAFT_LIFECYCLE_LOCK_STRIPES[lock_index]
+
+
+def _session_draft_path(session_id: str) -> Path:
+    """Return the per-session draft sidecar path.
+
+    This is deliberately separate from the full session sidecar so draft edits do
+    not force multi-MB full-session rewrites.
+    """
+    sid = _normalize_session_id_for_path(session_id)
+    if not sid:
+        raise ValueError(f"Unsafe session_id {session_id!r}; refusing to resolve draft path")
+    return _session_draft_dir() / f'{sid}.json'
+
+
+def _normalize_session_id_for_path(session_id) -> str | None:
+    sid = str(session_id or "").strip()
+    if not sid or not is_safe_session_id(sid):
+        return None
+    return sid
+
+
+def _session_draft_dir() -> Path:
+    return SESSION_DIR / ".drafts"
+
+
+def _load_session_draft(session_id: str) -> dict | None:
+    """Load a dedicated draft payload if it exists, else return None."""
+    if not _normalize_session_id_for_path(session_id):
+        return None
+    try:
+        path = _session_draft_path(session_id)
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        if isinstance(payload, dict):
+            return payload
+        logger.warning("Ignoring non-dict draft payload in %s", path)
+        return None
+    except json.JSONDecodeError as exc:
+        logger.warning("Ignoring malformed draft sidecar %s: %s", path, exc)
+        return None
+    except Exception as exc:
+        logger.debug("Failed to load draft sidecar %s: %s", path, exc)
+        return None
+
+
+def _apply_session_draft_overlay(data: dict, session_id: str) -> dict:
+    """Overlay dedicated draft payload onto an already-parsed session payload."""
+    if not isinstance(data, dict):
+        return data
+    draft = _load_session_draft(session_id)
+    if isinstance(draft, dict):
+        data["composer_draft"] = draft
+    return data
+
+
+def _save_session_draft(session_id: str, draft) -> None:
+    """Persist a draft payload to the dedicated per-session draft sidecar."""
+    if not _normalize_session_id_for_path(session_id):
+        raise ValueError(f"Unsafe session_id {session_id!r}; refusing to persist dedicated draft")
+    sid = _normalize_session_id_for_path(session_id)
+    lock = _draft_lifecycle_lock_for_session_id(sid)
+    with lock:
+        _session_draft_dir().mkdir(parents=True, exist_ok=True)
+        path = _session_draft_path(sid)
+        payload = draft if isinstance(draft, dict) else {}
+        tmp = path.with_name(
+            f'{path.name}.tmp.{os.getpid()}.{threading.current_thread().ident}'
+        )
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
+            if not (SESSION_DIR / f"{sid}.json").exists():
+                return
+            _safe_replace(tmp, path)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _delete_session_draft_by_dir(session_id: str, sessions_dir: Path) -> bool:
+    """Delete the dedicated draft sidecar for session_id under sessions_dir.
+
+    Returns True when deletion succeeds or the file is already absent; False
+    when the path cannot be removed due to unexpected IO/error.
+    """
+    if not _normalize_session_id_for_path(session_id):
+        return True
+    sid = _normalize_session_id_for_path(session_id)
+    lock = _draft_lifecycle_lock_for_session_id(sid)
+    with lock:
+        try:
+            draft_path = sessions_dir / ".drafts" / f"{sid}.json"
+            draft_path.unlink(missing_ok=True)
+        except Exception:
+            logger.debug(
+                "Failed to delete draft sidecar for %s in %s",
+                session_id,
+                sessions_dir,
+                exc_info=True,
+            )
+            return False
+        return True
+
+
+def _delete_session_draft(session_id: str) -> bool:
+    """Delete the dedicated draft sidecar for *session_id*."""
+    return _delete_session_draft_by_dir(session_id, SESSION_DIR)
+
+
 # Serializes index writers so concurrent Session.save() calls cannot race on
 # stale baselines while still allowing LOCK to be released before disk I/O.
 _INDEX_WRITE_LOCK = threading.RLock()
@@ -315,16 +500,17 @@ def _cleanup_stale_tmp_files() -> None:
     prevent startup.
     """
     cutoff = time.time() - _STALE_TMP_AGE_SECONDS
-    try:
-        for p in SESSION_DIR.glob('*.tmp.*'):
-            try:
-                if p.stat().st_mtime < cutoff:
-                    p.unlink(missing_ok=True)
-                    logger.debug("Cleaned up stale tmp file: %s", p.name)
-            except OSError:
-                pass  # best-effort
-    except Exception:
-        pass  # SESSION_DIR may not exist yet; that's fine
+    for base in (SESSION_DIR, _session_draft_dir()):
+        try:
+            for p in base.glob('*.tmp.*'):
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink(missing_ok=True)
+                        logger.debug("Cleaned up stale tmp file: %s", p)
+                except OSError:
+                    pass  # best-effort
+        except Exception:
+            pass  # SESSION_DIR may not exist yet; that's fine
 
 
 _PERSISTED_SESSION_IDS_CACHE: tuple[Path | None, int | None, frozenset[str]] = (None, None, frozenset())
@@ -1263,6 +1449,11 @@ def _load_session_from_path(path: Path) -> "Session | None":
     except Exception:
         return None
     data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
+    session_id = data.get('session_id')
+    if not isinstance(session_id, str) or not session_id:
+        session_id = path.stem
+    if path.parent == SESSION_DIR:
+        data = _apply_session_draft_overlay(data, session_id)
     return Session(**data)
 
 
@@ -1498,6 +1689,7 @@ class Session:
                  compression_anchor_message_key=None,
                  compression_anchor_summary=None,
                  pre_compression_snapshot: bool=False,
+                 pre_compression_continuation_session_id: str=None,
                  context_engine=None,
                  compression_anchor_engine=None,
                  compression_anchor_mode=None,
@@ -1606,6 +1798,11 @@ class Session:
         self.compression_anchor_message_key = compression_anchor_message_key
         self.compression_anchor_summary = compression_anchor_summary
         self.pre_compression_snapshot = bool(pre_compression_snapshot)
+        self.pre_compression_continuation_session_id = (
+            str(pre_compression_continuation_session_id).strip()
+            if pre_compression_continuation_session_id
+            else None
+        )
         self.context_engine = context_engine
         self.compression_anchor_engine = compression_anchor_engine
         self.compression_anchor_mode = compression_anchor_mode
@@ -1766,6 +1963,7 @@ class Session:
             '_webui_pending_user_timestamp_identity',
             'compression_anchor_visible_idx', 'compression_anchor_message_key',
             'compression_anchor_summary', 'pre_compression_snapshot',
+            'pre_compression_continuation_session_id',
             'context_engine', 'compression_anchor_engine', 'compression_anchor_mode',
             'compression_anchor_details', 'context_engine_state',
             'context_length', 'threshold_tokens', 'last_prompt_tokens',
@@ -2000,8 +2198,9 @@ class Session:
                 # Callers that explicitly skip the sidebar projection do not
                 # take _INDEX_WRITE_LOCK; the per-session persistence lock
                 # held by save() still orders them against every other save
-                # of this session (#7881).
-                _safe_replace(tmp, self.path)
+                # of this session (#7881). The replace still bumps the
+                # #8267 sidecar write generation.
+                _replace_session_sidecar(tmp, self.path, self.session_id)
             else:
                 # Publish the sidecar and its sidebar projection as one ordered
                 # operation. _write_session_index() uses this same RLock, so the
@@ -2010,7 +2209,7 @@ class Session:
                 # can publish both files, and then the older save can regress
                 # only the index with its frozen projection.
                 with _INDEX_WRITE_LOCK:
-                    _safe_replace(tmp, self.path)
+                    _replace_session_sidecar(tmp, self.path, self.session_id)
                     # Build the sidebar entry from the same guarded transcript
                     # snapshot as the JSON payload. A shallow copy avoids
                     # rebinding/mutating the live Session while keeping message
@@ -2070,6 +2269,7 @@ class Session:
         _pre_read_sig = _sidecar_stat_signature(p)
         data = json.loads(p.read_text(encoding='utf-8'))
         data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
+        data = _apply_session_draft_overlay(data, sid)
         session = cls(**data)
         if _collapsed_partials:
             try:
@@ -2140,6 +2340,7 @@ class Session:
                 return cls.load(sid)
             parsed['messages'] = []
             parsed['tool_calls'] = []
+            parsed = _apply_session_draft_overlay(parsed, sid)
             session = cls(**parsed)
             sidecar_message_count = _parse_nonnegative_int(parsed.get('message_count'))
             index_message_count = None
@@ -6627,6 +6828,9 @@ _FULL_SESSION_RESOLVE_SLOTS = threading.BoundedSemaphore(
 _FULL_SESSION_RESOLVE_INFLIGHT: dict[str, threading.Event] = {}
 _FULL_SESSION_RESOLVE_INFLIGHT_LOCK = threading.Lock()
 _FULL_SESSION_RESOLVE_LOCAL = threading.local()
+# A cold load re-reads at most this many times when another writer replaces
+# the sidecar mid-read (#8267), then publishes its last read as before.
+_COLD_PUBLISH_ATTEMPTS = 3
 
 
 def _claim_full_session_resolve(session_id: str) -> tuple[bool, threading.Event]:
@@ -6736,14 +6940,43 @@ def _resolve_session_once(
     else:
         if not allow_full_load:
             raise _FullSessionResolveRequired
-        s = Session.load(sid)
-    if s:
-        if cache_on_miss:
+        for attempt in range(_COLD_PUBLISH_ATTEMPTS):
+            before = _sidecar_write_generation(sid)
+            s = Session.load(sid)
+            if not s or not cache_on_miss:
+                break
             with LOCK:
-                SESSIONS[sid] = s
-                if promote_cache:
-                    SESSIONS.move_to_end(sid)
-                _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+                if not (SESSION_DIR / f"{sid}.json").exists():
+                    raise KeyError(sid)
+                resident = SESSIONS.get(sid)
+                now = _sidecar_write_generation(sid)
+                # Writes by this thread (a self-heal save inside load) are
+                # part of what it read; only other writers make it stale.
+                unchanged = (now[0] - before[0]) == (now[1] - before[1])
+                last_attempt = attempt == _COLD_PUBLISH_ATTEMPTS - 1
+                if resident is None and (unchanged or last_attempt):
+                    if not unchanged:
+                        logger.debug(
+                            "session %s kept changing during cold load; publishing the last read", sid,
+                        )
+                    SESSIONS[sid] = s
+                    if promote_cache:
+                        SESSIONS.move_to_end(sid)
+                    _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+                    break
+            if resident is not None:
+                # Another writer published this id while the sidecar was read
+                # (#8267). Serve that object through the cache-hit path instead
+                # of replacing it with an older read: one object per session id.
+                return _resolve_session_once(
+                    sid,
+                    metadata_only=False,
+                    promote_cache=promote_cache,
+                    cache_on_miss=cache_on_miss,
+                    allow_full_load=True,
+                )
+            # Another writer replaced the sidecar during the read: read it again.
+    if s:
         if not metadata_only:
             try:
                 synced_from_state = _sync_sidecar_from_state_db_if_newer(s)
@@ -7649,7 +7882,7 @@ def persist_recovered_workspace_binding(
                     json.dump(payload, handle, ensure_ascii=False, indent=2)
                     handle.flush()
                     os.fsync(handle.fileno())
-                _safe_replace(tmp, path)
+                _replace_session_sidecar(tmp, path, sid)
             except Exception as exc:
                 try:
                     tmp.unlink(missing_ok=True)
@@ -15745,6 +15978,13 @@ def _delete_cli_session_locked(sid, hermes_home) -> bool:
                             suffix,
                             exc_info=True,
                         )
+                if not _delete_session_draft_by_dir(removed_id, sessions_dir):
+                    ok = False
+                    logger.warning(
+                        "Failed to remove draft sidecar %s",
+                        removed_id,
+                        exc_info=True,
+                    )
                 try:
                     for path in list(
                         sessions_dir.glob(f"request_dump_{removed_id}_*.json")
@@ -15927,6 +16167,8 @@ def _clean_pending_artifact(sessions_dir, removed_id):
             artifact.unlink(missing_ok=True)
         except OSError:
             ok = False
+    if not _delete_session_draft_by_dir(removed_id, sessions_dir):
+        ok = False
     try:
         for path in list(sessions_dir.glob(f"request_dump_{removed_id}_*.json")):
             try:
