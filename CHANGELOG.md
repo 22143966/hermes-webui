@@ -73,6 +73,10 @@
 
 ### Fixed
 
+- **Composer stays above the keyboard on Android Chrome and Edge.** The page now asks Chromium browsers on Android to
+  resize the layout when the on-screen keyboard opens, the same setting Gemini, Open WebUI and LibreChat use. iPhone,
+  iPad and desktop are unchanged. Thanks @qxxaa. (#6475)
+
 - **A delegated task's result is retried again after a stuck delivery.** With a current Agent, a finished delegated
   task whose delivery was claimed by a process that then died stayed pending until WebUI restarted: WebUI scheduled the
   retry but never handed the completion back to the Agent, which now offers each restored result only once per process.
