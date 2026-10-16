@@ -69,6 +69,25 @@ def gateway_run_endpoint(run_id: str) -> tuple[str, str]:
     return _gateway_base_url(get_config()), _gateway_api_key()
 
 
+def gateway_stream_steer_target(stream_id: str) -> tuple[str, str, str] | None:
+    """(run_id, base_url, api_key) of stream_id's live run, read together under one lock.
+
+    None when the stream has no published run or its owning endpoint is gone:
+    a steer must never fall back to another Gateway than the one running it.
+    """
+    stream_id = str(stream_id or "").strip()
+    with _STREAM_RUN_STARTING_CONDITION:
+        run_id = str(_STREAM_RUN_IDS.get(stream_id) or "").strip()
+        if not run_id:
+            state = _STREAM_RUN_LIFECYCLE.get(stream_id) or {}
+            if str(state.get("phase") or "").strip().lower() == "ready":
+                run_id = str(state.get("run_id") or "").strip()
+        endpoint = _STREAM_ENDPOINTS.get(stream_id)
+        if not run_id or not endpoint:
+            return None
+        return run_id, endpoint[0], endpoint[1]
+
+
 def _mark_gateway_run_starting(stream_id: str) -> None:
     with _STREAM_RUN_STARTING_CONDITION:
         _STREAM_RUN_IDS.pop(stream_id, None)
@@ -1495,20 +1514,19 @@ GATEWAY_STEER_TIMEOUT_SECS = 10
 _GATEWAY_NOT_CONNECTED_ERRORS = (ConnectionRefusedError, socket.gaierror)
 
 
-def steer_gateway_run(run_id: str, text: str) -> str:
+def steer_gateway_run(run_id: str, text: str, base_url: str, api_key: str) -> str:
     """Forward steer text to the Gateway run.
 
     ``accepted``: 2xx with ``accepted: true``. ``refused``: the Gateway answered
-    otherwise, or no connection was ever made (refused, DNS, unreachable), so a
+    with a 2xx without acceptance or a 3xx/4xx, or no connection was ever made (refused, DNS, unreachable), so a
     re-queue cannot double-deliver. ``uncertain``: anything else — urllib wraps
     send-phase errors (reset/timeout while writing) in the same URLError, and the
     Gateway may already hold the text.
     """
     run_id = str(run_id or "").strip()
     text = str(text or "").strip()
-    if not run_id or not text:
+    if not run_id or not text or not base_url:
         return GATEWAY_STEER_REFUSED
-    base_url, api_key = gateway_run_endpoint(run_id)
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -1533,7 +1551,13 @@ def steer_gateway_run(run_id: str, text: str) -> str:
             payload = json.loads(response.read() or b"{}")
             accepted = isinstance(payload, dict) and payload.get("accepted") is True
             return GATEWAY_STEER_ACCEPTED if accepted else GATEWAY_STEER_REFUSED
-    except urllib.error.HTTPError:  # the Gateway answered with a non-2xx status
+    except urllib.error.HTTPError as exc:
+        # A 5xx (502/504 from a proxy, a crashed handler) does not say the steer
+        # was rejected: the Gateway may have taken it before the reply was lost.
+        # Only an explicit 3xx/4xx answer proves it was not accepted.
+        if int(getattr(exc, "code", 0) or 0) >= 500:
+            logger.debug("Gateway steer outcome unknown for run %s", run_id, exc_info=True)
+            return GATEWAY_STEER_UNCERTAIN
         logger.debug("Gateway steer refused for run %s", run_id, exc_info=True)
         return GATEWAY_STEER_REFUSED
     except urllib.error.URLError as exc:

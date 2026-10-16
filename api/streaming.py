@@ -16736,11 +16736,17 @@ def _deliver_gateway_steer(sid: str, result: dict, text: str) -> dict:
     stream_id = result.get("stream_id")
     try:
         from api.gateway_chat import (
-            GATEWAY_STEER_ACCEPTED, GATEWAY_STEER_UNCERTAIN, steer_gateway_run, wait_for_gateway_run_id,
+            GATEWAY_STEER_ACCEPTED, GATEWAY_STEER_UNCERTAIN, gateway_stream_steer_target, steer_gateway_run,
         )
 
-        _, run_id = wait_for_gateway_run_id(str(stream_id or ""), 0)
-        outcome = steer_gateway_run(run_id, text) if run_id else None
+        # Run id and its owning endpoint are captured together: reading them
+        # separately let a finishing worker drop the endpoint in between and the
+        # steer fall back to the process Gateway, which does not own the run.
+        target = gateway_stream_steer_target(str(stream_id or ""))
+        outcome = None
+        if target:
+            run_id, base_url, api_key = target
+            outcome = steer_gateway_run(run_id, text, base_url, api_key)
         if outcome == GATEWAY_STEER_ACCEPTED:
             return {"accepted": True, "fallback": None, "stream_id": stream_id}
         if outcome == GATEWAY_STEER_UNCERTAIN:

@@ -44,7 +44,7 @@ def gateway(monkeypatch):
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     base = f"http://127.0.0.1:{srv.server_port}"
-    monkeypatch.setattr(gateway_chat, "gateway_run_endpoint", lambda run_id: (base, "k3y"))
+    gateway_chat._STREAM_ENDPOINTS["run"] = (base, "k3y")
     monkeypatch.setattr(config, "SESSION_AGENT_CACHE", {})
     monkeypatch.setattr(config, "STREAMS", {"run": queue.Queue()})
     monkeypatch.setattr(config, "AGENT_INSTANCES", {})
@@ -57,6 +57,7 @@ def gateway(monkeypatch):
     yield _GatewayStub
     gateway_chat._STREAM_RUN_IDS.pop("run", None)
     gateway_chat._STREAM_RUN_LIFECYCLE.pop("run", None)
+    gateway_chat._STREAM_ENDPOINTS.pop("run", None)
     srv.shutdown()
 
 
@@ -80,6 +81,30 @@ def test_gateway_refusal_keeps_the_queue_fallback(gateway, status, body):
     gateway.status, gateway.body = status, body
     assert steer() == {"accepted": False, "fallback": "gateway_steer_queued", "stream_id": "run"}
     assert len(gateway.calls) == 1
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_gateway_server_error_is_uncertain_not_queued(gateway, status):
+    """Greptile 4237625017: a proxy 502/504 may follow an accepted steer; re-queueing could deliver it twice."""
+    gateway.status, gateway.body = status, {"error": "bad gateway"}
+    assert steer() == {"accepted": False, "fallback": "gateway_steer_uncertain", "stream_id": "run"}
+    assert len(gateway.calls) == 1
+
+
+def test_steer_is_not_sent_to_process_gateway_when_owner_endpoint_is_gone(gateway, monkeypatch):
+    """Greptile 4237625023: worker cleanup removed the reattached run's endpoint; the
+    steer must not fall back to the process Gateway (which does not own the run)."""
+    base, _ = gateway_chat._STREAM_ENDPOINTS.pop("run")
+    # The process Gateway is reachable (the stub), so any fallback would record a call.
+    monkeypatch.setattr(gateway_chat, "_gateway_base_url", lambda cfg: base)
+    assert steer() == {"accepted": False, "fallback": "gateway_steer_queued", "stream_id": "run"}
+    assert gateway.calls == []
+
+
+def test_steer_target_reads_run_id_and_endpoint_atomically(gateway):
+    assert gateway_chat.gateway_stream_steer_target("run")[0] == "run_1"
+    gateway_chat._STREAM_ENDPOINTS.pop("run", None)
+    assert gateway_chat.gateway_stream_steer_target("run") is None
 
 
 def test_unknown_run_id_is_not_forwarded(gateway):
@@ -112,7 +137,7 @@ def test_connect_failure_before_sending_keeps_the_queue_fallback(gateway, monkey
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()  # nothing listens: refused before any byte is sent
-    monkeypatch.setattr(gateway_chat, "gateway_run_endpoint", lambda run_id: (f"http://127.0.0.1:{port}", ""))
+    monkeypatch.setitem(gateway_chat._STREAM_ENDPOINTS, "run", (f"http://127.0.0.1:{port}", ""))
     assert steer() == {"accepted": False, "fallback": "gateway_steer_queued", "stream_id": "run"}
 
 
@@ -138,7 +163,7 @@ def test_send_phase_failure_wrapped_in_urlerror_is_uncertain(gateway, monkeypatc
 
 
 def test_dns_failure_keeps_the_queue_fallback(gateway, monkeypatch):
-    monkeypatch.setattr(gateway_chat, "gateway_run_endpoint", lambda run_id: ("http://no-such-host.invalid", ""))
+    monkeypatch.setitem(gateway_chat._STREAM_ENDPOINTS, "run", ("http://no-such-host.invalid", ""))
     assert steer() == {"accepted": False, "fallback": "gateway_steer_queued", "stream_id": "run"}
 
 

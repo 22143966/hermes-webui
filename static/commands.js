@@ -1748,31 +1748,69 @@ function _steerLines(text){
 }
 
 // The Agent joins its unconsumed steers with "\n", so a leftover is a sequence
-// of whole submitted bodies (each at most once; accepted ones may already have
-// been consumed) plus text this tab never sent. Explain the leftover with the
-// fewest unexplained lines over every such split: text was delivered only if
-// every best split uses it. Any equally good split without it (an interior or
-// prefix of an accepted body, two accepted steers spelling it) keeps recovery.
-const _STEER_MATCH_MAX_BODIES = 12;
+// of whole submitted bodies (each at most once) plus text this tab never sent.
+// Text was delivered only if explaining the leftover with it leaves strictly
+// fewer unexplained lines than every explanation without it. Every other
+// submission takes part (no recency cut-off): an omitted body could be the
+// real explanation. Iterative forward DP over reachable (line, used-bodies)
+// states, so line count never touches the call stack. Past the body/state
+// budget nothing is proven: recovery is kept.
+const _STEER_MATCH_MAX_RELEVANT_BODIES = 24;
+const _STEER_MATCH_MAX_STATES = 200000;
+function _steerFewestUnexplained(lines, bodies){
+  const n=lines.length;
+  const starts=bodies.map(b=>{
+    const at=new Set();
+    for(let pos=0;pos+b.length<=n;pos++){
+      let ok=true;
+      for(let k=0;k<b.length;k++)if(lines[pos+k]!==b[k]){ok=false;break;}
+      if(ok)at.add(pos);
+    }
+    return at;
+  });
+  // dp[pos]: Map(mask -> fewest unexplained lines before pos).
+  const dp=new Array(n+1);
+  dp[0]=new Map([[0,0]]);
+  let states=0;
+  for(let pos=0;pos<n;pos++){
+    const cur=dp[pos];
+    if(!cur)continue;
+    dp[pos]=null;
+    for(const [mask,cost] of cur){
+      if(++states>_STEER_MATCH_MAX_STATES)return null;
+      const put=(p,m,c)=>{const d=dp[p]||(dp[p]=new Map());if(!(d.get(m)<=c))d.set(m,c);};
+      put(pos+1,mask,cost+1);
+      for(let i=0;i<bodies.length;i++){
+        if(mask&(1<<i)||!starts[i].has(pos))continue;
+        put(pos+bodies[i].length,mask|(1<<i),cost);
+      }
+    }
+  }
+  return dp[n]||new Map();
+}
 function _steerLeftoverContains(leftover, text, others){
   const lines=_steerLines(leftover);
   const want=_steerLines(text);
-  const bodies=[want].concat((Array.isArray(others)?others:[]).slice(-_STEER_MATCH_MAX_BODIES).map(_steerLines));
-  const memo=new Map();
-  const best=(pos,used,withWant)=>{
-    if(pos>=lines.length)return 0;
-    const key=withWant+'|'+pos+'|'+used;
-    if(memo.has(key))return memo.get(key);
-    let m=1+best(pos+1,used,withWant);
-    for(let i=withWant?0:1;i<bodies.length;i++){
-      const b=bodies[i];
-      if(used&(1<<i)||pos+b.length>lines.length)continue;
-      if(b.every((w,j)=>lines[pos+j]===w))m=Math.min(m,best(pos+b.length,used|(1<<i),withWant));
+  const has=b=>{
+    for(let pos=0;pos+b.length<=lines.length;pos++){
+      let ok=true;
+      for(let k=0;k<b.length;k++)if(lines[pos+k]!==b[k]){ok=false;break;}
+      if(ok)return true;
     }
-    memo.set(key,m);
-    return m;
+    return false;
   };
-  return best(0,0,1)<best(0,0,0);
+  if(!has(want))return false;
+  // A body absent from the leftover cannot explain any of it.
+  const relevant=(Array.isArray(others)?others:[]).map(_steerLines).filter(has);
+  if(relevant.length+1>_STEER_MATCH_MAX_RELEVANT_BODIES)return false;
+  const withWant=_steerFewestUnexplained(lines,[want].concat(relevant));
+  if(!withWant)return false;
+  let bestWith=Infinity,bestWithout=Infinity;
+  for(const [mask,cost] of withWant){
+    if(mask&1)bestWith=Math.min(bestWith,cost);
+    else bestWithout=Math.min(bestWithout,cost);
+  }
+  return bestWith<bestWithout;
 }
 
 function _steerDraftRevision(sid){
@@ -1931,15 +1969,19 @@ async function _trySteer(msg, explicitSteer){
   if(!_steerUncertainBySid.has(ownerSid))_steerUncertainBySid.set(ownerSid,new Set());
   _steerUncertainBySid.get(ownerSid).add(inflight);
   try{
+    // Steering is not idempotent: never resend it automatically.
     result=await api('/api/chat/steer',{
       method:'POST',
+      retries:0,
       body:JSON.stringify({session_id:ownerSid,text:steerText}),
     });
   }catch(e){
-    // Network or server error — keep the active stream running and restore the draft.
-    result={accepted:false, fallback:'network_error'};
+    // Keep the active stream running and restore the draft. With no HTTP reply
+    // (connection dropped, timeout) the server may already have delivered the
+    // steer: keep it as an uncertain record so a later leftover can settle it.
+    result={accepted:false, fallback:'network_error', uncertain:!(e&&e.status)};
   }
-  const uncertain=!!(result&&result.fallback==='gateway_steer_uncertain');
+  const uncertain=!!(result&&(result.fallback==='gateway_steer_uncertain'||result.uncertain===true));
   if(!uncertain)_steerUncertainDrop(ownerSid,inflight);
   if(uncertain&&inflight.delivered){
     // The Gateway already handed this text back as a queued leftover: it was
@@ -1961,7 +2003,9 @@ async function _trySteer(msg, explicitSteer){
     // draft (it may not be the live session anymore if the user switched during
     // the upload/API await, which is fine: we're clearing the OWNER's draft).
     _steerUploadCache=null; // delivered — invalidate the retry cache
-    if(ownerSid){
+    // A reply that arrives after the run ended (done/cancel/apperror) belongs
+    // to that run: never let it explain a later run's leftover.
+    if(ownerSid&&!inflight.ended){
       const acc=_steerAcceptedBySid.get(ownerSid)||[];
       acc.push(steerText);
       _steerAcceptedBySid.set(ownerSid,acc);

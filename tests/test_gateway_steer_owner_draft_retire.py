@@ -397,3 +397,73 @@ await sleep(450);
 assert.equal(drafts.A&&drafts.A.text,'guidance','newer identical draft save still lands');
 finalChecks();
 """)
+
+
+def test_thirteen_accepted_bodies_do_not_falsely_prove_uncertain_prefix():
+    # Review 5479049117 item 1 / Greptile 4237663955: an older accepted multiline
+    # body must still explain the leftover after twelve newer submissions.
+    _run(r"""
+steerReplies.push({accepted:true,fallback:null,stream_id:'runA'});
+assert.equal(await _trySteer('accepted intro\nguidance\naccepted outro',false),true);
+for(let i=0;i<12;i++){steerReplies.push({accepted:true,fallback:null,stream_id:'runA'});assert.equal(await _trySteer('other-'+i,false),true);}
+inp.value='';const p=_trySteer('accepted intro',false);releaseSteer();assert.equal(await p,false);
+assert.equal(inp.value,'accepted intro');
+emitLeftover('accepted intro\nguidance\naccepted outro');await tick();await tick();await tick();
+assert.equal(inp.value,'accepted intro','unproven uncertain steer keeps its recovery draft');
+assert.equal(_steerUncertainBySid.get('A').size,1);
+// Positive control: the uncertain body joined after the accepted aggregate is proven.
+emitLeftover('accepted intro\nguidance\naccepted outro\naccepted intro');await tick();await tick();await tick();
+assert.equal(inp.value,'','joined uncertain steer retired');assert.equal(_steerUncertainBySid.size,0);
+""")
+
+
+def test_newline_rich_leftover_reconciles_through_the_listener():
+    # Review 5479049117 item 2 / Greptile 4237663958: 6000 lines then the steer;
+    # the matcher must not overflow the stack inside the leftover listener.
+    _run(r"""
+const p=submitSteer();releaseSteer();assert.equal(await p,false);
+assert.equal(inp.value,'guidance');
+const big=Array(6000).fill('x').join('\n')+'\nguidance';
+emitLeftover(big);await tick();await tick();await tick();
+assert.equal(queues.A.length,1,'leftover queued once');assert.equal(queues.A[0],big);
+assert.equal(inp.value,'','recovery retired');assert.equal(_steerUncertainBySid.size,0,'record settled');
+""")
+
+
+def test_steer_post_is_never_retried_and_lost_reply_is_uncertain():
+    # Greptile 4237625013: api() retries network errors by default; a steer must
+    # be sent once, and a reply lost in transit keeps an uncertain record.
+    _run(r"""
+const realApi=api;let steerCalls=0,steerOpts=null;
+api=async(path,opts)=>{
+  if(path==='/api/chat/steer'){steerCalls++;steerOpts=opts;throw new TypeError('Failed to fetch');}
+  return realApi(path,opts);
+};
+inp.value='';assert.equal(await _trySteer('guidance',false),false);
+assert.equal(steerCalls,1);assert.equal(steerOpts.retries,0);
+assert.equal(inp.value,'guidance');assert.equal(_steerUncertainBySid.get('A').size,1,'uncertain record kept');
+emitLeftover('guidance');await tick();await tick();await tick();
+assert.equal(inp.value,'','delivered steer retired');assert.equal(_steerUncertainBySid.size,0);
+""")
+
+
+def test_accepted_reply_after_run_end_does_not_claim_next_runs_leftover():
+    # Greptile 4237625020: an accepted reply arriving after done/cancel belongs to
+    # the ended run and must not explain the next run's leftover.
+    _run(r"""
+let releaseLate;const lateGate=new Promise(r=>releaseLate=r);
+const realApi=api;let n=0;
+api=async(path,opts)=>{
+  if(path==='/api/chat/steer'&&n++===0){await lateGate;return {accepted:true,fallback:null,stream_id:'runA'};}
+  return realApi(path,opts);
+};
+const late=_trySteer('guidance',false);await tick();
+_steerSettleTerminal('A');            // run A ends before the reply arrives
+releaseLate();assert.equal(await late,true);
+assert.equal(_steerAcceptedBySid.has('A'),false,'late accept not recorded for the next run');
+// Next run: an uncertain 'guidance' steer, then a leftover of just 'guidance'.
+inp.value='';const p=_trySteer('guidance',false);releaseSteer();assert.equal(await p,false);
+emitLeftover('guidance');await tick();await tick();await tick();
+assert.equal(inp.value,'','the new uncertain steer is proven, not the old accepted one');
+assert.equal(_steerUncertainBySid.size,0);
+""")
