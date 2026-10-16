@@ -356,6 +356,17 @@ class TestComposedGreptilePinchReversal20261015:
     def test_a_reversed_pinch_moves_the_image_immediately_mobile(self, composed):
         _check(composed.mobile, "gate1015_pinch_reversal_responds_immediately")
 
+    def test_a_spread_sequence_is_path_independent(self, composed):
+        """Greptile P1 on 5e206e06 (2026-10-15T23:28:11Z, static/ui.js:3222):
+        asked for several spread updates, because a constant-spread reversal
+        cannot see drift. The same two fingers must always produce the same
+        frame — true for the positional rebase shipped here, false for the
+        whole-baseline re-anchor the finding proposed."""
+        _check(composed.desktop, "gate1015_pinch_spread_is_path_independent")
+
+    def test_a_spread_sequence_is_path_independent_mobile(self, composed):
+        _check(composed.mobile, "gate1015_pinch_spread_is_path_independent")
+
 
 # Trusted-input regressions for the 2026-10-06 maintainer gate certificate.
 # These use Playwright's own input pipeline (real mouse/keyboard events), which

@@ -3211,15 +3211,19 @@ function _mountImgLightboxZoom(viewport, canvas, img, lb) {
       state.x = cx - (state.pinchStartCX - state.pinchStartX) * ratio;
       state.y = cy - (state.pinchStartCY - state.pinchStartY) * ratio;
       _imgApplyTransform();
-      // The clamp may have pulled the image back inside the stage. Move the
-      // pinch's positional baseline to the CLAMPED position, exactly as the pan
-      // path does for a reversed drag: leaving the clamped-away overshoot inside
-      // the baseline made a gesture reversed after overshooting an edge do
-      // nothing until the whole overshoot was retraced (greptile P2,
-      // 2026-10-15T23:15:55Z, static/ui.js:3213). Identity when the clamp did
-      // not bite.
-      state.pinchStartX = state.x - (cx - state.pinchStartCX) * ratio;
-      state.pinchStartY = state.y - (cy - state.pinchStartCY) * ratio;
+      // Re-anchor the WHOLE pinch baseline onto the frame just produced (the
+      // state.pinchC*/pinchDist set above), exactly as a fresh two-finger start
+      // does. Two reasons: leaving the clamped-away overshoot inside the
+      // baseline made a gesture reversed after overshooting an edge wait until
+      // the overshoot was retraced (greptile P2, 2026-10-15T23:15:55Z,
+      // static/ui.js:3213), and moving only the positional half (x/y) left the
+      // pair (pinchStartCX, pinchStartX) inconsistent with the scale baseline,
+      // so a later spread dragged the image ~700px away from the fingers
+      // (greptile P1, 2026-10-15T23:28:11Z, static/ui.js:3222; measured in
+      // gate1015_pinch_spread_is_path_independent). The anchored-zoom form is
+      // x = cx - (pinchStartCX - pinchStartX) * ratio, so the pair has to be
+      // re-anchored together on the current midpoint.
+      _imgRebasePinch();
     }
     if(e.preventDefault) e.preventDefault();
   }

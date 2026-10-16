@@ -1415,6 +1415,60 @@
     touch(box.vp, "touchend", []);
   }
 
+  // Greptile P1 on head 5e206e06 (2026-10-15T23:28:11Z, static/ui.js:3222,
+  // "Pinch zoom moves the image"): asked for a check with SEVERAL spread
+  // updates, because the constant-spread reversal check cannot see drift. This
+  // drives a spread/grow/spread-back sequence with a moving midpoint and
+  // asserts the invariant a user can see: the SAME two fingers always produce
+  // the SAME frame. The positional rebase above is the identity whenever the
+  // clamp did not bite, so this holds; re-anchoring the whole pinch baseline
+  // instead (pinchStartScale/pinchStartDist) breaks exactly this, which is why
+  // the reversal fix moves only the positional half.
+  async function pinchSpreadIsPathIndependent() {
+    var box = await openBox(IMG_W, IMG_H);
+    var size = vpSize(box.vp);
+    var rect = box.vp.getBoundingClientRect();
+    var cx = rect.left + size.w / 2;
+    var cy = rect.top + size.h / 2;
+    // Zoom in until the x axis overflows by 1600px, so the whole sequence stays
+    // far inside the clamp range: a fitting axis is force-centred by
+    // _imgClampPan, and a clamped frame legitimately re-anchors, so either would
+    // hide a genuine drift instead of exposing it.
+    var guard = 0;
+    while (box.z.boxW * box.z.scale < size.w + 1600 && guard++ < 60) key("+");
+    var d = 80;
+    function fingers(off, spread) {
+      return [
+        { x: cx + off - spread, y: cy, id: 1 },
+        { x: cx + off + spread, y: cy, id: 2 },
+      ];
+    }
+    touch(box.vp, "touchstart", fingers(0, d));
+    // A: spread 20% with the midpoint 10px right.
+    touch(box.vp, "touchmove", fingers(10, d * 1.2));
+    var scaleA = box.z.scale;
+    var xA = box.z.x;
+    // B: spread further and shift the midpoint again, so the ratio changes
+    // after a re-anchor would have happened.
+    touch(box.vp, "touchmove", fingers(30, d * 1.4));
+    assert_(box.z.scale > scaleA * 1.05, "fixture: the second spread must zoom further");
+    assert_(box.z.x !== xA, "fixture: the midpoint shift must move the image");
+    var scaleB = box.z.scale;
+    var xB = box.z.x;
+    // Back to EXACTLY A's fingers.
+    touch(box.vp, "touchmove", fingers(10, d * 1.2));
+    var xC = box.z.x;
+    var minX = size.w - box.z.boxW * box.z.scale;
+    var diag = " [xA=" + xA + " xB=" + xB + " xC=" + xC + " scaleA=" + scaleA +
+      " scaleB=" + scaleB + " scaleC=" + box.z.scale + " minX=" + minX +
+      " vw=" + size.w + " psX=" + box.z.pinchStartX + " psCX=" + box.z.pinchStartCX +
+      " psScale=" + box.z.pinchStartScale + " psDist=" + box.z.pinchStartDist + "]";
+    assert_(xC > minX + 5 && xC < -5, "fixture: the sequence must stay off the clamp edges" + diag);
+    approx(box.z.scale, scaleA, 1e-9, "the same fingers must restore the same scale" + diag);
+    approx(box.z.x, xA, 1.5, "the same fingers must restore the same position" + diag);
+    touch(box.vp, "touchend", []);
+  }
+
   async function runGate1015Touch(bucket) {
     await run("gate1015_fit_survives_a_gesture_started_without_geometry", bucket, fitSurvivesAGestureStartedWithoutGeometry);
     await run("gate1015_fit_resets_an_active_pinch", bucket, fitResetsAnActivePinch);
@@ -1422,6 +1476,7 @@
     await run("gate1015_keyboard_zoom_mid_pinch_is_not_undone", bucket, keyboardZoomMidPinchIsNotUndone);
     await run("gate1015_wheel_zoom_mid_pinch_is_not_undone", bucket, wheelZoomMidPinchIsNotUndone);
     await run("gate1015_pinch_reversal_responds_immediately", bucket, pinchReversalRespondsImmediately);
+    await run("gate1015_pinch_spread_is_path_independent", bucket, pinchSpreadIsPathIndependent);
     await run("gate1015_same_source_navigation_recentres", bucket, sameSourceNavigationRecentres);
   }
 
