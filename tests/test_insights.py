@@ -2593,8 +2593,19 @@ def test_insights_unavailable_custom_range_discloses_the_fall_back():
 def test_insights_date_inputs_are_capped_at_today():
     """UX r1 item 2 (client defense): the custom-range controls cannot offer a
     date after today, so the platform picker stops suggesting windows the
-    server rejects (the server-side check stays authoritative)."""
-    assert "if (startEl && endEl) startEl.max = endEl.max = _toDateLocal(new Date());" in PANELS_JS
+    server rejects (the server-side check stays authoritative).
+
+    Maintainer re-gate 2026-10-16T01:48:06Z: the cap must be written only when
+    it CHANGES. An unconditional ``max`` write resets the segment editor of a
+    focused Chromium date input (even to the same string), so typing a date
+    through the segments left both fields empty and the request lost its range.
+    """
+    cap = _function_body(PANELS_JS, "_insightsSyncDateLimits")
+    assert "const today = _toDateLocal(new Date());" in cap
+    assert "if (startEl.max !== today) startEl.max = today;" in cap
+    assert "if (endEl.max !== today) endEl.max = today;" in cap
+    assert "startEl.max = endEl.max = _toDateLocal" not in PANELS_JS, \
+        "an unconditional max write resets the focused date input's segment editor"
 
 
 def test_insights_date_cap_refreshes_on_focus_and_on_every_refresh():
@@ -2612,7 +2623,7 @@ def test_insights_date_cap_refreshes_on_focus_and_on_every_refresh():
     import textwrap
 
     helper = _function_body(PANELS_JS, "_insightsSyncDateLimits")
-    assert "startEl.max = endEl.max = _toDateLocal(new Date())" in helper, \
+    assert "if (startEl.max !== today) startEl.max = today;" in helper, \
         "the cap must live in the shared helper"
     assert "_insightsSyncDateLimits()" in _function_body(PANELS_JS, "insightsPeriodChange"), \
         "entering Custom must still cap the controls"
@@ -2652,6 +2663,77 @@ def test_insights_date_cap_refreshes_on_focus_and_on_every_refresh():
     """) % {"helper": helper}
     proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=10, check=False)
     assert proc.returncode == 0, "node cap probe failed: " + proc.stdout + proc.stderr
+    assert json.loads(proc.stdout.strip().splitlines()[-1])["ok"] is True
+
+
+def test_insights_date_cap_rewrites_max_only_when_the_day_changes():
+    """Maintainer re-gate 2026-10-16T01:48:06Z (static/panels.js:4602,
+    regression from 6c35e32d6): the helper assigned ``max`` on EVERY call, and
+    ``loadInsights()`` calls it while the pickers' ``onchange`` runs
+    ``loadInsights()`` on each segment edit - so typing a date reset the focused
+    Chromium segment editor and both fields came back empty
+    ("09012026"/"09302026" -> ``?start=0002-09-01`` -> no range at all).
+
+    Count the writes through the real helper: a second same-day call must write
+    NOTHING, while a real day rollover must still write exactly once.
+    """
+    import shutil, subprocess, textwrap
+
+    helper = _function_body(PANELS_JS, "_insightsSyncDateLimits")
+    assert "startEl.max = endEl.max = _toDateLocal" not in helper, \
+        "the unconditional write is what reset the focused segment editor"
+    node = shutil.which("node")
+    if not node:  # pragma: no cover
+        pytest.skip("node not available")
+    harness = textwrap.dedent(r"""
+        %(helper)s
+        function _toDateLocal(d){const pad=n=>String(n).padStart(2,'0');return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;}
+        // A counting `max` property: assigning it is observable, exactly like
+        // Chromium re-setting the <input type="date"> on a real write.
+        function probe(){
+          const writes = [];
+          const obj = {};
+          Object.defineProperty(obj, 'max', {
+            get(){ return obj._max === undefined ? '' : obj._max; },
+            set(v){ writes.push(v); obj._max = v; },
+          });
+          return {obj: obj, writes: writes};
+        }
+        const start = probe();
+        const end = probe();
+        global.$ = (id)=>{
+          if(id==='insightsStart') return start.obj;
+          if(id==='insightsEnd') return end.obj;
+          return null;
+        };
+        const RealDate = Date;
+        let now = new RealDate('2026-10-16T09:00:00');
+        global.Date = class extends RealDate {
+          constructor(...args){ if(args.length===0){ super(now.getTime()); } else { super(...args); } }
+        };
+        _insightsSyncDateLimits();
+        if(start.writes.length!==1 || end.writes.length!==1)
+          throw new Error('the first call must write max exactly once, got '+start.writes.length+'/'+end.writes.length);
+        if(start.obj.max!=='2026-10-16' || end.obj.max!=='2026-10-16')
+          throw new Error('the first call must cap at today, got '+start.obj.max+'/'+end.obj.max);
+        // A segment edit re-runs loadInsights() -> loadInsights() calls the helper.
+        _insightsSyncDateLimits();
+        _insightsSyncDateLimits();
+        if(start.writes.length!==1 || end.writes.length!==1)
+          throw new Error('a same-day re-cap must not rewrite max (it resets the focused segment editor), got '+start.writes.length+'/'+end.writes.length);
+        // Midnight passes while the panel stays open.
+        now = new RealDate('2026-10-17T00:30:00');
+        _insightsSyncDateLimits();
+        if(start.obj.max!=='2026-10-17' || end.obj.max!=='2026-10-17')
+          throw new Error('a new day must still re-cap, got '+start.obj.max+'/'+end.obj.max);
+        if(start.writes.length!==2 || end.writes.length!==2)
+          throw new Error('the rollover must write max exactly once more, got '+start.writes.length+'/'+end.writes.length);
+        console.log(JSON.stringify({ok:true}));
+    """) % {"helper": helper}
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=10,
+                          check=False, encoding="utf-8")
+    assert proc.returncode == 0, "node cap-write probe failed: " + \
+        (proc.stdout or "") + (proc.stderr or "")
     assert json.loads(proc.stdout.strip().splitlines()[-1])["ok"] is True
 
 

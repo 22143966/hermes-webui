@@ -4599,10 +4599,21 @@ async function loadInsights(animate) {
 // midnight with yesterday as the cap, so today was unselectable until the user
 // detoured through a preset (greptile P2, 2026-10-15T22:36:54Z,
 // static/panels.js:4604).
+//
+// Write `max` ONLY when the value actually changes.  Assigning it
+// unconditionally re-set the `<input type="date">` control on every segment
+// edit (the inputs run loadInsights() from onchange, which calls this helper),
+// and Chromium drops the in-progress segment editor when `max` is written -
+// even to the same string - so typing "09012026" into the month/day/year
+// segments ended with both fields empty and the request losing its range
+// (maintainer re-gate, 2026-10-16T01:48:06Z).
 function _insightsSyncDateLimits() {
   const startEl = $('insightsStart');
   const endEl = $('insightsEnd');
-  if (startEl && endEl) startEl.max = endEl.max = _toDateLocal(new Date());
+  if (!startEl || !endEl) return;
+  const today = _toDateLocal(new Date());
+  if (startEl.max !== today) startEl.max = today;
+  if (endEl.max !== today) endEl.max = today;
 }
 
 function insightsPeriodChange() {
