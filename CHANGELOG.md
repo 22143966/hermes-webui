@@ -73,6 +73,11 @@
 
 ### Fixed
 
+- **Session menu and Move-to-project picker stay with their row.** On tablets the sidebar menu and project picker
+  opened in the top-left corner over the header; they now open at the pressed row and stay inside the screen, keep
+  "+ New project" visible with long project lists on phones, and move with their row when the sidebar scrolls. Thanks
+  @pxxD1998. (#6713)
+
 - **A delegated task's result is retried again after a stuck delivery.** With a current Agent, a finished delegated
   task whose delivery was claimed by a process that then died stayed pending until WebUI restarted: WebUI scheduled the
   retry but never handed the completion back to the Agent, which now offers each restored result only once per process.
