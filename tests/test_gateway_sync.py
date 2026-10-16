@@ -1543,6 +1543,98 @@ def test_messaging_reset_successor_stays_toplevel(cleanup_test_sessions):
             pass
 
 
+def test_messaging_reset_successor_without_session_key(cleanup_test_sessions):
+    """Chat/user identity is the fallback when session_key is missing.
+
+    Matching chat+user (or origin_chat_id+origin_user_id) stays top-level.
+    Empty identity and a different thread_id stay nested — fail closed.
+    """
+    from api.agent_sessions import read_importable_agent_session_rows, read_session_lineage_metadata
+
+    conn = _ensure_state_db()
+    now = time.time()
+    cases = (
+        # (parent, child, updates parent, updates child, expect_toplevel)
+        (
+            'tg_reset_nokey_parent',
+            'tg_reset_nokey_child',
+            {'chat_id': '100', 'user_id': '200'},
+            {'chat_id': '100', 'user_id': '200'},
+            True,
+        ),
+        (
+            'tg_reset_origin_parent',
+            'tg_reset_origin_child',
+            {'origin_chat_id': '300', 'origin_user_id': '400'},
+            {'origin_chat_id': '300', 'origin_user_id': '400'},
+            True,
+        ),
+        (
+            'tg_reset_empty_parent',
+            'tg_reset_empty_child',
+            {},
+            {},
+            False,
+        ),
+        (
+            'tg_reset_thread_parent',
+            'tg_reset_thread_child',
+            {'chat_id': '500', 'user_id': '600', 'thread_id': 'thread_a'},
+            {'chat_id': '500', 'user_id': '600', 'thread_id': 'thread_b'},
+            False,
+        ),
+    )
+    ids = [sid for parent, child, *_rest in cases for sid in (parent, child)]
+    cleanup_test_sessions.extend(ids)
+    try:
+        for index, (parent_sid, child_sid, parent_fields, child_fields, _toplevel) in enumerate(cases):
+            _insert_agent_session_row(
+                conn,
+                session_id=parent_sid,
+                source='telegram',
+                title=f'Parent {index}',
+                started_at=now - 50 - index,
+                ended_at=now - 20,
+                end_reason='session_reset',
+                messages=2,
+            )
+            _insert_agent_session_row(
+                conn,
+                session_id=child_sid,
+                source='telegram',
+                title=f'Child {index}',
+                started_at=now - 10,
+                parent_session_id=parent_sid,
+                messages=2,
+            )
+            for sid, fields in ((parent_sid, parent_fields), (child_sid, child_fields)):
+                if not fields:
+                    continue
+                assignments = ', '.join(f'{column} = ?' for column in fields)
+                conn.execute(
+                    f'UPDATE sessions SET {assignments} WHERE id = ?',
+                    [*fields.values(), sid],
+                )
+        conn.commit()
+
+        rows = read_importable_agent_session_rows(_get_state_db_path(), exclude_sources=None)
+        by_id = {row['id']: row for row in rows}
+        lineage = read_session_lineage_metadata(_get_state_db_path(), ids)
+        for parent_sid, child_sid, _parent_fields, _child_fields, toplevel in cases:
+            for reader in (by_id, lineage):
+                relationship = reader[child_sid].get('relationship_type')
+                if toplevel:
+                    assert relationship != 'child_session', child_sid
+                else:
+                    assert relationship == 'child_session', child_sid
+    finally:
+        try:
+            _remove_test_sessions(conn, *ids)
+            conn.close()
+        except Exception:
+            pass
+
+
 def test_gateway_watcher_uses_normalized_source_metadata(monkeypatch):
     """SSE snapshots use the same normalized source contract as /api/sessions."""
     conn = _ensure_state_db()
