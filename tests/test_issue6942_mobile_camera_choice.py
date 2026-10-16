@@ -32,7 +32,9 @@ def test_camera_reselection_is_collision_safe_without_changing_global_dedupe():
     assert "new File([file],name" in camera
     assert "(${index++})" in camera
     assert "S.pendingFiles" in camera
-    assert "S.pendingFiles.find(p=>p.name===f.name)" in ui
+    # Global dedupe is master's #8204 identity check (same original name, size and mtime), which this PR must not
+    # change; the old name-only `.find(p=>p.name===f.name)` it used to pin was replaced by #8204.
+    assert "S.pendingFiles.some(p=>_pendingFileOrigName(p)===f.name&&p.size===f.size&&p.lastModified===f.lastModified)" in ui
     assert "pendingFiles.push" not in camera
     assert "fetch(" not in camera
 
