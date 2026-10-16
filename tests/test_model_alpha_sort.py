@@ -220,6 +220,122 @@ class TestInGroupModelAlphabetical:
         )
 
 
+# ── #7528 owner option B: WHERE the natural sort applies ─────────────────────
+# Built-in providers keep their curated catalog order (newest first); only
+# custom / aggregator groups are sorted whole, and every group's overflow tail
+# (`extra_models`) is sorted. The owner's example: OpenAI must keep reading
+# GPT-5.1, GPT-5, GPT-5 Mini, GPT-5 Nano, ... instead of burying GPT-5.1.
+_OWNER_OPENAI_NEWEST_FIRST = ["gpt-5.1", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-codex", "o3-pro"]
+# A machine-ordered legacy tail long enough to push the group past the
+# picker's overflow threshold (25 rows -> 15 visible + overflow).
+_OPENAI_LEGACY_TAIL = [
+    "gpt-4o-mini", "o1", "gpt-4.1-nano", "gpt-4o", "gpt-4.1", "o3-mini", "gpt-4-turbo",
+    "o1-mini", "gpt-4.1-mini", "gpt-3.5-turbo", "o3", "gpt-4", "o4-mini", "gpt-4o-2024-11-20",
+    "chatgpt-4o-latest", "gpt-4o-audio-preview", "babbage-002", "davinci-002", "gpt-image-1",
+    "o1-pro", "text-embedding-3-large", "text-embedding-3-small", "tts-1", "whisper-1",
+]
+_AGGREGATOR_INSERTION_ORDER = [
+    "model-10", "model-2", "zeta", "model-1", "Alpha", "model-21", "beta-7", "model-3",
+    "gamma-10", "gamma-9", "model-30", "delta", "model-11", "epsilon", "model-4",
+    "model-29", "omega", "model-5", "kappa-2", "model-12", "kappa-10", "model-6", "iota",
+    "model-22", "theta", "model-7", "lambda", "model-8", "mu", "model-9",
+]
+
+
+def _setup_openai(tmp_path, monkeypatch, live_ids=None, default="gpt-5.1"):
+    _setup_config(
+        tmp_path,
+        monkeypatch,
+        (
+            "model:\n"
+            "  provider: openai\n"
+            f"  default: {default}\n"
+            "providers:\n"
+            "  openai:\n"
+            "    api_key: sk-test-option-b\n"
+        ),
+    )
+    if live_ids is not None:
+        monkeypatch.setattr(
+            sys.modules["hermes_cli.models"],
+            "provider_model_ids",
+            lambda pid: list(live_ids) if pid == "openai" else [],
+        )
+        config.invalidate_models_cache()
+
+
+def _group(result, provider_id):
+    groups = result.get("groups", [])
+    group = next((g for g in groups if g.get("provider_id") == provider_id), None)
+    assert group is not None, f"{provider_id} group missing: {[g.get('provider_id') for g in groups]}"
+    return group
+
+
+class TestOwnerOptionBSortBoundaries:
+    def test_builtin_static_catalog_keeps_master_curated_order(self, tmp_path, monkeypatch):
+        """The static OpenAI catalog comes back in master's curated order
+        (newest first), not alphabetized."""
+        _setup_openai(tmp_path, monkeypatch, default="gpt-5.5")
+        ids = [m["id"] for m in _group(config._static_models_catalog_without_live_probes(), "openai")["models"]]
+        assert ids == [m["id"] for m in config._PROVIDER_MODELS["openai"]], ids
+        assert ids.index("gpt-5.5") < ids.index("gpt-5.4"), ids
+
+    def test_builtin_live_catalog_keeps_owner_newest_first_order(self, tmp_path, monkeypatch):
+        """GPT-5.1 stays above GPT-5 Nano: the provider's own catalog order is
+        kept on the live (get_available_models) path too."""
+        _setup_openai(tmp_path, monkeypatch, live_ids=_OWNER_OPENAI_NEWEST_FIRST)
+        group = _group(config.get_available_models(force_refresh=True), "openai")
+        ids = [m["id"] for m in group["models"]]
+        assert ids == _OWNER_OPENAI_NEWEST_FIRST, ids
+        assert ids.index("gpt-5.1") < ids.index("gpt-5-nano"), ids
+        assert not group.get("extra_models")
+
+    def test_builtin_overflow_tail_sorted_after_curated_head(self, tmp_path, monkeypatch):
+        """A built-in group past the overflow threshold keeps its visible
+        head in catalog order; only the overflow tail is natural-sorted."""
+        live = _OWNER_OPENAI_NEWEST_FIRST + _OPENAI_LEGACY_TAIL
+        _setup_openai(tmp_path, monkeypatch, live_ids=live)
+        group = _group(config.get_available_models(force_refresh=True), "openai")
+        visible = [m["id"] for m in group["models"]]
+        extra = [m["id"] for m in group.get("extra_models", [])]
+        assert visible == live[: len(visible)], visible
+        assert visible[: len(_OWNER_OPENAI_NEWEST_FIRST)] == _OWNER_OPENAI_NEWEST_FIRST
+        assert extra, "the fixture must exceed the overflow threshold"
+        assert sorted(visible + extra) == sorted(live)
+        natural = sorted(extra, key=lambda mid: config._natural_model_id_key({"id": mid}, "openai"))
+        assert extra == natural, extra
+
+    def test_custom_aggregator_sorted_whole_including_overflow(self, tmp_path, monkeypatch):
+        """custom:<name> groups (New-API style aggregators) are natural-sorted:
+        model-2 before model-10 in the visible rows, and the overflow tail is
+        natural-sorted too so the API matches the picker's Show-more order."""
+        models_yaml = "".join(f"      - {mid}\n" for mid in _AGGREGATOR_INSERTION_ORDER)
+        _setup_config(
+            tmp_path,
+            monkeypatch,
+            (
+                "model:\n"
+                "  provider: custom:aggregator\n"
+                "  default: model-10\n"
+                "custom_providers:\n"
+                "  - name: Aggregator\n"
+                "    base_url: http://127.0.0.1:9/v1\n"
+                "    api_key: local-key\n"
+                "    models:\n" + models_yaml
+            ),
+        )
+        group = _group(config.get_available_models(force_refresh=True), "custom:aggregator")
+        visible = [m["id"] for m in group["models"]]
+        extra = [m["id"] for m in group.get("extra_models", [])]
+        key = lambda mid: config._natural_model_id_key({"id": mid}, "custom:aggregator")  # noqa: E731
+        assert extra, "the fixture must exceed the overflow threshold"
+        assert sorted(visible + extra) == sorted(_AGGREGATOR_INSERTION_ORDER)
+        assert visible == sorted(visible, key=key), visible
+        assert visible.index("model-2") < visible.index("model-10"), visible
+        assert extra == sorted(extra, key=key), extra
+        assert extra.index("model-9") < extra.index("model-12"), extra
+
+
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_frontend_picker_sort_ignores_provider_routing_prefix(tmp_path):
     """自绘下拉框按模型 ID 排序，不按 @provider: 路由前缀或异步到达顺序排序。"""
@@ -308,12 +424,11 @@ def test_natural_numeric_order_matches_across_boundaries(tmp_path):
     assert backend_order == ["MODEL-1", "model-2", "model-9", "model-10", "model-10b"]
 
 
-def test_configured_section_rank_preserved_before_alpha_sort():
-    """Configured 区排序必须保留 primary/fallback 语义 rank（review 反馈）。
-
-    纯 ID 字母排序会把字母序靠前的 fallback 顶到 primary 上面，并让
-    _configuredRank 沦为死代码。排序比较器必须先比 rank、同 rank 内才比
-    字母序，且 _configuredRank 必须仍被引用。
+def test_configured_section_keeps_master_rank_then_name_order():
+    """#7528 owner option B (c): the Configured section is a user-configured
+    list, so it keeps master's ordering (semantic rank — primary < fallback N
+    < other configured — then display name) and is NOT re-sorted by the
+    natural model-id comparator the PR applies to custom provider groups.
     """
     ui = (REPO / "static" / "ui.js").read_text()
 
@@ -324,16 +439,19 @@ def test_configured_section_rank_preserved_before_alpha_sort():
     )
 
     m = re.search(
-        r"const configuredModels=\[\.\.\.configuredBySemanticKey\.values\(\)\]\.sort\(\(a,b\)=>\{",
+        r"const configuredModels=\[\.\.\.configuredBySemanticKey\.values\(\)\]\s*\.sort\(\(a,b\)=>\{",
         ui,
     )
     assert m is not None, "Configured section must sort via rank-first comparator"
     snippet = ui[m.start():m.start() + 400]
-    assert "_configuredRank(a.badge)-_configuredRank(b.badge)" in snippet, (
+    assert "configuredRankA!==configuredRankB" in snippet, (
         "comparator must compare semantic rank first"
     )
-    assert "return _compareModelPickerEntries(a,b);" in snippet, (
-        "alpha order must be the tie-breaker within the same rank"
+    assert "return a.name.localeCompare(b.name);" in snippet, (
+        "the Configured tie-break must stay master's display-name order"
+    )
+    assert "_compareModelPickerEntries" not in snippet, (
+        "the Configured section must not be re-sorted by model id (#7528 option B)"
     )
 
 

@@ -209,6 +209,32 @@ class _NaturalModelKey:
         return isinstance(other, _NaturalModelKey) and self._cmp(other) == 0
 
 
+def _sort_picker_group_models(group: dict) -> None:
+    """Apply the natural model sort WHERE it belongs (#7528 owner option B).
+
+    Custom / aggregator groups (``custom``, ``custom:<name>``) arrive in
+    machine insertion order (New-API style gateways with 50+ ids), so their
+    ``models`` are natural-sorted whole. Built-in providers keep their
+    curated catalog order in ``models`` (newest-first lists such as OpenAI's
+    stay newest-first). Every group's ``extra_models`` overflow tail is
+    machine-provided and natural-sorted, so the API order matches the
+    picker's Show-more order. Mirrors the frontend policy in ``static/ui.js``
+    (``_sortModelPickerOptions`` and ``renderModelDropdown``'s
+    ``_orderGroupRows``: custom groups whole, built-in groups only their
+    ``extra`` rows after the curated ones).
+    """
+    provider_id = str(group.get("provider_id") or "")
+    lowered = provider_id.strip().lower()
+    is_custom = lowered == "custom" or lowered.startswith("custom:")
+    for bucket in ("models", "extra_models") if is_custom else ("extra_models",):
+        rows = group.get(bucket)
+        if isinstance(rows, list) and len(rows) > 1:
+            try:
+                rows.sort(key=lambda _m, _pid=provider_id: _natural_model_id_key(_m, _pid))
+            except Exception:
+                pass
+
+
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     """Read a positive int from the environment, falling back on bad input.
 
@@ -7811,31 +7837,16 @@ def _static_models_catalog_without_live_probes() -> dict:
 
         groups.sort(key=_group_sort_key)
 
-        # Alphabetize model entries within each provider group (natural,
-        # case-insensitive numeric order, mirroring the frontend
-        # `_natural_model_id_key` comparator — the localeCompare(numeric:true)
-        # comparator this comment used to name was replaced in #7528).
-        # Previously models kept
-        # insertion order from config/live /v1/models probes, so a group
-        # like newapi showed jd-* / sn-* / sub-* intermixed in scramble
-        # (user request 2026-09-05). Natural order keeps model-2 before
-        # model-10 at both the API and the UI boundary.
+        # Natural, case-insensitive model order (#7528) — applied ONLY where
+        # the owner's option B allows it: custom/aggregator groups are sorted
+        # whole (a newapi-style gateway otherwise shows jd-* / sn-* / sub-*
+        # intermixed in insertion order, user request 2026-09-05); built-in
+        # providers keep their curated catalog order. The exact provider_id is
+        # threaded so a named custom provider such as `custom:abc` strips the
+        # FULL `@custom:abc:` prefix when sorting (review blocker 2,
+        # 2026-09-19). See `_sort_picker_group_models`.
         for _group in groups:
-            _group_models = _group.get("models")
-            if isinstance(_group_models, list) and len(_group_models) > 1:
-                # Thread the exact provider_id so a named custom provider such
-                # as `custom:abc` strips the FULL `@custom:abc:` prefix when
-                # sorting — without this, `@custom:abc:z-model` compares on
-                # `abc:z-model` while the picker strips `@custom:abc:` and
-                # compares `z-model`, and the api/picker order can disagree
-                # on mixed bare/routed entries (review blocker 2, 2026-09-19).
-                _group_provider_id = str(_group.get("provider_id") or "")
-                try:
-                    _group_models.sort(
-                        key=lambda _m, _pid=_group_provider_id: _natural_model_id_key(_m, _pid)
-                    )
-                except Exception:
-                    pass
+            _sort_picker_group_models(_group)
 
         model_aliases = _model_aliases_from_config()
 
@@ -11310,26 +11321,13 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             return (3, pid)
         groups.sort(key=_group_sort_key)
 
-        # Alphabetize model entries within each provider group (natural,
-        # case-insensitive numeric order). Mirrors the static catalog path
-        # (and the frontend `_natural_model_id_key` comparator, which replaced
-        # the localeCompare(numeric:true) one this comment used to name) so live
-        # /v1/models probe results are also sorted by model id, with
-        # model-2 before model-10 at every boundary (user request 2026-09-05).
+        # Natural model order (#7528 owner option B): custom/aggregator groups
+        # sorted whole, built-in providers keep their curated catalog order,
+        # and every group's `extra_models` overflow tail is sorted so the API
+        # order matches the picker's Show-more order. Mirrors the static
+        # catalog path (user request 2026-09-05; review blocker 2, 2026-09-19).
         for _group in groups:
-            _group_models = _group.get("models")
-            if isinstance(_group_models, list) and len(_group_models) > 1:
-                # Thread the exact provider_id so a named custom provider such
-                # as `custom:abc` strips the FULL `@custom:abc:` prefix when
-                # sorting — see the static-catalog path for the full rationale
-                # (review blocker 2, 2026-09-19).
-                _group_provider_id = str(_group.get("provider_id") or "")
-                try:
-                    _group_models.sort(
-                        key=lambda _m, _pid=_group_provider_id: _natural_model_id_key(_m, _pid)
-                    )
-                except Exception:
-                    pass
+            _sort_picker_group_models(_group)
 
         # 12. Include model aliases so the WebUI frontend can resolve them.
         model_aliases = _model_aliases_from_config()

@@ -1602,10 +1602,17 @@ function querySelectorAllImpl(node, selector) {
     if (selector.startsWith('.') && !selector.includes('[') && !selector.includes(' ')) {
       const className = selector.slice(1);
       if (n.className && String(n.className).split(/\s+/).includes(className)) results.push(n);
+    } else if (/^[a-z]+$/i.test(selector)) {
+      // Tag selector (`optgroup`) used by the real _addLiveModelsToSelect.
+      if (n.tagName === selector.toUpperCase()) results.push(n);
     } else if (selector.includes('[') && !selector.includes(' ')) {
       const match = selector.match(/^\.([^\[]+)\[data-([^\]=]+)="([^\]]+)"\]$/);
       if (match) {
-        const [, className, dataKey, dataVal] = match;
+        const [, className, dataKey, rawDataVal] = match;
+        // Browsers unescape CSS.escape output before matching (`custom\:x`
+        // matches data-group="custom:x"); mirror that so provider ids with a
+        // colon (custom:<name>) take the real in-place path (#7528 option B).
+        const dataVal = rawDataVal.replace(/\\(.)/g, '$1');
         if (n.className &&
             String(n.className).split(/\s+/).includes(className) &&
             n.dataset && n.dataset[dataKey] === dataVal) results.push(n);
@@ -1638,6 +1645,7 @@ function makeSelect(groups, selectedValue) {
     id: 'modelSelect', tagName: 'SELECT', children: [], options: [], value: selectedValue || '',
     querySelectorAll(selector) { return querySelectorAllImpl(this, selector); },
     querySelector(selector) { return querySelectorAllImpl(this, selector)[0] || null; },
+    appendChild(child) { this.children.push(child); return child; },
   };
   for (const group of groups || []) {
     const og = makeNode('optgroup');
@@ -1675,8 +1683,12 @@ function $(id) {
   if (id === 'modelSelect') return modelSelect;
   return null;
 }
-const window = { _configuredModelBadges: payload.configuredBadges || {} };
+const window = { _configuredModelBadges: payload.configuredBadges || {}, _activeProvider: '' };
 const document = { createElement(tag) { return makeNode(tag); } };
+// Globals the real _addLiveModelsToSelect touches (live /v1/models append).
+const S = { session: null };
+let _dynamicModelLabels = {};
+function _applyModelToDropdown() { return null; }
 function esc(v) { return String(v || ''); }
 function t(key, ...args) {
   if (key === 'model_show_all_models') return `Show all ${args[0]} models`;
@@ -1705,6 +1717,8 @@ for (const name of [
   '_readModelOverflowData',
   '_appendOverflowOptionsToGroup',
   '_isEquivalentConfiguredModelEntry',
+  '_getOptionProviderId',
+  '_addLiveModelsToSelect',
   'renderModelDropdown',
 ]) {
   eval(extractFunc(name));
@@ -1712,11 +1726,36 @@ for (const name of [
 
 eval(extractConst('_expandOverflowGroup'));
 
+// #7528 option B: optionally run the REAL live /v1/models append first, so a
+// built-in group carries live extras alongside its curated catalog rows.
+if (payload.live) {
+  _addLiveModelsToSelect(payload.live.provider, payload.live.models, modelSelect);
+}
+
+const groupKey = payload.groups[0].provider_id;
+const groupSelector = '.model-group-body[data-group="' + CSS.escape(groupKey) + '"]';
+// The stub's innerHTML setter does not materialize child nodes, so extract
+// the on-screen id of each rendered row from its markup (esc'd) in DOM order.
+function readRowOrder() {
+  const wrapper = querySelectorAllImpl(dropdown, groupSelector)[0] || null;
+  const order = [];
+  if (wrapper) {
+    for (const child of (wrapper.children || [])) {
+      if (child.className && String(child.className).includes('model-opt')) {
+        const m = String(child._innerHTML || '').match(/<span class="model-opt-id">([^<]*)<\/span>/);
+        if (m) order.push(m[1]);
+      }
+    }
+  }
+  return order;
+}
+
 renderModelDropdown();
+const initialOrder = readRowOrder();
 const showAllRow = findInTree(dropdown, node => String(node._innerHTML || '').includes('Show all'));
 showAllRow.click();
 
-const groupWrapper = querySelectorAllImpl(dropdown, '.model-group-body[data-group="g-1"]')[0] || null;
+const groupWrapper = querySelectorAllImpl(dropdown, groupSelector)[0] || null;
 let sortError = '';
 let childDump = '';
 try {
@@ -1733,21 +1772,16 @@ try {
     }
   }
 } catch (e) { sortError = String(e && e.message || e); }
-// The stub's innerHTML setter does not materialize child nodes, so extract
-// the on-screen id of each rendered row from its markup (esc'd) in DOM order.
-const rowOrder = [];
-if (groupWrapper) {
-  for (const child of (groupWrapper.children || [])) {
-    if (child.className && String(child.className).includes('model-opt')) {
-      const m = String(child._innerHTML || '').match(/<span class="model-opt-id">([^<]*)<\/span>/);
-      if (m) rowOrder.push(m[1]);
-    }
-  }
-}
+const rowOrder = readRowOrder();
 const expected = payload.expectedOrder || [];
+const selectGroup = modelSelect.children.find(og => og.dataset && og.dataset.provider === groupKey);
 
 process.stdout.write(JSON.stringify({
+  initialOrder,
   rowOrder,
+  // Native <select> order after the live append + Show-more option append
+  // (_sortModelPickerOptions ran on both).
+  selectOrder: selectGroup ? selectGroup.children.map(o => o.value) : [],
   globallySorted: rowOrder.join('|') === expected.join('|'),
   showAllGone: !findInTree(dropdown, node => String(node._innerHTML || '').includes('Show all')),
   sortError,
@@ -2093,20 +2127,25 @@ def test_runtime_inplace_expand_with_preexisting_options_reveals_them(_driver_pa
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_show_more_expands_group_into_globally_sorted_order(_driver_paths):
-    """Expanding 'Show more' must leave the WHOLE group globally ordered.
+    """Expanding 'Show more' must leave a CUSTOM group globally ordered.
 
-    #7528 round-3 blocker 1: the backend now sorts each provider's visible
+    #7528 round-3 blocker 1: the backend sorts each provider's visible
     (models) and overflow (extra_models) arrays separately, and the in-place
     reveal appended overflow rows before the expander while visible rows kept
     their slots — producing `[sorted visible z-*] [sorted overflow a-*]` until
     a later full re-render. The reveal must re-sort all rows of the group so
     the expanded list is immediately globally sorted.
+
+    #7528 owner option B: that whole-group re-sort applies to custom /
+    aggregator groups only (`custom:<name>`); built-in providers keep their
+    curated rows first — see
+    test_show_more_builtin_group_keeps_curated_rows_first below.
     """
     payload = {
         "groups": [
             {
                 "provider": "Test",
-                "provider_id": "g-1",
+                "provider_id": "custom:g-1",
                 "models": [
                     {"id": "z-model", "label": "Z Model"},
                     {"id": "y-model", "label": "Y Model"},
@@ -2133,10 +2172,172 @@ def test_show_more_expands_group_into_globally_sorted_order(_driver_paths):
     out = json.loads(result.stdout)
 
     assert out["showAllGone"], "Show more expander must be consumed after expansion"
+    # At rest the custom group's visible rows are natural-sorted too.
+    assert out["initialOrder"] == ["m-model", "y-model", "z-model"]
     assert out["rowOrder"] == payload["expectedOrder"], (
         f"Expanded group not globally sorted: got {out['rowOrder']}, expected {payload['expectedOrder']}"
     )
     assert out["globallySorted"] is True
+
+
+def _run_global_sort_driver(driver_path: str, payload: dict) -> dict:
+    result = subprocess.run(
+        [NODE, driver_path, str(REPO / "static" / "ui.js"), json.dumps(payload)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"node global_sort driver failed:\nSTDOUT={result.stdout}\nSTDERR={result.stderr}")
+    return json.loads(result.stdout)
+
+
+# #7528 owner option B fixtures: the newest-first curated OpenAI order the
+# owner cited, plus an overflow tail in machine (scrambled) order.
+_OPTION_B_OPENAI_CURATED = [
+    {"id": "gpt-5.1", "label": "GPT-5.1"},
+    {"id": "gpt-5", "label": "GPT-5"},
+    {"id": "gpt-5-mini", "label": "GPT-5 Mini"},
+    {"id": "gpt-5-nano", "label": "GPT-5 Nano"},
+    {"id": "gpt-5-codex", "label": "GPT-5 Codex"},
+    {"id": "o3-pro", "label": "o3-pro"},
+]
+_OPTION_B_OPENAI_OVERFLOW = [
+    {"id": "gpt-4o-mini", "label": "GPT-4o Mini"},
+    {"id": "o1", "label": "o1"},
+    {"id": "gpt-4.1-nano", "label": "GPT-4.1 Nano"},
+    {"id": "gpt-4o", "label": "GPT-4o"},
+    {"id": "gpt-4.1", "label": "GPT-4.1"},
+]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_show_more_builtin_group_keeps_curated_rows_first(_driver_paths):
+    """#7528 owner option B: a BUILT-IN provider keeps its curated catalog
+    order (newest first) at rest, and Show more appends the overflow rows as
+    one natural-sorted block AFTER the curated rows — never re-sorting or
+    interleaving the curated rows (the PR head turned GPT-5.1 into the last
+    GPT-5 row and pushed GPT-4o above it)."""
+    curated = [m["id"] for m in _OPTION_B_OPENAI_CURATED]
+    out = _run_global_sort_driver(_driver_paths["global_sort"], {
+        "groups": [{
+            "provider": "OpenAI",
+            "provider_id": "openai",
+            "models": _OPTION_B_OPENAI_CURATED,
+            "extra_models": _OPTION_B_OPENAI_OVERFLOW,
+        }],
+        "selectedValue": "gpt-5.1",
+    })
+    assert out["initialOrder"] == curated, out
+    assert out["initialOrder"].index("gpt-5.1") < out["initialOrder"].index("gpt-5-nano")
+    expected = curated + ["gpt-4.1", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini", "o1"]
+    assert out["showAllGone"], "Show more expander must be consumed after expansion"
+    assert out["rowOrder"] == expected, out
+    # The native <select> (source of truth for re-renders) agrees.
+    assert out["selectOrder"] == expected, out
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_show_more_builtin_group_merges_live_and_overflow_extras_into_one_sorted_block(_driver_paths):
+    """#7528 owner option B: live /v1/models extras (appended by the REAL
+    _addLiveModelsToSelect) and Show-more overflow rows are both non-curated,
+    so they form ONE natural-sorted block after the curated rows — at rest
+    (live extras only) and after Show more (live + overflow merged)."""
+    curated = [m["id"] for m in _OPTION_B_OPENAI_CURATED]
+    out = _run_global_sort_driver(_driver_paths["global_sort"], {
+        "groups": [{
+            "provider": "OpenAI",
+            "provider_id": "openai",
+            "models": _OPTION_B_OPENAI_CURATED,
+            "extra_models": _OPTION_B_OPENAI_OVERFLOW,
+        }],
+        "selectedValue": "gpt-5.1",
+        "live": {
+            "provider": "openai",
+            "models": [
+                {"id": "gpt-5.1"},           # already curated -> skipped
+                {"id": "zz-live-preview"},
+                {"id": "gpt-5"},             # already curated -> skipped
+                {"id": "gpt-4o"},            # also in the overflow tail
+                {"id": "aa-live-10"},
+                {"id": "aa-live-2"},
+            ],
+        },
+    })
+    assert out["initialOrder"] == curated + ["aa-live-2", "aa-live-10", "gpt-4o", "zz-live-preview"], out
+    expected = curated + [
+        "aa-live-2", "aa-live-10", "gpt-4.1", "gpt-4.1-nano",
+        "gpt-4o", "gpt-4o-mini", "o1", "zz-live-preview",
+    ]
+    assert out["rowOrder"] == expected, out
+    assert out["selectOrder"] == expected, out
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("provider_id", ["openai", "custom:aggregator"])
+def test_option_b_api_and_picker_agree_on_group_order(_driver_paths, provider_id):
+    """#7528 owner option B, cross-boundary: for the SAME raw group, the API
+    (api/config.py `_sort_picker_group_models`) and the picker
+    (renderModelDropdown + Show more) produce the same order.
+
+    * built-in: API `models` keep the curated order and equal the picker's
+      at-rest rows; API `models + extra_models` equals the picker after Show
+      more (curated first, overflow natural-sorted after);
+    * custom:<name>: API `models` are natural-sorted (model-2 before
+      model-10) and equal the picker's at-rest rows; after Show more the
+      picker shows the whole group natural-sorted with the API comparator.
+    """
+    import copy as _copy
+
+    from api import config as _config
+
+    raw_models = [
+        {"id": "model-10", "label": "model-10"},
+        {"id": "Model-1", "label": "Model-1"},
+        {"id": "zeta-pro", "label": "zeta-pro"},
+        {"id": "model-2", "label": "model-2"},
+        {"id": "alpha-mini", "label": "alpha-mini"},
+        {"id": "model-9", "label": "model-9"},
+    ]
+    raw_extra = [
+        {"id": "model-20", "label": "model-20"},
+        {"id": "beta-3", "label": "beta-3"},
+        {"id": "Alpha-2", "label": "Alpha-2"},
+        {"id": "model-11", "label": "model-11"},
+        {"id": "gamma", "label": "gamma"},
+    ]
+    group = {
+        "provider": "P",
+        "provider_id": provider_id,
+        "models": _copy.deepcopy(raw_models),
+        "extra_models": _copy.deepcopy(raw_extra),
+    }
+    _config._sort_picker_group_models(group)
+    api_models = [m["id"] for m in group["models"]]
+    api_extra = [m["id"] for m in group["extra_models"]]
+
+    out = _run_global_sort_driver(_driver_paths["global_sort"], {
+        "groups": [{
+            "provider": "P",
+            "provider_id": provider_id,
+            "models": raw_models,
+            "extra_models": raw_extra,
+        }],
+        "selectedValue": "model-10",
+    })
+    assert out["initialOrder"] == api_models, (provider_id, out, api_models)
+    if provider_id.startswith("custom"):
+        assert api_models == ["alpha-mini", "Model-1", "model-2", "model-9", "model-10", "zeta-pro"]
+        whole = sorted(
+            raw_models + raw_extra,
+            key=lambda m: _config._natural_model_id_key(m, provider_id),
+        )
+        assert out["rowOrder"] == [m["id"] for m in whole], out
+    else:
+        assert api_models == [m["id"] for m in raw_models], "built-in curated order must not move"
+        assert out["rowOrder"] == api_models + api_extra, (out, api_models, api_extra)
+    # The overflow tail is natural-sorted on both sides for every group.
+    assert api_extra == ["Alpha-2", "beta-3", "gamma", "model-11", "model-20"]
 
 
 # Driver: build an OpenRouter group with 10 visible rows and 4 overflow rows

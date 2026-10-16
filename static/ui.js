@@ -3431,7 +3431,16 @@ function _sortModelPickerOptions(group){
     selectedOption=select.selectedOptions[0];
   }
   const options=Array.from(group.children).filter(option=>option&&option.tagName==='OPTION');
-  const ordered=_sortModelPickerEntries(options);
+  // #7528 owner option B: custom/aggregator groups (`custom`, `custom:<name>`)
+  // are natural-sorted whole. Built-in provider groups keep their curated
+  // catalog options in place and natural-sort only the appended `extra`
+  // options (live /v1/models rows, Show-more overflow) as one block after
+  // them. Mirrors api/config.py `_sort_picker_group_models`.
+  const _groupPid=String((group.dataset&&group.dataset.provider)||'').trim().toLowerCase();
+  const _isExtraOption=option=>!!(option.dataset&&option.dataset.extra);
+  const ordered=(_groupPid==='custom'||_groupPid.startsWith('custom:'))
+    ? _sortModelPickerEntries(options)
+    : options.filter(option=>!_isExtraOption(option)).concat(_sortModelPickerEntries(options.filter(_isExtraOption)));
   if(typeof group.replaceChildren==='function'){
     group.replaceChildren(...ordered);
   }else if(Array.isArray(group.children)){
@@ -4363,7 +4372,7 @@ async function populateModelDropdown(opts={}){
         const display=(String(providerId).startsWith('custom:')
           ? String(providerId).slice('custom:'.length)
           : String(providerId))||'Configured';
-        groups.push({provider:display,provider_id:providerId,models:_sortModelEntries(models,providerId)});
+        groups.push({provider:display,provider_id:providerId,models});
       }
       return groups;
     };
@@ -4394,7 +4403,11 @@ async function populateModelDropdown(opts={}){
         og.dataset.modelsEndpointError=JSON.stringify(g.models_endpoint_error);
         if(errorKey) window._modelEndpointErrors[errorKey]=g.models_endpoint_error;
       }
-      for(const m of (Array.isArray(g.models)?_sortModelEntries(g.models,g.provider_id):[])){
+      // #7528 owner option B: only custom/aggregator groups are re-sorted;
+      // built-in groups keep the curated catalog order the API shipped.
+      const _gPid=String(g.provider_id||'').trim().toLowerCase();
+      const _gModels=Array.isArray(g.models)?g.models:[];
+      for(const m of ((_gPid==='custom'||_gPid.startsWith('custom:'))?_sortModelEntries(_gModels,g.provider_id):_gModels)){
         const opt=document.createElement('option');
         opt.value=m.id;
         opt.textContent=m.label;
@@ -4519,6 +4532,9 @@ function _addLiveModelsToSelect(provider, models, sel){
     opt.textContent=m.label||m.id;
     opt.title='Live model — fetched from provider';
     opt.dataset.provider=provider;
+    // Not part of the group's curated `models` list: _sortModelPickerOptions
+    // sorts these after the catalog rows of a built-in group (#7528 option B).
+    opt.dataset.extra='1';
     if(m && (m.supports_fast_tier === true || String(m.supports_fast_tier).toLowerCase()==='true')){
       opt.dataset.fast='1';
     }else if(m && (m.supports_fast_tier === false || String(m.supports_fast_tier).toLowerCase()==='false')){
@@ -4947,11 +4963,15 @@ function _appendOverflowOptionsToGroup(group, extraModels){
     if(existing){
       // Move the already-present option into this group rather than duplicating it.
       if(existing.parentNode!==group) group.appendChild(existing);
+      if(existing.dataset) existing.dataset.extra='1';
       continue;
     }
     const opt=document.createElement('option');
     opt.value=m.id;
     opt.textContent=m.label||m.id;
+    // Overflow rows come from `extra_models`, not the curated `models` list
+    // (#7528 option B: sorted after a built-in group's catalog rows).
+    if(opt.dataset) opt.dataset.extra='1';
     group.appendChild(opt);
     appended++;
   }
@@ -5168,6 +5188,19 @@ function renderModelDropdown(){
         const rawB=String(b&&b.value!=null?b.value:(b&&b.id!=null?b.id:b)||'');
         return _cmpStr(av,bv)||_cmpStr(rawA,rawB);
       });
+  // #7528 owner option B — WHERE the comparator applies (mirrors
+  // _sortModelPickerOptions and api/config.py `_sort_picker_group_models`):
+  // custom/aggregator groups (`custom`, `custom:<name>`) are natural-sorted
+  // whole; built-in provider groups keep their curated rows in catalog order
+  // and natural-sort only their `extra` rows (Show-more overflow, live
+  // /v1/models additions) as one block after them.
+  const _sortsWholeGroup=(providerId)=>{
+    const pid=String(providerId||'').trim().toLowerCase();
+    return pid==='custom'||pid.startsWith('custom:');
+  };
+  const _orderGroupRows=(rows,providerId)=>_sortsWholeGroup(providerId)
+    ? _sortPickerEntries(rows)
+    : rows.filter(m=>!m.extra).concat(_sortPickerEntries(rows.filter(m=>m.extra)));
   const _ensureGroupMeta=(groupKey,groupLabel,providerId,optgroup)=>{
     if(!_groupMeta.has(groupKey)){
       _groupMeta.set(groupKey,{
@@ -5206,7 +5239,7 @@ function renderModelDropdown(){
         const displayName=rawValue.startsWith('@custom:')
           ? getModelLabel(rawValue)
           : (opt.textContent||getModelLabel(rawValue));
-        const entry={value:opt.value,name:esc(displayName),id:esc(opt.value),group:child.label||'',groupKey,providerId,modelsEndpointError,badge:_getConfiguredModelBadge(opt.value,_badgeMap,providerId),hiddenByDefault:false};
+        const entry={value:opt.value,name:esc(displayName),id:esc(opt.value),group:child.label||'',groupKey,providerId,modelsEndpointError,badge:_getConfiguredModelBadge(opt.value,_badgeMap,providerId),hiddenByDefault:false,extra:!!(opt.dataset&&opt.dataset.extra)};
         _modelData.push(entry);
         groupMeta.modelCount++;
       }
@@ -5224,6 +5257,7 @@ function renderModelDropdown(){
           modelsEndpointError,
           badge:_getConfiguredModelBadge(overflowModel.id,_badgeMap,providerId),
           hiddenByDefault:true,
+          extra:true,
         });
         groupMeta.modelCount++;
         groupMeta.hiddenCount++;
@@ -5414,7 +5448,7 @@ function renderModelDropdown(){
       // — so a sorted visible head followed by a sorted overflow tail would
       // not be globally ordered ([z-*] visible … [a-*] revealed). Re-position
       // ALL `.model-opt` rows of the group in one picker-order pass so the
-      // fully expanded group is a contiguous alphabetical sequence (#7528).
+      // fully expanded group follows the option-B order below (#7528).
       // GUARD: a subgrouped group (OpenRouter/Nous with >= SUB_GROUP_MIN_MODELS
       // visible rows) nests rows inside `.model-group-body.sub` wrappers. The
       // in-place re-sort collects rows via `wrap.querySelectorAll('.model-opt')`
@@ -5446,12 +5480,23 @@ function renderModelDropdown(){
         }
         if(_rowIds.length>1){
           const _groupProvider=(og.dataset&&og.dataset.provider)||'';
-          _rowIds.sort((x,y)=>{
+          const _cmpRows=(x,y)=>{
             const xKV=x.id.startsWith('@')?{id:x.id,providerId:_groupProvider}:{id:x.id};
             const yKV=y.id.startsWith('@')?{id:y.id,providerId:_groupProvider}:{id:y.id};
             return _compareModelPickerEntries(xKV,yKV,_groupProvider);
-          });
-          for(const _pair of _rowIds) wrap.appendChild(_pair.row);
+          };
+          // #7528 owner option B: a built-in group keeps its curated rows in
+          // place and sorts only its extra rows (revealed overflow + live
+          // /v1/models rows) as one block after them; custom groups re-sort whole.
+          const _extraIds=new Set();
+          for(const _md of _modelData){
+            if(_md&&_md.groupKey===groupKey&&_md.extra){ _extraIds.add(_md.id); _extraIds.add(_md.value); }
+          }
+          const _isExtraRow=_pair=>_extraIds.has(_pair.id);
+          const _orderedRows=_sortsWholeGroup(_groupProvider)
+            ? _rowIds.sort(_cmpRows)
+            : _rowIds.filter(_pair=>!_isExtraRow(_pair)).concat(_rowIds.filter(_isExtraRow).sort(_cmpRows));
+          for(const _pair of _orderedRows) wrap.appendChild(_pair.row);
         }
       }catch(_se){ /* keep revealed rows even if re-sort fails */ }
       _forceOpenGroups.add(groupKey);
@@ -5557,15 +5602,13 @@ function renderModelDropdown(){
         configuredBySemanticKey.set(semanticKey,candidate);
       }
     }
-    // Semantic rank first (primary < fallback N < other configured), then
-    // alphabetical within the same rank.  A pure sort by model id would
-    // let a fallback float above the primary just because its id sorts
-    // earlier, and would strand `_configuredRank` as dead code.
-    const configuredModels=[...configuredBySemanticKey.values()].sort((a,b)=>{
-      const rankDiff=_configuredRank(a.badge)-_configuredRank(b.badge);
-      if(rankDiff!==0) return rankDiff;
-      return _compareModelPickerEntries(a,b);
-    });
+    const configuredModels=[...configuredBySemanticKey.values()]
+      .sort((a,b)=>{
+        const configuredRankA=_configuredRank(a.badge);
+        const configuredRankB=_configuredRank(b.badge);
+        if(configuredRankA!==configuredRankB) return configuredRankA-configuredRankB;
+        return a.name.localeCompare(b.name);
+      });
     const configuredIds=new Set(configuredModels.map(m=>m.value));
     const configuredSemanticKeys=new Set(configuredModels.map(m=>`${_configuredProviderKey(m)}::${_configuredModelKey(m)}`));
     const _effectiveHiddenCount=(groupKey)=>_modelData.filter(m=>
@@ -5611,13 +5654,13 @@ function renderModelDropdown(){
       const meta=_groupMeta.get(groupKey);
       if(!meta) continue;
       const hiddenCount=_effectiveHiddenCount(groupKey);
-      const groupRows=_sortPickerEntries(_modelData.filter(m=>
+      const groupRows=_orderGroupRows(_modelData.filter(m=>
         m.groupKey===groupKey
         && !configuredIds.has(m.value)
         && !m.endpointErrorOnly
         && matches(m)
         && (!m.hiddenByDefault || !!term)
-      ));
+      ),meta.providerId);
       const shouldRenderHeading=!!meta.label&&(groupRows.length||meta.endpointErrorOnly||(!term&&hiddenCount));
       if(shouldRenderHeading){
         const heading=document.createElement('div');
@@ -5681,7 +5724,7 @@ function renderModelDropdown(){
             return b[1].length-a[1].length;
           });
           for(const [pfx,pfxRows] of sorted){
-            const orderedPrefixRows=_sortPickerEntries(pfxRows);
+            const orderedPrefixRows=_orderGroupRows(pfxRows,meta.providerId);
             if(pfxRows.length>=2){
               const subKey=`${groupKey}::${pfx}`;
               if(!(subKey in _groupOpenState)) _groupOpenState[subKey]=true;

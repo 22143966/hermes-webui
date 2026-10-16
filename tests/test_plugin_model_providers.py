@@ -368,8 +368,7 @@ class TestPluginFallbackModelsInStaticCatalog:
                 "plugin provider with fallback_models must appear in static catalog"
             )
             model_ids = [m.get("id") for m in myplugin_group.get("models", [])]
-            # Model entries are alphabetized; compare as sets.
-            assert set(model_ids) == set(fallback), (
+            assert model_ids == list(fallback), (
                 f"static catalog should use plugin's fallback_models, got {model_ids}"
             )
         finally:
