@@ -252,6 +252,12 @@ def _avoid_leaking_shared_state_db():
     """
     before = _shared_state_db_identity()
     yield
+    # A background cwd sync (api.state_sync.sync_session_cwd_background) that the test started can still be about to
+    # open SessionDB here; deleting first and letting it recreate state.db afterwards would leak the file to the next
+    # test. Drain those threads before comparing. Nothing to drain when the module was never imported.
+    state_sync = sys.modules.get('api.state_sync')
+    if state_sync is not None and not state_sync.drain_cwd_syncs():
+        pytest.fail('background cwd sync did not finish')
     after = _shared_state_db_identity()
     if after == before:
         return
