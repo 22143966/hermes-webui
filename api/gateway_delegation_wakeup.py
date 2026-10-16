@@ -29,6 +29,7 @@ Without reserve+commit the poller stays inert.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -51,9 +52,10 @@ _STOP = threading.Event()
 _LOCK = threading.Lock()
 _BACKOFF: dict[tuple[str, str], tuple[int, float]] = {}  # (db, state sid) -> (failures, retry at)
 _FLOOR: dict[str, int] = {}  # db -> lowest message id the next poll scans (rowid high-water mark)
+_UNOWNED: dict[str, set[str]] = {}  # db -> state sids with no WebUI sidecar of that profile: never pin the floor
 
 _PENDING_SQL = (
-    "SELECT session_id, MIN(id) FROM messages WHERE id >= ? AND role = 'user'"
+    "SELECT session_id, MIN(id) FROM messages NOT INDEXED WHERE id >= ? AND role = 'user'"
     " AND display_kind IN ('async_delegation_complete', 'hidden')"
     " AND coalesce(json_extract(display_metadata, '$.delegation_id'), '') != ''"
     " AND json_extract(display_metadata, '$.caller_history_consumed') IS NULL"
@@ -84,8 +86,10 @@ def _pending_session_ids(db_path: Path, since: float) -> list[str]:
         rows = conn.execute(_PENDING_SQL, (_FLOOR.get(key, 0), since)).fetchall()
     finally:
         conn.close()
-    # Rows stay pending until committed, so the lowest pending id is a safe floor.
-    _FLOOR[key] = min((r[1] for r in rows), default=top + 1)
+    # Rows stay pending until committed, so the lowest pending id is a safe floor. Rows of sessions this
+    # poller never wakes (no sidecar of the profile) would pin it forever, so they are left out.
+    unowned = _UNOWNED.get(key, ())
+    _FLOOR[key] = min((r[1] for r in rows if r[0] not in unowned), default=top + 1)
     return [r[0] for r in rows]
 
 
@@ -214,6 +218,8 @@ def settle_reservation(webui_sid: str, stream_id, accepted: bool) -> None:
         res = _held_reservation(webui_sid, stream_id)
         if res is None:
             return
+        # A lease already accepted (its commit failed earlier) is never released by a later teardown.
+        accepted = accepted or bool(res.get("accepted"))
         db = _session_db_cls()(Path(res["db"]))
         try:
             if accepted:
@@ -248,11 +254,22 @@ def _retry_accepted_commit(webui_sid: str) -> bool:
 
 
 def _profile_uses_gateway(profile: str) -> bool:
+    """True when *profile*'s wake turns go to the Gateway worker that settles the lease.
+
+    Same resolution as the wake's routing and the worker's endpoint: the profile's own runtime env applies.
+    Runner-owned turns (``HERMES_WEBUI_RUNTIME_ADAPTER=runner-local``, read by ``_start_run`` from the process
+    env) never reach that worker, so they are not woken: their rows stay for the next turn's fold."""
+    from api import profiles as _profiles
     from api.config import get_config_for_profile_home
     from api.gateway_chat import webui_gateway_chat_enabled
-    from api.profiles import get_hermes_home_for_profile
+    from api.runtime_adapter import runtime_adapter_runner_enabled
 
-    return webui_gateway_chat_enabled(get_config_for_profile_home(get_hermes_home_for_profile(profile)))
+    if runtime_adapter_runner_enabled():
+        return False
+    home = _profiles.get_hermes_home_for_profile(profile)
+    environ = {k: v for k, v in os.environ.items() if k not in _profiles._loaded_profile_env_keys}
+    environ.update(_profiles.filter_runtime_env_for_gateway_parity(_profiles.get_profile_runtime_env(home)))
+    return webui_gateway_chat_enabled(get_config_for_profile_home(home), environ)
 
 
 def _claim_and_wake(db_path: Path, state_sid: str, webui_sid: str) -> int:
@@ -307,6 +324,8 @@ def poll_once(since: float) -> int:
                 webui_sid = _webui_session_id(db_path, sid, profile)
                 if webui_sid:
                     woken += _claim_and_wake(db_path, sid, webui_sid)
+                else:  # not this profile's WebUI session: its rows must not pin the scan floor
+                    _UNOWNED.setdefault(str(db_path), set()).add(sid)
             except Exception:
                 logger.warning("gateway delegation wakeup raised for %s", sid, exc_info=True)
     return woken

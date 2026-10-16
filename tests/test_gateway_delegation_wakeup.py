@@ -526,3 +526,95 @@ def test_gateway_worker_config_is_the_session_profile(tmp_path, monkeypatch):
     assert gateway_chat._gateway_config_for_profile("default") is None
     assert gateway_chat._gateway_config_for_profile("") is None
     assert gateway_chat._gateway_config_for_profile("work")["agent"]["reasoning_effort"] == "high"
+
+
+def test_teardown_after_failed_accepted_commit_does_not_rewake(env, monkeypatch):
+    """Review 5487133536 MUST-FIX 1: the worker's teardown settle (accepted=False) after a failed accepted
+    commit must not release the lease; the next poll re-commits it and the result wakes exactly once."""
+    calls, _ = env
+    FakeDB.add("sid1", "deleg_teardown")
+    real_commit = FakeDB.commit_caller_history_deliveries
+    fail = {"n": 1}
+
+    def flaky(self, token, owner):
+        if fail["n"]:
+            fail["n"] -= 1
+            raise RuntimeError("database is locked")
+        return real_commit(self, token, owner)
+
+    monkeypatch.setattr(FakeDB, "commit_caller_history_deliveries", flaky)
+    assert gdw.poll_once(0) == 1
+    gdw.settle_reservation("sid1", "s", accepted=False)  # gateway worker teardown
+    _admit("sid1", None, None)  # the wake turn ended
+    assert FakeDB.rows[1]["consumed"] is True and FakeDB.rows[1]["lease"] is None
+    assert Session.load("sid1").delegation_reservation is None
+    FakeDB.clock[0] += gdw.RESERVATION_TTL_S + 1
+    assert gdw.poll_once(0) == 0 and len(calls) == 1
+
+
+def _agent_schema_db(path):
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT,"
+                 " display_kind TEXT, display_metadata TEXT, timestamp REAL)")
+    conn.execute("CREATE INDEX idx_messages_session ON messages(session_id, timestamp)")
+    conn.execute("CREATE INDEX idx_messages_session_id ON messages(session_id, id)")
+    return conn
+
+
+def test_pending_scan_is_a_rowid_range_on_the_agent_schema(tmp_path):
+    """Review 5487133536 SHOULD-FIX 2: with the Agent's (session_id, id) index the scan must still be bounded by rowid."""
+    conn = _agent_schema_db(tmp_path / "s.db")
+    plan = " ".join(r[-1] for r in conn.execute("EXPLAIN QUERY PLAN " + gdw._PENDING_SQL, (10, 0.0)))
+    conn.close()
+    assert "INTEGER PRIMARY KEY" in plan and "SCAN" not in plan, plan
+
+
+def test_unowned_session_row_does_not_pin_the_floor(env, tmp_path, monkeypatch):
+    """Review 5487133536 SHOULD-FIX 2: a pending row of a session with no sidecar of this profile is skipped by the floor."""
+    db = tmp_path / "agent.db"
+    conn = _agent_schema_db(db)
+    meta = json.dumps({"delegation_id": "d"})
+    conn.execute("INSERT INTO messages VALUES (5, 'ghost', 'user', 'async_delegation_complete', ?, 1.0)", (meta,))
+    conn.executemany("INSERT INTO messages VALUES (?, 'plain', 'user', NULL, NULL, 1.0)", [(i,) for i in range(6, 20)])
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(gdw, "_pending_session_ids", _REAL["pending"])
+    monkeypatch.setattr(gdw, "_profile_state_dbs", lambda: [("default", db)])
+    monkeypatch.setattr(gdw, "_UNOWNED", {})
+    monkeypatch.setattr(gdw, "_FLOOR", {})
+    assert gdw.poll_once(0) == 0 and gdw._FLOOR[str(db)] == 5
+    assert gdw.poll_once(0) == 0 and gdw._FLOOR[str(db)] == 20
+
+
+def _profile_home(tmp_path, monkeypatch, env_text, cfg_text=""):
+    import api.profiles as profiles
+
+    home = tmp_path / "profiles" / "work"
+    home.mkdir(parents=True)
+    (home / ".env").write_text(env_text)
+    (home / "config.yaml").write_text(cfg_text)
+    monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda _n: home)
+    monkeypatch.delenv("HERMES_WEBUI_CHAT_BACKEND", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_RUNTIME_ADAPTER", raising=False)
+    return home
+
+
+def test_profile_env_selects_gateway_for_the_scan(tmp_path, monkeypatch):
+    """Review 5487133536 SHOULD-FIX 3: a backend chosen in the profile's own .env counts, as in the wake routing."""
+    _profile_home(tmp_path, monkeypatch, "HERMES_WEBUI_CHAT_BACKEND=gateway\n")
+    assert gdw._profile_uses_gateway("work") is True
+
+
+def test_profile_without_gateway_env_or_config_is_not_scanned(tmp_path, monkeypatch):
+    _profile_home(tmp_path, monkeypatch, "")
+    assert gdw._profile_uses_gateway("work") is False
+
+
+def test_runner_local_adapter_is_not_woken(tmp_path, monkeypatch):
+    """Greptile 4237671348: runner-owned turns never reach the Gateway worker that settles the lease."""
+    _profile_home(tmp_path, monkeypatch, "", "webui_chat_backend: gateway\n")
+    assert gdw._profile_uses_gateway("work") is True
+    monkeypatch.setenv("HERMES_WEBUI_RUNTIME_ADAPTER", "runner-local")
+    assert gdw._profile_uses_gateway("work") is False
