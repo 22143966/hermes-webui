@@ -8086,6 +8086,35 @@ def _sanitize_messages_for_agent(
     return sanitized
 
 
+def _replay_user_row_is_compaction_carrier(row):
+    """Return True when a user row is a compaction-summary handoff carrier.
+
+    #7237 round 8 finding 2 (nesquena-hermes 2026-10-15): the user-fold guard
+    must refuse whatever the installed ``_merge_consecutive_users`` refuses,
+    and that predicate is ``split_user_originated_turn(prev)[0] is not None``.
+    The handoff half of that split exists for exactly one class of row —
+    ``is_compaction_summary_message`` — so this helper delegates to the
+    installed recognizer instead of a hand-maintained prefix list. The
+    installed check covers the metadata flag, the legacy
+    ``[CONTEXT SUMMARY]:`` handoff, the merged-delimiter carrier shape
+    (``[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]``) and every
+    historical summary prefix — the webui marker predicate alone matched none
+    of the first three, so the fold welded the carrier into the next user row
+    and the settle's strict-prefix proof then refused the changed prefix.
+
+    When the installed recognizer cannot even be imported (broken agent
+    checkout), this helper reports "carrier" for every row: without the real
+    predicate the guard must refuse to weld user rows at all — never mutate
+    durable rows on an unverified guess.
+    """
+    try:
+        from agent.context_compressor import is_compaction_summary_message
+    except Exception:
+        return True
+
+    return bool(is_compaction_summary_message(row))
+
+
 def _replay_user_row_is_plain_mergeable(row):
     """Return True when a user row may take part in the Agent's user-pair merge.
 
@@ -8093,6 +8122,12 @@ def _replay_user_row_is_plain_mergeable(row):
     user rows merge. Compression/summary carriers (``split_user_originated``
     material), /steer control rows (``display_kind == 'steer'``), structured
     (JSON-prefixed / list) content, and non-replayable rows are left alone.
+
+    The two PREV-side refusals of the installed guard — a compaction-summary
+    carrier and a /steer row — are evaluated in
+    ``_merge_agent_replay_bare_user_rows`` (the installed guard is asymmetric:
+    only the preceding row is checked), alongside this predicate (#7237 round
+    8 finding 2).
     """
     if not isinstance(row, dict) or row.get('role') != 'user':
         return False
@@ -8146,6 +8181,16 @@ def _merge_agent_replay_bare_user_rows(messages):
             prev is not None
             and _replay_user_row_is_plain_mergeable(prev)
             and _replay_user_row_is_plain_mergeable(msg)
+            # #7237 round 8 finding 2 (nesquena-hermes 2026-10-15): mirror the
+            # installed ``_merge_consecutive_users`` PREV-side refusals exactly:
+            # a summary carrier (``split_user_originated_turn(prev)[0] is not
+            # None``) is a deliberate durable shape after retry/rewind and must
+            # never be welded into the next user row, and a /steer row that
+            # ended the previous run is already persisted (merging the next
+            # prompt into it would rewrite it in place). The installed guard is
+            # asymmetric — only ``prev`` is checked — so the mirror is too.
+            and not _replay_user_row_is_compaction_carrier(prev)
+            and prev.get('display_kind') != 'steer'
         ):
             survivor = copy.deepcopy(prev)
             prev_content = survivor.get('content')
@@ -8165,31 +8210,86 @@ def _merge_agent_replay_bare_user_rows(messages):
     return merged
 
 
+def _installed_repair_runtime_usable():
+    """True when the installed Agent's repair machinery can run unmodified.
+
+    ``repair_message_sequence`` imports the persistence codec
+    (``hermes_state.SessionDB``) at call time and reads its class attributes.
+    Test harnesses that fake ``hermes_state`` (a lambda or ``Mock`` in the
+    ``SessionDB`` slot) make those reads raise or, worse, silently return mock
+    objects that would corrupt row content. Probe the codec's actual contract
+    before trusting it: the sentinel prefix must be a real string and a plain
+    string must round-trip unchanged.
+    """
+    try:
+        from hermes_state import SessionDB
+
+        return (
+            isinstance(getattr(SessionDB, "_CONTENT_JSON_PREFIX", None), str)
+            and SessionDB._decode_content("plain-text-probe") == "plain-text-probe"
+        )
+    except Exception:
+        return False
+
+
+def _apply_installed_repair(rows):
+    """Run the installed Agent's ``repair_message_sequence`` on ``rows`` in place.
+
+    Returns True when the installed repair ran. On a missing/stubbed agent
+    runtime it returns False WITHOUT trusting a half-applied mutation (repair
+    can raise mid-sequence and its passes mutate row dicts in place), so the
+    caller must discard ``rows`` and fall back to the webui mirrors on a fresh
+    copy.
+    """
+    if not _installed_repair_runtime_usable():
+        return False
+    try:
+        from agent.agent_runtime_helpers import repair_message_sequence
+
+        repair_message_sequence(None, rows)
+    except Exception:
+        return False
+    return True
+
+
 def _agent_replay_settle_projection(sent_history):
     """Return the history form the installed Agent will RETURN for the rows
     this process actually handed it.
 
-    The sent projection keeps out-of-clock-order splice pairs separate so the
-    durable raw rows stay individually addressable in the outbound snapshot
-    (#7237 boundary matrix, late-output shapes). The installed Agent's
-    ``repair_message_sequence`` merges every adjacent bare assistant pair
-    unconditionally, so the settle's strict-prefix proof must compare against
-    the UNCONDITIONAL merge of the sent rows — otherwise a real merging Agent's
-    returned prefix diverges from the snapshot and the settle fails closed,
-    dropping the current turn's output. For every other history the sent form
-    and the unconditional merge are identical, so this is a no-op there.
+    The installed Agent's ``repair_message_sequence`` normalizes its whole
+    working set before every call — pass 0 (adjacent assistant merge), pass 1
+    (stray / duplicate tool-result removal), pass 2 (unanswered tool-call
+    pruning plus payload-empty drop) and pass 3 (consecutive-user merge) — and
+    that repaired sequence is the prefix the settle's strict-prefix proof must
+    match. #7237 round 8 finding 1 (nesquena-hermes 2026-10-15): modeling only
+    pass 0 and pass 3 left the projection holding rows the installed repair had
+    dropped (a duplicate tool result for one call; a call row whose only result
+    was orphaned by an interleaved Codex interim), the prefix proof refused
+    the genuine suffix, and settlement failed closed at
+    ``return list(previous_context), None`` — the current exchange survived in
+    display but was lost from the saved model context.
 
-    #7237 round 7 finding 1 (nesquena-hermes 2026-10-14): the fold models ALL
-    native repair passes, not only the assistant pass. Removing rows in the
-    sanitizer (an empty partial between two users) can leave adjacent plain
-    user rows that the pipeline never re-folded — the user merge deliberately
-    runs BEFORE the sanitizer. The installed Agent folds those into one row
-    joined with a literal blank line, so the settle projection must model that
-    fold too, or prefix ownership refuses the genuine suffix and the current
-    exchange is lost from the model-facing context.
+    The projection is therefore the installed whole-sequence repair of the
+    sent rows, on a SEPARATE deep copy (the Agent mutates the list and the
+    tail dicts it receives in place; the snapshot the settle compares against
+    must never be a moving target). Splice pairs stay separate in the SENT
+    projection itself (``preserve_splices``); the repair here is what the
+    installed Agent returns, which merges every adjacent bare assistant pair
+    unconditionally (#7237 boundary matrix, late-output shapes).
+
+    When the installed agent runtime is missing or its persistence codec is a
+    test stub (``_installed_repair_runtime_usable`` is False), the webui
+    mirrors of pass 0 and pass 3 run instead: those environments cannot compute
+    the real contract at all, and their suites pin the mirror behavior. The
+    durable raw history and the strict-prefix ownership contract are
+    unchanged either way.
     """
+    source = list(sent_history or [])
+    projected = copy.deepcopy(source)
+    if _apply_installed_repair(projected):
+        return projected
     projected = _merge_agent_replay_bare_assistant_rows(
-        copy.deepcopy(sent_history), preserve_splices=False
+        copy.deepcopy(source), preserve_splices=False
     )
     return _merge_agent_replay_bare_user_rows(projected)
 
