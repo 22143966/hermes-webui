@@ -25,6 +25,7 @@ What must hold:
   * an explicitly invalid retention value DISABLES its cap instead of falling
     through, and terminal classification requires the writer's own metadata.
 """
+import contextlib
 import gzip
 import json
 import multiprocessing
@@ -2986,3 +2987,211 @@ def test_tolerated_torn_archive_tail_does_not_refuse_live_suffix_appends(tmp_pat
     read = rj.read_run_events(sid, rid, session_dir=tmp_path, validated_recovery=True)
     assert [int(e["seq"]) for e in read["events"]] == [1, 2, 3, 4], read
     assert read["malformed"] == []
+
+
+# ── 23:55Z re-gate: separator-safe splits + claim-hidden archives ───────────
+#
+# F1 [CORE]: U+0085 / U+2028 / U+2029 are legal RAW characters inside a JSON
+# string (`json.dumps(ensure_ascii=False)` only escapes C0 controls), but
+# `str.splitlines()` treats them as line breaks. A row split through one
+# reconstructs as a broken row and cold recovery failed the whole run
+# (recovery_malformed_row); the bounded merged replay yielded fragments.
+# F2 [SILENT]: a crash-left prune claim renames the canonical archive away, so
+# "canonical absent" read as "no archive" and a continuing writer acknowledged
+# seq 1; when the sweep restored the claimed entry, readers masked every
+# acknowledged row at or below the restored maximum.
+
+_SEP_TEXT = "before\u2028middle\u0085end\u2029."
+
+
+def _setup_archived_run_with_separator_suffix(tmp_path, sep_text=_SEP_TEXT):
+    """Real writer + real sweep + real append: archived seq 1,2, live seq 3
+    whose payload carries raw Unicode separators."""
+    sid, rid = "s1", "r1"
+    rj.append_run_event(sid, rid, "token", {"text": "one"}, session_dir=tmp_path)
+    rj.append_run_event(sid, rid, "done", {"terminal_state": "completed"}, session_dir=tmp_path)
+    live = tmp_path / rj.RUN_JOURNAL_DIR_NAME / sid / f"{rid}.jsonl"
+    old = time.time() - 30 * 86400.0
+    os.utime(live, (old, old))
+    counters = _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+    assert counters["archived_files"] == 1
+    _simulate_restart()
+    assert rj.append_run_event(sid, rid, "token", {"text": sep_text}, session_dir=tmp_path)["seq"] == 3
+    return sid, rid, live
+
+
+def test_separator_payload_survives_cold_recovery_with_both_copies(tmp_path):
+    """The crash-window shape (both copies on disk) must not lose the run.
+
+    Reproduces the finding: with archive + live present and separators inside
+    a payload, the string-side merge split the live rows through the
+    separators, rebuilt them as broken rows, and cold recovery returned [].
+    """
+    sid, rid = "s1", "r1"
+    rj.append_run_event(sid, rid, "token", {"text": _SEP_TEXT}, session_dir=tmp_path)
+    rj.append_run_event(sid, rid, "done", {"terminal_state": "completed"}, session_dir=tmp_path)
+    live = tmp_path / rj.RUN_JOURNAL_DIR_NAME / sid / f"{rid}.jsonl"
+    live_bytes = live.read_bytes()
+    assert "\u2028" in live_bytes.decode("utf-8"), "writer must store separators raw"
+    old = time.time() - 30 * 86400.0
+    os.utime(live, (old, old))
+    counters = _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+    assert counters["archived_files"] == 1
+    live.write_bytes(live_bytes)  # the crash window: the live unlink never ran
+
+    _simulate_restart()
+    read = rj.read_run_events(sid, rid, session_dir=tmp_path, validated_recovery=True)
+    assert [int(e["seq"]) for e in read["events"]] == [1, 2], read
+    assert read["events"][0]["payload"]["text"] == _SEP_TEXT
+    assert read["malformed"] == []
+
+
+def test_separator_continuation_row_survives_cold_recovery(tmp_path):
+    """Archived run + a continuation row carrying separators reads back whole.
+
+    Reproduces the finding: the re-created suffix row was split through its
+    separators during the merge -> recovery_malformed_row -> [].
+    """
+    sid, rid, _live = _setup_archived_run_with_separator_suffix(tmp_path)
+
+    _simulate_restart()
+    read = rj.read_run_events(sid, rid, session_dir=tmp_path, validated_recovery=True)
+    assert [int(e["seq"]) for e in read["events"]] == [1, 2, 3], read
+    assert read["events"][2]["payload"]["text"] == _SEP_TEXT
+    assert read["malformed"] == []
+
+
+def test_bounded_merged_replay_keeps_separator_rows_whole(tmp_path):
+    """The bounded merged replay must split only on \\n (never through a payload).
+
+    Reproduces the finding: `splitlines(keepends=True)` over the merged text
+    yielded 6 fragments of the 3 stored rows (only 2 parseable), the separator
+    row's bytes rewritten.
+    """
+    sid, rid, live = _setup_archived_run_with_separator_suffix(tmp_path)
+
+    arch_text = rj._read_gz_text(_archive_path(tmp_path, sid, rid)) or ""
+    expected = [ln.encode("utf-8", "surrogateescape") + b"\n" for ln in arch_text.split("\n") if ln]
+    expected += [ln + b"\n" for ln in live.read_bytes().split(b"\n") if ln]
+    got = [raw for _n, raw, _t in rj._iter_bounded_raw_jsonl_lines(live, max_bytes=10**7)]
+
+    assert got == expected
+    assert [json.loads(raw.decode("utf-8"))["seq"] for raw in got] == [1, 2, 3]
+    assert "\u2028" in got[-1].decode("utf-8")
+
+
+def test_merge_and_eof_keep_unicode_separators_as_data():
+    """Surgical: the merge must not rewrite a separator; the EOF boundary must
+    keep a trailing separator byte (both were split by `splitlines()`)."""
+    archive_text = '{"seq":1}\n'
+    live_text = '{"seq":2,"payload":{"text":"a\u2028b"}}\n'
+    merged = rj._merge_archive_and_live_text(archive_text, live_text, path=None)
+    assert "\u2028" in merged
+    assert merged == archive_text + live_text.rstrip("\n") + "\n"
+
+    live_tail = '{"seq":3,"payload":{"text":"c\u2029d"}}\u2029'
+    merged2 = rj._merge_archive_and_live_text(archive_text, live_tail, path=None)
+    assert merged2 == archive_text + live_tail
+    assert merged2.endswith("\u2029")
+
+
+def test_merge_dedupes_separator_rows_without_identity_context():
+    """The legacy (no-identity) merge skim must dedupe the archive's own copy
+    of a row even when the row carries separators; a genuinely newer row
+    still continues the union byte-exact."""
+    archive_text = '{"seq":5,"payload":{"text":"a\u2028b"}}\n'
+    same_copy = '{"seq":5,"payload":{"text":"a\u2028b"}}\n'
+    merged = rj._merge_archive_and_live_text(archive_text, same_copy, path=None)
+    assert merged == archive_text  # seq 5 <= archived max 5: the copy is dropped
+
+    newer = '{"seq":6,"payload":{"text":"c\u2029d"}}\n'
+    merged2 = rj._merge_archive_and_live_text(archive_text, newer, path=None)
+    assert merged2 == archive_text + newer
+    assert "\u2029" in merged2
+
+
+def _setup_claim_hidden_archive(tmp_path, sid="s1", rid="r1"):
+    """Real writer + real sweep, then simulate the crashed prune: the canonical
+    archive is renamed to a stale claim (crash between rename and unlink)."""
+    rj.append_run_event(sid, rid, "token", {"text": "one"}, session_dir=tmp_path)
+    rj.append_run_event(sid, rid, "done", {"terminal_state": "completed"}, session_dir=tmp_path)
+    live = tmp_path / rj.RUN_JOURNAL_DIR_NAME / sid / f"{rid}.jsonl"
+    old = time.time() - 30 * 86400.0
+    os.utime(live, (old, old))
+    counters = _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+    assert counters["archived_files"] == 1
+    canonical = _archive_path(tmp_path, sid, rid)
+    claim = canonical.parent / f".{canonical.name}.prune-claim.999"
+    os.rename(canonical, claim)
+    stale = time.time() - 7200.0  # past the quiescence window
+    os.utime(claim, (stale, stale))
+    return canonical, claim
+
+
+def test_claim_hidden_archive_continues_beyond_restored_prefix(tmp_path):
+    """A crash-left claim is retained history: the writer restores it under the
+    authority and seeds beyond the archived maximum instead of restarting at 1.
+
+    Reproduces the finding: the writer acknowledged seq 1 beside the hidden
+    history; the sweep then restored the claimed 1-2 and every acknowledged row
+    at or below the restored maximum vanished from reads.
+    """
+    sid, rid = "s1", "r1"
+    canonical, claim = _setup_claim_hidden_archive(tmp_path, sid, rid)
+
+    _simulate_restart()
+    row = rj.append_run_event(sid, rid, "token", {"text": "four"}, session_dir=tmp_path)
+    assert row["seq"] == 3, "the claim is retained history, not 'no archive'"
+    assert canonical.exists(), "the claimed entry was not restored under the authority"
+    assert not claim.exists()
+
+    # The continuation keeps going from the restored prefix (hot path included).
+    assert rj.append_run_event(sid, rid, "token", {"text": "five"}, session_dir=tmp_path)["seq"] == 4
+
+    # A later sweep finds nothing left to restore and reads stay complete.
+    _sweep(tmp_path, ttl_days=14, max_runs_per_session=0, max_bytes_per_session=0)
+    _simulate_restart()
+    read = rj.read_run_events(sid, rid, session_dir=tmp_path, validated_recovery=True)
+    assert [int(e["seq"]) for e in read["events"]] == [1, 2, 3, 4], read
+    texts = [e["payload"].get("text") for e in read["events"]]
+    assert "four" in texts and "five" in texts
+    assert read["malformed"] == []
+
+
+def test_claim_hidden_archive_without_authority_refuses_append(tmp_path, monkeypatch):
+    """With the authority unholdable, a claim-hidden archive refuses the append
+    (never acknowledges into history the sweep will reveal)."""
+    sid, rid = "s1", "r1"
+    canonical, claim = _setup_claim_hidden_archive(tmp_path, sid, rid)
+
+    @contextlib.contextmanager
+    def _no_lock(dir_fd, *, blocking=True):
+        yield False
+
+    monkeypatch.setattr(rj, "_flock_dir_exclusive", _no_lock)
+    _simulate_restart()
+    with pytest.raises(ValueError, match="archive_sequence_unavailable"):
+        rj.append_run_event(sid, rid, "token", {"text": "four"}, session_dir=tmp_path)
+    assert claim.exists() and not canonical.exists(), "recovery must not run outside the authority"
+
+
+def test_prune_claim_restoration_is_serialized(tmp_path):
+    """Claim restoration must serialize with the shared archive authority: a
+    busy authority defers it (claim untouched); after release it completes."""
+    fcntl = pytest.importorskip("fcntl")
+    canonical, claim = _setup_claim_hidden_archive(tmp_path)
+    before = claim.read_bytes()
+    o_dir = getattr(os, "O_DIRECTORY", 0)
+    hold_fd = os.open(str(canonical.parent), os.O_RDONLY | o_dir)
+    cleanup_fd = os.open(str(canonical.parent), os.O_RDONLY | o_dir)
+    try:
+        fcntl.flock(hold_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # a busy authority
+        rj._cleanup_archive_temps(cleanup_fd)
+        assert claim.exists() and not canonical.exists(), "restore raced the authority"
+        fcntl.flock(hold_fd, fcntl.LOCK_UN)
+        rj._cleanup_archive_temps(cleanup_fd)
+        assert canonical.exists() and not claim.exists()
+        assert canonical.read_bytes() == before
+    finally:
+        os.close(cleanup_fd)
+        os.close(hold_fd)

@@ -661,6 +661,28 @@ def _archive_committed_text(archive_text: str) -> str:
     return archive_text
 
 
+def _split_lines_newline_only(text: str, *, keepends: bool = False) -> list[str]:
+    """Split journal text on ``\\n`` ONLY — separators inside payloads are data.
+
+    ``str.splitlines()`` also breaks on U+0085 / U+2028 / U+2029, all legal
+    RAW characters inside a JSON string (``json.dumps(ensure_ascii=False)``
+    only escapes C0 controls), so a row carrying one splits through it. The
+    fragments then reconstruct into a broken row — the separator becomes a
+    newline, an invalid raw character inside the JSON string — and cold
+    recovery fails the whole run. Durable rows are ``\\n``-terminated by
+    construction and every durable-byte reader (the binary scanners) already
+    iterates on ``\\n``; the string-side helpers mirror that exactly so
+    archival can never change what the stored bytes mean.
+    """
+    parts = text.split("\n")
+    if not keepends:
+        return parts
+    rows = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        rows.append(parts[-1])
+    return rows
+
+
 def _merge_archive_and_live_text(
     archive_text: str, live_text: str, *, path: Path | None = None,
 ) -> str:
@@ -685,7 +707,7 @@ def _merge_archive_and_live_text(
     if session_id is None:
         # No identity context to validate against: legacy weak skim (no
         # in-tree caller reaches this shape; kept for standalone safety).
-        for raw in committed.splitlines():
+        for raw in _split_lines_newline_only(committed):
             stripped = raw.strip()
             if not stripped:
                 continue
@@ -700,7 +722,7 @@ def _merge_archive_and_live_text(
         if events:
             max_archived_seq = int(events[-1]["seq"])
     kept: list[str] = []
-    for raw in live_text.splitlines():
+    for raw in _split_lines_newline_only(live_text):
         if not raw.strip():
             continue
         try:
@@ -720,7 +742,9 @@ def _merge_archive_and_live_text(
     # complete row and failed the whole run's cold recovery.
     tail_newline = "\n"
     if not live_text.endswith("\n"):
-        last_raw = next((raw for raw in reversed(live_text.splitlines()) if raw.strip()), None)
+        last_raw = next(
+            (raw for raw in reversed(_split_lines_newline_only(live_text)) if raw.strip()), None
+        )
         if last_raw is not None and kept[-1] == last_raw:
             tail_newline = ""
     return committed + joiner + body + tail_newline
@@ -962,7 +986,7 @@ def _iter_bounded_raw_jsonl_lines(path: Path, *, max_bytes: int, retained_bytes:
         merged = _read_run_file_text(path)
         if merged is None:
             return
-        for raw in merged.splitlines(keepends=True):
+        for raw in _split_lines_newline_only(merged, keepends=True):
             # Reversible encode mirrors the lossless decode: lone surrogates
             # reproduce the ORIGINAL bytes so the replay path sees exactly what
             # is stored (and its strict per-row decode still fails closed).
@@ -1240,6 +1264,82 @@ def _scan_validated_journal(
     return events, [], prefix_bytes
 
 
+def _resolve_claim_hidden_archive(path: Path, archived: Path, *, holding: bool) -> bool:
+    """True iff a canonical archive for ``path`` is PRESENT after claim recovery.
+
+    Three-state ``lstat`` first: present / absent / unknown (unknown refuses —
+    the module rule is that only a confirmed absence may permit a lenient
+    step). On absence, a matching crash-left prune claim is recognized as
+    RETAINED HISTORY: the only way an archive entry leaves its canonical name
+    is a prune claiming it (``.{name}.prune-claim.{pid}``), and only a crash
+    leaves the claim behind. Treating canonical-absence as "no archive" let a
+    continuing writer restart at seq 1 while the run's real history sat under
+    the claim; when the sweep later restored it, readers union archive+live by
+    seq and masked every acknowledged row at or below the restored maximum.
+
+    Restoration runs under the shared archive authority and never outside it:
+    a LIVE prune holds that lock across [claim -> unlink], so a claim visible
+    while holding is always crash debris — and an authority that cannot be
+    held refuses rather than acknowledge into hidden history.
+    """
+    try:
+        os.lstat(archived)
+        return True
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise ValueError("archive_sequence_unavailable") from exc
+    try:
+        names = os.listdir(archived.parent)
+    except FileNotFoundError:
+        # The archive directory itself is gone: nothing can be retained
+        # under a claim, so an absent canonical is provably "no archive".
+        return False
+    except OSError as exc:
+        raise ValueError("archive_sequence_unavailable") from exc
+    claims = []
+    for name in names:
+        m = _ARCHIVE_CLAIM_RE.fullmatch(name)
+        if m is not None and m.group("original") == archived.name:
+            claims.append(name)
+    if not claims:
+        return False
+    if not holding:
+        # History may sit under a claim this append cannot restore under the
+        # shared authority: refuse rather than restart at 1 into a union that
+        # will mask the acknowledged rows when the claim is restored.
+        raise ValueError("archive_sequence_unavailable")
+    dir_fd = _open_archive_session_dir_pinned(path)
+    if dir_fd is None:
+        raise ValueError("archive_sequence_unavailable")
+    try:
+        # Newest generation first: `_restore_prune_claim` links a claim back
+        # under the canonical name and drops later restores as redundant
+        # (link fails closed on EEXIST) — an archive only ever grows, so the
+        # newest bytes must win the name.
+        aged: list[tuple[float, str]] = []
+        for name in claims:
+            try:
+                st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                aged.append((float(st.st_mtime), name))
+        for _mtime, name in sorted(aged, reverse=True):
+            _restore_prune_claim(name, archived.name, dir_fd)
+        try:
+            os.stat(archived.name, dir_fd=dir_fd, follow_symlinks=False)
+            return True
+        except FileNotFoundError:
+            # Restore could not publish the entry (left in place; the sweep
+            # retries): the retained history is still hidden -> refuse.
+            raise ValueError("archive_sequence_unavailable") from None
+        except OSError as exc:
+            raise ValueError("archive_sequence_unavailable") from exc
+    finally:
+        os.close(dir_fd)
+
+
 def _archived_next_seq(path: Path | None) -> int:
     """Next seq after the archived copy of ``path`` (#7613).
 
@@ -1260,21 +1360,23 @@ def _archived_next_seq(path: Path | None) -> int:
     (``_scan_archive_prefix`` — the scanner's own contract) seeds; any failure
     past it refuses, and a tolerated uncommitted torn tail does not
     invalidate the prefix before it.
+
+    Canonical-absence itself is resolved under the authority first: a
+    crash-left prune claim hides the entry under its claim name, so "no
+    canonical file" only means "no archive" after the claim scan (see
+    ``_resolve_claim_hidden_archive``) — which restores matching claims or
+    refuses. Restarting at 1 beside restored history is exactly the
+    acknowledged-then-masked failure this closes.
     """
     archived = _archive_path_for(path) if path is not None else None
     if archived is None:
         return 1
-    try:
+    with _archive_run_authority(path) as holding:
         # lstat (no symlink follow) gives a true three-state: present / absent /
         # unknown. `Path.exists()` collapses permission errors into "absent",
         # which would let an unreadable archive restart the sequence at 1.
-        os.lstat(archived)
-    except FileNotFoundError:
-        return 1
-    except OSError as exc:
-        # Existence itself cannot be established: refuse (see docstring).
-        raise ValueError("archive_sequence_unavailable") from exc
-    with _archive_run_authority(path) as holding:
+        if not _resolve_claim_hidden_archive(path, archived, holding=holding):
+            return 1
         if _prune_authority_possible() and not holding:
             # An archive entry exists and this platform can prune: seeding
             # without the shared authority could read a prefix the prune is
@@ -1282,17 +1384,15 @@ def _archived_next_seq(path: Path | None) -> int:
             raise ValueError("archive_sequence_unavailable")
         text = _read_gz_text(archived)
         if text is None:
-            try:
-                # Same three-state check for the read-failed case: `_read_gz_text`
-                # returns None when the entry vanished mid-flight (then there is
-                # genuinely no archive) or when it is corrupt/unpinnable (then the
-                # stored history is real and the last seq is unknown).
-                os.lstat(archived)
-            except FileNotFoundError:
+            # The entry resolved above; a failed read is a corrupt/unpinnable
+            # copy, or one that vanished through interference. Re-resolve
+            # once — a vanished entry may again be sitting under a claim, and
+            # "genuinely gone" still needs the claim scan before seq 1.
+            if not _resolve_claim_hidden_archive(path, archived, holding=holding):
                 return 1
-            except OSError as exc:
-                raise ValueError("archive_sequence_unavailable") from exc
-            raise ValueError("archive_sequence_unavailable")
+            text = _read_gz_text(archived)
+            if text is None:
+                raise ValueError("archive_sequence_unavailable") from None
         session_id, run_id = path.parent.name, path.stem
         events, fatal = _scan_archive_prefix(text or "", session_id, run_id)
         if fatal is not None:
@@ -3180,7 +3280,10 @@ def _cleanup_archive_temps(archive_fd: int) -> None:
         claiming an entry (crash/power loss between ``rename`` and ``unlink``).
         The claimed entry may be the ONLY copy of that run, so it is RESTORED
         to its canonical name (never deleted); if the canonical name is
-        occupied the claim is a redundant older copy and is dropped.
+        occupied the claim is a redundant older copy and is dropped. The
+        restore is serialized with the shared archive authority (a busy
+        authority defers it to the next pass): it must never race a writer
+        restoring/seeding from — or a prune claiming — the same entry.
 
     Both matchers are anchored end-to-end. An unanchored ``find`` on the claim
     marker also matched a CANONICAL archive whose run id contains the marker
@@ -3212,7 +3315,16 @@ def _cleanup_archive_temps(archive_fd: int) -> None:
         # the settlement window is debris from an interrupted pass.
         if time.time() - float(st.st_mtime) < _RETENTION_MIN_QUIESCENT_SECONDS:
             continue
-        _restore_prune_claim(name, original, archive_fd)
+        # Serialize the restoration with the shared archive authority (the
+        # same lock a re-seeding writer or a live prune holds): a claim a
+        # writer is restoring from — or a canonical name a seed is about to
+        # read — must not be raced. A busy authority defers this claim to the
+        # next pass; a claim visible while holding is always crash debris (a
+        # live prune holds the lock across [claim -> unlink]).
+        with _flock_dir_exclusive(archive_fd, blocking=False) as holding:
+            if not holding:
+                continue
+            _restore_prune_claim(name, original, archive_fd)
 
 
 def _sweep_session_entries(
