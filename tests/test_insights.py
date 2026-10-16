@@ -2142,7 +2142,7 @@ def test_insights_range_keys_are_localized_at_runtime():
     env = dict(os.environ)
     env["I18N_JS"] = str(pathlib.Path(__file__).parent.parent / "static" / "i18n.js")
     proc = subprocess.run([node, "-e", harness], capture_output=True, text=True,
-                          timeout=60, check=False, env=env)
+                          encoding="utf-8", timeout=60, check=False, env=env)
     assert proc.returncode == 0, f"node harness failed:\n{proc.stdout}\n{proc.stderr}"
     out = json.loads(proc.stdout.strip().splitlines()[-1])
 
@@ -2776,7 +2776,7 @@ def test_insights_range_fallback_note_is_localized_at_runtime():
     env = dict(os.environ)
     env["I18N_JS"] = str(pathlib.Path(__file__).parent.parent / "static" / "i18n.js")
     proc = subprocess.run([node, "-e", harness], capture_output=True, text=True,
-                          timeout=60, check=False, env=env)
+                          encoding="utf-8", timeout=60, check=False, env=env)
     assert proc.returncode == 0, f"node harness failed:\n{proc.stdout}\n{proc.stderr}"
     out = json.loads(proc.stdout.strip().splitlines()[-1])
 
