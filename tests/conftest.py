@@ -1293,6 +1293,11 @@ _REAL_HERMES_STATE = sys.modules.get("hermes_state")
 # real sys.path entries once so the guard below can restore them.
 _AGENT_PATH_ENV_KEYS = ("HERMES_WEBUI_AGENT_DIR", "PYTHONPATH", "HERMES_WEBUI_PYTHON")
 _REAL_AGENT_ENV = {k: os.environ.get(k) for k in _AGENT_PATH_ENV_KEYS}
+# api.config appends the discovered Agent dir to sys.path at import time. Import it
+# BEFORE the snapshot so the per-test restore keeps that entry: a snapshot without it
+# stripped the Agent dir after the first test, and later Agent imports fell back to the
+# venv's editable-install finder, which maps only modules that existed at install time.
+import api.config as _api_config_for_agent_path  # noqa: E402,F401
 _REAL_SYS_PATH = list(sys.path)
 
 # Keep the Windows restart seams inert after the suite isolation snapshots.
