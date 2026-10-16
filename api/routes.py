@@ -18123,6 +18123,12 @@ def handle_post(handler, parsed) -> bool:
                         },
                         status=409,
                     )
+                # #7881/#7776: a lock-held cold reload after an eviction lacks the
+                # CLI source identity that materialization stamps only in memory;
+                # copy it from the outside-resolved object (same id only, no I/O)
+                # so the reload this call publishes does not turn the chat into a
+                # WebUI-native one at its next whole-session save.
+                _carry_cli_source_identity(request_session, s)
 
                 resolved_sid = str(getattr(request_session, "session_id", "") or "").strip()
                 if not resolved_sid or not is_safe_session_id(resolved_sid):
@@ -18187,7 +18193,13 @@ def handle_post(handler, parsed) -> bool:
                     _draft_files = next_draft.get("files", []) or []
                     _has_meaningful_draft = bool(_draft_text) or bool(_draft_files)
                     if not (SESSION_DIR / f"{authoritative_sid}.json").exists() and _has_meaningful_draft:
-                        with LOCK:
+                        # The owner-record save below runs under LOCK, and Session.save()
+                        # takes the #7881 per-session persist lock, whose order is
+                        # persist -> _INDEX_WRITE_LOCK -> LOCK. Take persist first so
+                        # this path never waits on it while holding LOCK (a concurrent
+                        # same-id save holds persist and waits on LOCK in its index
+                        # write). save() re-enters the RLock.
+                        with _session_persist_lock(authoritative_sid), LOCK:
                             if SESSIONS.get(authoritative_sid) is not request_session:
                                 return j(
                                     handler,

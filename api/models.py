@@ -6161,7 +6161,10 @@ def _write_persisted_reasoning_effort(sid, value, identity_source=None, profile=
             f.flush()
             os.fsync(f.fileno())
         with _INDEX_WRITE_LOCK:
-            _safe_replace(tmp, path)
+            # Count the replace like Session.save() does (#8267), so a cold
+            # get_session() that read the pre-pick sidecar re-reads instead of
+            # publishing the old effort.
+            _replace_session_sidecar(tmp, path, sid)
             # The sidebar projection is built from the sidecar just written,
             # never from a possibly stale live object (same ordered publish
             # as save()).
