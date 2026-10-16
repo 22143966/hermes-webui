@@ -4519,12 +4519,14 @@ function _addLiveModelsToSelect(provider, models, sel){
     }
     if(existingIds.has(mid)) continue;
     const identity=optionIdentity(mid,provider);
+    let twin=null;
     if(existingNorm.has(identity)){
       const sameGroup=Array.from(providerGroup.children||[]).find(o=>optionIdentity(o.value,_getOptionProviderId(o))===identity);
       if(sameGroup){
         const incomingRoutable=String(mid).startsWith('@');
         const existingRoutable=String(sameGroup.value||'').startsWith('@');
         if(!(!existingRoutable&&incomingRoutable)) continue; // let proxy replace catalog twin
+        twin=sameGroup;
       }
     }
     const opt=document.createElement('option');
@@ -4532,15 +4534,24 @@ function _addLiveModelsToSelect(provider, models, sel){
     opt.textContent=m.label||m.id;
     opt.title='Live model — fetched from provider';
     opt.dataset.provider=provider;
-    // Not part of the group's curated `models` list: _sortModelPickerOptions
-    // sorts these after the catalog rows of a built-in group (#7528 option B).
-    opt.dataset.extra='1';
     if(m && (m.supports_fast_tier === true || String(m.supports_fast_tier).toLowerCase()==='true')){
       opt.dataset.fast='1';
     }else if(m && (m.supports_fast_tier === false || String(m.supports_fast_tier).toLowerCase()==='false')){
       opt.dataset.fast='0';
     }
-    providerGroup.appendChild(opt);
+    if(twin){
+      // A routed replacement for a catalog twin takes the twin's place and its
+      // curated/extra status (#7528 option B): dedup then drops the bare twin,
+      // so a built-in group keeps its curated order instead of the replacement
+      // being sorted into the extras block.
+      if(twin.dataset&&twin.dataset.extra) opt.dataset.extra='1';
+      providerGroup.insertBefore(opt,twin);
+    }else{
+      // Not part of the group's curated `models` list: _sortModelPickerOptions
+      // sorts these after the catalog rows of a built-in group (#7528 option B).
+      opt.dataset.extra='1';
+      providerGroup.appendChild(opt);
+    }
     existingIds.add(mid);
     existingNorm.add(identity);
     _dynamicModelLabels[mid]=m.label||m.id;
