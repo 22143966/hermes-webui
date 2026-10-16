@@ -208,6 +208,60 @@ def _isolate_hermes_config_path():
     os.environ['HERMES_CONFIG_PATH'] = isolated_config_path
 
 
+# TEST_STATE_DIR is both the live test server's state dir and the in-process
+# HERMES_HOME of the default profile, so a state.db one test leaves there is
+# inherited by every later test and by the server. A real Agent SessionDB opened
+# there (for example by a fake-Agent streaming worker) creates the Agent schema,
+# whose unique title index made test_gateway_sync's INSERT OR REPLACE fixtures
+# silently delete their own rows. Tests that need a shared state.db create it
+# themselves (see test_gateway_sync._ensure_state_db).
+_SHARED_STATE_DB_FILES = tuple(
+    TEST_STATE_DIR / f"state.db{suffix}" for suffix in ("", "-wal", "-shm", "-journal")
+)
+
+
+def _shared_state_db_identity():
+    identity = []
+    for path in _SHARED_STATE_DB_FILES:
+        try:
+            st = path.stat()
+        except OSError:
+            identity.append(None)
+        else:
+            identity.append((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns))
+    return tuple(identity)
+
+
+@pytest.fixture(autouse=True)
+def _avoid_leaking_shared_state_db():
+    """Remove a shared state.db that this test created or changed.
+
+    The files are compared by identity (inode, size, mtime) before and after the
+    test. When any of them differs, the whole family is removed: state.db and its
+    -wal/-shm/-journal sidecars only make sense together, so a partial removal
+    could leave a database next to a WAL from another generation. A file that was
+    already there and that the test left untouched is not removed. Removing a file
+    that a connection still holds open is safe on POSIX: SQLite skips the
+    close-time checkpoint and WAL unlink for a database file that was unlinked,
+    so a late close cannot delete the WAL of a database the next test creates.
+    Where the OS refuses to unlink an open file (Windows), the file is left as before.
+
+    The name sorts first among this file's autouse fixtures, and pytest orders
+    same-scope autouse fixtures from one conftest by name, so this one is set up
+    first and torn down last, after cleanup_test_sessions has talked to the server.
+    """
+    before = _shared_state_db_identity()
+    yield
+    after = _shared_state_db_identity()
+    if after == before:
+        return
+    for path in _SHARED_STATE_DB_FILES:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 # A test that launches `sys.executable` with an env built from scratch drops the
 # suite's HERMES_DISABLE_LAZY_INSTALLS. On a machine whose Hermes Agent is a
 # PM-managed install, that subprocess then installs a full Agent environment
