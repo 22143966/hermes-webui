@@ -274,8 +274,10 @@ let releaseCas;casGate=new Promise(r=>releaseCas=r);
 emitLeftover('guidance');await tick();
 // While compare-and-clear is pending, a newer draft with the same text and a file wins.
 drafts.A={text:'guidance',files:_composerDraftFilesForPersist([newer])};
-S.session={session_id:'A',active_stream_id:null,composer_draft:{...drafts.A}};S.pendingFiles=[newer];
+S.session={session_id:'A',active_stream_id:null,composer_draft:{...drafts.A}};
 _restoreComposerDraft(drafts.A,'A');
+// Server-metadata restore cannot recreate File objects; the user re-attaches it.
+S.pendingFiles=[newer];
 assert.equal(inp.value,'guidance','newer same-text draft with other files restored while retiring');
 releaseCas();await tick();await tick();await tick();
 assert.equal(drafts.A.text,'guidance');assert.equal(drafts.A.files.length,1,'server kept newer draft');
