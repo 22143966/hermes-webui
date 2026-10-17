@@ -10235,6 +10235,9 @@ function copyToastText(btn){
   _copyText(text).then(done).catch(()=>{});
 }
 function showToast(msg,ms,type){
+  // A type name in the duration slot (showToast(msg,'error')) is a type, not a duration: setTimeout(fn,'error')
+  // fires at once, so those toasts vanished as soon as they appeared.
+  if(typeof ms==='string'&&type==null&&!/^\s*\d+(\.\d+)?\s*$/.test(ms)){type=ms;ms=null;}
   const el=$('toast');if(!el)return;
   const s=String(msg==null?'':msg);let t=type;
   if(!t){const low=s.toLowerCase();if(/fail|error|denied|invalid|unavailable|no active|no workspace match|no model match|no personalities/.test(low))t='error';else if(/warn|queued|takes effect|skipped|fallback/.test(low))t='warning';else if(/saved|created|imported|restored|switched|set to|updated|duplicated|moved to|renamed|deleted|complete|pinned|archived|cleared|stopped/.test(low))t='success';else t='info';}
