@@ -60,6 +60,54 @@ class TestCopyButtonSelectorGuard:
             "selector must stay scoped to pre > code, got: " f"{selector!r}"
         )
 
+    def test_selector_excludes_exactly_the_marker_that_is_written(self):
+        """The excluded attribute and the written marker must be the SAME one.
+
+        Both halves were previously asserted in isolation: the selector only had
+        to contain *some* ``data-`` attribute and the stamp only had to be *some*
+        ``dataset`` assignment. Renaming one side — selector
+        ``:not([data-copy-button])`` while still writing ``dataset.copyBtn`` —
+        satisfies every other assertion in this file, yet no block is ever
+        excluded, so the repeat pass keeps matching the whole transcript and
+        the O(code blocks) walk this PR removes comes straight back.
+
+        ``dataset.copyBtn`` is what the DOM exposes as ``data-copy-btn``, so the
+        two spellings have to be reconciled rather than eyeballed.
+        """
+        fn = _fn("addCopyButtons")
+        m = re.search(r"querySelectorAll\(\s*'([^']*)'", fn)
+        assert m, "addCopyButtons must use a querySelectorAll selector"
+        selector = m.group(1)
+
+        excluded = re.findall(r":not\(\[([^\]]+)\]\)", selector)
+        assert excluded, f"selector must exclude the processed marker, got: {selector!r}"
+
+        written = {m.group(1) for m in re.finditer(r"codeEl\.dataset\.(\w+)\s*=", fn)}
+        assert written, "addCopyButtons must stamp a dataset marker"
+
+        def _as_attr(dataset_key: str) -> str:
+            # dataset.camelCase -> data-kebab-case, matching DOMTokenList.
+            return "data-" + re.sub(r"(?<!^)(?=[A-Z])", "-", dataset_key).lower()
+
+        written_attrs = {_as_attr(key) for key in written}
+        assert set(excluded) == written_attrs, (
+            "the selector must exclude exactly the attribute addCopyButtons "
+            f"writes; selector excludes {excluded} but the function writes "
+            f"{sorted(written_attrs)}"
+        )
+
+    def test_selector_uses_the_canonical_marker_attribute(self):
+        """Pin the literal selector so a rename is a deliberate, visible change."""
+        fn = _fn("addCopyButtons")
+        m = re.search(r"querySelectorAll\(\s*'([^']*)'", fn)
+        assert m, "addCopyButtons must use a querySelectorAll selector"
+        selector = m.group(1)
+        assert selector == "pre > code:not([data-copy-btn])", (
+            "addCopyButtons selector changed unexpectedly; if the marker is "
+            "being renamed, update this test in the same commit so the two can "
+            f"never drift apart. Got: {selector!r}"
+        )
+
     def test_marks_processed_code_blocks(self):
         """Processed blocks must be marked so the selector can skip them."""
         fn = _fn("addCopyButtons")
