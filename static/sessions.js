@@ -556,6 +556,7 @@ const _sessionStreamingById = new Map();
 const _sessionListSnapshotById = new Map();
 const _sessionListSourceById = new Map();
 let _sessionListPointerActive = false;
+let _sessionRowPointerReleasePending = false;
 let _sessionListLastScrollAt = 0;
 let _pendingSessionListPayload = null;
 let _pendingSessionListApplyTimer = 0;
@@ -568,6 +569,9 @@ const SESSION_SWIPE_REFLOW_LEAD_MS = 220;
 const SESSION_REFLOW_TIMEOUT_MS = 420;
 const SESSION_LIST_FLIP_TIMEOUT_MS = 460;
 const SESSION_LONG_PRESS_DELAY_MS = 400;
+// Controls inside a session row that own their clicks; activating one never
+// opens the row's conversation.
+const SESSION_ROW_NESTED_CONTROL_SELECTOR = '.session-select-cb-wrapper,.session-tag,.session-title-input,.session-child-count,.session-child-sessions,.session-child-session,.session-lineage-count,.session-lineage-segments,.session-lineage-segment';
 const SESSION_ARCHIVE_SWIPE_THRESHOLD_PX = 128;
 const SESSION_DELETE_SWIPE_THRESHOLD_PX = 128;
 const SESSION_SWIPE_CANCEL_RATIO = 0.75;
@@ -5993,6 +5997,18 @@ function _findSessionRenameRow(sessionId){
   return document.querySelector('.session-item[data-sid="'+sid+'"], .session-child-session[data-sid="'+sid+'"]');
 }
 
+// A press on a non-focusable part of a row moves focus out of whatever had
+// it, so editors that save on blur (a session or project rename, a queued
+// message) commit and the on-screen keyboard closes. Row handlers that cancel
+// that press (the title's mousedown, the row's touchend) do it with this.
+// A press on the focusable title keeps focus there when it already has it
+// (a screen reader's activate command starts with mousedown).
+function _releaseFocusLikeRowPress(pressedTitle){
+  const active=document.activeElement;
+  if(!active||active===document.body||active===pressedTitle) return;
+  if(typeof active.blur==='function') active.blur();
+}
+
 function _buildSessionRenameStarter(session, displayEl, renderDisplay){
   return ()=>{
     if(_isReadOnlySession(session)){ if(typeof showToast==='function') showToast('Read-only imported sessions cannot be renamed.',3000); return; }
@@ -9542,16 +9558,17 @@ function _attachProjectQuickCreateButton(chip, project){
   chip.appendChild(btn);
 }
 
-function _installSessionOpenControl(control, session){
+function _installSessionOpenControl(control, session, activate){
   if(!control||!session||!session.session_id) return;
+  control.onkeydown=(e)=>{
+    if((e.key==='Enter'||e.key===' ')&&(e.repeat||e.ctrlKey||e.metaKey||e.altKey||e.shiftKey)) e.preventDefault();
+  };
   control.onclick=async(e)=>{
     // Pointer and touch activation stay owned by the row gesture state machine.
     // Native keyboard activation and assistive-technology synthesized clicks use
     // detail=0, so handling only that path avoids opening a conversation twice.
     if(!e||e.detail!==0||_sessionSelectMode||_renamingSid) return;
-    const search=$('sessionSearch');
-    if(search&&(search.value||'').trim()) _hideSearchPreviewsAfterSelect=true;
-    await _openSidebarSession(session);
+    await activate();
   };
 }
 
@@ -10168,13 +10185,29 @@ function renderSessionListFromCache(){
       title.type='button';
       title.dataset.sid=s.session_id;
       if(isActive) title.setAttribute('aria-current','page');
-      _installSessionOpenControl(title,s);
+      _installSessionOpenControl(title,s,()=>_activateRowWithoutPointer(title));
     }
     const displayTitle=cleanTitle||'Untitled';
     const titleMatched=Boolean(searchQueryRaw&&displayTitle.toLowerCase().includes(searchQueryRaw.toLowerCase()));
     if(titleMatched) _appendHighlightedText(title,displayTitle,searchQueryRaw,'session-search-hit');
     else title.textContent=displayTitle;
     title.title=_sessionFullTitleTooltip(rawTitle,cleanTitle,s);
+    // Keep native button activation for Enter/Space. Pointer-only presses must
+    // still release editors without parking focus on the title.
+    if(!_sessionSelectMode){
+      // Keyboard focus only: a mouse press must not move focus onto the title,
+      // or the list stays :focus-within and deferred refreshes never apply.
+      // A title that already has focus keeps it. Click, double-click rename
+      // and assistive activation are unaffected.
+      title.onmousedown=(e)=>{
+        // Left and right presses: a right press opens the context menu, and
+        // closing it would otherwise hand focus back to the title.
+        if(e.button!==0&&e.button!==2) return;
+        e.preventDefault();
+        // The prevented default also leaves focus where it was.
+        _releaseFocusLikeRowPress(title);
+      };
+    }
     const tsMs=_sessionTimestampMs(s);
     const ts=document.createElement('span');
     const hasAttentionState=isStreaming||hasUnread||Boolean(attention);
@@ -10977,16 +11010,72 @@ function renderSessionListFromCache(){
       _tapTimer=setTimeout(async()=>{
         _tapTimer=null;
         _lastTapTime=0;
-        if(_renamingSid) return;
-        try{
-          if(($('sessionSearch').value||'').trim()) _hideSearchPreviewsAfterSelect=true;
-          await _openSidebarSession(s);
-        }finally{
-          el.classList.remove('loading');
-        }
+        await _openRowSession();
       }, delay);
       return false;
     };
+    const _openRowSession=async()=>{
+      if(_renamingSid) return;
+      try{
+        if(($('sessionSearch').value||'').trim()) _hideSearchPreviewsAfterSelect=true;
+        await _openSidebarSession(s);
+      }finally{
+        el.classList.remove('loading');
+      }
+    };
+    // Activation that does not come from this row's pointer/touch gesture:
+    // Enter on the title link, or a screen reader's activate command (NVDA
+    // browse mode in Firefox dispatches mousedown/mouseup/click with no pointer
+    // events, so the gesture machine never arms). Same guards as the gesture
+    // path: row controls, nested controls, an open menu, selection mode.
+    const _activateRowWithoutPointer=(target)=>{
+      if(_isSessionActionTarget(target)) return;
+      if(target&&target.closest&&target.closest(SESSION_ROW_NESTED_CONTROL_SELECTOR)) return;
+      if(_sessionActionMenu){closeSessionActionMenu();return;}
+      if(_sessionSelectMode){if(!readOnly)toggleSessionSelect(s.session_id);return;}
+      clearTimeout(_tapTimer);_tapTimer=null;_lastTapTime=0;
+      void _openRowSession().then(_refocusOpenSessionTitle);
+    };
+    // Opening rebuilds the list and detaches the focused title, dropping focus
+    // to <body>. Hand it to the open conversation's rebuilt title so the next
+    // Tab continues from there. Focus that went somewhere real is left alone,
+    // and focus() is a no-op inside the closed (inert) phone drawer. A newer
+    // open still loading refocuses when it lands; an open superseded by one
+    // that already landed hands focus to the conversation that is current,
+    // never to its own stale row.
+    const _refocusOpenSessionTitle=()=>{
+      const current=document.activeElement;
+      if(current&&current!==document.body&&current.isConnected) return;
+      if(_loadingSessionId) return;
+      const sid=S.session&&S.session.session_id;
+      if(!sid) return;
+      const list=$('sessionList');
+      const row=list&&list.querySelector('.session-item[data-sid="'+CSS.escape(sid)+'"]');
+      const rowTitle=row&&row.querySelector('.session-open-control');
+      if(rowTitle) _focusSessionActionMenuRestoreTarget(rowTitle);
+    };
+    // A bare click is assistive-technology activation. The gesture's own
+    // clicks never get here as one: a mouse/pen release flags the click the
+    // browser dispatches in the same task (cleared once that task ends, so it
+    // cannot outlive the gesture, and is list-wide so a row rebuilt in between
+    // still matches), and a handled touch tap cancels its compatibility click
+    // at touchend. Both listeners use the capture phase so inner controls that
+    // stop propagation (the actions button) still publish and consume the flag.
+    el.addEventListener('pointerup',(e)=>{
+      if(e.pointerType==='touch'||e.button!==0) return;
+      _sessionRowPointerReleasePending=true;
+      setTimeout(()=>{_sessionRowPointerReleasePending=false;},0);
+    },true);
+    el.addEventListener('click',(e)=>{
+      if(_sessionRowPointerReleasePending){
+        _sessionRowPointerReleasePending=false;
+        return;
+      }
+      // Native keyboard/AT clicks belong to the button's detail=0 handler.
+      // Firefox AT mouse events (detail=1, no pointerup) still use this path.
+      if(e.detail===0&&e.target&&e.target.closest&&e.target.closest('.session-open-control')) return;
+      _activateRowWithoutPointer(e.target);
+    },true);
     el.onpointerdown=(e)=>{
       if(e.pointerType==='touch') return;
       if(e.pointerType==='mouse' && e.button!==0) return;
@@ -11072,8 +11161,24 @@ function renderSessionListFromCache(){
     el.addEventListener('touchend',(e)=>{
       const touch=e.changedTouches&&e.changedTouches[0];
       if(!touch) return;
+      // A tap (or long press) on the row itself is fully handled by the
+      // gesture machine; cancel the browser's compatibility click so it cannot
+      // act on the row a second time. Drags and swipes produce no click, and
+      // nested controls keep theirs.
+      const tapHandledHere=_gestureState==='pressing'&&!_swipeTracking
+        &&!_isSessionActionTarget(e.target)
+        &&!(e.target&&e.target.closest&&e.target.closest(SESSION_ROW_NESTED_CONTROL_SELECTOR));
       if(_finishSessionGesture(touch.clientX,touch.clientY,e.target,'touch')) e.stopPropagation();
-    },{passive:true});
+      if(tapHandledHere&&e.cancelable){
+        e.preventDefault();
+        // Cancelling also drops the compatibility mousedown that would move
+        // focus. Release it here instead (a long press that opened the menu
+        // gets no mousedown either). During a rename this commits it, and it
+        // must come after _finishSessionGesture: an unchanged rename ends at
+        // once, and the gesture must still see it active and open nothing.
+        if(!_longPressMenuOpened) _releaseFocusLikeRowPress(e.target&&e.target.closest&&e.target.closest('.session-title'));
+      }
+    },{passive:false});
     return el;
   }
 }

@@ -57,7 +57,7 @@ def test_top_level_conversation_titles_use_separate_native_open_controls():
     assert "title.className=_sessionSelectMode?'session-title':'session-title session-open-control';" in render
     assert "title.dataset.sid=s.session_id;" in render
     assert "if(isActive) title.setAttribute('aria-current','page');" in render
-    assert "_installSessionOpenControl(title,s);" in render
+    assert "_installSessionOpenControl(title,s,()=>_activateRowWithoutPointer(title));" in render
 
     title_append = render.index("titleGroup.appendChild(title);")
     tag_append = render.index("titleGroup.appendChild(chip);")
@@ -92,7 +92,7 @@ def test_focus_identity_wraps_the_destructive_list_rebuild():
 def test_select_mode_keeps_titles_out_of_the_tab_order():
     render = _function_source("renderSessionListFromCache")
     create = render.index("document.createElement(_sessionSelectMode?'span':'button')")
-    install = render.index("_installSessionOpenControl(title,s);")
+    install = render.index("_installSessionOpenControl(title,s,()=>_activateRowWithoutPointer(title));")
     assert create < install
     assert "if(!_sessionSelectMode){" in render[create:install]
 
@@ -127,7 +127,7 @@ def _browser_fixture_script() -> str:
                   </section>
                 </aside>`;
               const control = document.querySelector('.session-open-control');
-              _installSessionOpenControl(control, {session_id: 'session-a'});
+              _installSessionOpenControl(control, {session_id: 'session-a'}, () => _openSidebarSession());
               control.focus();
               return document.activeElement === control;
             };
