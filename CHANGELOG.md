@@ -80,6 +80,8 @@
 
 ### Fixed
 
+- **Composer menus stay open when the on-screen keyboard opens on tablets.** On tablets and foldables, typing in the model picker's search box no longer snaps the model, reasoning or workspace menu shut. They close only on a real switch between phone and desktop layouts, or when the composer collapses into its compact menu. Thanks @jatinbharadia. (#7472)
+
 - **Error toasts stay on screen.** Twenty-one error messages (Kanban unavailable, task dependency, workspace worktree and
   reorder failures, the MCP server toggle, checkpoint restore, copy failure) passed their type where the duration
   goes, so the toast vanished the moment it appeared; the Kanban dispatcher result and eight worktree errors had the
