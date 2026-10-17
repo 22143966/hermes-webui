@@ -80,6 +80,12 @@
 
 ### Fixed
 
+- **Error toasts stay on screen.** Twenty-one error messages (Kanban unavailable, task dependency, workspace worktree and
+  reorder failures, the MCP server toggle, checkpoint restore, copy failure) passed their type where the duration
+  goes, so the toast vanished the moment it appeared; the Kanban dispatcher result and eight worktree errors had the
+  same problem in two other shapes. `showToast` now reads a type name in that position as the type and treats 0 as the
+  default duration. (#8315)
+
 - **Model picker keeps its search box and highlighted row visible, and sorts custom provider lists.** Once the picker is
   scrolled, the note at the top no longer lets rows show through, the search box stays visible, and the row you move
   to with the arrow keys is never hidden under the header. Custom and aggregator providers (for example a New-API
