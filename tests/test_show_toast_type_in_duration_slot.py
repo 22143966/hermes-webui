@@ -63,6 +63,10 @@ def test_type_in_the_duration_slot_is_honoured():
         "three_arg_error": ["Something", None, "error"],
         "explicit_ms": ["Saved", 1500],
         "plain": ["Saved"],
+        "swapped_info_ms": ["Dispatched 2 tasks", "info", 6000],
+        "zero_sentinel_error": ["Worktree failed", 0, "error"],
+        "unknown_string_ms": ["Saved", "oops"],
+        "numeric_string_ms": ["Failed", "1e3"],
     }
     res = subprocess.run(
         [NODE, "-e", HARNESS, str(REPO / "static" / "ui.js"), consts + "\n" + funcs, json.dumps(cases)],
@@ -77,3 +81,16 @@ def test_type_in_the_duration_slot_is_honoured():
         assert "error" in out[label]["cls"].split(), (label, out[label])
     assert out["explicit_ms"]["delay"] == 1500
     assert out["plain"]["delay"] == default_ms
+    # (msg, 'info', 6000): the Kanban dispatcher result toast passes type and duration swapped.
+    assert out["swapped_info_ms"]["delay"] == 6000
+    assert "info" in out["swapped_info_ms"]["cls"].split()
+    # 0 was the "use the default" sentinel before ms==null replaced ms||2800; it must not hide the toast at once.
+    assert out["zero_sentinel_error"]["delay"] == error_ms
+    assert "error" in out["zero_sentinel_error"]["cls"].split()
+    # Only the four type names are treated as types; other strings keep text-based inference.
+    assert "oops" not in out["unknown_string_ms"]["cls"].split()
+    assert "success" in out["unknown_string_ms"]["cls"].split()
+    assert out["unknown_string_ms"]["delay"] == default_ms
+    # A numeric string is still a duration (setTimeout coerces it).
+    assert float(out["numeric_string_ms"]["delay"]) == 1000
+    assert "error" in out["numeric_string_ms"]["cls"].split()
