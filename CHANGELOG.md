@@ -80,6 +80,8 @@
 
 ### Fixed
 
+- **Keyboard and screen-reader users can open chats from the sidebar.** Tab now reaches each conversation title, Enter or a screen reader's click opens it, and the focused row shows a focus ring. Mouse and touch behave as before: a press doesn't leave focus on the title, drags and swipes don't open a chat, and clicking elsewhere during a rename saves it. Thanks @grzezlo. (#8214)
+
 - **Error toasts stay on screen.** Twenty-one error messages (Kanban unavailable, task dependency, workspace worktree and
   reorder failures, the MCP server toggle, checkpoint restore, copy failure) passed their type where the duration
   goes, so the toast vanished the moment it appeared; the Kanban dispatcher result and eight worktree errors had the
