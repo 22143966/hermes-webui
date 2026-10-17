@@ -449,6 +449,53 @@ class TestIssue5127CustomProviderBareSuffixRepair:
         assert kept == ("@custom:lab:live-b", "custom:lab", False)
         assert config.resolve_model_provider(kept[0])[0] == "live-b"
 
+    def test_root_session_env_default_keeps_launcher_value(self, monkeypatch, tmp_path):
+        """A launcher-supplied value the root ``.env`` doesn't repeat still counts for root."""
+        import api.config as config
+        import api.profiles as profiles
+        from api.routes import _resolve_compatible_session_model_state
+
+        root_home = tmp_path / "root"
+        root_home.mkdir()
+        monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda _name: root_home)
+        monkeypatch.setattr(profiles, "_INITIAL_PROCESS_ENV", {"LAB_MODEL": "live-b"})
+        # Switched to another profile since: its .env value is live, root's isn't.
+        monkeypatch.setenv("LAB_MODEL", "server-only")
+        profile_cfg = {
+            "custom_providers": [
+                {
+                    "name": "lab",
+                    "base_url": "http://lab.invalid/v1",
+                    "model": "${LAB_MODEL}",
+                    "models": ["saved-a"],
+                }
+            ]
+        }
+        monkeypatch.setattr(config, "cfg", profile_cfg)
+
+        kept = _resolve_compatible_session_model_state(
+            "@custom:lab:live-b",
+            "custom:lab",
+            profile_config=profile_cfg,
+            prefer_cached_catalog=True,
+            profile="default",
+        )
+
+        assert kept == ("@custom:lab:live-b", "custom:lab", False)
+        assert config.resolve_model_provider(kept[0])[0] == "live-b"
+
+    def test_named_profile_env_ignores_launcher_snapshot(self, monkeypatch, tmp_path):
+        """The launcher snapshot is root-only: a named profile stays fail-closed."""
+        import api.profiles as profiles
+        from api.config import _thread_local_env_value
+
+        monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda _name: tmp_path)
+        monkeypatch.setattr(profiles, "get_profile_runtime_env", lambda _home: {})
+        monkeypatch.setattr(profiles, "_INITIAL_PROCESS_ENV", {"LAB_MODEL": "live-b"})
+
+        with profiles.profile_env_for_thread_readonly("work", include_root=True):
+            assert _thread_local_env_value("LAB_MODEL") == ""
+
     def test_thread_readonly_env_still_skips_root_by_default(self, monkeypatch, tmp_path):
         """Other callers keep the root no-op unless they opt in with ``include_root``."""
         import api.profiles as profiles

@@ -40,6 +40,10 @@ _CLONE_CONFIG_FILES = ['config.yaml', '.env', 'SOUL.md']
 # startup control: a pinned profile's .env may be loaded into live os.environ
 # later, but must not be able to change whether the process is isolated.
 _INITIAL_HERMES_HOME = os.getenv('HERMES_HOME', '').strip()
+# Launcher/deployment env before any profile .env is applied (init_profile_state
+# runs after this import). A root-profile read layers the root .env over this
+# instead of the live os.environ, which holds the switched-to profile's .env.
+_INITIAL_PROCESS_ENV = dict(os.environ)
 _INITIAL_ISOLATED_PROFILE_OPT_IN = os.getenv('HERMES_WEBUI_ISOLATED_PROFILE', '').strip().lower()
 _ISOLATED_SYMLINK_WARNING_EMITTED = False
 _ISOLATED_PROFILE_SHAPE_WITHOUT_OPT_IN_WARNING_EMITTED = False
@@ -1401,8 +1405,10 @@ def profile_env_for_thread_readonly(
     No-ops for default-profile sessions unless ``include_root`` is set:
     after a process-wide profile switch ``os.environ`` holds the switched-to
     profile's ``.env``, so callers that must resolve a root session's own
-    ``${VAR}`` bind the root home explicitly too. On resolution failure it
-    logs and yields with the thread's current env state untouched.
+    ``${VAR}`` bind the root env explicitly: the launcher env captured at
+    import (``_INITIAL_PROCESS_ENV``) with the root home's runtime env over
+    it, matching what the root profile sees when it is active. On resolution
+    failure it logs and yields with the thread's current env state untouched.
     """
     log = logger_override or logger
     raw_profile = session if isinstance(session, str) else getattr(session, "profile", "")
@@ -1433,7 +1439,8 @@ def profile_env_for_thread_readonly(
     previous_env = getattr(_thread_ctx, "env", {})
     previous_env = dict(previous_env) if isinstance(previous_env, dict) else {}
     previous_block = bool(getattr(_thread_ctx, "block_process_env_fallback", False))
-    thread_env = dict(safe_runtime_env)
+    thread_env = dict(_INITIAL_PROCESS_ENV) if profile == "default" else {}
+    thread_env.update(safe_runtime_env)
     thread_env["HERMES_HOME"] = str(profile_home_path)
     try:
         _thread_ctx.env = thread_env
