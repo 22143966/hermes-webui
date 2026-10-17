@@ -80,6 +80,11 @@
 
 ### Fixed
 
+- **Session menu and Move-to-project picker stay with their row.** On tablets the sidebar menu and project picker
+  opened in the top-left corner over the header; they now open at the pressed row and stay inside the screen, keep
+  "+ New project" visible with long project lists on phones, and move with their row when the sidebar scrolls. Thanks
+  @pxxD1998. (#6713)
+
 - **Two recurring CI failures fixed.** The `[SLOW]` diagnostics on draft saves and session loads no longer raise on a
   request handler without the WebUI print helper (they read it the same guarded way as every other diagnostics site),
   and the legacy-Agent worker test keeps the rows it tracks by identity alive so CPython cannot reuse their ids. Both
