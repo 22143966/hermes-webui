@@ -100,17 +100,18 @@ def test_cron_css_classes_exist():
     assert 'cron-dot-pulse' in src, 'cron-dot-pulse animation not found'
 
 
-def test_cron_unread_markers_share_badge_red():
-    """The new-run dot and the Last Output highlight must match the rail badge red (#e53e3e).
+def test_cron_unread_markers_use_the_app_unread_accent():
+    """The new-run dot and the Last Output highlight use the app's unread accent, not a state colour.
 
     #1140 regression: the dot used the green --success colour, so an unread job
-    read as "success" instead of "unread". Both markers must be the same red as
-    the sidebar .cron-badge so the per-task indicator visually matches the count.
+    read as "success". #6767 first moved it to the badge red, but red is the
+    error/approval colour in this list (the `error` status pill sits beside it),
+    so a red dot next to a green `active` pill read as "failed". The owner chose
+    the chat sidebar's unread idiom: the accent colour (RM-20261017-D5, Fable r1).
+    The dot sits in the row's left gutter so a marked row's title doesn't shift.
     """
     with open('static/style.css') as f:
         src = f.read()
-
-    RED = '#e53e3e'
 
     def rule_body(selector):
         start = src.find(selector + '{')
@@ -120,17 +121,15 @@ def test_cron_unread_markers_share_badge_red():
 
     dot = rule_body('.cron-new-dot')
     has_new_run = rule_body('.has-new-run')
-    badge = rule_body('.cron-badge')
-
-    # Both unread markers explicitly use the same red as the rail badge,
-    # not a --success fallback.
-    assert RED in dot, f'.cron-new-dot should use {RED} in rule: {dot}'
-    assert RED in has_new_run, f'.has-new-run should use {RED} in rule: {has_new_run}'
-    # The red is hard-coded (not the --success variable that used to leak in).
-    assert '--success' not in dot, '.cron-new-dot must not fall back to --success green'
-    assert '--success' not in has_new_run, '.has-new-run must not fall back to --success green'
-    # Sanity: the badge this matches against really is the same red.
-    assert RED in badge, f'.cron-badge should use {RED} in rule: {badge}'
+    for name, body in (('.cron-new-dot', dot), ('.has-new-run', has_new_run)):
+        assert 'var(--accent)' in body, f'{name} should use the accent unread colour: {body}'
+        assert '--success' not in body, f'{name} must not use --success green: {body}'
+        assert '#e53e3e' not in body and '--error' not in body, f'{name} must not use the error red: {body}'
+    # Out of flow, in the header's left gutter: a marked row keeps its icon/title position.
+    assert 'position:absolute' in dot, dot
+    assert 'position:relative' in rule_body('  .cron-header'), 'cron header must anchor the gutter dot'
+    # The pulse stops for reduced motion.
+    assert '@media (prefers-reduced-motion:reduce){.cron-new-dot{animation:none;}}' in src
 
 
 # ── #6767 P1 stale-refresh guard (node harness) ──────────────────────────────
