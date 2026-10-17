@@ -114,6 +114,8 @@ def _ensure_state_db(profile=None):
         ('parent_session_id', 'ALTER TABLE sessions ADD COLUMN parent_session_id TEXT'),
         ('ended_at', 'ALTER TABLE sessions ADD COLUMN ended_at REAL'),
         ('end_reason', 'ALTER TABLE sessions ADD COLUMN end_reason TEXT'),
+        ('model_config', 'ALTER TABLE sessions ADD COLUMN model_config TEXT'),
+        ('session_source', 'ALTER TABLE sessions ADD COLUMN session_source TEXT'),
     ):
         existing = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
         if column not in existing:
@@ -1621,6 +1623,89 @@ def test_messaging_reset_successor_without_session_key(cleanup_test_sessions):
         by_id = {row['id']: row for row in rows}
         lineage = read_session_lineage_metadata(_get_state_db_path(), ids)
         for parent_sid, child_sid, _parent_fields, _child_fields, toplevel in cases:
+            for reader in (by_id, lineage):
+                relationship = reader[child_sid].get('relationship_type')
+                if toplevel:
+                    assert relationship != 'child_session', child_sid
+                else:
+                    assert relationship == 'child_session', child_sid
+    finally:
+        try:
+            _remove_test_sessions(conn, *ids)
+            conn.close()
+        except Exception:
+            pass
+
+
+def test_messaging_reset_keeps_explicit_branch_provenance(cleanup_test_sessions):
+    """A same-key branch of a reset parent stays nested.
+
+    ``_reset_from`` naming this parent, and a ``_branched_from`` that names an
+    earlier ancestor, are still the reset segment. An unreadable marker and a
+    WebUI fork are not.
+    """
+    from api.agent_sessions import read_importable_agent_session_rows, read_session_lineage_metadata
+
+    conn = _ensure_state_db()
+    now = time.time()
+    key = 'agent:main:telegram:dm:reset-branch'
+    parent_sid = 'tg_reset_branch_parent'
+    cases = (
+        ('tg_reset_direct_branch', json.dumps({'_branched_from': parent_sid}), None, False),
+        ('tg_reset_direct_delegate', json.dumps({'_delegate_from': parent_sid}), None, False),
+        ('tg_reset_ordinary', None, None, True),
+        ('tg_reset_marker', json.dumps({'_reset_from': parent_sid}), None, True),
+        ('tg_reset_inherited', json.dumps({'_branched_from': 'older-ancestor'}), None, True),
+        ('tg_reset_unknown_marker', '{', None, False),
+        ('tg_reset_fork', None, 'fork', False),
+        ('tg_reset_legacy_branch', json.dumps({'_branched_from': parent_sid}), None, False),
+    )
+    ids = [parent_sid, *[child for child, *_rest in cases]]
+    cleanup_test_sessions.extend(ids)
+    try:
+        _insert_agent_session_row(
+            conn,
+            session_id=parent_sid,
+            source='telegram',
+            title='Reset parent',
+            started_at=now - 50,
+            ended_at=now - 20,
+            end_reason='session_reset',
+            messages=2,
+        )
+        conn.execute(
+            'UPDATE sessions SET session_key = ?, user_id = ?, chat_id = ? WHERE id = ?',
+            (key, '264339801', '264339801', parent_sid),
+        )
+        for index, (child_sid, model_config, session_source, _toplevel) in enumerate(cases):
+            _insert_agent_session_row(
+                conn,
+                session_id=child_sid,
+                source='telegram',
+                title=child_sid,
+                started_at=now - 10,
+                parent_session_id=parent_sid,
+                messages=2,
+            )
+            if child_sid == 'tg_reset_legacy_branch':
+                conn.execute(
+                    'UPDATE sessions SET user_id = ?, chat_id = ?, model_config = ? WHERE id = ?',
+                    ('264339801', '264339801', model_config, child_sid),
+                )
+            else:
+                conn.execute(
+                    '''UPDATE sessions
+                       SET session_key = ?, user_id = ?, chat_id = ?,
+                           model_config = ?, session_source = ?
+                       WHERE id = ?''',
+                    (key, '264339801', '264339801', model_config, session_source, child_sid),
+                )
+        conn.commit()
+
+        rows = read_importable_agent_session_rows(_get_state_db_path(), exclude_sources=None)
+        by_id = {row['id']: row for row in rows}
+        lineage = read_session_lineage_metadata(_get_state_db_path(), ids)
+        for child_sid, _config, _source, toplevel in cases:
             for reader in (by_id, lineage):
                 relationship = reader[child_sid].get('relationship_type')
                 if toplevel:

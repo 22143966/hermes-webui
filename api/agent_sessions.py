@@ -463,6 +463,21 @@ def _is_messaging_reset_successor(parent: dict | None, child: dict | None) -> bo
                 return False
         except (TypeError, ValueError):
             return False
+    # An explicit branch or delegate of this parent is not the reset segment,
+    # even when it shares the chat key and starts after the reset. A WebUI
+    # fork and an unreadable marker fail closed the same way. ``_reset_from``
+    # naming this parent is the reset segment itself. A branch marker that
+    # names an earlier ancestor was inherited and does not block the exemption.
+    if str(child.get('session_source') or '').strip().lower() == 'fork':
+        return False
+    marker_state, child_markers = _branch_markers(child)
+    if marker_state == 'unknown':
+        return False
+    parent_id = str(parent.get('id') or '').strip()
+    if parent_id and child_markers.get('_branched_from') == parent_id:
+        return False
+    if parent_id and child_markers.get('_delegate_from') == parent_id:
+        return False
     parent_key = str(parent.get('session_key') or '').strip()
     child_key = str(child.get('session_key') or '').strip()
     if parent_key and child_key:
