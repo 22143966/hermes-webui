@@ -10154,7 +10154,9 @@ function renderSessionListFromCache(){
       // A title that already has focus keeps it. Click, double-click rename
       // and assistive activation are unaffected.
       title.onmousedown=(e)=>{
-        if(e.button!==0) return;
+        // Left and right presses: a right press opens the context menu, and
+        // closing it would otherwise hand focus back to the title.
+        if(e.button!==0&&e.button!==2) return;
         e.preventDefault();
         // The prevented default also leaves focus where it was.
         _releaseFocusLikeRowPress(title);
