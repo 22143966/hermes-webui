@@ -449,6 +449,40 @@ class TestIssue5127CustomProviderBareSuffixRepair:
         assert kept == ("@custom:lab:live-b", "custom:lab", False)
         assert config.resolve_model_provider(kept[0])[0] == "live-b"
 
+    def test_renamed_root_alias_keeps_launcher_value(self, monkeypatch, tmp_path):
+        """A renamed root alias (#1612) resolves like 'default': the launcher snapshot is layered under root's .env."""
+        import api.config as config
+        import api.profiles as profiles
+        from api.routes import _resolve_compatible_session_model_state
+
+        root_home = tmp_path / "root"
+        root_home.mkdir()
+        monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda _name: root_home)
+        monkeypatch.setattr(profiles, "_is_root_profile", lambda name: name in ("default", "main"))
+        monkeypatch.setattr(profiles, "_INITIAL_PROCESS_ENV", {"LAUNCH_ONLY_MODEL": "launch-x"})
+        monkeypatch.delenv("LAUNCH_ONLY_MODEL", raising=False)
+        profile_cfg = {
+            "custom_providers": [
+                {
+                    "name": "lab2",
+                    "base_url": "http://lab2.invalid/v1",
+                    "model": "${LAUNCH_ONLY_MODEL}",
+                    "models": ["saved-c"],
+                }
+            ]
+        }
+        monkeypatch.setattr(config, "cfg", profile_cfg)
+
+        kept = _resolve_compatible_session_model_state(
+            "@custom:lab2:launch-x",
+            "custom:lab2",
+            profile_config=profile_cfg,
+            prefer_cached_catalog=True,
+            profile="main",
+        )
+
+        assert kept == ("@custom:lab2:launch-x", "custom:lab2", False)
+
     def test_root_session_env_default_keeps_launcher_value(self, monkeypatch, tmp_path):
         """A launcher-supplied value the root ``.env`` doesn't repeat still counts for root."""
         import api.config as config

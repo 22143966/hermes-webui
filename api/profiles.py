@@ -1439,7 +1439,9 @@ def profile_env_for_thread_readonly(
     previous_env = getattr(_thread_ctx, "env", {})
     previous_env = dict(previous_env) if isinstance(previous_env, dict) else {}
     previous_block = bool(getattr(_thread_ctx, "block_process_env_fallback", False))
-    thread_env = dict(_INITIAL_PROCESS_ENV) if profile == "default" else {}
+    # Any name that resolves to the root home (the legacy "default" or a renamed root alias, #1612) layers
+    # the root .env over the launcher snapshot, exactly like "default".
+    thread_env = dict(_INITIAL_PROCESS_ENV) if _is_root_profile(profile) else {}
     thread_env.update(safe_runtime_env)
     thread_env["HERMES_HOME"] = str(profile_home_path)
     try:
