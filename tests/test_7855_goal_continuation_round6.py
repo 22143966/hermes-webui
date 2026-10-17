@@ -83,8 +83,14 @@ def test_the_save_helper_accepts_and_persists_the_token() -> None:
         "the draft save helper does not accept a continuation token, so a "
         "reload between a failed start and its retry loses it (#7855 finding 1)"
     )
-    assert "body.goal_continuation_id" in body, (
-        "the token is accepted but never put on the wire"
+    # The token reaches the wire through the shared payload helper, whose
+    # default-empty / explicit-id argument is what puts it on the body.
+    assert "_postComposerDraftPayload(sid, normalizedDraft, intent, normalizedGoalContId)" in body, (
+        "the token is accepted but never handed to the payload helper"
+    )
+    post_body = _js_function(SESSIONS_JS, "function _postComposerDraftPayload(")
+    assert "goal_continuation_id: normalizedGoalContId" in post_body, (
+        "the payload helper does not put the continuation token on the wire"
     )
 
 
@@ -124,14 +130,18 @@ def test_the_failed_send_persist_passes_the_token() -> None:
     start = MESSAGES_JS.find("function _restoreComposerDraftAfterFailedSend(")
     assert start >= 0
     body = MESSAGES_JS[start : start + 6000]
-    assert "_saveComposerDraftNow(sid, liveText" in body, (
+    assert "_saveComposerDraftNow(sid," in body, (
         "the failed-send persist no longer calls the save helper"
     )
     # The 4th argument is the token, and it is conditional on the text being
     # unchanged — an edited draft must not inherit it.
-    assert "_restoreContId:'')" in body, (
+    assert "_persistContId" in body, (
         "the failed-send persist does not pass the token (and does not fail "
         "closed on an edited draft) (#7855 finding 1)"
+    )
+    assert "_saveComposerDraftNow(sid,persistedText,persistedFiles,_persistContId)" in body, (
+        "the failed-send persist does not hand the resolved token to the save "
+        "helper (#7855 finding 1)"
     )
 
 
@@ -140,8 +150,8 @@ def test_an_edited_draft_does_not_persist_the_token() -> None:
     start = MESSAGES_JS.find("function _restoreComposerDraftAfterFailedSend(")
     body = MESSAGES_JS[start : start + 6000]
     assert (
-        "String(liveText||'').trim()===String(restore||'').trim()?_restoreContId:''"
-        in body
+        "const _persistContId=_restoreContId" in body
+        and "String(persistedText||'').trim()===String(restore||'').trim()" in body
     ), (
         "the persist must drop the token as soon as the composer text differs "
         "from the restored draft (#7855 finding 1)"
@@ -151,9 +161,17 @@ def test_an_edited_draft_does_not_persist_the_token() -> None:
 def test_submitting_the_draft_clears_the_stored_token() -> None:
     """``_clearComposerDraft`` must send an explicit empty token."""
     body = _js_function(SESSIONS_JS, "function _clearComposerDraft(")
-    assert "goal_continuation_id: ''" in body, (
+    # The clear posts through the shared payload helper with NO 4th argument,
+    # and that helper's default is an explicit empty token — so the stored
+    # token is dropped together with the draft it belonged to.
+    assert "_postComposerDraftPayload(sid, { text: '', files: [] }, intent)" in body, (
         "clearing the draft leaves the stored token behind on the server, and "
         "the next session to restore that draft inherits it (#7855 finding 1)"
+    )
+    post_body = _js_function(SESSIONS_JS, "function _postComposerDraftPayload(")
+    assert "goalContinuationId=''" in post_body, (
+        "the payload helper's default is not an explicit empty token, so a "
+        "clear would leave the stored continuation token behind"
     )
 
 

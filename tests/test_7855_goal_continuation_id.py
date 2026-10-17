@@ -435,8 +435,17 @@ class TestFrontendWiring:
         assert "let _goalContinuationId=_normalizeGoalContinuationId(_sendOptions.goalContinuationId)" in src, (
             "send() must bind the continuation ID from its own argument"
         )
-        assert "goal_continuation_id:_goalContinuationId||undefined" in src, (
+        # Round 9 (MUST-FIX 2): the key must ALWAYS be present on the wire.
+        # `||undefined` let JSON.stringify drop it, so a current client's
+        # genuine turn and a pre-upgrade tab's turn were byte-identical and a
+        # key-presence legacy path would admit every genuine turn (#6885).
+        assert "goal_continuation_id:_goalContinuationId||''" in src, (
             "send() must post the invocation-bound ID in the /api/chat/start body"
+        )
+        assert "goal_continuation_id:_goalContinuationId||undefined" not in src, (
+            "send() still posts the ID as `||undefined`; JSON.stringify drops the "
+            "undefined key, so the server cannot distinguish a genuine turn from "
+            "a pre-upgrade tab's turn (#6885 would return via the legacy path)"
         )
 
     def test_no_shared_drain_slot_remains(self):

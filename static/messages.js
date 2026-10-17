@@ -175,7 +175,8 @@ function _markActiveSessionViewedOnReturn() {
   if(!_isDocumentVisibleAndFocused() || !S.session || !S.session.session_id) return;
   _markSessionViewed(S.session.session_id, S.session.message_count || (S.messages&&S.messages.length) || 0);
   if(typeof _clearSessionCompletionUnread==='function') _clearSessionCompletionUnread(S.session.session_id);
-  if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
+  if(typeof _repaintSidebarForBackgroundChurn==='function') _repaintSidebarForBackgroundChurn();
+  else if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
 }
 
 function _chatPayloadModel(){
@@ -1330,7 +1331,7 @@ function _sessionTitleLooksDefaultOrProvisional(titleText, provisionalText){
 }
 
 function _firstUserMessageTitleCandidate(){
-  const first=(S.messages||[]).find(m=>m&&m.role==='user'&&m.content);
+  const first=(S.messages||[]).find(m=>m&&m.role==='user'&&m._source!=='delegation_wakeup'&&m.content);
   return first?String(first.content||'').trim().slice(0,64):'';
 }
 
@@ -1358,7 +1359,7 @@ function applySessionTitleUpdate(sid, titleText, options={}){
   }
   if(row) row.title=newTitle;
   if(options.rememberProvisional) _sessionTitleProvisionalBySid.set(sid,newTitle);
-  if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
+  if(typeof _repaintSidebarForBackgroundChurn==='function') _repaintSidebarForBackgroundChurn();
   else if(typeof renderSessionList==='function') renderSessionList();
   return true;
 }
@@ -1415,7 +1416,11 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
   // loop ended silently. Recorded as a text-bound restored draft so the token
   // applies only while the user still sends exactly this text, and dies with a
   // replaced/abandoned draft (#788).
-  const _restoreContId=_normalizeGoalContinuationId(goalContinuationId);
+  // The normalizer is defined at this file's module scope (line 44); the local
+  // guard keeps a harness that extracts only this helper runnable.
+  const _restoreContId=(typeof _normalizeGoalContinuationId==='function')
+    ?_normalizeGoalContinuationId(goalContinuationId)
+    :String(goalContinuationId||'').trim();
 
   // Only mutate the VISIBLE composer / staged tray when the failed send belongs
   // to the session the user is currently looking at — otherwise a background
@@ -1460,41 +1465,55 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
   // draft synchronously with the persist so both halves agree.
   if(sid&&typeof _saveComposerDraftNow==='function'){
     const _persist=()=>{
-      try{
-        const stillVisible=(S.session&&S.session.session_id)===sid;
-        if(stillVisible){
-          const inp=$('msg');
-          const liveText=inp?String(inp.value||''):restore;
-          // #7855 CORE (round 6): the token survives the reload only if it is
-          // persisted WITH this text. Pass it through; the save helper drops it
-          // when the text is gone, so an abandoned draft cannot orphan a token.
-          if(_restoreContId&&typeof _setRestoredGoalContinuationDraft==='function'
-             && String(liveText||'').trim()===String(restore||'').trim()){
-            // Unchanged restore: keep the one-shot binding so a one-key resend
-            // still carries the token in-page as well as across a reload.
-            _setRestoredGoalContinuationDraft(_restoreContId,restore);
-          }
-          _saveComposerDraftNow(sid, liveText, S.pendingFiles?[...S.pendingFiles]:[],
-            String(liveText||'').trim()===String(restore||'').trim()?_restoreContId:'');
-        } else if(!restoredVisible){
-          // Background failure (sid was never the visible session): no live
-          // composer to read, so persist the captured snapshot — it's the only copy.
-          // #7855 CORE (round 7): the token must travel with that snapshot.
-          // The background restore saves only text/files, so a return to this
-          // session and a retry posted no id and start admission scored it
-          // goal_related=false (master scores true). Pass the restored
-          // continuation id alongside the exact text it belongs to.
-          if(_restoreContId){
-            _saveComposerDraftNow(sid, restore, files, _restoreContId);
-          } else {
-            _saveComposerDraftNow(sid, restore, files);
-          }
+      let persistedText=restore;
+      let persistedFiles=files;
+      const stillVisible=(S.session&&S.session.session_id)===sid;
+      if(stillVisible){
+        const inp=$('msg');
+        const liveText=inp?String(inp.value||''):restore;
+        persistedText=liveText;
+        persistedFiles=S.pendingFiles?[...S.pendingFiles]:files;
+        // #7855 CORE (round 6): the token survives the reload only if it is
+        // persisted WITH this text. Pass it through; the save helper drops it
+        // when the text is gone, so an abandoned draft cannot orphan a token.
+        if(_restoreContId&&typeof _setRestoredGoalContinuationDraft==='function'
+           && String(liveText||'').trim()===String(restore||'').trim()){
+          // Unchanged restore: keep the one-shot binding so a one-key resend
+          // still carries the token in-page as well as across a reload.
+          _setRestoredGoalContinuationDraft(_restoreContId,restore);
         }
-        // else: restored the visible composer, then the user switched away — the
+      } else if(!restoredVisible){
+        // Background failure (sid was never the visible session): no live
+        // composer to read, so persist the captured snapshot — it's the only copy.
+        // #7855 CORE (round 7): the token must travel with that snapshot.
+        // The background restore saves only text/files, so a return to this
+        // session and a retry posted no id and start admission scored it
+        // goal_related=false (master scores true). Pass the restored
+        // continuation id alongside the exact text it belongs to.
+        persistedText=restore;
+        persistedFiles=files;
+      } else {
+        // Restored the visible composer, then user switched away — the
         // session-switch save path already saved sid's composer; skip stale write.
-      }catch(_){ }
+        return;
+      }
+      // #7855 (round 6/7): the token travels only with the exact text it was
+      // restored for — an edited draft must not inherit it (round-7 rule).
+      const _persistContId=_restoreContId
+        && String(persistedText||'').trim()===String(restore||'').trim()
+        ?_restoreContId:'';
+      try{
+        const result=_saveComposerDraftNow(sid,persistedText,persistedFiles,_persistContId);
+        if(result&&typeof result.catch==='function'){
+          return result.catch((error)=>_handleComposerDraftPostFailure(error,sid,persistedText,persistedFiles));
+        }
+        return result;
+      }catch(error){
+        _handleComposerDraftPostFailure(error,sid,persistedText,persistedFiles);
+        return;
+      }
     };
-    if(clearPromise&&typeof clearPromise.then==='function') clearPromise.then(_persist,_persist);
+    if(clearPromise&&typeof clearPromise.then==='function') clearPromise.then(_persist,_persist).catch(()=>{});
     else _persist();
   }
 
@@ -1579,6 +1598,11 @@ async function send(){
     _sendInProgress=false;_sendInProgressSid=null;
     return;
   }
+  // Capture overlay authority at the originating Send action. Bundle/catalog
+  // resolution below can await before it discovers that a session must be
+  // created; recapturing inside newSession() would let that older Send retire a
+  // project picker the user opened during the resolver wait.
+  const _sendProjectPickerClaim=(typeof _projectPickerOpenEpoch==='number')?_projectPickerOpenEpoch:0;
 
   // #5472: snapshot the ORIGINAL user-typed composer state now — before slash
   // rewrites (/moa, bundles) mutate `text` and before uploadPendingFiles()
@@ -1741,7 +1765,7 @@ async function send(){
         ? await getAgentCommandMetadata(_parsedCmd.name)
         : null;
       if(_agentCmd&&_agentCmd.cli_only){
-        if(!S.session){await newSession();}
+        if(!S.session){await newSession(false,{pickerClaimEpoch:_sendProjectPickerClaim});}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd),_ts:Date.now()/1000});
         renderMessages();
@@ -1749,7 +1773,7 @@ async function send(){
       }
       const _agentCmdName=String(_agentCmd&&_agentCmd.name||_parsedCmd&&_parsedCmd.name||'').trim().toLowerCase();
       if(_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName)){
-        if(!S.session){await newSession();}
+        if(!S.session){await newSession(false,{pickerClaimEpoch:_sendProjectPickerClaim});}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         let _agentOutput='(no output)';
         try{
@@ -1764,7 +1788,7 @@ async function send(){
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
       if(_agentCmd&&_agentCmd.category==='Plugin'){
-        if(!S.session){await newSession();}
+        if(!S.session){await newSession(false,{pickerClaimEpoch:_sendProjectPickerClaim});}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         let _pluginOutput='(no output)';
         try{
@@ -1780,7 +1804,7 @@ async function send(){
       }
       if(_agentCmdName==='moa'){
         const _moaArgs=(text.split(/\s+/).slice(1).join(' ')||'').trim();
-        if(!S.session){await newSession();}
+        if(!S.session){await newSession(false,{pickerClaimEpoch:_sendProjectPickerClaim});}
         if(!_moaArgs){
           let _moaUsage='/moa <prompt>';
           try{const _moaCfgU=await api('/api/commands/moa/resolve');_moaUsage=_moaCfgU.usage||_moaUsage;}catch(_eu){}
@@ -1812,7 +1836,7 @@ async function send(){
           _slashDisplayTextOverride=text;
           text=_bundleMessage;
         }catch(e){
-          if(!S.session){await newSession();}
+          if(!S.session){await newSession(false,{pickerClaimEpoch:_sendProjectPickerClaim});}
           S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
           S.messages.push({role:'assistant',content:`Bundle command error: ${e&&e.message||e}`,_ts:Date.now()/1000});
           renderMessages();
@@ -1821,7 +1845,7 @@ async function send(){
       }
     }
   }
-  if(!S.session){await newSession();}
+  if(!S.session){await newSession(false,{pickerClaimEpoch:_sendProjectPickerClaim});}
 
   const activeSid=S.session.session_id;
   _sendInProgressSid=activeSid;
@@ -1902,6 +1926,13 @@ async function send(){
   // set there; nothing to re-declare here.
   const displayText=_slashDisplayTextOverride||text||(uploaded.length?`Uploaded: ${uploadedNames.join(', ')}`:'(file upload)');
   const userMsg={role:'user',content:displayText,attachments:uploaded.length?uploadedNames:undefined,_ts:Date.now()/1000,_pending:true};
+  // #7882 (greptile round-4 P2): visible-length of the transcript BEFORE the
+  // optimistic push — the local tail the server could already know. Passed to
+  // every upsertActiveSessionForLocalTurn call of this send so the visible-count
+  // bump is exactly the rows this send added (idempotent across the updater's
+  // multiple passes, and correct when only a paginated tail is loaded). Same
+  // hidden-row rule as the updater in sessions.js.
+  const _localVisibleBeforePush=(Array.isArray(S.messages)?S.messages:[]).filter(m=>m&&m.role&&m._source!=='delegation_wakeup').length;
   S.toolCalls=[];  // clear tool calls from previous turn
   clearLiveToolCards();  // clear any leftover live cards from last turn
   let optimisticMessages;
@@ -1914,7 +1945,7 @@ async function send(){
     // can save pending state on the server.
     _runOptionalPreStartUiStep('upsertActiveSessionForLocalTurn.initial', ()=>{
       if(typeof upsertActiveSessionForLocalTurn==='function'){
-        upsertActiveSessionForLocalTurn({title:displayText.slice(0,64),messageCount:S.messages.length,timestampMs:Date.now()});
+        upsertActiveSessionForLocalTurn({title:displayText.slice(0,64),messageCount:S.messages.length,timestampMs:Date.now(),localVisibleBeforePush:_localVisibleBeforePush});
       }
     });
     optimisticMessages=[...S.messages];
@@ -1945,12 +1976,12 @@ async function send(){
         if(typeof upsertActiveSessionForLocalTurn==='function'){
           // Second optimistic pass: carry the provisional title into the cached row
           // without re-fetching /api/sessions before pending state exists server-side.
-          upsertActiveSessionForLocalTurn({title:provisionalTitle,messageCount:S.messages.length,timestampMs:Date.now()});
+          upsertActiveSessionForLocalTurn({title:provisionalTitle,messageCount:S.messages.length,timestampMs:Date.now(),localVisibleBeforePush:_localVisibleBeforePush});
         }
       });
     } else if(typeof upsertActiveSessionForLocalTurn==='function'){
       _runOptionalPreStartUiStep('upsertActiveSessionForLocalTurn.titled', ()=>{
-        upsertActiveSessionForLocalTurn({title:S.session&&S.session.title||displayText.slice(0,64),messageCount:S.messages.length,timestampMs:Date.now()});
+        upsertActiveSessionForLocalTurn({title:S.session&&S.session.title||displayText.slice(0,64),messageCount:S.messages.length,timestampMs:Date.now(),localVisibleBeforePush:_localVisibleBeforePush});
       });
     } else {
       _runOptionalPreStartUiStep('renderSessionListFromCache.prestart', ()=>{
@@ -2023,7 +2054,14 @@ async function send(){
       // queue (kept through edits/combines/late sends). Bound to THIS send
       // invocation, so it is absent on a genuine user turn — which is exactly
       // the #6885 distinction — and a concurrent drain can never supply it.
-      goal_continuation_id:_goalContinuationId||undefined
+      // Round 9 (MUST-FIX 2): post `||''`, never `||undefined`. JSON.stringify
+      // drops undefined keys, which made a current client's genuine turn and a
+      // pre-upgrade tab's turn byte-identical on the wire — a key-presence
+      // legacy path on the server would then have admitted every genuine turn
+      // (#6885 again). The explicit empty string keeps the key present so the
+      // server can tell "genuine turn" from "pre-upgrade tab that must still
+      // get marker admission".
+      goal_continuation_id:_goalContinuationId||''
     })});
     _pendingMoaConfig=null;
     postStartData = startData;
@@ -2048,6 +2086,13 @@ async function send(){
       if(!_clarifySessionId || _clarifySessionId===activeSid) hideClarifyCard(true, 'terminal');
       removeThinking();
       S.session=null;S.messages=[];
+      // The tray renders from S.todos whenever the todoStateMeta sentinel is
+      // present (_currentTodos in ui.js), so clearing the session alone left the
+      // deleted conversation's tasks on screen over an empty transcript. Drop
+      // the snapshot exactly like the other session-clearing paths do
+      // (clearConversation, deleteSession): hydrate against a null session,
+      // which resets S.todos/S.todoStateMeta and reschedules the tray paint.
+      if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(null);
       setBusy(false);setComposerStatus('');
       if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(activeSid);
       if(typeof renderMessages==='function') renderMessages();
@@ -2159,7 +2204,7 @@ async function send(){
     if(typeof upsertActiveSessionForLocalTurn==='function'){
       // Third optimistic pass: stream_id is now known, so the row can reconcile
       // against real active-stream metadata before the background refresh lands.
-      upsertActiveSessionForLocalTurn({title:S.session&&S.session.title||displayText.slice(0,64),messageCount:S.messages.length,timestampMs:Date.now()});
+      upsertActiveSessionForLocalTurn({title:S.session&&S.session.title||displayText.slice(0,64),messageCount:S.messages.length,timestampMs:Date.now(),localVisibleBeforePush:_localVisibleBeforePush});
     }
     if(!INFLIGHT[activeSid]){
       INFLIGHT[activeSid]={messages:optimisticMessages,uploaded:uploadedNames,toolCalls:[]};
@@ -6768,6 +6813,18 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const _prevCost=(S.session&&S.session.estimated_cost)||0;
           const _prevCacheRead=(S.session&&S.session.cache_read_tokens)||0;
           const _prevCacheWrite=(S.session&&S.session.cache_write_tokens)||0;
+          // #6112: capture the pre-settle transcript so the guard after the carry-forward can
+          // put it back. `_carryForwardEphemeralTurnFields` returns the NEW list whenever
+          // either side is empty, so a `done` payload with no messages blanked the whole
+          // visible transcript — and a payload that never received the in-flight assistant
+          // turn (context compression rotating the session at the turn boundary) dropped the
+          // answer the reader was watching. Neither is recoverable downstream: a blank
+          // transcript stays blank, and the #373 no-reply guard is gated on `!assistantText`,
+          // so no "No response received." card is pushed either. A reload restores it because
+          // the server copy was never touched — which is the whole #6112 symptom.
+          let _doneFinalAnswer='';
+          try{ if(typeof _streamDisplay==='function') _doneFinalAnswer=_streamDisplay()||''; }catch(_){}
+          const _preSettle=Array.isArray(S.messages)?S.messages:[];
           S.session=d.session;S.messages=_carryForwardEphemeralTurnFields(S.messages||[], d.session.messages||[]);if(typeof _adoptRegenerationRevision==='function')_adoptRegenerationRevision(d.session);if(typeof _messagesTruncated!=='undefined')_messagesTruncated=!!d.session._messages_truncated;
           if(_pendingTitleUpdates.has(completedSid)){
             applySessionTitleUpdate(completedSid, _pendingTitleUpdates.get(completedSid), {expectedCurrent:_pendingTitleExpectedCurrent.get(completedSid)});
@@ -6776,6 +6833,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           }
           // #4720: reset _oldestIdx (full-load symmetry; keeps the #4613 anchor aligned).
           if(typeof _oldestIdx!=='undefined')_oldestIdx=d.session._messages_offset||0;
+          // #6112 settle guard.
+          S.messages=_adoptDoneSnapshotMessages(_preSettle, S.messages, _doneFinalAnswer).messages;
           S.messages=_filterRecoveryControlMessages(S.messages || []);
           if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
           if(typeof clearVisibleMessageRowCache==='function') clearVisibleMessageRowCache();
@@ -7571,6 +7630,103 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   if(typeof window!=='undefined'){
     window._carryForwardEphemeralTurnFields=_carryForwardEphemeralTurnFields;
   }
+  // #6112 — a `done` settle must never leave the transcript without the final answer.
+  //
+  // The settled snapshot used to be adopted with no questions asked:
+  //     S.messages=_carryForwardEphemeralTurnFields(S.messages||[], d.session.messages||[]);
+  // `_carryForwardEphemeralTurnFields` returns the NEW list unconditionally whenever either
+  // side is empty, so a payload whose `session.messages` was absent, null, or [] replaced the
+  // whole visible transcript with []. Two concrete ways the streamed answer then disappears
+  // while the server copy stays intact:
+  //   1. empty/absent snapshot -> every message the reader was watching is dropped;
+  //   2. snapshot whose transcript simply never received the streamed answer (context
+  //      compression rotates the session at the turn boundary, and the rotated session's
+  //      message list is built without the in-flight assistant turn) -> adopted verbatim, and
+  //      the answer lives only in the live segment, which the settled rebuild throws away.
+  // Either way `_filterRecoveryControlMessages` does not recover it and the #373 no-reply
+  // guard is suppressed (it is gated on `!assistantText`), so NO "No response received." card
+  // is pushed either: the pane just renders empty, exactly as reported, and a reload — which
+  // re-reads the intact server transcript — brings the same answer back.
+  //
+  // The `stream_end` path has had the matching shorter-snapshot protection since #5224/#3195
+  // (`preserveVisibleOnShorterTerminalSnapshot` / prefix+suffix matching). This is the `done`
+  // counterpart: only a snapshot that actually carries the turn's answer may replace what the
+  // reader is already looking at.
+  //
+  // `finalAnswer` is the display-ready streamed text (thinking/tool-call markup already
+  // stripped by the caller). An empty one disables the answer-presence rule, so callers that
+  // cannot supply it keep today's behaviour.
+  function _finalAnswerIsInTranscript(messages, finalAnswer){
+    const answer=String(finalAnswer||'').trim();
+    if(!answer) return true;
+    const tail=answer.slice(-160);
+    const list=Array.isArray(messages)?messages:[];
+    for(const m of list){
+      if(!m||m.role!=='assistant') continue;
+      let c=m.content;
+      if(Array.isArray(c)) c=c.map(p=>(p&&typeof p==='object')?((p.text||p.input_text||'')||''):(p||'')).join('');
+      c=String(c||'').trim();
+      if(!c) continue;
+      if(c===answer) return true;
+      if(answer.indexOf(c)>=0) return true;
+      if(c.indexOf(answer)>=0) return true;
+      if(tail&&c.indexOf(tail)>=0) return true;
+    }
+    return false;
+  }
+  // Settle guard, run right after the #3018 carry-forward assignment in the `done` handler.
+  // `preSettleMessages` is the transcript as the reader was looking at it, `settledMessages`
+  // is what the snapshot reconciled to. Two rules:
+  //   1. an empty settled list may not replace a non-empty transcript — there is nothing in
+  //      it to reconcile, so it would only blank the pane;
+  //   2. whatever wins must still contain the streamed final answer — otherwise the answer is
+  //      re-attached to the tail so the settled rebuild has something to render.
+  // True when the settled snapshot already ends the current turn with a usable
+  // final assistant row: real text that is not a tool-only row, a compression
+  // marker, a recovery-control row, or a terminal stream-error marker. The Agent
+  // may legitimately rewrite final content before persisting it
+  // (transform_llm_output), so the snapshot's last assistant row can be the
+  // authoritative final reply even when its text differs from the streamed
+  // answer. In that case the streamed copy must NOT be re-appended as a second
+  // assistant row (#6112).
+  function _snapshotHasUsableFinalAssistantRow(messages){
+    const list=Array.isArray(messages)?messages:[];
+    for(let i=list.length-1;i>=0;i--){
+      const m=list[i];
+      if(!m) continue;
+      if(m.role==='user') return false;            // crossed into the prior turn: no assistant row this turn
+      if(m.role!=='assistant') continue;            // skip tool / other rows
+      // m is the last assistant row of the current turn — decide usability.
+      if(_streamRecoveryControlMessage(m)) return false;
+      if(_isMarkerOnlyAssistantMessage(m)) return false;
+      if(typeof _isTerminalStreamErrorMarkerMessage==='function'&&_isTerminalStreamErrorMarkerMessage(m)) return false;
+      let c=m.content;
+      if(Array.isArray(c)) c=c.map(p=>(p&&typeof p==='object')?((p.text||p.input_text||'')||''):(p||'')).join('');
+      c=String(c||'').trim();
+      return !!c;                                  // usable iff it carries real text
+    }
+    return false;
+  }
+  function _adoptDoneSnapshotMessages(preSettleMessages, settledMessages, finalAnswer){
+    const pre=Array.isArray(preSettleMessages)?preSettleMessages:[];
+    const settled=Array.isArray(settledMessages)?settledMessages:[];
+    const adopted=settled.length>0;
+    const messages=(adopted||!pre.length)?settled:pre;
+    const answer=String(finalAnswer||'').trim();
+    if(!answer) return {adopted:adopted,messages:messages};
+    if(_finalAnswerIsInTranscript(messages,answer)) return {adopted:adopted,messages:messages};
+    // #6112: if the snapshot already ends this turn in a usable final assistant
+    // row (e.g. the Agent rewrote the answer before persisting), keep the
+    // snapshot and do not append the streamed copy — re-attach only when that
+    // row is absent.
+    if(_snapshotHasUsableFinalAssistantRow(messages)) return {adopted:adopted,messages:messages};
+    if(!messages.length) return {adopted:adopted,messages:messages};
+    return {adopted:true,messages:messages.concat([{role:'assistant',content:String(finalAnswer)}])};
+  }
+  if(typeof window!=='undefined'){
+    window._adoptDoneSnapshotMessages=_adoptDoneSnapshotMessages;
+    window._snapshotHasUsableFinalAssistantRow=_snapshotHasUsableFinalAssistantRow;
+  }
 
   async function _restoreSettledSession(source, options=null){
     const returnStatus=!!(options&&options.status);
@@ -7841,7 +7997,7 @@ function transcript(){
   const lines=[`# Hermes session ${S.session?.session_id||''}`,``,
     `Workspace: ${S.session?.workspace||''}`,`Model: ${S.session?.model||''}`,``];
   for(const m of S.messages){
-    if(!m||m.role==='tool')continue;
+    if(!m||m.role==='tool'||m._source==='delegation_wakeup')continue;
     let c=m.content||'';
     if(Array.isArray(c))c=c.filter(p=>p&&p.type==='text').map(p=>p.text||'').join('\n');
     const ct=String(c).trim();
@@ -9148,12 +9304,15 @@ function _handleBgTaskCompleteEvent(e, expectedSid, opts) {
       try { _markSessionViewed(sid, (S&&S.session&&S.session.session_id===sid)?(S.session.message_count??(S.messages&&S.messages.length)??0):0); } catch(_){}
       try { if(typeof _clearSessionCompletionUnread==='function') _clearSessionCompletionUnread(sid); } catch(_){}
     } else {
-      // T4 drop-when-focused: suppress toast only; ack below still fires.
-      try {
-        const tid = (d.task_id || '').slice(0, 8) || '?';
-        const tail = d.summary ? `: ${String(d.summary).slice(0, 80)}` : '';
-        showToast(`Task ${tid} done${tail}`, 2600);
-      } catch (_) {}
+      // Child report-backs are internal; ordinary process completions still toast.
+      // The diagnostic ack below fires for both kinds.
+      if (d.kind !== 'async_delegation') {
+        try {
+          const tid = (d.task_id || '').slice(0, 8) || '?';
+          const tail = d.summary ? `: ${String(d.summary).slice(0, 80)}` : '';
+          showToast(`Task ${tid} done${tail}`, 2600);
+        } catch (_) {}
+      }
     }
 
     // Fire-and-forget ack (diagnostic only — Option Z made this a no-op for

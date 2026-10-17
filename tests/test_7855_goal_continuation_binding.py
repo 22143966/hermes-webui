@@ -282,7 +282,21 @@ def _run(source: str, tmp_path: Path, mode: str = "race") -> str:
     path = tmp_path / "harness.js"
     path.write_text(script, encoding="utf-8")
     proc = subprocess.run([NODE, str(path)], capture_output=True, text=True, timeout=120)
-    assert proc.returncode == 0, f"node harness failed: {proc.stderr[:2000]}"
+    # Node 26 aborts (SIGABRT) during interpreter teardown on this host — it
+    # happens AFTER the harness has printed every probe line, so the observed
+    # signal says nothing about the code under test. Reproduced on the
+    # untouched PR head (553a74168) with `node /tmp/send_only.js`. Accept a
+    # clean-abort-at-exit, but still fail on a real crash or a non-zero exit
+    # that produced no output.
+    if proc.returncode != 0:
+        crashed_after_output = (
+            proc.returncode == -6
+            and "=" in proc.stdout
+            and "HARNESS_ERR" not in proc.stdout
+        )
+        assert crashed_after_output, (
+            f"node harness failed: {proc.stderr[:2000] or proc.stdout[:2000]}"
+        )
     return proc.stdout
 
 def _field(stdout: str, key: str):
@@ -320,9 +334,11 @@ def test_the_harness_reproduces_the_shared_slot_defect(tmp_path):
     """Guard the guard: synthesize the round-4 shared-slot shape from the CURRENT
     source and prove this same harness reports the stolen ID. Without this, a
     green run could just mean the probe stopped exercising anything."""
-    # Rebuild the old shape: a global slot the drain publishes and the POST reads.
+    # Rebuild the old shape: a global slot the drain publishes and the POST
+    # reads — plus the round-9 wire defect (`||undefined` instead of `||''`),
+    # since that is what made a genuine turn byte-identical to a legacy tab.
     buggy = MESSAGES_SRC.replace(
-        "goal_continuation_id:_goalContinuationId||undefined",
+        "goal_continuation_id:_goalContinuationId||''",
         "goal_continuation_id:_drainingGoalContinuationId||undefined",
         1,
     )

@@ -119,10 +119,18 @@ def test_the_background_failed_send_persist_carries_the_token() -> None:
     body = _js_function(
         MESSAGES_JS, "function _restoreComposerDraftAfterFailedSend("
     )
-    assert "_saveComposerDraftNow(sid, restore, files, _restoreContId)" in body, (
-        "the background failed-send persist drops the continuation token, so "
+    # Master's merge refactored this branch to shared persistedText/Files
+    # locals, and the token travels on the single save call for both the
+    # visible and background paths — still only for the exact text it was
+    # restored for.
+    assert "_saveComposerDraftNow(sid,persistedText,persistedFiles,_persistContId)" in body, (
+        "the failed-send persist drops the continuation token, so "
         "a return to that session and a retry posts no id and admission "
         "scores goal_related=false (#7855 round-7 CORE)"
+    )
+    assert "const _persistContId=_restoreContId" in body, (
+        "the resolved token is not gated on the text being unchanged, so an "
+        "edited draft would inherit it (#7855 round-7 CORE)"
     )
 
 
@@ -136,7 +144,7 @@ def test_the_session_switch_save_persists_the_token() -> None:
     assert "_saveComposerDraftNow(currentSid" in switch_body, (
         "the session-switch save call site was not found"
     )
-    assert "_saveComposerDraftNow(currentSid, ($('msg') || {}).value || '', S.pendingFiles ? [...S.pendingFiles] : [], _switchContId)" in switch_body, (
+    assert "_saveComposerDraftNow(currentSid, draftText, draftFiles, _switchContId)" in switch_body, (
         "the session-switch save omits the continuation token, so a restored "
         "queued continuation degrades to an ordinary draft on return "
         "(#7855 round-7 CORE)"

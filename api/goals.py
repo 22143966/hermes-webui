@@ -779,7 +779,9 @@ def register_pending_goal_continuation(session_id: str, continuation_prompt: str
     for the user to send later — so a TTL retired a continuation that was
     still perfectly usable. A record now lives until it is consumed
     (admitted-and-consumed by its ID) or explicitly retired (goal cleared /
-    paused / session retired).
+    session retired). Pause does NOT retire it — the resume path restores
+    the active goal with the same pending continuation, so clearing it on
+    pause silently stopped the goal loop (test_7855_regate_behaviour CORE 2).
     """
     session_id = str(session_id or "").strip()
     prompt = str(continuation_prompt or "").strip()
@@ -918,7 +920,10 @@ def _drop_pending_goal_continuation(session_id: str) -> None:
 
 def clear_pending_goal_continuation(session_id: str) -> None:
     """Drop any pending continuation record for *session_id* (goal clear /
-    pause / session-retirement paths)."""
+    session-retirement paths). Pause deliberately does NOT clear it: the
+    resume path restores the active goal with the same pending continuation,
+    so clearing it on pause broke the resume retry (test_7855_regate_behaviour
+    CORE 2)."""
     session_id = str(session_id or "").strip()
     if not session_id:
         return

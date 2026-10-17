@@ -264,10 +264,12 @@ wired into `/api/chat/start` by `routes.py`):
   browser deliberately keeps a queued continuation — it survives a refresh
   and is restored for the user to send later — so a TTL retired continuations
   that were still perfectly usable. A record ends when it is consumed
-  (admitted-and-consumed by its ID) or explicitly retired: `goal clear/pause`,
+  (admitted-and-consumed by its ID) or explicitly retired: `goal clear`,
   session retirement, and the orphan sweep inside the `/goal` command handler,
   which also collapses a marker without a record (or vice versa) so the two
-  halves cannot drift apart.
+  halves cannot drift apart. Pause does NOT retire a record: the resume path
+  restores the active goal with the same pending continuation, so clearing it
+  on pause silently stopped the goal loop (#7855 regate CORE 2).
 
 The semantic taxonomy table remains a draft for the proposed per-session
 endpoint vocabulary and must be confirmed during maintainer review before that

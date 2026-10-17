@@ -84,9 +84,16 @@ def test_the_draft_route_passes_the_stored_draft_to_the_helper():
         f"the helper's second argument is not `current_draft`; an edited draft "
         f"will keep re-binding the stale continuation token. Call: {args[:200]!r}"
     )
-    # And the stored draft must be captured BEFORE next_draft is mutated.
-    capture_idx = src.find("current_draft = dict(getattr(s, \"composer_draft\"", idx - 2000)
-    assert 0 < capture_idx < idx, (
+    # And the stored draft must be captured BEFORE next_draft is mutated. The
+    # capture lives in whichever draft-authority path the handler is using:
+    # master's bounded authority-hop walk binds `request_session`, the plain
+    # path binds `s`. Search backwards for either shape.
+    window = src[max(0, idx - 4000) : idx]
+    capture_idx = max(
+        window.rfind("current_draft = dict(getattr(s, \"composer_draft\""),
+        window.rfind("current_draft = dict(getattr(request_session, \"composer_draft\""),
+    )
+    assert capture_idx >= 0, (
         "the stored draft is not captured before the helper call"
     )
 
