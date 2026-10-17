@@ -3074,14 +3074,15 @@ function _inlineMediaHtmlForRef(ref, sessionId, altText){
     try{
       const u=new URL(ref);
       // #8033: file:///C:/Users/me/x parses to pathname '/C:/Users/me/x' —
-      // the file-URI grammar keeps the leading separator. Strip exactly that
-      // ONE separator before the drive letter; never a generic leading-slash
-      // removal (POSIX and UNC semantics differ). Non-local file authorities
-      // (UNC: file://server/share/...) are explicitly rejected here — never
-      // silently rewired to a local path.
+      // the file-URI grammar keeps the leading separator before the drive
+      // letter. The once-decoded pathname is forwarded to the backend AS-IS
+      // (no client-side strip): the server gates the drive-letter conversion
+      // on its own OS, so on a POSIX server '/C:/...' stays absolute and can
+      // never alias a cwd-relative drive-shaped path. Non-local file
+      // authorities (UNC: file://server/share/...) are explicitly rejected
+      // here — never silently rewired to a local path.
       if(u.hostname&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(u.hostname)) return '';
       ref=decodeURIComponent(u.pathname||ref.replace(/^file:\/\//i,''));
-      ref=ref.replace(/^[\\/]([A-Za-z]:[\\/])/,'$1');
     }catch(_){
       // Fail-closed on a parse failure (AGENTS.md): the raw string may hide
       // a non-local authority that the URL parse above never got to check.
@@ -3090,7 +3091,6 @@ function _inlineMediaHtmlForRef(ref, sessionId, altText){
       if(/^file:\/\/[^/?#]+/i.test(ref)) return '';
       try{ref=decodeURIComponent(ref.replace(/^file:\/\//i,''));}
       catch(__){ref=ref.replace(/^file:\/\//i,'');}
-      ref=ref.replace(/^[\\/]([A-Za-z]:[\\/])/,'$1');
     }
   }
   if(/^https?:\/\//i.test(ref)){

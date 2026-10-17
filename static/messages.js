@@ -4797,10 +4797,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // rewired to a local path.
       if(u.hostname&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(u.hostname)) return href;
       const path=decodeURIComponent(u.pathname||href.replace(/^file:\/\//i,''));
-      // #8033: file:///C:/Users/me/x parses to '/C:/Users/me/x' — strip
-      // exactly the URI-style separator before the drive letter (never a
-      // generic leading-slash removal: POSIX/UNC semantics differ).
-      return 'api/media?path='+encodeURIComponent(path.replace(/^[\\/]([A-Za-z]:[\\/])/,'$1'))+'&inline=1';
+      // #8033: file:///C:/Users/me/x parses to '/C:/Users/me/x' — the
+      // once-decoded pathname is forwarded AS-IS (no client-side strip).
+      // The backend gates the drive-letter conversion on the server OS:
+      // on a POSIX server '/C:/...' stays absolute and can never alias a
+      // cwd-relative drive-shaped path inside an allowed workspace.
+      return 'api/media?path='+encodeURIComponent(path)+'&inline=1';
     }catch(_){
       // Fail-closed on a parse failure (AGENTS.md): a file URI we cannot
       // parse may hide a non-local authority, and the raw string still
@@ -4808,7 +4810,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // 'file://<authority>/...' with a non-empty authority instead of
       // silently building a local media URL from it.
       if(/^file:\/\/[^/?#]+/i.test(href)) return href;
-      return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,'').replace(/^[\\/]([A-Za-z]:[\\/])/,'$1'))+'&inline=1';
+      return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,''))+'&inline=1';
     }
   }
   function _smdFileHref(raw){

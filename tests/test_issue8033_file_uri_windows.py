@@ -13,15 +13,20 @@ Root cause (maintainer-confirmed 2026-10-07):
   ``target = Path(raw_path).resolve()``. On Windows ``Path('/C:/x')`` is
   root-relative and resolves to the wrong location.
 
-Fix (narrowly Windows-gated, per maintainer review):
-- Server: a small ``_normalize_media_request_path`` helper strips exactly ONE
-  URI-style leading separator when it sits immediately before a drive letter
-  (regex ``^[\\\\/][A-Za-z]:[\\\\/]``). POSIX and UNC paths do not match the
-  shape and are returned unchanged. No generic leading-slash removal.
-- Clients: the same one-separator strip after the single ``decodeURIComponent``;
-  non-local file authorities (UNC: ``file://server/share/...``) are explicitly
-  rejected, never silently rewired to a local path. Streaming and settled
-  policies are identical.
+Fix (server-OS-gated, per maintainer review 2026-10-14):
+- Server: ``_normalize_media_request_path`` strips exactly ONE URI-style
+  leading separator when it sits immediately before a drive letter
+  (regex ``^[\\/][A-Za-z]:[\\/]``) — and ONLY on a Windows server
+  (``_is_windows_server``). On POSIX the separator is preserved: stripping
+  ``/C:/report.png`` there would turn an absolute path into a cwd-relative
+  ``C:/report.png`` that can alias a file inside an allowed workspace. POSIX
+  and UNC paths never match the shape and are returned unchanged. No generic
+  leading-slash removal.
+- Clients: the once-decoded pathname is forwarded to the backend AS-IS (the
+  previous client-side one-separator strip is gone — only the server knows
+  its own OS semantics, so only it may convert); non-local file authorities
+  (UNC: ``file://server/share/...``) are explicitly rejected, never silently
+  rewired to a local path. Streaming and settled policies are identical.
 
 These are behavioural tests (pure Python for the server helper, node-driven
 for the real client converters). The old static source-string pins in
@@ -66,30 +71,37 @@ _PNG_BYTES = (
 # ── Server: _normalize_media_request_path (pure Python) ───────────────────────
 
 class TestNormalizeMediaRequestPath:
-    """Behavioral coverage for the server-side Windows drive-letter strip."""
+    """Behavioral coverage for the server-side Windows drive-letter strip.
+
+    The strip is gated on the server being Windows (``_is_windows_server``),
+    so every strip assertion pins the gate open (``windows=True``) and the
+    POSIX assertions pin it closed (``windows=False``). The tests are
+    therefore platform-independent and pass on both POSIX and Windows CI.
+    """
 
     @staticmethod
-    def _norm(raw):
+    def _norm(raw, *, windows=False):
         from api import routes
-        return routes._normalize_media_request_path(raw)
+        with mock.patch.object(routes, "_is_windows_server", return_value=windows):
+            return routes._normalize_media_request_path(raw)
 
-    # ① upper/lowercase drive letters
+    # ① upper/lowercase drive letters — Windows server only
     def test_uppercase_drive_letter_strips_one_leading_separator(self):
-        assert self._norm("/C:/Users/me/report.md") == "C:/Users/me/report.md"
+        assert self._norm("/C:/Users/me/report.md", windows=True) == "C:/Users/me/report.md"
 
     def test_lowercase_drive_letter_strips_one_leading_separator(self):
-        assert self._norm("/c:/Users/me/report.md") == "c:/Users/me/report.md"
+        assert self._norm("/c:/Users/me/report.md", windows=True) == "c:/Users/me/report.md"
 
     def test_backslash_uri_style_separator_stripped(self):
-        assert self._norm("\\C:\\Users\\me\\report.md") == "C:\\Users\\me\\report.md"
-        assert self._norm("/C:\\Users\\me\\report.md") == "C:\\Users\\me\\report.md"
+        assert self._norm("\\C:\\Users\\me\\report.md", windows=True) == "C:\\Users\\me\\report.md"
+        assert self._norm("/C:\\Users\\me\\report.md", windows=True) == "C:\\Users\\me\\report.md"
 
     # ① encoded space / literal percent: helper is shape-only, no percent-decoding
     def test_encoded_space_kept_literal(self):
-        assert self._norm("/C:/Users/me/my%20report.md") == "C:/Users/me/my%20report.md"
+        assert self._norm("/C:/Users/me/my%20report.md", windows=True) == "C:/Users/me/my%20report.md"
 
     def test_literal_percent_kept_literal(self):
-        assert self._norm("/C:/Users/me/100%25.png") == "C:/Users/me/100%25.png"
+        assert self._norm("/C:/Users/me/100%25.png", windows=True) == "C:/Users/me/100%25.png"
 
     # ③ POSIX paths are untouched
     def test_posix_absolute_path_unchanged(self):
@@ -119,21 +131,37 @@ class TestNormalizeMediaRequestPath:
     # separator must sit immediately before the drive letter), so it is
     # preserved — a generic leading-slash removal would wrongly eat it.
     def test_double_separator_not_a_drive_uri_shape(self):
-        assert self._norm("//C:/x") == "//C:/x"
+        assert self._norm("//C:/x", windows=True) == "//C:/x"
+
+    # #8033 must-fix (maintainer 2026-10-14): the conversion only runs on a
+    # Windows server. On POSIX, '/C:/...' must stay absolute — stripping it
+    # would alias '<cwd>/C:/...' inside an allowed workspace.
+    def test_posix_drive_letter_shape_stays_absolute(self):
+        raw = "/C:/report.png"
+        assert self._norm(raw, windows=False) == raw  # separator preserved
+        resolved = pathlib.Path(self._norm(raw, windows=False)).resolve()
+        assert resolved.is_absolute()
+        assert resolved == pathlib.Path("/C:/report.png")  # stays at the root
+        assert resolved != pathlib.Path("C:/report.png").resolve()  # never cwd-relative
+
+    def test_drive_letter_strip_only_happens_on_windows_server(self):
+        raw = "/C:/Users/me/report.md"
+        assert self._norm(raw, windows=True) == "C:/Users/me/report.md"
+        assert self._norm(raw, windows=False) == raw
 
     def test_pure_windows_path_drive_semantics(self):
         """PureWindowsPath proves the bug and the fix at the Windows semantic layer.
 
         Pre-fix shape '/C:/Users/me/report.md' is drive='' root='\\' and NOT
-        absolute (no drive). After normalization the drive is 'C:' and the
-        path is absolute on the C: drive.
+        absolute (no drive). After normalization (Windows server) the drive is
+        'C:' and the path is absolute on the C: drive.
         """
         buggy = PureWindowsPath("/C:/Users/me/report.md")
         assert buggy.drive == ""
         assert buggy.root == "\\"
         assert not buggy.is_absolute()
 
-        fixed = PureWindowsPath(self._norm("/C:/Users/me/report.md"))
+        fixed = PureWindowsPath(self._norm("/C:/Users/me/report.md", windows=True))
         assert fixed.drive == "C:"
         assert fixed.root == "\\"
         assert fixed.is_absolute()
@@ -188,26 +216,20 @@ class TestHandleMediaWiresNormalization:
         Deterministic end-to-end wiring proof: the helper is invoked with the
         exact raw path, and (because it is shape-only) the POSIX path still
         resolves inside an allowed root.
+
+        The file is built inside the isolated allowed WORKSPACE (mocked via
+        get_last_workspace) instead of /tmp, so this 200-path proof runs on
+        every platform — including ones whose temp dir is not an allowed
+        media root (maintainer follow-up 2026-10-14: no more skip).
         """
         from api import routes
 
-        # /tmp is an allowed media root, but a native Windows checkout has no
-        # /tmp — use the platform temp dir and skip when it is not one of the
-        # route's allowed roots (the wiring proof below needs the file inside
-        # an allowed root to reach the 200 path).
-        _tmp_root = pathlib.Path(tempfile.gettempdir()).resolve()
-        if not (
-            _tmp_root == pathlib.Path("/tmp").resolve()
-            or str(_tmp_root).startswith(str(pathlib.Path("/tmp").resolve()))
-        ):
-            pytest.skip("platform temp dir is not an allowed media root")
-        with tempfile.TemporaryDirectory(dir=str(_tmp_root)) as tmpd, \
-             tempfile.TemporaryDirectory() as home:
+        with tempfile.TemporaryDirectory() as home:
             hermes_home = pathlib.Path(home) / ".hermes"
             hermes_home.mkdir(parents=True)
             ws = hermes_home / "workspace"
             ws.mkdir()
-            png = pathlib.Path(tmpd) / "shot.png"
+            png = ws / "shot.png"
             png.write_bytes(_PNG_BYTES)
 
             handler = _CaptureHandler()
@@ -232,9 +254,23 @@ class TestHandleMediaWiresNormalization:
             assert handler.status == 200
             assert handler.body == _PNG_BYTES
 
-    def test_handle_media_normalizes_drive_letter_shape_before_resolve(self):
-        """A Windows drive-letter-shaped path reaches the helper raw and is
-        never served on POSIX (it cannot resolve inside an allowed root)."""
+    def test_handle_media_drive_letter_shape_never_aliases_workspace(self):
+        """A '/C:/...' request must never resolve into an allowed workspace.
+
+        Maintainer must-fix (2026-10-14): the pre-fix normalizer stripped the
+        leading separator on every OS, turning the absolute '/C:/report.png'
+        into the cwd-relative 'C:/report.png'. With the server cwd inside an
+        allowed workspace, a decoy at '<ws>/C:/report.png' was served. The
+        strip is now gated on the server being Windows, so the request fails
+        closed: the raw path still reaches the helper, the resolved target
+        stays absolute at '/C:/report.png', and the decoy bytes are never
+        served.
+
+        The server-OS gate is pinned to POSIX (windows=False) so the alias
+        proof is deterministic on every CI platform, and os.getcwd is pinned
+        to the allowed workspace so a (buggy) strip would land exactly on the
+        decoy.
+        """
         from api import routes
 
         with tempfile.TemporaryDirectory() as home:
@@ -242,11 +278,23 @@ class TestHandleMediaWiresNormalization:
             hermes_home.mkdir(parents=True)
             ws = hermes_home / "workspace"
             ws.mkdir()
+            # Decoy at the exact spot a buggy POSIX strip would resolve to:
+            # '<cwd>/C:/report.png' with cwd pinned to the allowed workspace.
+            decoy_dir = ws / "C:"
+            decoy_dir.mkdir()
+            decoy = decoy_dir / "report.png"
+            decoy.write_bytes(_PNG_BYTES)
 
             handler = _CaptureHandler()
             with mock.patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}), \
                  mock.patch.object(routes, "get_last_workspace", lambda: str(ws)), \
                  mock.patch("api.auth.is_auth_enabled", lambda: False), \
+                 mock.patch("os.getcwd", return_value=str(ws)), \
+                 mock.patch.object(
+                     routes,
+                     "_is_windows_server",
+                     return_value=False,
+                 ), \
                  mock.patch.object(
                      routes,
                      "_normalize_media_request_path",
@@ -255,14 +303,15 @@ class TestHandleMediaWiresNormalization:
                 routes._handle_media(
                     handler,
                     SimpleNamespace(
-                        query="path=%2FC%3A%2FUsers%2Fme%2Freport.md",
+                        query="path=%2FC%3A%2Freport.png&inline=1",  # /C:/report.png
                         path="/api/media",
                     ),
                 )
 
             assert spy.call_count == 1
-            assert spy.call_args.args[0] == "/C:/Users/me/report.md"
-            assert handler.status != 200  # POSIX cannot serve a Windows drive path
+            assert spy.call_args.args[0] == "/C:/report.png"  # raw path reaches helper
+            assert handler.status != 200  # fail closed, POSIX cannot serve a drive path
+            assert handler.body != _PNG_BYTES  # the allowed-cwd decoy is never served
 
     def test_handle_media_serves_after_windows_normalization(self):
         """When the helper does its Windows job, the whole production chain
@@ -270,7 +319,7 @@ class TestHandleMediaWiresNormalization:
 
         On POSIX we cannot resolve a real 'C:/...' path, so the helper is
         simulated returning a genuine allowed-root path — exactly what it
-        produces on Windows for '/C:/...' inputs.
+        produces on a Windows server for '/C:/...' inputs.
         """
         from api import routes
 
@@ -445,24 +494,29 @@ def streaming_results(tmp_path_factory):
 
 @_NODE_REQUIRED
 class TestSettledFileUriConverter:
-    """Real _inlineMediaHtmlForRef from static/ui.js, driven in node."""
+    """Real _inlineMediaHtmlForRef from static/ui.js, driven in node.
 
-    def test_uppercase_drive_letter_loses_uri_leading_separator(self, settled_results):
+    The clients forward the once-decoded pathname AS-IS (leading separator
+    included): the backend is the only place that knows the server OS and
+    therefore the only place that may convert a drive-letter shape.
+    """
+
+    def test_uppercase_drive_letter_forwards_once_decoded_pathname(self, settled_results):
         r = settled_results["file:///C:/Users/me/report.png"]
         assert r["hasMediaRoute"]
-        assert r["pathParam"] == "C:/Users/me/report.png"
+        assert r["pathParam"] == "/C:/Users/me/report.png"
 
-    def test_lowercase_drive_letter_loses_uri_leading_separator(self, settled_results):
+    def test_lowercase_drive_letter_forwards_once_decoded_pathname(self, settled_results):
         r = settled_results["file:///c:/Users/me/report.png"]
-        assert r["pathParam"] == "c:/Users/me/report.png"
+        assert r["pathParam"] == "/c:/Users/me/report.png"
 
     def test_encoded_space_decoded_once(self, settled_results):
         r = settled_results["file:///C:/Users/me/my%20report.png"]
-        assert r["pathParam"] == "C:/Users/me/my report.png"
+        assert r["pathParam"] == "/C:/Users/me/my report.png"
 
     def test_literal_percent_decoded_exactly_once(self, settled_results):
         r = settled_results["file:///C:/Users/me/100%25.png"]
-        assert r["pathParam"] == "C:/Users/me/100%.png"
+        assert r["pathParam"] == "/C:/Users/me/100%.png"
 
     def test_posix_path_keeps_leading_slash(self, settled_results):
         r = settled_results["file:///home/me/x.png"]
@@ -484,33 +538,38 @@ class TestSettledFileUriConverter:
 
     def test_localhost_authority_treated_as_local(self, settled_results):
         r = settled_results["file://localhost/C:/x.png"]
-        assert r["pathParam"] == "C:/x.png"
+        assert r["pathParam"] == "/C:/x.png"
 
-    def test_non_image_drive_letter_path_normalized(self, settled_results):
+    def test_non_image_drive_letter_path_forwards_leading_separator(self, settled_results):
         r = settled_results["file:///C:/Users/me/report.md"]
-        assert r["pathParam"] == "C:/Users/me/report.md"
+        assert r["pathParam"] == "/C:/Users/me/report.md"
 
 
 @_NODE_REQUIRED
 class TestStreamingFileUriConverter:
-    """Real _smdLinkHref from static/messages.js, driven in node."""
+    """Real _smdLinkHref from static/messages.js, driven in node.
 
-    def test_uppercase_drive_letter_loses_uri_leading_separator(self, streaming_results):
+    Same forward-as-is policy as the settled converter: the once-decoded
+    pathname keeps its leading separator; the server OS gate decides whether
+    a drive-letter conversion applies.
+    """
+
+    def test_uppercase_drive_letter_forwards_once_decoded_pathname(self, streaming_results):
         r = streaming_results["file:///C:/Users/me/report.png"]
         assert r["hasMediaRoute"]
-        assert r["pathParam"] == "C:/Users/me/report.png"
+        assert r["pathParam"] == "/C:/Users/me/report.png"
 
-    def test_lowercase_drive_letter_loses_uri_leading_separator(self, streaming_results):
+    def test_lowercase_drive_letter_forwards_once_decoded_pathname(self, streaming_results):
         r = streaming_results["file:///c:/Users/me/report.png"]
-        assert r["pathParam"] == "c:/Users/me/report.png"
+        assert r["pathParam"] == "/c:/Users/me/report.png"
 
     def test_encoded_space_decoded_once(self, streaming_results):
         r = streaming_results["file:///C:/Users/me/my%20report.png"]
-        assert r["pathParam"] == "C:/Users/me/my report.png"
+        assert r["pathParam"] == "/C:/Users/me/my report.png"
 
     def test_literal_percent_decoded_exactly_once(self, streaming_results):
         r = streaming_results["file:///C:/Users/me/100%25.png"]
-        assert r["pathParam"] == "C:/Users/me/100%.png"
+        assert r["pathParam"] == "/C:/Users/me/100%.png"
 
     def test_posix_path_keeps_leading_slash(self, streaming_results):
         r = streaming_results["file:///home/me/x.png"]
@@ -532,11 +591,11 @@ class TestStreamingFileUriConverter:
 
     def test_localhost_authority_treated_as_local(self, streaming_results):
         r = streaming_results["file://localhost/C:/x.png"]
-        assert r["pathParam"] == "C:/x.png"
+        assert r["pathParam"] == "/C:/x.png"
 
-    def test_non_image_drive_letter_path_normalized(self, streaming_results):
+    def test_non_image_drive_letter_path_forwards_leading_separator(self, streaming_results):
         r = streaming_results["file:///C:/Users/me/report.md"]
-        assert r["pathParam"] == "C:/Users/me/report.md"
+        assert r["pathParam"] == "/C:/Users/me/report.md"
 
     def test_streaming_and_settled_policies_match(self, settled_results, streaming_results):
         """② UNC policy must be identical across both converters."""
