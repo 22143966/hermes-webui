@@ -95,23 +95,36 @@ function rej(i,e){ if(calls[i])calls[i].reject(e); }
   res(3);
   await settle();
 
-  // Queued input goes out in pieces within the server's 8192-character limit,
-  // and a large paste is split the same way.
+  // Keys joined while waiting go out in pieces within the server's
+  // 8192-character limit.
   calls.length=0;
   onData('k');
   onData('a'.repeat(5000));
   onData('b'.repeat(5000));
   onData('c');
-  onData('d'.repeat(9000));
+  onData('d'.repeat(3000));
   await settle();
-  for(let i=0;i<4;i++){ res(i); await settle(); }
+  for(let i=0;i<3;i++){ res(i); await settle(); }
   out.chunk_lengths=calls.map(c=>c.data.length);
-  out.chunks_joined=calls.map(c=>c.data).join('')==='k'+'a'.repeat(5000)+'b'.repeat(5000)+'c'+'d'.repeat(9000);
+  out.chunks_joined=calls.map(c=>c.data).join('')==='k'+'a'.repeat(5000)+'b'.repeat(5000)+'c'+'d'.repeat(3000);
+
+  // A single paste over the limit is refused whole, as the server refuses it,
+  // and keys around it still go through.
+  calls.length=0;
+  toasts.length=0;
+  onData('k');
+  onData('d'.repeat(9000));
+  onData('l');
+  await settle();
+  for(let i=0;i<2;i++){ res(i); await settle(); }
+  out.oversized_sent=sent();
+  out.oversized_toasts=toasts.slice();
 
   // A piece never ends between the two halves of a surrogate pair.
   calls.length=0;
   onData('k');
-  onData('x'.repeat(8191)+'\u{1F600}'+'y');
+  onData('x'.repeat(8191));
+  onData('\u{1F600}y');
   await settle();
   for(let i=0;i<3;i++){ res(i); await settle(); }
   out.surrogate_lengths=calls.map(c=>c.data.length);
@@ -149,6 +162,23 @@ function rej(i,e){ if(calls[i])calls[i].reject(e); }
   res(0);
   await settle();
   out.after_restart_settled=sent();
+  res(1);
+  await settle();
+
+  // A failed request of a closed shell does not drop the keys typed into the
+  // reopened one, and says nothing about it.
+  calls.length=0;
+  toasts.length=0;
+  onData('g');
+  await settle();
+  await closeComposerTerminal('s1',{skipApi:true});
+  TERMINAL_UI.sessionId='s1';
+  onData('h');
+  await settle();
+  rej(0,new Error('terminal not running'));
+  await settle();
+  out.after_stale_failure=sent();
+  out.stale_failure_toasts=toasts.slice();
   res(1);
   await settle();
 
@@ -197,8 +227,13 @@ def test_a_failed_request_drops_the_keys_queued_behind_it(result):
 
 
 def test_input_is_sent_in_pieces_within_the_server_limit(result):
-    assert result["chunk_lengths"] == [1, 8192, 8192, 2617]
+    assert result["chunk_lengths"] == [1, 8192, 4809]
     assert result["chunks_joined"] is True
+
+
+def test_a_single_paste_over_the_limit_is_refused_whole(result):
+    assert result["oversized_sent"] == ["k", "l"]
+    assert result["oversized_toasts"] == ["terminal_input_failedinput too large"]
 
 
 def test_a_piece_does_not_split_a_surrogate_pair(result):
@@ -214,6 +249,11 @@ def test_closing_drops_unsent_keys_and_the_reopened_shell_waits(result):
 def test_restarting_drops_unsent_keys_and_the_new_shell_waits(result):
     assert result["after_restart"] == ["m"]
     assert result["after_restart_settled"] == ["m", "o"]
+
+
+def test_a_closed_shells_failure_keeps_the_new_shells_keys(result):
+    assert result["after_stale_failure"] == ["g", "h"]
+    assert result["stale_failure_toasts"] == []
 
 
 def test_sessions_do_not_wait_for_each_other(result):

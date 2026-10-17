@@ -84,33 +84,42 @@ function _trackTerminalInput(data){
 // Send terminal input one request at a time per session. Parallel POSTs can
 // reach the shell out of order (the server handles each on its own thread), so
 // keys typed while a request is in flight wait and go out together in the next
-// one. A session's queue outlives close and restart (only its unsent keys are
-// dropped), so a reopened shell's keys still wait for an earlier request.
+// one. A session has a queue exactly while a request is in flight. The queue
+// outlives close and restart (only its unsent keys are dropped), so a reopened
+// shell's keys still wait for an earlier request.
 const TERMINAL_INPUT_MAX_CHARS=8192; // api/routes.py rejects longer input with 413
 
 function _sendTerminalInput(sid,data){
-  let queue=TERMINAL_UI.inputQueues.get(sid);
-  if(!queue){
-    queue={pending:'',sending:false};
-    TERMINAL_UI.inputQueues.set(sid,queue);
+  if(data.length>TERMINAL_INPUT_MAX_CHARS){
+    // One paste over the limit is refused whole, as the server would refuse it.
+    showToast(t('terminal_input_failed')+'input too large',2600,'error');
+    return;
   }
-  queue.pending+=data;
-  if(!queue.sending)_flushTerminalInput(sid,queue);
+  const queue=TERMINAL_UI.inputQueues.get(sid);
+  if(queue){
+    queue.pending+=data;
+    return;
+  }
+  const fresh={pending:data,generation:0};
+  TERMINAL_UI.inputQueues.set(sid,fresh);
+  _flushTerminalInput(sid,fresh);
 }
 
 function _dropUnsentTerminalInput(sid){
   const queue=sid&&TERMINAL_UI.inputQueues.get(sid);
-  if(queue)queue.pending='';
+  if(!queue)return;
+  queue.pending='';
+  queue.generation+=1;
 }
 
 function _flushTerminalInput(sid,queue){
   if(!queue.pending){
-    queue.sending=false;
     TERMINAL_UI.inputQueues.delete(sid);
     return;
   }
-  // Stay within the server's limit (JS length counts UTF-16 units, never fewer
-  // than Python's len), without splitting a surrogate pair.
+  // Keys joined while waiting can exceed the server's limit; send them in pieces
+  // (JS length counts UTF-16 units, never fewer than Python's len) without
+  // splitting a surrogate pair.
   let end=Math.min(queue.pending.length,TERMINAL_INPUT_MAX_CHARS);
   if(end<queue.pending.length){
     const last=queue.pending.charCodeAt(end-1);
@@ -118,12 +127,15 @@ function _flushTerminalInput(sid,queue){
   }
   const data=queue.pending.slice(0,end);
   queue.pending=queue.pending.slice(end);
-  queue.sending=true;
+  const generation=queue.generation;
   api('/api/terminal/input',{method:'POST',body:JSON.stringify({
     session_id:sid,
     data,
   })})
     .catch(e=>{
+      // A request for a shell that has since been closed or restarted says
+      // nothing about the keys typed into the new one.
+      if(queue.generation!==generation)return;
       // Keys queued after the lost ones would leave a gap in the command line,
       // possibly followed by Enter, so drop them too.
       queue.pending='';
