@@ -120,6 +120,16 @@ function rej(i,e){ if(calls[i])calls[i].reject(e); }
   out.oversized_sent=sent();
   out.oversized_toasts=toasts.slice();
 
+  // The limit counts code points, as the server does: 5000 emoji (10000 UTF-16
+  // units) are accepted, and go out in pieces that keep each pair whole.
+  calls.length=0;
+  toasts.length=0;
+  onData('\u{1F600}'.repeat(5000));
+  await settle();
+  for(let i=0;i<2;i++){ res(i); await settle(); }
+  out.emoji_lengths=calls.map(c=>c.data.length);
+  out.emoji_toasts=toasts.slice();
+
   // A piece never ends between the two halves of a surrogate pair.
   calls.length=0;
   onData('k');
@@ -234,6 +244,11 @@ def test_input_is_sent_in_pieces_within_the_server_limit(result):
 def test_a_single_paste_over_the_limit_is_refused_whole(result):
     assert result["oversized_sent"] == ["k", "l"]
     assert result["oversized_toasts"] == ["terminal_input_failedinput too large"]
+
+
+def test_the_paste_limit_counts_code_points_like_the_server(result):
+    assert result["emoji_lengths"] == [8192, 1808]
+    assert result["emoji_toasts"] == []
 
 
 def test_a_piece_does_not_split_a_surrogate_pair(result):

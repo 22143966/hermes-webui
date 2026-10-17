@@ -90,7 +90,8 @@ function _trackTerminalInput(data){
 const TERMINAL_INPUT_MAX_CHARS=8192; // api/routes.py rejects longer input with 413
 
 function _sendTerminalInput(sid,data){
-  if(data.length>TERMINAL_INPUT_MAX_CHARS){
+  // The server counts code points (Python len); [...data] does too.
+  if(data.length>TERMINAL_INPUT_MAX_CHARS&&[...data].length>TERMINAL_INPUT_MAX_CHARS){
     // One paste over the limit is refused whole, as the server would refuse it.
     showToast(t('terminal_input_failed')+'input too large',2600,'error');
     return;
@@ -772,7 +773,7 @@ async function restartComposerTerminal(){
   }
   if(TERMINAL_UI.term)TERMINAL_UI.term.reset();
   // Keys not yet sent belonged to the old shell.
-  _dropUnsentTerminalInput(TERMINAL_UI.sessionId);
+  _dropUnsentTerminalInput(TERMINAL_UI.sessionId||_terminalSessionId());
   try{await _startComposerTerminal(true);}
   catch(e){showToast(t('terminal_start_failed')+e.message,3200,'error');}
 }
