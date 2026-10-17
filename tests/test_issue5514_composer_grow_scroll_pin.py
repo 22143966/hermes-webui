@@ -35,6 +35,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._composer_metrics import CONFIG_LARGE
+
 ROOT = Path(__file__).parents[1]
 UI_JS = (ROOT / "static" / "ui.js").read_text(encoding="utf-8")
 MESSAGES_JS = (ROOT / "static" / "messages.js").read_text(encoding="utf-8")
@@ -409,19 +411,88 @@ def test_resize_observer_installed_on_composer():
     assert "can't strand" in BOOT_JS
 
 
-def test_single_line_growth_skips_the_height_round_trip():
+def _run_composer_single_row_fixture(*, value: str, previous_value: str,
+                                     offset_height: int, content_height: int | None = None,
+                                     config=None):
+    """Run the REAL autoResize() body against a faithful textarea stub whose
+    ``getComputedStyle`` returns a real composer's computed styles, and report the
+    observable resize behaviour (height writes, settled height, repins).
+
+    The configuration (and therefore every dimension) is derived from
+    ``static/style.css`` by ``tests/_composer_metrics.py`` instead of being typed
+    in here: the composer's box depends on the appearance font-size setting, and
+    hardcoding one configuration is exactly how the first revision of this test
+    encoded the 18px ``data-font-size=large`` composer as "stock".
+
+    ``content_height`` is the height the content WANTS (default: one row); a real
+    textarea reports its box height in scrollHeight while the box is taller than
+    the content and the content height once the box collapses to ``height:'auto'``.
+    """
+    node = shutil.which("node")
+    if not node:  # pragma: no cover
+        pytest.skip("node not available")
+    config = CONFIG_LARGE if config is None else config
+    if content_height is None:
+        content_height = config.offset_height
     body = _autoresize_body()
-    assert "let _composerLastResizeValue='';" in MESSAGES_JS
-    assert "const _isAppendOnly=_nextValue.length>_composerLastResizeValue.length&&_nextValue.startsWith(_composerLastResizeValue);" in body
-    assert "const _fitsCurrentHeight=el.scrollHeight<=el.offsetHeight;" in body
-    assert "const _minHeightRaw=_isAppendOnly&&_fitsCurrentHeight?getComputedStyle(el).minHeight:'';" in body
-    assert "const _minHeight=/^(?:\\d+(?:\\.\\d+)?|\\.\\d+)px$/.test(_minHeightRaw)?parseFloat(_minHeightRaw):NaN;" in body
-    # The strict finite-pixel guard rejects a percentage/auto/calc min-height so a
-    # bogus parseFloat("50%")===50 can't wrongly enable the fast path (Codex #6349 re-gate).
-    assert "parseFloat(getComputedStyle(el).minHeight)" not in body  # old lax parse is gone
-    assert "const _isAtMinimumHeight=Number.isFinite(_minHeight)&&el.offsetHeight<=Math.ceil(_minHeight)+1;" in body
-    assert "if(_isAppendOnly&&_fitsCurrentHeight&&_isAtMinimumHeight){" in body
-    assert "el.style.height='auto'" in body
+    harness = textwrap.dedent(
+        """
+        let _composerAutoResizeRaf = 0;
+        let _composerLastResizeValue = %(previous_value)r;
+        let writes = 0, height = %(offset_height)s, repins = 0;
+        const NATURAL_ROW = %(natural_row)s;
+        const CONTENT_H = %(content_height)s;
+        const msg = {
+          value: %(value)r,
+          get offsetHeight() { return height; },
+          get scrollHeight() { return height > NATURAL_ROW ? height : CONTENT_H; },
+          style: {
+            set height(value) { writes += 1; height = value === 'auto' ? NATURAL_ROW : parseInt(value, 10); },
+            get height() { return height + 'px'; },
+          },
+        };
+        const messages = { scrollTop: 0 };
+        const $ = (id) => id === 'msg' ? msg : id === 'messages' ? messages : null;
+        const COMPUTED = %(computed)s;
+        function getComputedStyle() { return COMPUTED; }
+        function updateSendBtn() {}
+        function _repinMessagesAfterComposerResize() { repins += 1; }
+        %(autoresize)s
+        autoResize();
+        console.log(JSON.stringify({ writes, height, lastValue: _composerLastResizeValue, repins }));
+        """
+    ) % {
+        "previous_value": previous_value,
+        "offset_height": offset_height,
+        "content_height": content_height,
+        "natural_row": config.offset_height,
+        "value": value,
+        "computed": json.dumps(config.computed),
+        "autoresize": body,
+    }
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, f"node harness failed: {proc.stderr}"
+    return json.loads(proc.stdout)
+
+
+def test_single_line_growth_skips_the_height_round_trip():
+    # The one-row fast path must be REACHABLE. It gates on el.offsetHeight against
+    # the min-height ceiling, and the composer's natural one-row height
+    # (line-height + vertical padding + borders) is 47.7px in the reported
+    # configuration (the 18px `data-font-size=large` composer) against a pre-fix
+    # ceiling of ceil(44px)+1 = 45px - so every append at rest missed the skip and
+    # paid the height:'auto' round trip, whose scrollHeight read forces a
+    # synchronous full-document reflow (typing lag that grows with the rendered
+    # transcript). Behaviour, not source: the fixture runs the real autoResize().
+    one_row = CONFIG_LARGE.offset_height
+    out = _run_composer_single_row_fixture(value="a", previous_value="", offset_height=one_row)
+    assert out == {"writes": 0, "height": one_row, "lastValue": "a", "repins": 0}, out
+    # ...and the widened ceiling stays BOUNDED: an oversized composer is far above
+    # one row, so it still remeasures back down (the #5514 shrink-back invariant).
+    oversized = _run_composer_single_row_fixture(
+        value="a", previous_value="", offset_height=CONFIG_LARGE.oversized_box
+    )
+    assert oversized == {"writes": 2, "height": one_row, "lastValue": "a", "repins": 0}, oversized
 # ---------------------------------------------------------------------------
 
 def _run(scenario):

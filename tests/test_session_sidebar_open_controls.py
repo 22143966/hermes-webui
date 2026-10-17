@@ -237,6 +237,7 @@ def test_title_activation_reaches_document_menu_dismissal(activation):
         page.add_script_tag(content="""
             document.body.insertAdjacentHTML('beforeend', '<div id="composerModelDropdown" class="open"></div>');
             const PROJECT_COLORS = ['#123456'];
+            const t = key => key;
         """ + _function_source('_showProjectContextMenu') + ui_js[close_start:close_end] + ui_js[model_start:model_end])
         page.evaluate("_showProjectContextMenu({clientX:200,clientY:200}, {project_id:'test',name:'Test'}, null)")
         page.wait_for_timeout(50)  # Production listener is installed on the next task.
@@ -254,7 +255,8 @@ def test_title_activation_reaches_document_menu_dismissal(activation):
 
 
 @pytest.mark.parametrize("skin", ["default", "github"])
-def test_first_touch_tag_filters_without_hover_relayout(skin):
+@pytest.mark.parametrize("picker_open", [False, True])
+def test_first_touch_tag_filters_without_hover_relayout(skin, picker_open):
     playwright_api = pytest.importorskip("playwright.sync_api")
     render = _function_source("renderSessionListFromCache")
     tag_start = render.index("for(const tag of tags){")
@@ -274,14 +276,36 @@ def test_first_touch_tag_filters_without_hover_relayout(skin):
             const titleGroup = document.querySelector('.session-title-group');
             const tags = ['#ops'];
             let filters = 0;
-            function filterSessions(){ filters++; }
-        """ + render[tag_start:tag_end])
+            let opens = 0;
+            let _projectPickerTeardown = null;
+            let _openProjectPicker = null;
+            let _sessionListRepaintDeferredByPicker = false;
+            document.querySelector('.session-item').onclick = () => opens++;
+            function filterSessions(){
+              if (_projectPickerTeardown) {
+                _sessionListRepaintDeferredByPicker = true;
+                return;
+              }
+              filters++;
+            }
+        """ + _function_source("_retireProjectPickerForExplicitRepaint") + render[tag_start:tag_end])
+        if picker_open:
+            page.evaluate("""() => {
+              const picker = document.createElement('div');
+              picker.className = 'project-picker';
+              document.body.appendChild(picker);
+              _projectPickerTeardown = () => picker.remove();
+              _sessionListRepaintDeferredByPicker = true;
+            }""")
         assert page.evaluate("matchMedia('(hover: hover)').matches") is False
         tag = page.locator('.session-tag')
         before = tag.bounding_box()
         tag.tap()  # Real browser touch synthesis, not dispatchEvent('click').
         assert page.locator('#sessionSearch').input_value() == '#ops'
         assert page.evaluate('filters') == 1
+        assert page.evaluate('opens') == 0
+        assert page.locator('.project-picker').count() == 0
+        assert page.evaluate('_sessionListRepaintDeferredByPicker') is False
         after = tag.bounding_box()
         assert abs(after['x'] - before['x']) < 1
         assert page.locator('.session-time').is_visible()
