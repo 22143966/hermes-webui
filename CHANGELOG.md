@@ -518,6 +518,8 @@
 
 ### Changed
 
+- **Russian: the last English strings translated.** The Profiles explainer and the Transparent Stream timestamp setting now read in Russian. Thanks @RajPabnani03. (#8001)
+
 - **Open thinking cards follow the reasoning as it streams.** A reasoning card that is open while the model thinks now
   keeps the newest text in view instead of sitting at the top. Scroll up inside the card to hold your place; scroll back
   to the bottom to resume following. Thanks @esc247. (#7988)
