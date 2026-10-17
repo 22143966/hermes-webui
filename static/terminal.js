@@ -20,7 +20,7 @@ const TERMINAL_UI={
   fontFitFrame:null,
   fontLoadGeneration:0,
   fontLoadRequest:null,
-  input:null,
+  inputQueues:new Map(),
 };
 
 const TERMINAL_HEIGHT_DEFAULT=260;
@@ -81,51 +81,55 @@ function _trackTerminalInput(data){
   return null;
 }
 
-// Send terminal input one request at a time. Parallel POSTs can reach the shell
-// out of order (the server handles each on its own thread), so keys typed while
-// a request is in flight wait and go out together in the next one.
-// TERMINAL_UI.input is the queue of the current shell; closing or restarting the
-// terminal drops it, and a request still in flight for it then sends nothing more.
+// Send terminal input one request at a time per session. Parallel POSTs can
+// reach the shell out of order (the server handles each on its own thread), so
+// keys typed while a request is in flight wait and go out together in the next
+// one. A session's queue outlives close and restart (only its unsent keys are
+// dropped), so a reopened shell's keys still wait for an earlier request.
 const TERMINAL_INPUT_MAX_CHARS=8192; // api/routes.py rejects longer input with 413
-const TERMINAL_INPUT_TIMEOUT_MS=10000;
 
 function _sendTerminalInput(sid,data){
-  let queue=TERMINAL_UI.input;
-  if(!queue||queue.sid!==sid){
-    queue={sid,pending:[],sending:false};
-    TERMINAL_UI.input=queue;
+  let queue=TERMINAL_UI.inputQueues.get(sid);
+  if(!queue){
+    queue={pending:'',sending:false};
+    TERMINAL_UI.inputQueues.set(sid,queue);
   }
-  queue.pending.push(data);
-  if(!queue.sending)_flushTerminalInput(queue);
+  queue.pending+=data;
+  if(!queue.sending)_flushTerminalInput(sid,queue);
 }
 
-function _flushTerminalInput(queue){
-  if(TERMINAL_UI.input!==queue||!queue.pending.length){
+function _dropUnsentTerminalInput(sid){
+  const queue=sid&&TERMINAL_UI.inputQueues.get(sid);
+  if(queue)queue.pending='';
+}
+
+function _flushTerminalInput(sid,queue){
+  if(!queue.pending){
     queue.sending=false;
+    TERMINAL_UI.inputQueues.delete(sid);
     return;
   }
-  // Join queued keys, but never past the server's limit. A single paste that is
-  // already over it goes alone and is rejected, as before.
-  let data=queue.pending.shift();
-  while(queue.pending.length&&data.length+queue.pending[0].length<=TERMINAL_INPUT_MAX_CHARS){
-    data+=queue.pending.shift();
+  // Stay within the server's limit (JS length counts UTF-16 units, never fewer
+  // than Python's len), without splitting a surrogate pair.
+  let end=Math.min(queue.pending.length,TERMINAL_INPUT_MAX_CHARS);
+  if(end<queue.pending.length){
+    const last=queue.pending.charCodeAt(end-1);
+    if(last>=0xd800&&last<=0xdbff)end-=1;
   }
+  const data=queue.pending.slice(0,end);
+  queue.pending=queue.pending.slice(end);
   queue.sending=true;
-  api('/api/terminal/input',{
-    method:'POST',
-    body:JSON.stringify({session_id:queue.sid,data}),
-    // Not idempotent: a retry could type the same keys twice.
-    retries:0,
-    timeoutMs:TERMINAL_INPUT_TIMEOUT_MS,
-    timeoutToast:false,
-  })
+  api('/api/terminal/input',{method:'POST',body:JSON.stringify({
+    session_id:sid,
+    data,
+  })})
     .catch(e=>{
-      // Keys typed after the lost ones would leave a gap in the command line,
+      // Keys queued after the lost ones would leave a gap in the command line,
       // possibly followed by Enter, so drop them too.
-      queue.pending.length=0;
+      queue.pending='';
       showToast(t('terminal_input_failed')+e.message,2600,'error');
     })
-    .finally(()=>_flushTerminalInput(queue));
+    .finally(()=>_flushTerminalInput(sid,queue));
 }
 
 function _terminalCssVar(name,fallback){
@@ -744,7 +748,7 @@ async function closeComposerTerminal(sessionId,opts){
   TERMINAL_UI.sessionId=null;
   TERMINAL_UI.workspace=null;
   // Keys not yet sent belonged to the closed shell.
-  TERMINAL_UI.input=null;
+  _dropUnsentTerminalInput(sid);
   syncTerminalButton();
 }
 
@@ -756,7 +760,7 @@ async function restartComposerTerminal(){
   }
   if(TERMINAL_UI.term)TERMINAL_UI.term.reset();
   // Keys not yet sent belonged to the old shell.
-  TERMINAL_UI.input=null;
+  _dropUnsentTerminalInput(TERMINAL_UI.sessionId);
   try{await _startComposerTerminal(true);}
   catch(e){showToast(t('terminal_start_failed')+e.message,3200,'error');}
 }

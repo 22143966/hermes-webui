@@ -4,8 +4,8 @@ xterm.js calls ``onData`` once per key (or once per paste). Each call used to
 start its own ``/api/terminal/input`` POST without waiting for the previous one.
 The server handles requests on separate threads, so those POSTs could reach the
 shell out of order and a fast-typed command arrived scrambled. The terminal now
-keeps one input request in flight and sends keys typed meanwhile together in the
-next request.
+keeps one input request in flight per session and sends keys typed meanwhile
+together in the next request, in pieces within the server's input limit.
 
 These tests drive the real ``static/terminal.js`` in Node with a fake xterm and
 an ``api()`` whose requests resolve only when the test says so.
@@ -59,6 +59,9 @@ global.api=(path,opts)=>{
 """ + TERMINAL_JS + r"""
 async function settle(){ for(let i=0;i<5;i++) await Promise.resolve(); }
 function sent(){ return calls.map(c=>c.data); }
+// Settle request i if it was made (on a broken build it may not exist).
+function res(i){ if(calls[i])calls[i].resolve({}); }
+function rej(i,e){ if(calls[i])calls[i].reject(e); }
 (async()=>{
   const out={};
   _ensureXterm();
@@ -69,10 +72,10 @@ function sent(){ return calls.map(c=>c.data); }
   await settle();
   out.while_first_in_flight=sent();
   out.first_opts=calls[0].opts;
-  calls[0].resolve({});
+  res(0);
   await settle();
   out.after_first_done=sent();
-  calls[1].resolve({});
+  res(1);
   await settle();
   out.after_second_done=sent();
 
@@ -82,18 +85,18 @@ function sent(){ return calls.map(c=>c.data); }
   onData('x');
   onData('y');
   await settle();
-  calls[2].reject(new Error('boom'));
+  rej(2,new Error('boom'));
   await settle();
   out.after_failure=sent();
   out.toasts=toasts.slice();
   onData('q');
   await settle();
   out.after_failure_next_key=sent();
-  calls[3].resolve({});
+  res(3);
   await settle();
 
-  // Joined input never exceeds the server's 8192-character limit; a single
-  // paste over it is sent alone, unchanged.
+  // Queued input goes out in pieces within the server's 8192-character limit,
+  // and a large paste is split the same way.
   calls.length=0;
   onData('k');
   onData('a'.repeat(5000));
@@ -101,12 +104,21 @@ function sent(){ return calls.map(c=>c.data); }
   onData('c');
   onData('d'.repeat(9000));
   await settle();
-  for(let i=0;i<4;i++){ calls[i].resolve({}); await settle(); }
-  out.capped_lengths=calls.map(c=>c.data.length);
-  out.capped_joined=calls.map(c=>c.data).join('')==='k'+'a'.repeat(5000)+'b'.repeat(5000)+'c'+'d'.repeat(9000);
+  for(let i=0;i<4;i++){ res(i); await settle(); }
+  out.chunk_lengths=calls.map(c=>c.data.length);
+  out.chunks_joined=calls.map(c=>c.data).join('')==='k'+'a'.repeat(5000)+'b'.repeat(5000)+'c'+'d'.repeat(9000);
 
-  // Closing drops unsent keys; the reopened shell's keys do not wait for the
-  // old shell's request still in flight.
+  // A piece never ends between the two halves of a surrogate pair.
+  calls.length=0;
+  onData('k');
+  onData('x'.repeat(8191)+'\u{1F600}'+'y');
+  await settle();
+  for(let i=0;i<3;i++){ res(i); await settle(); }
+  out.surrogate_lengths=calls.map(c=>c.data.length);
+  out.surrogate_second_ends=calls[1]?calls[1].data.charCodeAt(calls[1].data.length-1):null;
+
+  // Closing drops unsent keys. A reopened shell of the same session still waits
+  // for the request already in flight, so its keys can't overtake it.
   calls.length=0;
   onData('a');
   onData('b');
@@ -116,12 +128,13 @@ function sent(){ return calls.map(c=>c.data); }
   onData('z');
   await settle();
   out.after_reopen=sent();
-  calls[0].resolve({});
-  calls[1].resolve({});
+  res(0);
   await settle();
   out.after_reopen_settled=sent();
+  res(1);
+  await settle();
 
-  // Restarting drops unsent keys too.
+  // Restarting drops unsent keys too, the same way.
   calls.length=0;
   onData('m');
   onData('n');
@@ -130,11 +143,26 @@ function sent(){ return calls.map(c=>c.data); }
   TERMINAL_UI.collapsed=false;
   _startComposerTerminal=async()=>{};
   await restartComposerTerminal();
-  calls[0].resolve({});
-  await settle();
   onData('o');
   await settle();
   out.after_restart=sent();
+  res(0);
+  await settle();
+  out.after_restart_settled=sent();
+  res(1);
+  await settle();
+
+  // Another session's terminal does not wait for this session's request.
+  calls.length=0;
+  onData('s');
+  await settle();
+  TERMINAL_UI.sessionId='s2';
+  onData('t');
+  await settle();
+  out.other_session=calls.map(c=>[c.sid,c.data]);
+  calls.forEach((_,i)=>res(i));
+  await settle();
+  out.queues_left=TERMINAL_UI.inputQueues?TERMINAL_UI.inputQueues.size:null;
   process.stdout.write(JSON.stringify(out));
 })().catch(e=>{console.error(e);process.exit(1);});
 """
@@ -157,11 +185,9 @@ def test_keys_typed_during_a_request_wait_for_it(result):
     assert result["after_second_done"] == ["e", "cho hi"]
 
 
-def test_input_requests_are_not_retried(result):
-    # A retry after a lost response would type the same keys twice.
-    assert result["first_opts"]["retries"] == 0
-    assert result["first_opts"]["timeoutToast"] is False
-    assert 0 < result["first_opts"]["timeoutMs"] <= 10000
+def test_input_requests_keep_the_api_defaults(result):
+    # api()'s network-error retries recover from a stale idle connection.
+    assert result["first_opts"] == {}
 
 
 def test_a_failed_request_drops_the_keys_queued_behind_it(result):
@@ -170,15 +196,26 @@ def test_a_failed_request_drops_the_keys_queued_behind_it(result):
     assert result["after_failure_next_key"] == ["e", "cho hi", "\r", "q"]
 
 
-def test_joined_input_stays_within_the_server_limit(result):
-    assert result["capped_lengths"] == [1, 5000, 5001, 9000]
-    assert result["capped_joined"] is True
+def test_input_is_sent_in_pieces_within_the_server_limit(result):
+    assert result["chunk_lengths"] == [1, 8192, 8192, 2617]
+    assert result["chunks_joined"] is True
 
 
-def test_closing_drops_unsent_keys_and_does_not_block_the_next_shell(result):
-    assert result["after_reopen"] == ["a", "z"]
+def test_a_piece_does_not_split_a_surrogate_pair(result):
+    assert result["surrogate_lengths"] == [1, 8191, 3]
+    assert result["surrogate_second_ends"] == ord("x")
+
+
+def test_closing_drops_unsent_keys_and_the_reopened_shell_waits(result):
+    assert result["after_reopen"] == ["a"]
     assert result["after_reopen_settled"] == ["a", "z"]
 
 
-def test_restarting_drops_unsent_keys(result):
-    assert result["after_restart"] == ["m", "o"]
+def test_restarting_drops_unsent_keys_and_the_new_shell_waits(result):
+    assert result["after_restart"] == ["m"]
+    assert result["after_restart_settled"] == ["m", "o"]
+
+
+def test_sessions_do_not_wait_for_each_other(result):
+    assert result["other_session"] == [["s1", "s"], ["s2", "t"]]
+    assert result["queues_left"] == 0
