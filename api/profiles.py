@@ -1371,6 +1371,8 @@ def profile_env_for_thread_readonly(
     session,
     purpose: str = "thread-local read",
     logger_override: Optional[logging.Logger] = None,
+    *,
+    include_root: bool = False,
 ):
     """Bind a session profile's env to the CURRENT THREAD only.
 
@@ -1396,13 +1398,16 @@ def profile_env_for_thread_readonly(
     the literal.
 
     Accepts a session-like object with ``.profile`` or a profile name.
-    No-ops for default-profile sessions; on resolution failure it logs and
-    yields with the thread's current env state untouched.
+    No-ops for default-profile sessions unless ``include_root`` is set:
+    after a process-wide profile switch ``os.environ`` holds the switched-to
+    profile's ``.env``, so callers that must resolve a root session's own
+    ``${VAR}`` bind the root home explicitly too. On resolution failure it
+    logs and yields with the thread's current env state untouched.
     """
     log = logger_override or logger
     raw_profile = session if isinstance(session, str) else getattr(session, "profile", "")
     profile = str(raw_profile or "").strip()
-    if not profile or profile == "default":
+    if not profile or (profile == "default" and not include_root):
         yield
         return
 

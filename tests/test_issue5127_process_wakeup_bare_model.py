@@ -405,6 +405,65 @@ class TestIssue5127CustomProviderBareSuffixRepair:
         assert (model, provider, normalized) == ("@custom:lab:saved-a", "custom:lab", True)
         assert config.resolve_model_provider(model)[0] == "saved-a"
 
+    def test_root_session_env_default_ignores_switched_process_env(
+        self, monkeypatch, tmp_path
+    ):
+        """A ``default`` session expands with the root ``.env``, not the switched-to profile's."""
+        import api.config as config
+        import api.profiles as profiles
+        from api.routes import _resolve_compatible_session_model_state
+
+        root_home = tmp_path / "root"
+        work_home = tmp_path / "work"
+        root_home.mkdir()
+        work_home.mkdir()
+        (root_home / ".env").write_text("LAB_MODEL=live-b\n", encoding="utf-8")
+        (work_home / ".env").write_text("LAB_MODEL=server-only\n", encoding="utf-8")
+        monkeypatch.setattr(
+            profiles,
+            "get_hermes_home_for_profile",
+            lambda name: root_home if name in ("", "default") else work_home,
+        )
+        # After switch_profile("work") the process env holds work's .env.
+        monkeypatch.setenv("LAB_MODEL", "server-only")
+        profile_cfg = {
+            "custom_providers": [
+                {
+                    "name": "lab",
+                    "base_url": "http://lab.invalid/v1",
+                    "model": "${LAB_MODEL}",
+                    "models": ["saved-a"],
+                }
+            ]
+        }
+        monkeypatch.setattr(config, "cfg", profile_cfg)
+
+        kept = _resolve_compatible_session_model_state(
+            "@custom:lab:live-b",
+            "custom:lab",
+            profile_config=profile_cfg,
+            prefer_cached_catalog=True,
+            profile="default",
+        )
+
+        assert kept == ("@custom:lab:live-b", "custom:lab", False)
+        assert config.resolve_model_provider(kept[0])[0] == "live-b"
+
+    def test_thread_readonly_env_still_skips_root_by_default(self, monkeypatch, tmp_path):
+        """Other callers keep the root no-op unless they opt in with ``include_root``."""
+        import api.profiles as profiles
+        from api.config import _thread_local_env_value
+
+        monkeypatch.setattr(profiles, "get_hermes_home_for_profile", lambda _name: tmp_path)
+        monkeypatch.setattr(profiles, "get_profile_runtime_env", lambda _home: {"LAB_MODEL": "live-b"})
+        monkeypatch.setenv("LAB_MODEL", "server-only")
+
+        with profiles.profile_env_for_thread_readonly("default"):
+            assert _thread_local_env_value("LAB_MODEL") == "server-only"
+        with profiles.profile_env_for_thread_readonly("default", include_root=True):
+            assert _thread_local_env_value("LAB_MODEL") == "live-b"
+        assert _thread_local_env_value("LAB_MODEL") == "server-only"
+
     @pytest.mark.parametrize(
         "serialized",
         [

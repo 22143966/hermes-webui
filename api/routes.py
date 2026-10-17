@@ -8598,15 +8598,6 @@ def _repair_removed_qualified_custom_provider_model(
     if any("${" in item for item in pinned):
         # Unresolved env reference: the raw profile YAML isn't the real ID.
         return None
-    default_raw = str(entry.get("model") or "").strip()
-    if "${" in default_raw:
-        # Expand with the session profile's env (read-only, fail-closed);
-        # left unresolved, it falls back to the pinned list below.
-        from api.config import _expand_env_vars
-        from api.profiles import profile_env_for_thread_readonly
-
-        with profile_env_for_thread_readonly(profile or "", "custom provider default"):
-            default_raw = _expand_env_vars(default_raw).strip()
 
     def _own_bare(item: str) -> str:
         # Unwrap only this provider's own wrapper; ``@safe:x`` is a real ID.
@@ -8614,9 +8605,22 @@ def _repair_removed_qualified_custom_provider_model(
         return bare if item_provider == prov else item
 
     pinned_bare = [_own_bare(item) for item in pinned]
+    if not pinned or bare_model in pinned_bare:
+        return None
+    default_raw = str(entry.get("model") or "").strip()
+    if "${" in default_raw:
+        # Expand with the session profile's env, root included (read-only,
+        # fail-closed); left unresolved, it falls back to the pinned list.
+        from api.config import _expand_env_vars
+        from api.profiles import profile_env_for_thread_readonly
+
+        with profile_env_for_thread_readonly(
+            profile or "", "custom provider default", include_root=True,
+        ):
+            default_raw = _expand_env_vars(default_raw).strip()
     default_bare = _own_bare(default_raw)
     # The singular default stays a picker entry even outside ``models``.
-    if not pinned or bare_model in pinned_bare or bare_model == default_bare:
+    if bare_model == default_bare:
         return None
     replacement = default_bare if default_bare in pinned_bare else pinned_bare[0]
     return f"@{prov}:{replacement}"
