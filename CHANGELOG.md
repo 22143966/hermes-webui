@@ -80,6 +80,8 @@
 
 ### Fixed
 
+- **Scheduled Tasks mark the job that just ran.** When a job finishes in the background, the Tasks list now refreshes on its own and marks the job with a dot, and an open job's Last Output card is marked too, without collapsing output you have open. The marker uses the app's unread colour and sits in the row's gutter so titles don't shift. Thanks @martindell. (#6767)
+
 - **Error toasts stay on screen.** Twenty-one error messages (Kanban unavailable, task dependency, workspace worktree and
   reorder failures, the MCP server toggle, checkpoint restore, copy failure) passed their type where the duration
   goes, so the toast vanished the moment it appeared; the Kanban dispatcher result and eight worktree errors had the
