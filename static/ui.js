@@ -4242,6 +4242,9 @@ function _ensureModelOptionInDropdown(modelId, sel, preferredProviderId){
         opt.dataset.model=String(opt.value).slice(prefix.length);
         opt.dataset.provider=requestedProvider;
       }
+      // A restored overflow row is still an overflow ("extra") row: #7528 sorts a built-in group's curated rows
+      // first and natural-sorts extras after them, so an untagged restore would jump ahead of its siblings.
+      opt.dataset.extra='1';
       group.appendChild(opt);
       group.dataset.extraModels=JSON.stringify(extra.filter((_,index)=>index!==match.index));
       const restored=_applyModelToDropdown(modelId,sel,requestedProvider);

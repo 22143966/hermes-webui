@@ -476,6 +476,7 @@ if (payload.restoreModel) {
     selectedValue: modelSelect.value,
     selectedState: _modelStateForSelect(modelSelect, modelSelect.value),
     selectedProvider: _getOptionProviderId(modelSelect.selectedOptions[0]),
+    selectedExtra: (modelSelect.selectedOptions[0] && modelSelect.selectedOptions[0].dataset && modelSelect.selectedOptions[0].dataset.extra) || '',
     options: modelSelect.options.map(option => ({value: option.value, provider: _getOptionProviderId(option)})),
   };
 }
@@ -2019,6 +2020,9 @@ def test_repeated_openrouter_colon_overflow_restoration_renders_one_routed_row(
     }
     assert out["restoration"]["selectedProvider"] == "openrouter"
     assert out["restoration"]["selectedValue"] == selected_model
+    # The restored overflow row stays an "extra" row, so #7528's built-in-group sort keeps it among its
+    # overflow siblings instead of promoting it into the curated block.
+    assert out["restoration"]["selectedExtra"] == "1"
     for value, provider in ((selected_model, "openrouter"), (selected_model, "custom:backup")):
         assert out["restoration"]["options"].count({"value": value, "provider": provider}) == 1
 
