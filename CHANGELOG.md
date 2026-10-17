@@ -80,6 +80,8 @@
 
 ### Fixed
 
+- **Less CPU while chats are open.** Finding a run's journal file walked every session directory on each lookup, and those lookups sit on per-poll paths (stream reconnect probes, ownership checks). With hundreds of sessions that walk took a large share of the process and slowed even `/health`. Run paths are now cached (bounded, revalidated on use), hundreds of times faster per warm lookup. Thanks @silent-reader-cn. (#8322)
+
 - **Error toasts stay on screen.** Twenty-one error messages (Kanban unavailable, task dependency, workspace worktree and
   reorder failures, the MCP server toggle, checkpoint restore, copy failure) passed their type where the duration
   goes, so the toast vanished the moment it appeared; the Kanban dispatcher result and eight worktree errors had the
