@@ -520,6 +520,8 @@
 
 ### Changed
 
+- **Russian: the last English strings translated.** The Profiles explainer and the Transparent Stream timestamp setting now read in Russian. Thanks @RajPabnani03. (#8001)
+
 - **German: Scheduled Tasks strings translated.** The cron editor's weekdays, time fields and hints were still English in German. Thanks @solarmaster961. (#8289)
 
 - **Open thinking cards follow the reasoning as it streams.** A reasoning card that is open while the model thinks now
