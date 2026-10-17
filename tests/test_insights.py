@@ -2141,7 +2141,7 @@ def test_insights_custom_range_inputs_have_visible_translated_labels():
             f"#{eid} visible text must be bound to the {key} key"
     for rule in (
         ".insights-range-field{display:flex;flex-direction:column;gap:3px;min-width:0;}",
-        ".insights-range-field-label{font-size:11px;color:var(--muted);}",
+        ".insights-range-field-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);}",
         "#insightsCustomRange{display:none;flex-direction:column;gap:6px;}",
     ):
         assert rule in STYLE_CSS, f"missing stylesheet rule: {rule}"
