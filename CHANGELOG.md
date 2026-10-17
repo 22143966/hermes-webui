@@ -80,6 +80,8 @@
 
 ### Fixed
 
+- **Failed file previews say why.** When an inline CSV, diff, PDF, HTML or Excalidraw preview can't load, the card now explains it: session expired (reload the page), no access (move the file into the workspace or check permissions), or file gone. The download link is dropped for those three cases, since it would fail too. Translated in all 15 languages. Thanks @pxxD1998. (#7254)
+
 - **Error toasts stay on screen.** Twenty-one error messages (Kanban unavailable, task dependency, workspace worktree and
   reorder failures, the MCP server toggle, checkpoint restore, copy failure) passed their type where the duration
   goes, so the toast vanished the moment it appeared; the Kanban dispatcher result and eight worktree errors had the
