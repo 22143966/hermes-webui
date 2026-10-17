@@ -20,6 +20,9 @@ const TERMINAL_UI={
   fontFitFrame:null,
   fontLoadGeneration:0,
   fontLoadRequest:null,
+  inputSending:false,
+  inputSessionId:null,
+  inputPending:'',
 };
 
 const TERMINAL_HEIGHT_DEFAULT=260;
@@ -78,6 +81,35 @@ function _trackTerminalInput(data){
     TERMINAL_UI.typedLine+=data;
   }
   return null;
+}
+
+// Send terminal input one request at a time. Parallel POSTs can reach the shell
+// out of order (the server handles each on its own thread), so keys typed while
+// a request is in flight wait and go out together in the next one.
+function _sendTerminalInput(sid,data){
+  if(TERMINAL_UI.inputSessionId!==sid){
+    TERMINAL_UI.inputSessionId=sid;
+    TERMINAL_UI.inputPending='';
+  }
+  TERMINAL_UI.inputPending+=data;
+  if(!TERMINAL_UI.inputSending)_flushTerminalInput();
+}
+
+function _flushTerminalInput(){
+  const sid=TERMINAL_UI.inputSessionId;
+  const data=TERMINAL_UI.inputPending;
+  if(!sid||!data){
+    TERMINAL_UI.inputSending=false;
+    return;
+  }
+  TERMINAL_UI.inputSending=true;
+  TERMINAL_UI.inputPending='';
+  api('/api/terminal/input',{method:'POST',body:JSON.stringify({
+    session_id:sid,
+    data,
+  })})
+    .catch(e=>showToast(t('terminal_input_failed')+e.message,2600,'error'))
+    .finally(_flushTerminalInput);
 }
 
 function _terminalCssVar(name,fallback){
@@ -232,10 +264,7 @@ function _ensureXterm(){
     }
     const sid=TERMINAL_UI.sessionId||_terminalSessionId();
     if(!sid)return;
-    api('/api/terminal/input',{method:'POST',body:JSON.stringify({
-      session_id:sid,
-      data,
-    })}).catch(e=>showToast(t('terminal_input_failed')+e.message,2600,'error'));
+    _sendTerminalInput(sid,data);
   });
   TERMINAL_UI.term=term;
   TERMINAL_UI.fitAddon=fitAddon;
@@ -698,6 +727,8 @@ async function closeComposerTerminal(sessionId,opts){
   if(composerWrap)composerWrap.classList.remove('terminal-dock-visible');
   TERMINAL_UI.sessionId=null;
   TERMINAL_UI.workspace=null;
+  // Keys not yet sent belonged to the closed shell.
+  TERMINAL_UI.inputPending='';
   syncTerminalButton();
 }
 
