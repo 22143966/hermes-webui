@@ -22,7 +22,6 @@ import re
 import pytest
 from html.parser import HTMLParser
 
-import pytest
 
 REPO = pathlib.Path(__file__).parent.parent
 HTML = (REPO / "static" / "index.html").read_text(encoding="utf-8")
