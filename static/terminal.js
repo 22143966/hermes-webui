@@ -20,9 +20,7 @@ const TERMINAL_UI={
   fontFitFrame:null,
   fontLoadGeneration:0,
   fontLoadRequest:null,
-  inputSending:false,
-  inputSessionId:null,
-  inputPending:'',
+  input:null,
 };
 
 const TERMINAL_HEIGHT_DEFAULT=260;
@@ -86,30 +84,48 @@ function _trackTerminalInput(data){
 // Send terminal input one request at a time. Parallel POSTs can reach the shell
 // out of order (the server handles each on its own thread), so keys typed while
 // a request is in flight wait and go out together in the next one.
+// TERMINAL_UI.input is the queue of the current shell; closing or restarting the
+// terminal drops it, and a request still in flight for it then sends nothing more.
+const TERMINAL_INPUT_MAX_CHARS=8192; // api/routes.py rejects longer input with 413
+const TERMINAL_INPUT_TIMEOUT_MS=10000;
+
 function _sendTerminalInput(sid,data){
-  if(TERMINAL_UI.inputSessionId!==sid){
-    TERMINAL_UI.inputSessionId=sid;
-    TERMINAL_UI.inputPending='';
+  let queue=TERMINAL_UI.input;
+  if(!queue||queue.sid!==sid){
+    queue={sid,pending:[],sending:false};
+    TERMINAL_UI.input=queue;
   }
-  TERMINAL_UI.inputPending+=data;
-  if(!TERMINAL_UI.inputSending)_flushTerminalInput();
+  queue.pending.push(data);
+  if(!queue.sending)_flushTerminalInput(queue);
 }
 
-function _flushTerminalInput(){
-  const sid=TERMINAL_UI.inputSessionId;
-  const data=TERMINAL_UI.inputPending;
-  if(!sid||!data){
-    TERMINAL_UI.inputSending=false;
+function _flushTerminalInput(queue){
+  if(TERMINAL_UI.input!==queue||!queue.pending.length){
+    queue.sending=false;
     return;
   }
-  TERMINAL_UI.inputSending=true;
-  TERMINAL_UI.inputPending='';
-  api('/api/terminal/input',{method:'POST',body:JSON.stringify({
-    session_id:sid,
-    data,
-  })})
-    .catch(e=>showToast(t('terminal_input_failed')+e.message,2600,'error'))
-    .finally(_flushTerminalInput);
+  // Join queued keys, but never past the server's limit. A single paste that is
+  // already over it goes alone and is rejected, as before.
+  let data=queue.pending.shift();
+  while(queue.pending.length&&data.length+queue.pending[0].length<=TERMINAL_INPUT_MAX_CHARS){
+    data+=queue.pending.shift();
+  }
+  queue.sending=true;
+  api('/api/terminal/input',{
+    method:'POST',
+    body:JSON.stringify({session_id:queue.sid,data}),
+    // Not idempotent: a retry could type the same keys twice.
+    retries:0,
+    timeoutMs:TERMINAL_INPUT_TIMEOUT_MS,
+    timeoutToast:false,
+  })
+    .catch(e=>{
+      // Keys typed after the lost ones would leave a gap in the command line,
+      // possibly followed by Enter, so drop them too.
+      queue.pending.length=0;
+      showToast(t('terminal_input_failed')+e.message,2600,'error');
+    })
+    .finally(()=>_flushTerminalInput(queue));
 }
 
 function _terminalCssVar(name,fallback){
@@ -728,7 +744,7 @@ async function closeComposerTerminal(sessionId,opts){
   TERMINAL_UI.sessionId=null;
   TERMINAL_UI.workspace=null;
   // Keys not yet sent belonged to the closed shell.
-  TERMINAL_UI.inputPending='';
+  TERMINAL_UI.input=null;
   syncTerminalButton();
 }
 
@@ -739,6 +755,8 @@ async function restartComposerTerminal(){
     TERMINAL_UI.source=null;
   }
   if(TERMINAL_UI.term)TERMINAL_UI.term.reset();
+  // Keys not yet sent belonged to the old shell.
+  TERMINAL_UI.input=null;
   try{await _startComposerTerminal(true);}
   catch(e){showToast(t('terminal_start_failed')+e.message,3200,'error');}
 }

@@ -52,7 +52,8 @@ global.api=(path,opts)=>{
   let resolve,reject;
   const p=new Promise((res,rej)=>{resolve=res;reject=rej;});
   const body=JSON.parse(opts.body);
-  calls.push({sid:body.session_id,data:body.data,resolve,reject});
+  const {body:_b,method:_m,...rest}=opts;
+  calls.push({sid:body.session_id,data:body.data,opts:rest,resolve,reject});
   return p;
 };
 """ + TERMINAL_JS + r"""
@@ -67,6 +68,7 @@ function sent(){ return calls.map(c=>c.data); }
   'echo hi'.split('').forEach(ch=>onData(ch));
   await settle();
   out.while_first_in_flight=sent();
+  out.first_opts=calls[0].opts;
   calls[0].resolve({});
   await settle();
   out.after_first_done=sent();
@@ -74,30 +76,65 @@ function sent(){ return calls.map(c=>c.data); }
   await settle();
   out.after_second_done=sent();
 
-  // A failed request still lets later keys through, in order.
+  // A failed request drops the keys queued behind it (they would leave a gap in
+  // the line), and keys typed afterwards go through.
   onData('\r');
   onData('x');
+  onData('y');
   await settle();
   calls[2].reject(new Error('boom'));
   await settle();
   out.after_failure=sent();
   out.toasts=toasts.slice();
+  onData('q');
+  await settle();
+  out.after_failure_next_key=sent();
   calls[3].resolve({});
   await settle();
 
-  // Keys not yet sent when the terminal closes are dropped, not sent to the
-  // next shell; the request already in flight is left to finish.
+  // Joined input never exceeds the server's 8192-character limit; a single
+  // paste over it is sent alone, unchanged.
+  calls.length=0;
+  onData('k');
+  onData('a'.repeat(5000));
+  onData('b'.repeat(5000));
+  onData('c');
+  onData('d'.repeat(9000));
+  await settle();
+  for(let i=0;i<4;i++){ calls[i].resolve({}); await settle(); }
+  out.capped_lengths=calls.map(c=>c.data.length);
+  out.capped_joined=calls.map(c=>c.data).join('')==='k'+'a'.repeat(5000)+'b'.repeat(5000)+'c'+'d'.repeat(9000);
+
+  // Closing drops unsent keys; the reopened shell's keys do not wait for the
+  // old shell's request still in flight.
+  calls.length=0;
   onData('a');
   onData('b');
   await settle();
   await closeComposerTerminal('s1',{skipApi:true});
-  calls[4].resolve({});
-  await settle();
-  out.after_close=sent();
   TERMINAL_UI.sessionId='s1';
   onData('z');
   await settle();
   out.after_reopen=sent();
+  calls[0].resolve({});
+  calls[1].resolve({});
+  await settle();
+  out.after_reopen_settled=sent();
+
+  // Restarting drops unsent keys too.
+  calls.length=0;
+  onData('m');
+  onData('n');
+  await settle();
+  TERMINAL_UI.open=true;
+  TERMINAL_UI.collapsed=false;
+  _startComposerTerminal=async()=>{};
+  await restartComposerTerminal();
+  calls[0].resolve({});
+  await settle();
+  onData('o');
+  await settle();
+  out.after_restart=sent();
   process.stdout.write(JSON.stringify(out));
 })().catch(e=>{console.error(e);process.exit(1);});
 """
@@ -120,11 +157,28 @@ def test_keys_typed_during_a_request_wait_for_it(result):
     assert result["after_second_done"] == ["e", "cho hi"]
 
 
-def test_a_failed_request_does_not_block_or_reorder_later_keys(result):
-    assert result["after_failure"] == ["e", "cho hi", "\r", "x"]
+def test_input_requests_are_not_retried(result):
+    # A retry after a lost response would type the same keys twice.
+    assert result["first_opts"]["retries"] == 0
+    assert result["first_opts"]["timeoutToast"] is False
+    assert 0 < result["first_opts"]["timeoutMs"] <= 10000
+
+
+def test_a_failed_request_drops_the_keys_queued_behind_it(result):
+    assert result["after_failure"] == ["e", "cho hi", "\r"]
     assert result["toasts"] == ["terminal_input_failedboom"]
+    assert result["after_failure_next_key"] == ["e", "cho hi", "\r", "q"]
 
 
-def test_closing_drops_unsent_keys(result):
-    assert result["after_close"] == ["e", "cho hi", "\r", "x", "a"]
-    assert result["after_reopen"] == ["e", "cho hi", "\r", "x", "a", "z"]
+def test_joined_input_stays_within_the_server_limit(result):
+    assert result["capped_lengths"] == [1, 5000, 5001, 9000]
+    assert result["capped_joined"] is True
+
+
+def test_closing_drops_unsent_keys_and_does_not_block_the_next_shell(result):
+    assert result["after_reopen"] == ["a", "z"]
+    assert result["after_reopen_settled"] == ["a", "z"]
+
+
+def test_restarting_drops_unsent_keys(result):
+    assert result["after_restart"] == ["m", "o"]
