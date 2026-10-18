@@ -107,14 +107,18 @@ def _claim_api_available() -> bool:
     return all(callable(getattr(cls, name, None)) for name in _REQUIRED_API)
 
 
+class OwnershipUnknown(Exception):
+    """A sidecar could not be read: ownership is retried next poll, never recorded as unowned."""
+
+
 def _sidecar_profile_matches(sidecar: Path, profile: str) -> bool:
     import json
     from api.profiles import _profiles_match
 
     try:
         data = json.loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
+    except (OSError, ValueError) as exc:
+        raise OwnershipUnknown(str(sidecar)) from exc
     return isinstance(data, dict) and _profiles_match(data.get("profile"), profile)
 
 
@@ -138,6 +142,20 @@ def _webui_session_id(db_path: Path, session_id: str, profile: str) -> str | Non
         return None
     finally:
         conn.close()
+
+
+def _live_webui_sid(webui_sid: str, profile: str) -> str | None:
+    """*webui_sid*, or its compression continuation's sidecar; None when it is sealed without one.
+    A sealed parent is never reopened by a wake (the rows stay for the next turn's fold)."""
+    from api.compression_continuation import durable_compression_continuation
+    from api.config import SESSION_DIR
+    from api.models import get_session
+
+    sealed, tip = durable_compression_continuation(get_session(webui_sid))
+    if not sealed:
+        return webui_sid
+    sidecar = Path(SESSION_DIR) / f"{tip}.json" if tip else None
+    return tip if sidecar is not None and sidecar.is_file() and _sidecar_profile_matches(sidecar, profile) else None
 
 
 def _start_wakeup(webui_sid: str, on_admitted) -> bool:
@@ -323,9 +341,14 @@ def poll_once(since: float) -> int:
             try:
                 webui_sid = _webui_session_id(db_path, sid, profile)
                 if webui_sid:
-                    woken += _claim_and_wake(db_path, sid, webui_sid)
+                    webui_sid = _live_webui_sid(webui_sid, profile)
+                    if webui_sid:
+                        woken += _claim_and_wake(db_path, sid, webui_sid)
                 else:  # not this profile's WebUI session: its rows must not pin the scan floor
                     _UNOWNED.setdefault(str(db_path), set()).add(sid)
+            except OwnershipUnknown:
+                _UNOWNED.get(str(db_path), set()).discard(sid)
+                logger.debug("gateway delegation ownership unreadable for %s; retrying", sid, exc_info=True)
             except Exception:
                 logger.warning("gateway delegation wakeup raised for %s", sid, exc_info=True)
     return woken

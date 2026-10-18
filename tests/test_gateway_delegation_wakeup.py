@@ -618,3 +618,44 @@ def test_runner_local_adapter_is_not_woken(tmp_path, monkeypatch):
     assert gdw._profile_uses_gateway("work") is True
     monkeypatch.setenv("HERMES_WEBUI_RUNTIME_ADAPTER", "runner-local")
     assert gdw._profile_uses_gateway("work") is False
+
+
+def test_wake_never_reopens_a_sealed_parent(env, monkeypatch):
+    """Greptile 4291967495: a compressed parent is woken on its continuation, or not at all."""
+    import api.compression_continuation as cc
+
+    calls, _ = env
+    Session(session_id="tip1", messages=[{"role": "user", "content": "go"}]).save()
+    tips = {"sid1": "tip1"}
+    monkeypatch.setattr(cc, "durable_compression_continuation",
+                        lambda s: (s.session_id in tips, tips.get(s.session_id)))
+    FakeDB.add("sid1", "deleg_s")
+    assert gdw.poll_once(0) == 1 and calls[0]["sid"] == "tip1"
+    assert not any(m.get("_source") == "process_wakeup" for m in _context("sid1"))
+    tips["sid1"] = None  # sealed without a resumable continuation: leave the row pending
+    FakeDB.add("sid1", "deleg_t")
+    assert gdw.poll_once(0) == 0 and len(calls) == 1
+    assert FakeDB.rows[2]["lease"] is None and not FakeDB.rows[2]["consumed"]
+
+
+def test_unreadable_sidecar_is_retried_not_marked_unowned(env, tmp_path, monkeypatch):
+    """Greptile 4291967503: a transient sidecar read failure must not hide the row behind the floor."""
+    db = tmp_path / "agent.db"
+    conn = _agent_schema_db(db)
+    meta = json.dumps({"delegation_id": "d"})
+    conn.execute("INSERT INTO messages VALUES (5, 'sid1', 'user', 'async_delegation_complete', ?, 1.0)", (meta,))
+    conn.executemany("INSERT INTO messages VALUES (?, 'plain', 'user', NULL, NULL, 1.0)", [(i,) for i in range(6, 20)])
+    conn.commit()
+    conn.close()
+    sidecar = tmp_path / "sessions" / "sid1.json"
+    good = sidecar.read_text()
+    sidecar.write_text("{truncated")
+    monkeypatch.setattr(gdw, "_pending_session_ids", _REAL["pending"])
+    monkeypatch.setattr(gdw, "_profile_state_dbs", lambda: [("default", db)])
+    monkeypatch.setattr(gdw, "_UNOWNED", {})
+    monkeypatch.setattr(gdw, "_FLOOR", {})
+    assert gdw.poll_once(0) == 0 and "sid1" not in gdw._UNOWNED.get(str(db), set())
+    assert gdw.poll_once(0) == 0 and gdw._FLOOR[str(db)] == 5
+    sidecar.write_text(good)
+    FakeDB.add("sid1", "d")
+    assert gdw.poll_once(0) == 1
