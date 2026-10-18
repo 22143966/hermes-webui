@@ -299,6 +299,28 @@ def _trusted_agent_dir(agent_dir: Path) -> bool:
         return False
 
 
+def _agent_install_dir(agent_dir: Path) -> Path:
+    """Resolve the directory auto-install should actually install *from*.
+
+    In the documented multi-container compose stacks the agent source is a
+    read-only mount (:ro). setuptools' ``egg_info`` step writes into the source
+    tree, so installing from that mount fails immediately with
+    ``could not create 'hermes_agent.egg_info': Read-only file system`` (#8113).
+    ``docker_init.bash`` stages a writable copy and exports it here, so the
+    recovery path installs from the staged tree instead of the read-only mount.
+
+    Falls back to ``agent_dir`` whenever the staged path is unset, missing, or
+    fails the same ownership/permission trust check that guards the mount —
+    an attacker-controlled env var must never redirect the install.
+    """
+    raw = os.environ.get('HERMES_WEBUI_AGENT_STAGE_DIR', '').strip()
+    if raw:
+        staged = Path(raw).expanduser()
+        if staged.is_dir() and _trusted_agent_dir(staged):
+            return staged.resolve()
+    return agent_dir
+
+
 def auto_install_agent_deps(expected_agent_dir: Path | None = None) -> bool:
     enabled = os.environ.get('HERMES_WEBUI_AUTO_INSTALL', '').strip().lower() in ('1', 'true', 'yes')
     if not enabled:
@@ -314,14 +336,19 @@ def auto_install_agent_deps(expected_agent_dir: Path | None = None) -> bool:
     if not _trusted_agent_dir(agent_dir):
         print('[!!] Auto-install skipped: agent directory failed trust check (check ownership/permissions).', flush=True)
         return False
-    req_file = agent_dir / 'requirements.txt'
-    pyproject = agent_dir / 'pyproject.toml'
+    # Identity is still validated against the *authorized* agent above; only the
+    # install target moves to the writable staged copy (#8113).
+    install_dir = _agent_install_dir(agent_dir)
+    if install_dir != agent_dir:
+        print(f'[ok] Agent source is mounted read-only — installing from the staged copy {install_dir}.', flush=True)
+    req_file = install_dir / 'requirements.txt'
+    pyproject = install_dir / 'pyproject.toml'
     if req_file.exists():
         install_args = [sys.executable, '-m', 'pip', 'install', '--quiet', '-r', str(req_file)]
         print(f'     Installing from {req_file} ...', flush=True)
     elif pyproject.exists():
-        install_args = [sys.executable, '-m', 'pip', 'install', '--quiet', str(agent_dir)]
-        print(f'     Installing from {agent_dir} (pyproject.toml) ...', flush=True)
+        install_args = [sys.executable, '-m', 'pip', 'install', '--quiet', str(install_dir)]
+        print(f'     Installing from {install_dir} (pyproject.toml) ...', flush=True)
     else:
         print('[!!] Auto-install skipped: no requirements.txt or pyproject.toml in agent dir.', flush=True)
         return False
