@@ -487,24 +487,24 @@ function _restoreComposerDraft(draft, targetSid, opts={}) {
   const current = ta.value || '';
   const preserveActiveInput = !!(opts && opts.preserveActiveInput);
   const restoreSid = targetSid || (S.session && S.session.session_id);
-  const localFallback = restoreSid && _composerDraftLocalFallbackBySid.get(restoreSid);
-  let useLocalFallback = !!localFallback;
-  if (useLocalFallback) {
+  let localFallback = restoreSid && _composerDraftLocalFallbackBySid.get(restoreSid);
+  if (localFallback) {
     text = localFallback.text;
     files = localFallback.files;
   }
-  let hasServerDraftPayload = _composerDraftHasPayload(text, files);
-  let serverDraftText = (draft && typeof draft.text === 'string') ? draft.text : '';
-  let serverDraftFiles = (draft && Array.isArray(draft.files)) ? draft.files : [];
-  let serverDraftHasPayload = _composerDraftHasPayload(serverDraftText, serverDraftFiles);
+  // A delivered steer's exact draft (server or local fallback) is being
+  // compare-and-cleared: show the empty projection in place, without re-reading it.
+  if (restoreSid && _composerDraftHasPayload(text, files) && !_isComposerDraftRestoreSuppressed(restoreSid, text, files)
+      && typeof _steerDraftIsRetiring === 'function' && _steerDraftIsRetiring(restoreSid, text, files)) {
+    draft = null; localFallback = null; text = ''; files = [];
+  }
+  const useLocalFallback = !!localFallback;
+  const hasServerDraftPayload = _composerDraftHasPayload(text, files);
+  const serverDraftText = (draft && typeof draft.text === 'string') ? draft.text : '';
+  const serverDraftFiles = (draft && Array.isArray(draft.files)) ? draft.files : [];
+  const serverDraftHasPayload = _composerDraftHasPayload(serverDraftText, serverDraftFiles);
 
   if (restoreSid && hasServerDraftPayload && _isComposerDraftRestoreSuppressed(restoreSid, text, files)) return;
-  // A delivered steer's exact draft (server or local fallback) is being
-  // compare-and-cleared: show the empty projection in place.
-  if (restoreSid && hasServerDraftPayload && typeof _steerDraftIsRetiring === 'function' && _steerDraftIsRetiring(restoreSid, text, files)) {
-    text = serverDraftText = ''; files = serverDraftFiles = [];
-    useLocalFallback = hasServerDraftPayload = serverDraftHasPayload = false;
-  }
   if (restoreSid && !hasServerDraftPayload && serverDraftHasPayload
       && _isComposerDraftRestoreSuppressed(restoreSid, serverDraftText, serverDraftFiles)) return;
   if (restoreSid && !hasServerDraftPayload) _clearComposerDraftRestoreSuppression(restoreSid);
