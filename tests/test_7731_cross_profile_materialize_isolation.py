@@ -9,6 +9,7 @@ The reviewer gate requires:
   3. A behavioral test exercising both halves.
 """
 
+import collections
 import io
 import json
 from pathlib import Path
@@ -324,6 +325,12 @@ class TestArchiveRequestScoped:
             routes_module.SESSIONS[sid] = sess
             return sess
         monkeypatch.setattr(routes_module, "import_cli_session", _fake_import)
+        # The fake import publishes into the shared SESSIONS cache, which the
+        # autouse cleanup fixture does NOT restore (it only deletes through the
+        # separate test server). A later in-process all_sessions() would call
+        # this zero-argument compact() with kwargs and raise TypeError. Give
+        # this test a private cache that monkeypatch rolls back afterwards.
+        monkeypatch.setattr(routes_module, "SESSIONS", collections.OrderedDict())
         _lock_obj = type("L", (), {"acquire": lambda s, timeout=0: True, "release": lambda s: None, "__enter__": lambda s: s, "__exit__": lambda s, *a: None})()
         monkeypatch.setattr(routes_module, "_get_session_agent_lock",
                             lambda sid: _lock_obj)
