@@ -557,6 +557,7 @@ else
         --exclude='*.egg-info' --exclude='build' --exclude='dist' \
         --exclude='__pycache__' --exclude='.git' \
         --exclude='.playwright' \
+        --exclude='.install.lock' \
         "$_agent_src"/ "$_stage_src"/ \
         || error_exit "Failed to stage hermes-agent source to writable build dir"
     else
@@ -566,6 +567,7 @@ else
         || error_exit "Failed to copy hermes-agent source to writable build dir"
       rm -rf "$_stage_src"/*.egg-info "$_stage_src"/build "$_stage_src"/dist 2>/dev/null || true
       rm -rf "$_stage_src"/.playwright 2>/dev/null || true
+      rm -rf "$_stage_src"/.install.lock "$_stage_src"/tools/.install.lock 2>/dev/null || true
       find "$_stage_src" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
     fi
     chmod -R u+w "$_stage_src" \
