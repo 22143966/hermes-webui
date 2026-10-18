@@ -19,6 +19,7 @@ the very breakage #8113 reports.
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -44,16 +45,66 @@ def _fake_venv(tmp_path: Path, *, has_dotenv: bool) -> Path:
     ``hermes_cli.env_loader`` -> ``import dotenv`` at module scope, so its
     absence is the earliest observable symptom of the wrong interpreter.
 
-    ``bin/python3`` is a real interpreter so the probe genuinely executes; the
-    module is placed in the venv root, which is on ``sys.path`` for ``-c``.
+    ``bin/python3`` is a real interpreter so the probe genuinely executes.
+
+    The ``pyvenv.cfg`` must be *complete* or the fixture is not hermetic. A
+    config without ``home`` leaves CPython unable to locate a base
+    installation, so it falls back to the interpreter's own ``base_prefix``
+    and keeps user site-packages enabled — the fake venv then inherits
+    whatever the *host* happens to have installed. CI runners install
+    ``python-dotenv``, so a ``has_dotenv=False`` venv would still import it,
+    the dropped-dependency case would silently stop reproducing, and
+    ``test_cli_verify_exits_nonzero_when_the_import_is_dropped`` would fail in
+    CI while passing locally. ``home`` plus
+    ``include-system-site-packages = false`` isolates the fixture; the module
+    then goes in the venv's own ``site-packages``, which is where pip puts it.
     """
+    major, minor = sys.version_info[:2]
     venv = tmp_path / "venv"
+    site_packages = venv / "lib" / f"python{major}.{minor}" / "site-packages"
+    site_packages.mkdir(parents=True)
     (venv / "bin").mkdir(parents=True)
-    (venv / "pyvenv.cfg").write_text("version_info = 3.12.15\n", encoding="utf-8")
+    (venv / "pyvenv.cfg").write_text(
+        f"home = {Path(sys.executable).parent}\n"
+        "include-system-site-packages = false\n"
+        f"version = {major}.{minor}.{sys.version_info.micro}\n"
+        f"version_info = {major}.{minor}\n",
+        encoding="utf-8",
+    )
     (venv / "bin" / "python3").symlink_to(sys.executable)
     if has_dotenv:
-        (venv / "dotenv.py").write_text("", encoding="utf-8")
+        (site_packages / "dotenv.py").write_text("", encoding="utf-8")
     return venv
+
+
+def test_fake_venv_is_hermetic_and_sees_no_ambient_packages(tmp_path):
+    """Guard the fixture itself.
+
+    If the fake venv can reach the host interpreter's site-packages, the
+    dropped-dependency case stops reproducing and the tests below pass for the
+    wrong reason. Assert the isolation directly rather than trusting it.
+    """
+    venv = _fake_venv(tmp_path, has_dotenv=False)
+    result = subprocess.run(
+        [str(venv / "bin" / "python3"), "-c",
+         "import json,site,sys;"
+         "print(json.dumps({'prefix': sys.prefix,"
+         "'user_site': site.ENABLE_USER_SITE,"
+         "'paths': sys.path}))"],
+        cwd=str(venv),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    info = json.loads(result.stdout)
+    assert info["prefix"] == str(venv), f"fixture did not become the prefix: {info}"
+    assert info["user_site"] is False, f"user site-packages leaked in: {info}"
+    foreign = [
+        p for p in info["paths"]
+        if "packages" in p and not p.startswith(str(venv))
+    ]
+    assert not foreign, f"ambient site-packages leaked into the fixture: {foreign}"
 
 
 def test_readiness_passes_when_the_gated_dependency_imports(tmp_path):
@@ -72,10 +123,16 @@ def test_readiness_fails_and_names_the_missing_module(tmp_path):
 
 
 def test_readiness_reports_the_interpreter_it_actually_used(tmp_path):
-    """The whole fault is an interpreter mismatch — the report must show it."""
+    """The whole fault is an interpreter mismatch — the report must show it.
+
+    Asserted against the running interpreter rather than a literal ``3.12``:
+    CI fans out 3.11/3.12/3.13 shards, and this fixture is a real interpreter,
+    so a hardcoded version would fail on every shard but one.
+    """
     venv = _fake_venv(tmp_path, has_dotenv=False)
     _, detail = dvp.check_critical_imports(venv, expected=(3, 14))
-    assert "3.12" in detail
+    major, minor = sys.version_info[:2]
+    assert f"{major}.{minor}" in detail
     assert "3.14" in detail
 
 
