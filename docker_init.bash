@@ -427,14 +427,12 @@ for _p in "${_agent_paths[@]}"; do
   fi
 done
 
-# The writable staged copy of the agent source. `auto_install_agent_deps()`
-# (api/startup.py) installs from this instead of the read-only agent mount,
-# which cannot satisfy setuptools' egg_info step under the documented `:ro`
-# compose mounts (#8113). Exported here so `server.py` inherits it on the
-# recovery path, and set before the fast-restart guard so a reused venv still
-# points at an already-staged tree.
-_stage_src="/app/hermes-agent-src"
-export HERMES_WEBUI_AGENT_STAGE_DIR="$_stage_src"
+# `auto_install_agent_deps()` (api/startup.py) installs from the writable staged
+# copy rather than the read-only agent mount, which cannot satisfy setuptools'
+# egg_info step under the documented `:ro` compose mounts (#8113). Exported here,
+# before the fast-restart guard, so `server.py` inherits it on the recovery path
+# even when the staging block below is skipped and the copy already exists.
+export HERMES_WEBUI_AGENT_STAGE_DIR="/app/hermes-agent-src"
 
 # Ask the staged agent which interpreter it actually requires instead of
 # inheriting the base image's. A bare `uv venv` pins whatever /app/venv ends up
@@ -549,8 +547,9 @@ else
     # with "Permission denied" even though `_stage_src` itself was created
     # writable by hermeswebui. Re-add owner-write on the staged tree after the
     # copy so the build dir is genuinely writable, not just owned by us.
-    # (`$_stage_src` / HERMES_WEBUI_AGENT_STAGE_DIR are set above the venv
-    # decision so the recovery path inherits them on a fast restart too.)
+    # (HERMES_WEBUI_AGENT_STAGE_DIR is exported above the venv decision so the
+    # recovery path inherits it on a fast restart too.)
+    _stage_src="/app/hermes-agent-src"
     rm -rf "$_stage_src"
     mkdir -p "$_stage_src"
     if command -v rsync >/dev/null 2>&1; then
