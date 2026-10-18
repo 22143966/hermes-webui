@@ -440,16 +440,44 @@ def verdict(res):
     for name in ('normalize', 'finalize'):
         if checks.get(name) != 'ok':
             bad.append(f'runtime:{name}: {checks.get(name)}')
-    # The two in-page samples are REQUIRED: they are the measurements this probe
-    # exists to take, at the settle edge and the frame after it. A sample that
-    # was never captured is not "nothing to check" -- skipping it is how CI
-    # passed without ever having looked at the settle frame
-    # (Greptile P2 discussion_r4302597979). after_wait/after_idle stay optional:
-    # they are conditional on the settle succeeding / the idle probe running.
+    # EVERY observation this variant promises is required. They are the
+    # measurements the probe exists to take, and an observation that was never
+    # captured is not "nothing to check" -- skipping it is how CI passed
+    # without ever having looked at the settle frame (Greptile P2
+    # discussion_r4302597979).
+    #
+    # Required set:
+    #   same_frame, first_frame -- always. They are the settle edge and the
+    #       frame after it; the whole point of the in-page sampler.
+    #   after_wait             -- required once the settle succeeded. It is the
+    #       reading taken after the 1500ms dwell, i.e. the proof the settled
+    #       reply STAYS visible while the renderer repaints. When the settle
+    #       itself errored, `settled` already carries that error and is
+    #       reported below; after_wait is None only as a consequence, so
+    #       requiring it there would double-report one failure.
+    #   after_idle             -- required exactly when an idle probe was
+    #       requested ('equal'/'changed'). A variant named for idle recovery
+    #       that never captured the idle reading proved nothing about it.
+    #       For idle_probe='none' there is no such promise and it stays
+    #       optional.
+    settled = res.get('settled')
+    settle_errored = isinstance(settled, dict) and 'error' in settled
+    if settle_errored:
+        # run() records WHY the settle was never captured in `settled`, and
+        # leaves same_frame None. Report that cause verbatim: "sample missing"
+        # alone sends the reader hunting in the page for a sampler that never
+        # ran, instead of at the timeout that let it expire.
+        bad.append(f'settle: {settled}')
+    required = ['same_frame', 'first_frame']
+    if not settle_errored:
+        required.append('after_wait')
+    if res.get('idle_probe') in ('equal', 'changed'):
+        required.append('after_idle')
+
     for label in ('same_frame', 'first_frame', 'after_wait', 'after_idle'):
         r = res.get(label)
         if not r:
-            if label in ('same_frame', 'first_frame'):
+            if label in required:
                 bad.append(f'{label}: sample missing — the in-page settle '
                            'sampler never recorded it')
             continue
