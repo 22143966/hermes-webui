@@ -467,3 +467,19 @@ emitLeftover('guidance');await tick();await tick();await tick();
 assert.equal(inp.value,'','the new uncertain steer is proven, not the old accepted one');
 assert.equal(_steerUncertainBySid.size,0);
 """)
+
+
+def test_refresh_during_retire_with_pending_local_save_does_not_recurse():
+    _run(r'''
+const p=submitSteer();releaseSteer();assert.equal(await p,false);
+assert.equal(inp.value,'guidance');
+_saveComposerDraft('A',inp.value,[]);   // pending debounced save keeps a local fallback
+let releaseCas;casGate=new Promise(r=>releaseCas=r);
+emitLeftover('guidance');await tick();
+assert.ok(_composerDraftLocalFallbackBySid.has('A'),'local fallback still held while clearing');
+inp.value='guidance';
+assert.doesNotThrow(()=>_restoreComposerDraft({text:'guidance',files:[]},'A'));
+assert.equal(inp.value,'','retiring local fallback shown empty');
+releaseCas();await tick();await tick();await tick();
+assert.equal(drafts.A&&drafts.A.text||'','');
+''')
