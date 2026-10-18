@@ -349,6 +349,57 @@ def test_old_schema_without_ledger_deletes(tmp_path, monkeypatch):
         conn.close()
 
 
+def test_row_free_session_deletes_when_the_helper_is_missing(tmp_path, monkeypatch):
+    """No runtime rows means nothing for the fence to protect.
+
+    A downgraded or misconfigured Agent must not turn "helper unavailable" into
+    "every session is undeletable": the Agent's own trigger allows deleting a
+    row-free session too.
+    """
+    import api.models as models
+
+    state_db, conn = _make_db(tmp_path)
+    try:
+        _seed_session(conn, "sid")
+        conn.commit()
+    finally:
+        conn.close()
+    _install_home(monkeypatch, tmp_path)
+    monkeypatch.setitem(sys.modules, "hermes_state_mutation_retirement", None)
+
+    assert models.delete_cli_session("sid") is True
+
+    conn = sqlite3.connect(state_db)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_row_free_session_deletes_on_a_partial_ledger_schema(tmp_path, monkeypatch):
+    import api.models as models
+
+    schema = LEDGER_SCHEMA.replace(
+        "CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT);", ""
+    )
+    state_db, conn = _make_db(tmp_path, schema=schema)
+    try:
+        _seed_session(conn, "sid")
+        conn.commit()
+    finally:
+        conn.close()
+    _install_home(monkeypatch, tmp_path)
+    _install_retirement_stub(monkeypatch, _agent_like_retirement([]))
+
+    assert models.delete_cli_session("sid") is True
+
+    conn = sqlite3.connect(state_db)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_sidecar_only_session_without_state_db_deletes(tmp_path, monkeypatch):
     """A WebUI-only session has no state.db at all.
 

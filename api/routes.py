@@ -18749,8 +18749,6 @@ def handle_post(handler, parsed) -> bool:
                 close_terminal(sid)
             except Exception:
                 logger.debug("Failed to close workspace terminal for deleted session %s", sid)
-            with LOCK:
-                SESSIONS.pop(sid, None)
             sidecar_deleted = False
             with LOCK:
                 SESSIONS.pop(sid, None)

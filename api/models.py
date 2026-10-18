@@ -15370,15 +15370,41 @@ _LEDGER_TABLES = frozenset(
 )
 
 
+def _has_gateway_runtime_rows(conn, session_ids, tables):
+    """True when any of these sessions still has gateway runtime rows.
+
+    Admissions point at a session through ``target_session_id``; workers through
+    ``session_id`` (receipts are their children, so a row-free worker table means
+    no receipts either).
+    """
+    placeholders = ",".join("?" * len(session_ids))
+    for table, column in (
+        ("session_admissions", "target_session_id"),
+        ("worker_executions", "session_id"),
+    ):
+        if table not in tables:
+            continue
+        if conn.execute(
+            f"SELECT 1 FROM {table} WHERE {column} IN ({placeholders}) LIMIT 1",
+            session_ids,
+        ).fetchone():
+            return True
+    return False
+
+
 def _retire_gateway_runtime_ledger(conn, session_ids, tables):
     """Retire gateway runtime rows with the Agent's own deletion fence.
 
     Terminal receipts survive as exact-retry evidence; live or unknown work
     refuses the delete instead of being erased. A schema without the ledger
     tables has nothing to retire. A partial ledger schema fails closed: deleting
-    only some of the ledger would leave the Agent's guards unsatisfied.
+    only some of the ledger would leave the Agent's guards unsatisfied — but only
+    when there is something to retire, so a downgraded or misconfigured Agent
+    cannot block deleting a session that has no runtime rows at all.
     """
     if not tables & {"session_admissions", "worker_executions"}:
+        return
+    if not _has_gateway_runtime_rows(conn, session_ids, tables):
         return
     if not _LEDGER_TABLES.issubset(tables):
         raise SessionDeleteRefused("runtime_ledger_unavailable")
