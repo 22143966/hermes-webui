@@ -148,6 +148,47 @@ def test_status_messages_total_label_is_translated():
     assert "status_messages_total: 'Total messages'" in I18N_JS
 
 
+def _locales_defining(key: str) -> set:
+    """Locale codes whose own map declares `key`.
+
+    The render probe below only visits locales that already define the key, so
+    it cannot notice a locale that silently falls back to English.
+    """
+    probe = """
+const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const sandbox = {window:{}, document:{documentElement:{lang:''}, addEventListener(){},
+    querySelectorAll(){return []}},
+  navigator:{language:'en'}, localStorage:{getItem(){return null},setItem(){}}, console};
+sandbox.window.localStorage = sandbox.localStorage;
+vm.createContext(sandbox);
+vm.runInContext(src + ";globalThis.__i18nProbe = {LOCALES};", sandbox);
+const {LOCALES} = sandbox.__i18nProbe;
+const out = [];
+for (const code of Object.keys(LOCALES)) {
+  const map = LOCALES[code];
+  if (map && Object.prototype.hasOwnProperty.call(map, process.argv[3])) out.push(code);
+}
+console.log(JSON.stringify(out));
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+        handle.write(probe)
+        script_path = pathlib.Path(handle.name)
+    if NODE is None:
+        pytest.skip("node not on PATH")
+    try:
+        result = subprocess.run(
+            [NODE, str(script_path), str(REPO_ROOT / "static" / "i18n.js"), key],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=30,
+        )
+    finally:
+        script_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
+    return set(json.loads(result.stdout.strip()))
+
+
 def _render_labels_in_all_locales(key: str) -> dict:
     """Render `key` through the REAL i18n.js in every locale that defines it.
 
@@ -213,6 +254,19 @@ def test_status_messages_total_renders_in_every_locale_that_defines_it():
     # Pin their own translations so a regression is visible rather than inferred.
     assert rendered.get("es") == "Mensajes totales"
     assert rendered.get("de") == "Nachrichten gesamt"
+    assert rendered.get("zh") == "消息总数"
+    # Own-key coverage, not just "defined somewhere": the probe above skips a
+    # locale whose map lacks the key, so a missing translation would silently
+    # pass as an English fallback. Every locale that translates the sibling
+    # `status_messages` label must carry `status_messages_total` too.
+    locales = _locales_defining("status_messages")
+    assert "zh-Hant" in locales, sorted(locales)
+    # Simplified Chinese does not translate `status_messages`, so the render
+    # probe cannot reach it; its entry is pinned directly above.
+    assert "status_messages_total: '消息总数'" in I18N_JS
+    missing = sorted(locales - set(rendered))
+    assert "zh" not in missing, "zh defines status_messages_total but rendered no label"
+    assert not missing, f"locales translating status_messages but not status_messages_total: {missing}"
 
 
 def test_status_message_keys_present_in_es_and_de():
