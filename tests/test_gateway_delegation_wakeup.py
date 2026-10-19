@@ -2,9 +2,8 @@
 
 The Gateway persists them as delivery rows in the profile state.db and starts
 no turn; the WebUI poller reserves them and wakes with a fixed prompt; the
-Gateway worker commits the lease only once the Gateway accepts the run. A fake SessionDB exposes the optional
-reserve/commit/release methods (used directly when a SessionDB has them); the real-SessionDB
-tests run the module's own lease transaction against upstream hermes-agent main.
+Gateway worker commits the lease only once the Gateway accepts the run. A fake SessionDB implements the Agent's
+reserve/commit/release contract (hermes-agent#125451).
 """
 import json
 
@@ -220,7 +219,7 @@ def test_profile_without_gateway_backend_is_skipped(env, monkeypatch):
 def test_poller_starts_when_only_a_named_profile_uses_the_gateway(monkeypatch):
     monkeypatch.setattr("api.gateway_chat.webui_gateway_chat_enabled", lambda *_a, **_k: False)
     monkeypatch.setattr(gdw, "_session_db_cls", lambda: FakeDB)
-    for name in gdw._LEASE_API:
+    for name in gdw._REQUIRED_API:
         assert callable(getattr(FakeDB, name))
     monkeypatch.setattr(gdw, "_loop", lambda: gdw._STOP.wait(5))
     try:
@@ -316,72 +315,10 @@ def test_poller_inert_without_hermes_state(monkeypatch):
     assert gdw.start_gateway_delegation_poller() is False
 
 
-def _real_session_db():
-    hermes_state = pytest.importorskip("hermes_state")
-    assert all(callable(getattr(hermes_state.SessionDB, n, None)) for n in gdw._MAIN_API)
-    return hermes_state
-
-
-def _row_meta(db_path, row_id):
-    import sqlite3
-    conn = sqlite3.connect(db_path)
-    try:
-        return json.loads(conn.execute("SELECT display_metadata FROM messages WHERE id = ?", (row_id,)).fetchone()[0])
-    finally:
-        conn.close()
-
-
-class _NoLeaseApi:
-    """A SessionDB proxy that hides any reserve/commit/release methods, forcing the module's own transaction."""
-
-    def __init__(self, db):
-        self._db = db
-
-    def __getattr__(self, name):
-        if name in gdw._LEASE_API:
-            raise AttributeError(name)
-        return getattr(self._db, name)
-
-
-def test_real_agent_session_db_reserve_commit_release_round_trip(tmp_path):
-    hermes_state = _real_session_db()
-    db_path = tmp_path / "rt-state.db"
-    real = hermes_state.SessionDB(db_path)
-    db = _NoLeaseApi(real)
-    try:
-        real.create_session("parent", source="api_server")
-        rid = real.append_delegation_delivery("parent", "result A", {"delegation_id": "deleg_a"})
-        owner = gdw.RESERVATION_OWNER
-        rows = gdw._reserve_deliveries(db, "parent", owner, 60)
-        assert [r["id"] for r in rows] == [rid] and rows[0]["content"] == "result A"
-        token = rows[0]["reservation_token"]
-        assert _row_meta(db_path, rid)["caller_history_reservation"]["token"] == token
-        assert gdw._reserve_deliveries(db, "parent", owner, 60) == []  # live lease is exclusive
-        assert gdw._release_deliveries(db, reservation_token="other", owner=owner) == 0
-        assert gdw._release_deliveries(db, reservation_token=token, owner=owner) == 1
-        assert "caller_history_reservation" not in _row_meta(db_path, rid)
-        # Expired lease: still settleable by its token while nobody re-reserved it.
-        token = gdw._reserve_deliveries(db, "parent", owner, -1)[0]["reservation_token"]
-        assert gdw._commit_deliveries(db, token, "someone-else") == 0
-        assert gdw._commit_deliveries(db, token, owner) == 1
-        assert _row_meta(db_path, rid)["caller_history_consumed"] == 1
-        assert gdw._reserve_deliveries(db, "parent", owner, 60) == []
-        # Row-id commit needs a live lease; rows of a compression parent are reached from the child.
-        rid2 = real.append_delegation_delivery("parent", "result B", {"delegation_id": "deleg_b"})
-        real.end_session("parent", "compression")
-        real.create_session("child", source="api_server", parent_session_id="parent")
-        assert [r["id"] for r in gdw._reserve_deliveries(db, "child", owner, -1)] == [rid2]
-        assert gdw._commit_deliveries(db, [rid2], owner) == 0
-        assert [r["id"] for r in gdw._reserve_deliveries(db, "child", owner, 60)] == [rid2]
-        assert gdw._commit_deliveries(db, [], owner) == 0
-        assert gdw._commit_deliveries(db, [rid2], owner) == 1
-        assert _row_meta(db_path, rid2)["caller_history_consumed"] == 1
-    finally:
-        real.close()
-
-
 def test_real_agent_session_db_round_trip(env, tmp_path, monkeypatch):
-    hermes_state = _real_session_db()
+    hermes_state = pytest.importorskip("hermes_state")
+    if not callable(getattr(hermes_state.SessionDB, "reserve_caller_history_deliveries", None)):
+        pytest.skip("installed Hermes Agent predates the reservation API")
     calls, _ = env
     monkeypatch.setattr(gdw, "_session_db_cls", lambda: hermes_state.SessionDB)
     monkeypatch.setattr(gdw, "_pending_session_ids", _REAL["pending"])
@@ -395,7 +332,7 @@ def test_real_agent_session_db_round_trip(env, tmp_path, monkeypatch):
         assert gdw.poll_once(0) == 1
         assert calls[0]["prompt"] == gdw.WAKE_PROMPT
         assert sum("deleg_r" in str(m.get("content")) for m in _context()) == 1
-        assert gdw._reserve_deliveries(_NoLeaseApi(db), "sid1", "probe", 60) == []  # still leased
+        assert db.claim_caller_history_deliveries("sid1") == []
         assert gdw.poll_once(0) == 0
     finally:
         db.close()

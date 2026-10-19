@@ -9,10 +9,8 @@ or ``hidden`` for presentation-suppressed notices) and deliberately starts no tu
 (``gateway.wake.persist_delegation_delivery``). Without a consumer here the
 parent agent only sees the result when the user next types.
 
-This poller leases those rows (a ``caller_history_reservation`` lease in the row's
-``display_metadata``, written through upstream ``SessionDB._execute_write``; a
-``SessionDB`` that ships ``reserve/commit/release_caller_history_deliveries`` is
-used directly instead), copies each result once into
+This poller leases those rows with the Agent's reservation API
+(``SessionDB.reserve_caller_history_deliveries``), copies each result once into
 the session's model-facing ``context_messages`` (keyed by row id, tagged
 ``_source: process_wakeup`` so the transcript shows it as a wakeup notice, not a
 user turn), and starts a wakeup turn whose prompt is a FIXED nudge. The results
@@ -26,8 +24,7 @@ sidecar keeps the lease until the database settle succeeds; a failed commit is
 retried by the next poll. A restart before settlement reattaches the run and
 settles it, or the lease expires and the next poll retries. Refused wakes, and
 wakes the Gateway never accepted, back off per session.
-Works against upstream hermes-agent ``main`` (``append_delegation_delivery``);
-without a usable ``SessionDB`` the poller stays inert.
+Without reserve+commit the poller stays inert.
 """
 from __future__ import annotations
 
@@ -45,11 +42,8 @@ RESERVATION_OWNER = "hermes-webui"
 RESERVATION_TTL_S = 120.0
 WAKE_PROMPT = ("[IMPORTANT: A delegated subagent finished. Its result is already in your "
                "conversation history above; review it and continue the task.]")
-# Upstream hermes-agent main: delivery rows + the writer transaction this module leases them with.
-_MAIN_API = ("append_delegation_delivery", "_execute_write")
-# A SessionDB that ships the lease API itself (used as-is when present).
-_LEASE_API = ("reserve_caller_history_deliveries", "commit_caller_history_deliveries",
-              "release_caller_history_deliveries")
+_REQUIRED_API = ("reserve_caller_history_deliveries", "commit_caller_history_deliveries",
+                 "release_caller_history_deliveries")
 # Rows older than this at first sight are left for the next user turn to fold.
 MAX_ROW_AGE_S = 6 * 3600
 
@@ -110,106 +104,7 @@ def _claim_api_available() -> bool:
         cls = _session_db_cls()
     except Exception:
         return False
-    return any(all(callable(getattr(cls, name, None)) for name in api) for api in (_MAIN_API, _LEASE_API))
-
-
-# Same lease semantics as the Agent's caller-history API: ``caller_history_consumed`` is final,
-# ``caller_history_reservation`` = {token, owner, until} is a lease that expires on its own.
-_LINEAGE_IDS_SQL = """WITH RECURSIVE lineage(id) AS (SELECT ? UNION
-    SELECT s.parent_session_id FROM sessions s JOIN lineage l ON s.id = l.id
-    JOIN sessions p ON p.id = s.parent_session_id WHERE p.end_reason = 'compression'
-) SELECT id FROM lineage"""
-_CH_PENDING = (
-    " AND role = 'user' AND display_kind IN ('async_delegation_complete', 'hidden')"
-    " AND json_extract(display_metadata, '$.delegation_id') IS NOT NULL"
-    " AND json_extract(display_metadata, '$.caller_history_consumed') IS NULL"
-    " AND COALESCE(json_extract(display_metadata, '$.caller_history_reservation.until'), 0) <= ?")
-
-
-def _has(db, name: str) -> bool:
-    return callable(getattr(db, name, None))
-
-
-def _write(db, fn):
-    return db._execute_write(fn, patience_s=getattr(db, "_TRANSCRIPT_WRITE_PATIENCE_S", 5.0))
-
-
-def _decode(db, name: str, raw):
-    dec = getattr(db, name, None)
-    if callable(dec):
-        return dec(raw)
-    import json
-    try:
-        return json.loads(raw) if isinstance(raw, str) and name == "_decode_display_metadata" else raw
-    except ValueError:
-        return {}
-
-
-def _reserve_deliveries(db, session_id: str, owner: str, ttl_seconds: float) -> list[dict]:
-    """Lease *session_id*'s (and its compression parents') pending delivery rows to *owner*."""
-    if _has(db, "reserve_caller_history_deliveries"):
-        return db.reserve_caller_history_deliveries(session_id, owner, ttl_seconds)
-    import json
-    import uuid
-    token = uuid.uuid4().hex
-
-    def _do(conn):
-        now = time.time()
-        lineage = [r[0] for r in conn.execute(_LINEAGE_IDS_SQL, (session_id,)).fetchall()]
-        rows = conn.execute(
-            f"SELECT id, session_id, content, display_metadata FROM messages"
-            f" WHERE session_id IN ({','.join('?' * len(lineage))})" + _CH_PENDING + " ORDER BY id",
-            (*lineage, now)).fetchall()
-        lease = json.dumps({"token": token, "owner": str(owner), "until": now + float(ttl_seconds)})
-        out = []
-        for row_id, sid, content, meta in rows:
-            conn.execute("UPDATE messages SET display_metadata = json_set(display_metadata,"
-                         " '$.caller_history_reservation', json(?)) WHERE id = ?", (lease, row_id))
-            content = _decode(db, "_decode_content", content)
-            out.append({"id": row_id, "delivery_id": row_id, "session_id": sid, "content": content,
-                        "result": content, "reservation_token": token,
-                        "display_metadata": _decode(db, "_decode_display_metadata", meta) or {}})
-        return out
-
-    return _write(db, _do)
-
-
-def _held_where(token_or_ids, owner):
-    clause = (" AND json_extract(display_metadata, '$.caller_history_consumed') IS NULL"
-              " AND json_extract(display_metadata, '$.caller_history_reservation.owner') = ?")
-    if isinstance(token_or_ids, str):
-        # A re-reserve replaces the token, so a matching token proves nobody took the rows over:
-        # its holder may settle them even after the lease ran out (e.g. after a restart).
-        return ("json_extract(display_metadata, '$.caller_history_reservation.token') = ?" + clause,
-                [token_or_ids, str(owner)])
-    ids = [int(i) for i in token_or_ids or ()]
-    if not ids:
-        return None, None
-    clause += " AND json_extract(display_metadata, '$.caller_history_reservation.until') > ?"
-    return (f"id IN ({','.join('?' * len(ids))})" + clause, [*ids, str(owner), time.time()])
-
-
-def _commit_deliveries(db, token_or_ids, owner: str) -> int:
-    """Mark rows still leased to *owner* (by token, or by live-lease row ids) delivered for good."""
-    if _has(db, "commit_caller_history_deliveries"):
-        return db.commit_caller_history_deliveries(token_or_ids, owner)
-    where, params = _held_where(token_or_ids, owner)
-    if where is None:
-        return 0
-    return _write(db, lambda conn: conn.execute(
-        "UPDATE messages SET display_metadata = json_remove(json_set(display_metadata,"
-        " '$.caller_history_consumed', 1), '$.caller_history_reservation') WHERE " + where,
-        tuple(params)).rowcount)
-
-
-def _release_deliveries(db, *, reservation_token: str, owner: str) -> int:
-    """Return rows leased to *owner* under *reservation_token* to pending."""
-    if _has(db, "release_caller_history_deliveries"):
-        return db.release_caller_history_deliveries(reservation_token=reservation_token, owner=owner)
-    where, params = _held_where(reservation_token, owner)
-    return _write(db, lambda conn: conn.execute(
-        "UPDATE messages SET display_metadata = json_remove(display_metadata,"
-        " '$.caller_history_reservation') WHERE " + where, tuple(params)).rowcount)
+    return all(callable(getattr(cls, name, None)) for name in _REQUIRED_API)
 
 
 class OwnershipUnknown(Exception):
@@ -346,9 +241,9 @@ def settle_reservation(webui_sid: str, stream_id, accepted: bool) -> None:
         db = _session_db_cls()(Path(res["db"]))
         try:
             if accepted:
-                _commit_deliveries(db, res["token"], res["owner"])
+                db.commit_caller_history_deliveries(res["token"], res["owner"])
             else:
-                _release_deliveries(db, reservation_token=res["token"], owner=res["owner"])
+                db.release_caller_history_deliveries(reservation_token=res["token"], owner=res["owner"])
         finally:
             db.close()
     except Exception:
@@ -409,11 +304,11 @@ def _claim_and_wake(db_path: Path, state_sid: str, webui_sid: str) -> int:
         return 0
     db = _session_db_cls()(db_path)
     try:
-        reserved = _reserve_deliveries(db, state_sid, RESERVATION_OWNER, RESERVATION_TTL_S)
+        reserved = db.reserve_caller_history_deliveries(state_sid, RESERVATION_OWNER, RESERVATION_TTL_S)
         rows = [r for r in reserved if isinstance(r.get("content"), str) and r["content"].strip()]
         blank = [r["id"] for r in reserved if r not in rows]
         if blank:  # nothing to deliver: settle them as the Gateway fold would
-            _commit_deliveries(db, blank, RESERVATION_OWNER)
+            db.commit_caller_history_deliveries(blank, RESERVATION_OWNER)
         if not rows:
             return 0
         lease = {"db": str(db_path), "sid": state_sid, "token": rows[0]["reservation_token"],
@@ -425,7 +320,7 @@ def _claim_and_wake(db_path: Path, state_sid: str, webui_sid: str) -> int:
         if _start_wakeup(webui_sid, on_admitted):
             return 1  # the wake turn's worker settles the lease and the back-off
         # Not admitted: nothing was published (or the launch rollback removed it).
-        _release_deliveries(db, reservation_token=lease["token"], owner=RESERVATION_OWNER)
+        db.release_caller_history_deliveries(reservation_token=lease["token"], owner=RESERVATION_OWNER)
         _record_outcome(lease, accepted=False)
         return 0
     finally:
@@ -470,7 +365,7 @@ def start_gateway_delegation_poller() -> bool:
     global _THREAD
     try:
         if not _claim_api_available():
-            logger.info("gateway delegation poller inactive: installed Hermes Agent SessionDB lacks delegation delivery rows")
+            logger.info("gateway delegation poller inactive: installed Hermes Agent lacks the delivery reserve/commit API")
             return False
         with _LOCK:
             if _THREAD is not None and _THREAD.is_alive():
