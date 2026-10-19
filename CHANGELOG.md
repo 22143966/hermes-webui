@@ -82,6 +82,12 @@
 
 ### Fixed
 
+- **Windows: starting the WebUI again reports "already running".** When our own WebUI already listens on the port, Windows can refuse the second bind with a permission error (WSAEACCES) instead of "address in use"; the launcher now recognises its own server behind that error. Thanks @Thanatos9404. (#8301, #8137)
+
+- **Faster session switching on code-heavy chats.** The copy-button pass marks code blocks it has already handled, so re-rendering a cached transcript no longer re-walks every code block to add nothing. Thanks @MuhammadUsamaMX. (#8309, #2168)
+
+- **Dashboard link setting rejects double-slash paths.** A browser dashboard URL whose path contains `//` (for example `https://host//dashboard`) is now refused when you save it, closing the last authority-like path shape the earlier #7844 hardening missed. Thanks @MuhammadUsamaMX. (#8354)
+
 - **Less CPU while chats are open.** Finding a run's journal file walked every session directory on each lookup, and those lookups sit on per-poll paths (stream reconnect probes, ownership checks). With hundreds of sessions that walk took a large share of the process and slowed even `/health`. Run paths are now cached (bounded, revalidated on use), hundreds of times faster per warm lookup. Thanks @silent-reader-cn. (#8322)
 
 - **Chats on a named custom provider keep their model.** A session pinned to `@custom:<name>:<model>` could silently switch to the catalog default on another provider when the catalog was cold (the provider lives in `custom_providers`, often in a profile config). Valid models are now kept, including server-side wakeup turns, and a model that was really removed from the provider's list moves to the provider's current default, with `${VAR}` defaults expanded in the session's own profile environment. Thanks @MoBluey. (#8256)
@@ -529,6 +535,8 @@
 - **Documented the gateway approval-runs API opt-in.** `docs/advanced-chat-setup.md` and `docs/docker.md` now explain how to enable and use the gateway approval-runs API. Thanks @rodboev. (#5549, #5269)
 
 ### Changed
+
+- **Test suite: the run-journal echo-scan scaling check no longer flakes on a busy runner,** while still failing on a genuinely quadratic rebuild. Thanks @MuhammadUsamaMX. (#8328)
 
 - **Russian: the last English strings translated.** The Profiles explainer and the Transparent Stream timestamp setting now read in Russian. Thanks @RajPabnani03. (#8001)
 
