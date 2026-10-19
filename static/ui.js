@@ -9357,7 +9357,7 @@ function renderMd(raw){
     // <code> fragments around the substitution and restore them right after.
     const _ic_stash=[];
     t=t.replace(/(<code\b[^>]*>[\s\S]*?<\/code>)/g,m=>{_ic_stash.push(m);return `\x00S${_ic_stash.length-1}\x00`;});
-    t=t.replace(/!\[([^\]]*)\][ \t]*(?:\r?\n[ \t]*)?\([ \t]*((?:https?:\/\/|file:\/\/|data:image\/)[^\)]+|\/(?!\/)[^\s\)]+)[ \t]*\)/g,(src,alt,url)=>(typeof _mdImageHtml==='function')?_stashImageFrag(_mdImageHtml(alt,url,src)):`<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`);
+    t=t.replace(/!\[([^\]]*)\][ \t]*(?:\r?\n[ \t]*)?\([ \t]*((?:https?:\/\/|file:\/\/|data:image\/)[^\)]+|\/(?!\/)[^\s\)]+)[ \t]*\)/g,(src,alt,url)=>(alt=alt.replace(/\x00S(\d+)\x00/g,(_,i)=>_ic_stash[+i]).replace(/\x00C(\d+)\x00/g,(_,i)=>_code_stash[+i]),(typeof _mdImageHtml==='function'))?_stashImageFrag(_mdImageHtml(alt,url,src)):`<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`);
     t=t.replace(/\x00S(\d+)\x00/g,(_,i)=>_ic_stash[+i]);
     // Stash rendered <img> tags so autolink never matches URLs inside src=
     const _img_stash=[];
@@ -9557,7 +9557,7 @@ function renderMd(raw){
   // rewrite its <span> or delete its download <svg>.
   const _oc_stash=[];
   s=s.replace(/(<code\b[^>]*>[\s\S]*?<\/code>)/g,m=>{_oc_stash.push(m);return `\x00S${_oc_stash.length-1}\x00`;});
-  s=s.replace(/!\[([^\]]*)\][ \t]*(?:\r?\n[ \t]*)?\([ \t]*((?:https?:\/\/|file:\/\/|data:image\/)[^\)]+|\/(?!\/)[^\s\)]+)[ \t]*\)/g,(src,alt,url)=>(typeof _mdImageHtml==='function')?_stashImageFrag(_mdImageHtml(alt,url,src)):`<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`);
+  s=s.replace(/!\[([^\]]*)\][ \t]*(?:\r?\n[ \t]*)?\([ \t]*((?:https?:\/\/|file:\/\/|data:image\/)[^\)]+|\/(?!\/)[^\s\)]+)[ \t]*\)/g,(src,alt,url)=>(alt=alt.replace(/\x00S(\d+)\x00/g,(_,i)=>_oc_stash[+i]),(typeof _mdImageHtml==='function'))?_stashImageFrag(_mdImageHtml(alt,url,src)):`<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`);
   s=s.replace(/\x00S(\d+)\x00/g,(_,i)=>_oc_stash[+i]);
   // Outer link pass for labeled links in plain paragraphs (outside table cells).
   // Runs AFTER the table pass so table cells are processed by inlineMd() only.

@@ -449,6 +449,23 @@ def test_https_image_in_list_item_still_renders(driver_path):
     assert "&lt;img" not in html
 
 
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("prefix", ["", "- item\n  ", "> ", "| a |\n|---|\n| "])
+def test_code_span_in_image_alt_renders_one_clean_img(driver_path, prefix):
+    """Maintainer fold: the code-fragment stash ran before the image pass, so an alt containing a code span
+    (``![`code`](https://...)``) restored raw ``<code>`` inside the alt attribute and the sanitizer left
+    ``code</code>">`` as visible text after the image (paragraph, list, blockquote, table)."""
+    html = _render(driver_path, prefix + "![`code`](https://example.com/a.png)" + (" |" if prefix.startswith("|") else ""))
+    assert html.count("<img") == 1, html
+    assert 'src="https://example.com/a.png"' in html, html
+    assert "\x00" not in html, repr(html)
+    img = html[html.index("<img"):]
+    img = img[: img.index(">") + 1]
+    assert "</code>" not in img and "<code" not in img, img
+    after = html[html.index(img) + len(img):]
+    assert "code</code>" not in after and '"' not in after.split("<")[0], html
+
+
 # ── Smaller fix 1: a refused bare path returns the ORIGINAL source text ─────
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
