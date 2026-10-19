@@ -1648,6 +1648,42 @@ def _strip_sidebar_heavy_metadata(row: dict) -> dict:
     return row
 
 
+def _validated_pending_hidden_wakeup_at(session, *, require_row: bool = True):
+    """Return the checkpoint fact only while it names the current pending row.
+
+    The fact is stamped by the eager checkpoint, and it must survive only as long
+    as the pending turn it belongs to. With ``require_row`` (the writer's check)
+    it must also still name a row in this transcript: a truncation or a reload
+    that dropped the row invalidates it. Every unknown answers ``None`` -- the
+    sidebar then treats the pending hidden row as still owed a discount, which is
+    the conservative branch (#7882 cap follow-up, GUIDELINES rule 3).
+    """
+    source = str(getattr(session, 'pending_user_source', '') or '').strip().lower()
+    if source != 'delegation_wakeup':
+        return None
+    value = getattr(session, '_pending_hidden_wakeup_at', None)
+    started = getattr(session, 'pending_started_at', None)
+    for candidate in (value, started):
+        if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+            return None
+        if float(candidate) <= 0:
+            return None
+    if float(value) != float(started):
+        # The fact belongs to a different pending turn.
+        return None
+    if not require_row:
+        return float(value)
+    for message in getattr(session, 'messages', None) or []:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get('_source') or '').strip().lower() != 'delegation_wakeup':
+            continue
+        timestamp, timestamp_valid = _message_exact_timestamp_details(message)
+        if timestamp_valid and timestamp == float(value):
+            return float(value)
+    return None
+
+
 def _validated_webui_pending_user_timestamp_identity(session, value):
     if not isinstance(value, (tuple, list)) or len(value) != 2:
         return None
@@ -1789,6 +1825,21 @@ class Session:
         self.pending_attachments = pending_attachments or []
         self.pending_started_at = pending_started_at
         self.pending_user_source = pending_user_source
+        # Exact start timestamp of the transcript row the CURRENT pending hidden
+        # wakeup materialised into (#7882 cap follow-up). The eager checkpoint
+        # stamps it at the point of intent; ``save`` re-validates it against the
+        # transcript and emits it in the metadata prefix as
+        # ``_pending_hidden_wakeup_at`` so a capped-out sidebar row -- which
+        # cannot re-walk the transcript -- still knows the row it would
+        # otherwise discount a second time is already excluded. Restored from
+        # persisted metadata on load (it rides the prefix), but only while it
+        # still names this session's pending turn: an index rebuild that reloads
+        # the sidecar keeps the fact, a leftover fact from a finished turn does
+        # not come back.
+        self._pending_hidden_wakeup_at = kwargs.get('_pending_hidden_wakeup_at')
+        self._pending_hidden_wakeup_at = _validated_pending_hidden_wakeup_at(
+            self, require_row=False
+        )
         self._webui_pending_user_timestamp_identity = (
             _validated_webui_pending_user_timestamp_identity(
                 self, kwargs.get('_webui_pending_user_timestamp_identity')
@@ -1931,6 +1982,17 @@ class Session:
                 self, getattr(self, '_webui_pending_user_timestamp_identity', None)
             )
         )
+        # Keep the checkpoint fact only while it still names a row in this
+        # transcript AND the same turn the pending fields name (#7882 cap
+        # follow-up). The eager checkpoint is the only writer, but it is not the
+        # only path that later mutates the object: a reload drops the fact (a
+        # restored transcript has no pending turn), a truncation can remove the
+        # row, and settlement clears the pending fields before the next save.
+        # Any of those invalidates the fact, and an invalid fact must never
+        # reach the prefix -- a stale one would excuse a discount that is
+        # actually still owed.
+        _pending_hidden_wakeup_at = _validated_pending_hidden_wakeup_at(self)
+        self._pending_hidden_wakeup_at = _pending_hidden_wakeup_at
         # Write metadata fields first so load_metadata_only() can read them
         # without parsing the full messages array (which may be 400KB+).
         # Fields are listed in the order they should appear in the JSON file.
@@ -2000,6 +2062,15 @@ class Session:
         # shrink as a growth and skip the #1558 backup. One save re-marks the
         # file, so the fast path still covers steady state.
         meta['_mc_v'] = _MESSAGE_COUNT_MARKER
+        # Eager-checkpoint provenance (#7882 cap follow-up): the exact start
+        # timestamp of the hidden wakeup row this sidecar already carries AND
+        # already excludes. Emitted in the prefix next to _mc_v, i.e. inside the
+        # metadata head a capped-out sidebar row reads, because the overlay's
+        # capped-out branch cannot re-walk the transcript. Only written while
+        # the fact is valid (see _validated_pending_hidden_wakeup_at), so a
+        # sidecar without a checkpoint is byte-identical to before.
+        if _pending_hidden_wakeup_at:
+            meta['_pending_hidden_wakeup_at'] = _pending_hidden_wakeup_at
         meta['anchor_scene_index'] = _anchor_scene_index_from_records(self.anchor_activity_scenes)
         # Keep the in-memory fingerprint aligned with what we just persisted, so a
         # later metadata-only reload of THIS object (or any fingerprint reader)
@@ -2471,6 +2542,13 @@ class Session:
         last_message_at = _last_message_timestamp(self.messages) or self.updated_at
         if has_pending_user_message and self.pending_started_at:
             last_message_at = self.pending_started_at
+        # #7882 cap follow-up: the checkpoint fact is only emitted while it still
+        # names THIS session's pending turn. A truncation or a settled turn can
+        # leave a stale value in memory, and a stale fact would excuse a discount
+        # that is actually still owed.
+        _pending_hidden_wakeup_at = _validated_pending_hidden_wakeup_at(
+            self, require_row=False
+        )
         compact = {
             'session_id': self.session_id,
             'title': self.title,
@@ -2551,6 +2629,22 @@ class Session:
                 {'pending_user_source': self.pending_user_source}
                 if str(self.pending_user_source or '').strip().lower()
                 not in ('', 'webui', 'fork')
+                else {}
+            ),
+            # #7882 cap follow-up: the overlay's capped-out branch cannot re-walk
+            # the transcript, so the row has to carry the checkpoint provenance
+            # itself -- together with the pending turn's exact start timestamp,
+            # which is the identity ``_active_turn_token`` and every
+            # timestamp-provenance check in this module are built on. Emitting
+            # both here binds the fact to the turn that is pending NOW instead of
+            # trusting any older same-text row; a settled turn owes no discount
+            # and therefore carries neither.
+            **(
+                {
+                    'pending_started_at': self.pending_started_at,
+                    '_pending_hidden_wakeup_at': _pending_hidden_wakeup_at,
+                }
+                if _pending_hidden_wakeup_at
                 else {}
             ),
             'is_cli_session': self.is_cli_session,
@@ -12265,40 +12359,46 @@ def _native_image_leading_text(message):
 
 
 def _pending_hidden_row_materialized(session) -> bool:
-    """True when the sidecar already holds the pending hidden wakeup row.
+    """True when the sidecar already holds the CURRENT pending hidden wakeup row.
 
-    The eager-save checkpoint writes the delegation wakeup user turn into the
-    sidecar BEFORE streaming starts, stamped with ``_source`` (and
-    ``_active_turn_token``) by ``_checkpoint_user_message_for_eager_session_save``.
-    In that case ``visible_message_count`` in the sidebar metadata already
-    discounts the row, so the overlay's raw-delta fallback must not subtract it
-    a second time. Without the checkpoint the row exists only in state.db and
-    the discount is still owed.
+    The eager-save checkpoint (``_checkpoint_user_message_for_eager_session_save``)
+    appends the delegation wakeup user turn to the transcript BEFORE streaming
+    starts, so ``visible_message_count`` in the sidebar metadata already excludes
+    that row and the overlay's raw-delta fallback must not subtract it a second
+    time. Without the checkpoint the row exists only in state.db and the discount
+    is still owed.
 
-    Reads the metadata-only payload's ``messages`` list when present (the
-    caller builds sidebar rows from ``to_dict(sidebar_metadata_only=True)``,
-    which keeps a compact transcript). An absent transcript is treated as "not
-    materialized": the discount is the conservative anti-resurrection branch.
+    The evidence rides the metadata, never a transcript: a capped-out sidebar
+    row cannot re-walk the transcript, the overlay pops ``messages`` and
+    ``_strip_sidebar_heavy_metadata`` drops it from the index snapshot, and no
+    producer emits a ``messages`` key into a sidebar row at all. So the
+    checkpoint records the exact start timestamp of the row it materialised,
+    ``Session.save`` re-validates it against the transcript and writes it into
+    the metadata prefix as ``_pending_hidden_wakeup_at``, and ``compact()``
+    carries it into the index entry and the sidebar row.
+
+    Ownership is bound to the current turn: the fact is only accepted when it
+    names the same exact start timestamp the row reports as its pending turn.
+    An older checkpointed row (or one stamped for a different stream) cannot
+    vouch for a newly pending wakeup. Every unknown -- absent fact, absent
+    pending timestamp, unparseable value -- answers False, i.e. the discount is
+    still owed: the conservative anti-resurrection branch.
     """
     if not isinstance(session, dict):
         return False
-    messages = session.get('messages')
-    if not isinstance(messages, list) or not messages:
+    if str(session.get('pending_user_source') or '').strip().lower() != 'delegation_wakeup':
         return False
-    pending_text = ' '.join(str(session.get('pending_user_message') or '').split())
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        if not is_hidden_transcript_row(message):
-            continue
-        if str(message.get('_source') or '').strip().lower() != 'delegation_wakeup':
-            continue
-        if pending_text:
-            content = ' '.join(str(message.get('content') or '').split())
-            if content != pending_text:
-                continue
-        return True
-    return False
+
+    def _epoch(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value) if value > 0 else None
+
+    materialized_at = _epoch(session.get('_pending_hidden_wakeup_at'))
+    pending_started_at = _epoch(session.get('pending_started_at'))
+    if materialized_at is None or pending_started_at is None:
+        return False
+    return materialized_at == pending_started_at
 
 
 def _stamp_pending_source_for_display(session, state_messages):

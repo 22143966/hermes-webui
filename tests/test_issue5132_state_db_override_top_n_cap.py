@@ -694,6 +694,7 @@ def _wakeup_row(**extra):
         "updated_at": 1.0,
         "pending_user_message": "handoff",
         "pending_user_source": "delegation_wakeup",
+        "pending_started_at": 1000.5,
     }
     row.update(extra)
     return row
@@ -705,17 +706,17 @@ def test_capped_out_hidden_wakeup_already_in_sidecar_is_not_double_discounted(mo
     The pending hidden row is materialised in the sidecar, so ``current_visible``
     already excludes it. Only the assistant reply since the last save shows up in
     the state.db delta; the hidden row must not be discounted a second time.
+
+    The evidence is the write-side fact the checkpoint persists
+    (``_pending_hidden_wakeup_at``), not a transcript: the sidebar overlay pops
+    ``messages`` and ``_strip_sidebar_heavy_metadata`` drops it from the index
+    snapshot, so a check that needs a transcript key can never fire on a real
+    row. The writer -> index -> row ingress itself is covered end to end by
+    ``test_issue7882_cap_checkpoint_ingress.py``; this pins the fallback's
+    arithmetic.
     """
     sessions = _capped_filler(3, cap=2)
-    sessions.append(
-        _wakeup_row(
-            messages=[
-                {"role": "user", "content": "handoff", "_source": "delegation_wakeup"},
-                {"role": "assistant", "content": "done"},
-                {"role": "user", "content": "reply"},
-            ]
-        )
-    )
+    sessions.append(_wakeup_row(_pending_hidden_wakeup_at=1000.5))
     metadata = _capped_metadata(sessions, "WAKEUP", count=3, last=20_000.0)
     reconciled = _apply_with_fallback(monkeypatch, sessions, metadata, cap=2)
 
@@ -731,7 +732,7 @@ def test_capped_out_hidden_wakeup_already_in_sidecar_is_not_double_discounted(mo
 def test_capped_out_hidden_wakeup_absent_from_sidecar_still_discounted(monkeypatch):
     """Deferred case: the hidden row exists only in state.db, so it is still owed."""
     sessions = _capped_filler(3, cap=2)
-    sessions.append(_wakeup_row(messages=[{"role": "assistant", "content": "done"}]))
+    sessions.append(_wakeup_row())
     metadata = _capped_metadata(sessions, "WAKEUP", count=3, last=20_000.0)
     _apply_with_fallback(monkeypatch, sessions, metadata, cap=2)
 
@@ -739,6 +740,49 @@ def test_capped_out_hidden_wakeup_absent_from_sidecar_still_discounted(monkeypat
     assert row["visible_message_count"] == 2, (
         "an unmaterialised hidden wakeup keeps its visible-count discount"
     )
+
+
+def test_materialised_fact_from_another_turn_does_not_vouch(monkeypatch):
+    """Ownership is per turn: a fact naming a DIFFERENT pending start is not evidence.
+
+    An older checkpointed wakeup that left its row behind must not excuse the
+    discount for a NEW pending wakeup, even when the text matches.
+    """
+    sessions = _capped_filler(3, cap=2)
+    sessions.append(
+        _wakeup_row(
+            pending_started_at=2000.0,
+            _pending_hidden_wakeup_at=1000.5,
+        )
+    )
+    metadata = _capped_metadata(sessions, "WAKEUP", count=3, last=20_000.0)
+    _apply_with_fallback(monkeypatch, sessions, metadata, cap=2)
+
+    assert sessions[-1]["visible_message_count"] == 2, (
+        "a fact bound to another pending turn cannot vouch for this one"
+    )
+
+
+def test_materialised_fact_fails_closed_without_a_pending_turn():
+    """Every unknown answers False: the discount is still owed."""
+    assert models._pending_hidden_row_materialized(
+        {"_pending_hidden_wakeup_at": 1000.5}
+    ) is False
+    assert models._pending_hidden_row_materialized(
+        {"pending_user_source": "delegation_wakeup", "_pending_hidden_wakeup_at": 1000.5}
+    ) is False
+    assert models._pending_hidden_row_materialized(
+        {"pending_user_source": "delegation_wakeup", "pending_started_at": 1000.5}
+    ) is False
+    assert models._pending_hidden_row_materialized(
+        {
+            "pending_user_source": "webui",
+            "pending_started_at": 1000.5,
+            "_pending_hidden_wakeup_at": 1000.5,
+        }
+    ) is False
+    assert models._pending_hidden_row_materialized({}) is False
+    assert models._pending_hidden_row_materialized(None) is False
 
 
 def test_capped_out_truncated_sidecar_does_not_credit_the_removed_suffix(monkeypatch):
