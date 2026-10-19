@@ -122,12 +122,12 @@ SEED_JS = """async () => {
     {role: 'assistant', content: 'hello back'},
   ];
   const sids = [];
-  for (const title of ['Alpha conversation', 'Beta conversation', 'Gamma conversation']) {
+  for (const title of ['Alpha conversation', 'Beta conversation', 'Gamma conversation', 'Delta conversation #short']) {
     const data = await post('/api/session/import', {title, messages});
     sids.push(data.session.session_id);
   }
   await renderSessionList({deferWhileInteracting: false});
-  return {alpha: sids[0], beta: sids[1], gamma: sids[2]};
+  return {alpha: sids[0], beta: sids[1], gamma: sids[2], delta: sids[3]};
 }"""
 
 # Count every sidebar open. _openSidebarSession is a global function the row
@@ -222,6 +222,11 @@ PROJECT_RENAMED_JS = """async ([projectId, suffix]) => {
 }"""
 
 FOCUS_IN_LIST_JS = "() => !!document.querySelector('#sessionList:focus-within')"
+
+CLEAR_SEARCH_JS = """() => {
+  const box = document.getElementById('sessionSearch');
+  if (box && box.value) { box.value = ''; if (typeof filterSessions === 'function') filterSessions(); }
+}"""
 
 
 def _title(page, sid):
@@ -811,6 +816,39 @@ def _check_touch(page, ctx, seed, label, phone):
         if not _wait_until(page, "() => !document.querySelector('.session-action-menu')", timeout_ms=2000):
             fail("Escape did not close the action menu opened by a long press")
     page.evaluate("() => typeof closeSessionActionMenu === 'function' && closeSessionActionMenu()")
+    page.wait_for_timeout(300)
+
+    # A long press on a tag chip still opens the row's action menu, as on master, and its release
+    # neither filters nor closes that menu. A plain tap on the tag filters and opens nothing.
+    delta = seed["delta"]
+    _open(page, alpha)
+    _open_drawer_if_phone(page, phone)
+    page.evaluate(CLEAR_SEARCH_JS)
+    tag = page.locator(f'#sessionList .session-item[data-sid="{delta}"] .session-tag').first
+    if not _wait_until(page, "(sid) => !!document.querySelector('#sessionList .session-item[data-sid=\"' + sid + '\"] .session-tag')", delta):
+        fail("the tagged conversation has no tag chip")
+    else:
+        page.evaluate(COUNT_OPENS_JS)
+        _native_long_press(page, cdp, tag.bounding_box())
+        page.wait_for_timeout(300)
+        if not page.evaluate("() => !!document.querySelector('.session-action-menu')"):
+            fail("a long press on a tag no longer opens the action menu")
+        if page.locator('#sessionSearch').input_value() != '':
+            fail("releasing a long press on a tag also filtered by the tag")
+        if _opens(page):
+            fail(f"a long press on a tag opened {_opens(page)}")
+        page.evaluate("() => typeof closeSessionActionMenu === 'function' && closeSessionActionMenu()")
+        page.wait_for_timeout(300)
+        page.evaluate(COUNT_OPENS_JS)
+        tag.tap()
+        page.wait_for_timeout(SETTLE_MS)
+        if page.locator('#sessionSearch').input_value() != '#short':
+            fail("a tap on a tag no longer filters by it")
+        if _opens(page):
+            fail(f"a tap on a tag opened {_opens(page)}")
+        if page.evaluate("() => !!document.querySelector('.session-action-menu')"):
+            fail("a tap on a tag opened the action menu")
+    page.evaluate(CLEAR_SEARCH_JS)
     page.wait_for_timeout(300)
 
     # A tap on another title while a rename is active must commit and end the

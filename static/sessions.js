@@ -10239,7 +10239,8 @@ function renderSessionListFromCache(){
       chip.className='session-tag';
       chip.textContent=tag;
       chip.title='Click to filter by '+tag;
-      ['pointerdown','pointerup','touchstart','touchend'].forEach(ev=>chip.addEventListener(ev,e=>e.stopPropagation()));
+      // Presses reach the row so a long press on a tag still opens the conversation actions, as on
+      // master; the row gesture treats an ordinary tag release as "filter, do not open".
       chip.onclick=(e)=>{
         e.stopPropagation();
         // Tag filtering is an explicit transition, not a background repaint.
@@ -10996,6 +10997,8 @@ function renderSessionListFromCache(){
       _pointerY=clientY;
       _commitSessionSwipe();
       if(_longPressMenuOpened){_gestureState='idle';return true;}
+      // A tag tap filters (the chip's own click handler) and never opens the conversation.
+      if(target&&target.closest&&target.closest('.session-tag')){_gestureState='idle';return false;}
       if(_gestureState==='committed') return true;
       if(_sessionActionMenu&&!_sessionActionMenu.contains(target)){
         closeSessionActionMenu();
@@ -11185,7 +11188,9 @@ function renderSessionListFromCache(){
         &&!_isSessionActionTarget(e.target)
         &&!(e.target&&e.target.closest&&e.target.closest(SESSION_ROW_NESTED_CONTROL_SELECTOR));
       if(_finishSessionGesture(touch.clientX,touch.clientY,e.target,'touch')) e.stopPropagation();
-      if(tapHandledHere&&e.cancelable){
+      // A long press that opened the actions menu must not also synthesize a click on release (on a tag
+      // that click would filter and close the menu it just opened).
+      if((tapHandledHere||_longPressMenuOpened)&&e.cancelable){
         e.preventDefault();
         // Cancelling also drops the compatibility mousedown that would move
         // focus. Release it here instead (a long press that opened the menu
