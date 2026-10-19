@@ -17366,6 +17366,10 @@ function _finalizeJustSettledTransparentScene(streamId){
   if(!settledSceneRendered) return false;
   const _visibleRows=turn.querySelectorAll('.transparent-event-row:not([hidden]):not([aria-hidden="true"])');
   if(_assistantTurnHasVisibleRenderedSegment(turn)!==true&&!_visibleRows.length) return false;
+  // The skipped full render was also the pass that enhanced Markdown tables (sort buttons and filter, wired by
+  // the renderMessages wrapper in messages.js). The scene renderer replaced this turn's rows, so enhance them
+  // here; tables in retained activity rows otherwise lose sorting and filtering (#7833 re-gate).
+  if(typeof enhanceMarkdownTables==='function') enhanceMarkdownTables(turn);
   // The skipped full render was also the one that (re)wrote _sessionHtmlCache:
   // the first settle render is excluded while the keep-open token is armed, so
   // drop any older entry for this session — a later switch must rebuild from

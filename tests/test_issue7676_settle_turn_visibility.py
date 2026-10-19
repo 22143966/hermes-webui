@@ -537,3 +537,43 @@ class TestTransparentSettleInPlace:
             "a manually closed detail must stay closed after the in-place "
             "finalize even though the default is open"
         )
+
+
+def _finalize_tables_harness(scene_rendered, visible):
+    finalizer = extract_function(read(str(REPO / "static/ui.js")), "_finalizeJustSettledTransparentScene")
+    return textwrap.dedent(
+        f"""
+        const SCENE_RENDERED={str(scene_rendered).lower()};
+        const VISIBLE={str(visible).lower()};
+        const S={{session:{{session_id:'s1'}}, messages:[{{role:'assistant',_anchor_activity_scene:{{}}}}]}};
+        const window={{}};
+        const turn={{querySelectorAll(){{ return VISIBLE?[{{}}]:[]; }}}};
+        const segment={{closest:(sel)=>sel==='.assistant-turn'?turn:null}};
+        const inner={{querySelector:()=>segment}};
+        function $(id){{ return id==='msgInner'?inner:null; }}
+        function isTransparentStream(){{ return true; }}
+        function _settledAssistantStreamId(){{ return 'st1'; }}
+        function _assistantTurnHasVisibleRenderedSegment(){{ return VISIBLE; }}
+        const _sessionHtmlCache={{delete:()=>{{}}}};
+        const enhanced=[];
+        function enhanceMarkdownTables(root){{ enhanced.push(root===turn?'turn':'other'); }}
+        function _renderSettledAnchorSceneTransparentForMessage(){{ return SCENE_RENDERED; }}
+        {finalizer}
+        const ok=_finalizeJustSettledTransparentScene('st1');
+        console.log(JSON.stringify({{ok, enhanced}}));
+        """
+    )
+
+
+def test_settle_finalize_enhances_markdown_tables_in_the_replaced_turn():
+    """Maintainer fold (#7833 re-gate): the in-place finalize replaces the turn's rows after the table enhancer
+    ran, and it skips the full render whose wrapper enhanced them. A long Transparent Stream turn with an
+    intermediate Markdown table lost its sort buttons and filter (Chromium: master 2 sort buttons + 1 filter,
+    the PR head none). The finalizer now enhances the replaced turn on success."""
+    import json
+
+    out = json.loads(_run_node(_finalize_tables_harness(True, True)).strip())
+    assert out == {"ok": True, "enhanced": ["turn"]}, out
+    # Failed finalize: the caller falls back to the full render, which enhances the whole transcript itself.
+    out = json.loads(_run_node(_finalize_tables_harness(False, True)).strip())
+    assert out == {"ok": False, "enhanced": []}, out
