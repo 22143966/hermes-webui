@@ -9802,8 +9802,18 @@ function lockComposerForClarify(placeholderText){
   if (sid && typeof _saveComposerDraftNow === 'function') {
     const saveText = String(input.value || '');
     const saveFiles = Array.isArray(S && S.pendingFiles) ? [...S.pendingFiles] : [];
+    // #7855: an unchanged restored goal continuation keeps its token in this save. Without it the
+    // payload stores goal_continuation_id '' and the continuation sent after a reload is no longer
+    // goal-related, which stops the goal loop. Edited text carries no token (round-7 rule).
+    const restoredCont = (typeof _peekRestoredGoalContinuationDraft === 'function')
+      ? _peekRestoredGoalContinuationDraft()
+      : null;
+    const saveContId = (restoredCont && restoredCont.id
+      && String(restoredCont.text || '').trim() === saveText.trim()) ? restoredCont.id : '';
     try {
-      const saveResult = _saveComposerDraftNow(sid, saveText, saveFiles);
+      const saveResult = saveContId
+        ? _saveComposerDraftNow(sid, saveText, saveFiles, saveContId)
+        : _saveComposerDraftNow(sid, saveText, saveFiles);
       if (saveResult && typeof saveResult.catch === 'function') {
         saveResult.catch((error)=>_handleComposerDraftPostFailure(error,sid,saveText,saveFiles));
       }

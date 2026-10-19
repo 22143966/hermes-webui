@@ -27256,7 +27256,7 @@ def _resolve_chat_start_goal_continuation_id(body: dict, session_id: str) -> str
     genuine-turn signal, and a key-presence legacy path would otherwise admit
     every genuine turn again.
     """
-    if "goal_continuation_id" not in body:
+    if "goal_continuation_id" not in body and body.get("regenerate") is not True:
         from api.goals import peek_pending_goal_continuation_id
 
         return _normalize_goal_continuation_id(peek_pending_goal_continuation_id(session_id))

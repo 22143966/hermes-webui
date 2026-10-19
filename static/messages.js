@@ -1503,7 +1503,7 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
         && String(persistedText||'').trim()===String(restore||'').trim()
         ?_restoreContId:'';
       try{
-        const result=_saveComposerDraftNow(sid,persistedText,persistedFiles,_persistContId);
+        const result=_persistContId?_saveComposerDraftNow(sid,persistedText,persistedFiles,_persistContId):_saveComposerDraftNow(sid,persistedText,persistedFiles);
         if(result&&typeof result.catch==='function'){
           return result.catch((error)=>_handleComposerDraftPostFailure(error,sid,persistedText,persistedFiles));
         }
