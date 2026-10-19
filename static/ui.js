@@ -9558,11 +9558,19 @@ function renderMd(raw){
       }
     }
     if(/^file:\/\//i.test(href)){
+      // #8033: same policy as the streaming converter (_smdLinkHref) and media refs (_inlineMediaHtmlForRef): only
+      // local authorities are served, a UNC 'file://server/share/...' link stays an inert file:// href, and the
+      // once-decoded pathname (with its '?…'/'#…' suffix) is forwarded with its leading separator.
       try{
-        const path=decodeURIComponent(href.replace(/^file:\/\//i,''));
+        const u=new URL(href);
+        if(u.hostname&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(u.hostname)) return href;
+        const path=decodeURIComponent((u.pathname||'')+(u.search||'')+(u.hash||''));
         return 'api/media?path='+encodeURIComponent(path)+'&inline=1';
       }catch(_){
-        return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,''))+'&inline=1';
+        // Fail closed: an unparseable URI with an authority may hide a non-local host.
+        if(/^file:\/\/[^/?#]+/i.test(href)) return href;
+        try{ return 'api/media?path='+encodeURIComponent(decodeURIComponent(href.replace(/^file:\/\//i,'')))+'&inline=1'; }
+        catch(__){ return 'api/media?path='+encodeURIComponent(href.replace(/^file:\/\//i,''))+'&inline=1'; }
       }
     }
     return href;
