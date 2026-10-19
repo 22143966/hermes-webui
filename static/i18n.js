@@ -24077,7 +24077,7 @@ const LOCALES = {
 
     profile_concept_title: 'Profiller ve çalışma alanları',
     profile_concept_subtitle: 'Profiller ajanın nasıl çalıştığını, çalışma alanları hangi dosyalar üzerinde çalıştığını belirler.',
-    profile_concept_desc_profiles: 'Ajan kimliği, bellek, beceriler, model/sağlayıcı yapılandırması ve bağlı araçlar. Araştırma yazar, pazarlamacı veya geliştirici gibi farklı bağlam veya yetenekler taşıması gereken roller için profiller oluşturun.',
+    profile_concept_desc_profiles: 'Ajan kimliği, bellek, beceriler, model/sağlayıcı yapılandırması ve bağlı araçlar. Araştırmacı, yazar, pazarlamacı veya geliştirici gibi farklı bağlam veya yetenekler taşıması gereken roller için profiller oluşturun.',
     profile_concept_desc_workspaces: 'Disk üzerindeki proje veya ürün klasörleri. Depo/ürün başına bir çalışma alanı kullanın ki sohbet, terminal ve dosya gezgini doğru dosyalara baksın.',
     profile_concept_desc_together: 'Bir profilin varsayılan bir çalışma alanı olabilir, ancak istediğiniz zaman çalışma alanları arasında geçiş yapabilirsiniz. Profiller „kim çalışıyor?“ sorusuna, çalışma alanları „nerede çalışıyorlar?“ sorusuna yanıt verir.',
     profile_concept_example: 'Örnek: web arama becerileri etkin bir „researcher“ profili ve proje klasörünüzü gösteren bir „my-app“ çalışma alanı oluşturun. researcher profili araştırma tercihlerinizi hatırlar; çalışma alanı sohbeti, terminali ve dosya gezginini o projede tutar.',

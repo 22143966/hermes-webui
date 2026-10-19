@@ -32,8 +32,14 @@ def _locale_blocks(src: str) -> dict[str, str]:
         for m in re.finditer(r"^  '?([A-Za-z][A-Za-z-]*)'?: \{", src, re.M)
     ]
     blocks: dict[str, str] = {}
+    # The last bundle ends at the `\n};\n` that closes LOCALES, not at end of file:
+    # i18n.js keeps `function t(` and the tool-label tables after LOCALES, and their
+    # keys must not be attributed to the final locale (they would mask a real gap).
+    locales_end = src.find("\n};\n", starts[-1][1]) if starts else -1
+    if locales_end < 0:
+        locales_end = len(src)
     for i, (name, start) in enumerate(starts):
-        end = starts[i + 1][1] if i + 1 < len(starts) else len(src)
+        end = starts[i + 1][1] if i + 1 < len(starts) else locales_end
         blocks[name] = src[start:end]
     return blocks
 
@@ -81,6 +87,19 @@ def test_quick_create_button_is_localized():
     assert "btn.title='New conversation in this project'" not in SESSIONS_JS
     assert "btn.setAttribute('aria-label','New conversation in this project')" not in SESSIONS_JS
     assert "t('project_chip_new_in_project')" in SESSIONS_JS
+    en_value = re.search(
+        r"^\s*project_chip_new_in_project:\s*'((?:[^'\\]|\\.)*)'", BLOCKS["en"], re.M
+    )
+    assert en_value and en_value.group(1) == "New conversation in this project", (
+        "en must keep the original English tooltip/aria-label text"
+    )
+
+
+def test_last_locale_block_stops_at_locales_close():
+    """The final bundle must not swallow the code after LOCALES (t(), tool tables)."""
+    last = BLOCKS[list(BLOCKS)[-1]] if BLOCKS else ""  # last bundle in FILE order (LOCALES is sorted)
+    assert "function t(" not in last
+    assert "_I18N_TOOL_" not in last
 
 
 def test_russian_bundle_translates_visible_placeholders():
