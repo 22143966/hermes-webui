@@ -594,7 +594,7 @@ global._getVisibleMessagesWithIdx=()=>S.messages.map((m,rawIdx)=>({m,rawIdx}));
 global._messageVirtualScrollTopForVisibleIdx=(vis,idx,c)=>Math.max(0,idx*ROW-Math.round(c.clientHeight*0.35));
 global.window.setTimeout=(f)=>0;
 global._ensureAllMessagesLoaded=async()=>{events.push('ensure-all');};
-for(const name of ['_messageSessionIndexBase','_messageRawIdxForSessionIndex','_messageVisibleIndexForRawIdx','_userMessageDomId','_highlightQuestionRow','jumpToTurnQuestion']) eval(extractFrom(uiSrc,name));
+for(const name of ['_messageSessionIndexBase','_messageRawIdxForSessionIndex','_messageVisibleIndexForRawIdx','_userMessageDomId','_highlightQuestionRow','_messageJumpScrollBehavior','jumpToTurnQuestion']) eval(extractFrom(uiSrc,name));
 for(const name of ['_currentSid','_expandOutlineRenderWindow','_searchHitMessageText','_jumpToFullSessionMessage']) eval(extractFrom(outlineSrc,name));
 (async()=>{
   const targetInDomBefore=rows.some(r=>r.dataset.msgIdx===String(scenario.idx));
@@ -763,3 +763,47 @@ def test_query_absent_from_the_loaded_transcript_does_not_jump():
 def test_no_query_keeps_the_index_jump():
     r = _run_jump(idx=2)
     assert r["ok"] is True and r["delegated"]["q"] == 2
+
+
+# -- Far jumps land instantly so the highlight is visible ---------------------------------------------------------
+# A smooth scroll from the bottom of a 240-message session to message 0 ran ~1.5 s over 86k px, and the highlight
+# (1.6 s pulse, peak at ~0.56 s) had faded before the row arrived. Far targets and reduced-motion users now jump
+# instantly; near targets keep the smooth scroll.
+
+_BEHAVIOR_DRIVER = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+const start = src.indexOf('function _messageJumpScrollBehavior(');
+let i = src.indexOf('{', start), depth = 1; i++;
+while (depth > 0) { if (src[i] === '{') depth++; else if (src[i] === '}') depth--; i++; }
+const sc = JSON.parse(process.argv[2]);
+global.window = { matchMedia: (q) => ({ matches: !!sc.reduced && q.includes('reduce') }) };
+eval(src.slice(start, i));
+const container = { clientHeight: 800, getBoundingClientRect: () => ({ top: 100 }) };
+const el = { getBoundingClientRect: () => ({ top: 100 + sc.offset }) };
+process.stdout.write(_messageJumpScrollBehavior(container, el));
+"""
+
+
+def _jump_behavior(offset, reduced=False):
+    r = subprocess.run([NODE, "-e", _BEHAVIOR_DRIVER, str(_UI_JS), json.dumps({"offset": offset, "reduced": reduced})],
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+@needs_node
+@pytest.mark.parametrize("offset,expected", [(300, "smooth"), (-1500, "smooth"), (1601, "auto"), (-86000, "auto")])
+def test_far_jump_targets_land_instantly_and_near_ones_scroll_smoothly(offset, expected):
+    assert _jump_behavior(offset) == expected
+
+
+@needs_node
+def test_reduced_motion_always_jumps_instantly():
+    assert _jump_behavior(300, reduced=True) == "auto"
+
+
+def test_question_and_answer_jumps_use_the_distance_aware_behavior():
+    ui = _UI_JS.read_text(encoding="utf-8")
+    assert "seg.scrollIntoView({block:'start',behavior:_messageJumpScrollBehavior(container,seg)})" in ui
+    assert "row.scrollIntoView({block:'center',behavior:_messageJumpScrollBehavior(container,row)})" in ui
