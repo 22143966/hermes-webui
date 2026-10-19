@@ -15404,13 +15404,15 @@ def _retire_gateway_runtime_ledger(conn, session_ids, tables):
     """
     if not tables & {"session_admissions", "worker_executions"}:
         return
-    if not _has_gateway_runtime_rows(conn, session_ids, tables):
-        return
     if not _LEDGER_TABLES.issubset(tables):
+        if not _has_gateway_runtime_rows(conn, session_ids, tables):
+            return
         raise SessionDeleteRefused("runtime_ledger_unavailable")
     try:
         from hermes_state_mutation_retirement import retire_sessions
     except Exception as exc:
+        if not _has_gateway_runtime_rows(conn, session_ids, tables):
+            return
         raise SessionDeleteRefused("runtime_ledger_unavailable") from exc
     try:
         retire_sessions(conn, session_ids)

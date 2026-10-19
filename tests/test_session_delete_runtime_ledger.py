@@ -376,6 +376,36 @@ def test_row_free_session_deletes_when_the_helper_is_missing(tmp_path, monkeypat
         conn.close()
 
 
+def test_row_free_session_still_runs_the_fence(tmp_path, monkeypatch):
+    """A complete schema plus an importable helper means the fence runs.
+
+    ``retire_sessions`` does more than clear admission rows: it retires
+    spillover candidates, mutation receipts, route fences and local receipts.
+    Skipping it for a row-free session would leave that Agent-side data behind.
+    """
+    import api.models as models
+
+    state_db, conn = _make_db(tmp_path)
+    try:
+        _seed_session(conn, "sid")
+        conn.commit()
+    finally:
+        conn.close()
+    _install_home(monkeypatch, tmp_path)
+    recorded = []
+    _install_retirement_stub(monkeypatch, _agent_like_retirement(recorded))
+
+    assert models.delete_cli_session("sid") is True
+    assert recorded == ["sid"]
+
+    conn = sqlite3.connect(state_db)
+    try:
+        keys = {row[0] for row in conn.execute("SELECT key FROM state_meta")}
+    finally:
+        conn.close()
+    assert "gateway.retired_session.v1.sid" in keys
+
+
 def test_row_free_session_deletes_on_a_partial_ledger_schema(tmp_path, monkeypatch):
     import api.models as models
 
