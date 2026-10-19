@@ -1571,7 +1571,10 @@ function _compensateScrollForMeasurementDelta(renderFn){
   const delta=actualOffset-anchorBefore.topOffset;
   if(Math.abs(delta)<2) return;
   _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
-  container.scrollTop=scrollTopBefore+delta;
+  // Correct from the CURRENT position. The render may already have moved scrollTop (the renderer restores its
+  // own anchor after calibration changes the spacer geometry); `delta` is measured against that position, so
+  // writing scrollTopBefore+delta threw the reader ~95 messages back on mobile (#8122 re-gate).
+  container.scrollTop+=delta;
   _lastScrollTop=container.scrollTop;
   _deferClearProgrammaticScroll();
 }

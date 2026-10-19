@@ -1144,3 +1144,74 @@ console.log(JSON.stringify({ repeatedOneRow, afterNewRow }));
     assert metrics["repeatedOneRow"] == 358
     # A second distinct row moves the estimate: (150+200+5*400)/7 = 336.
     assert metrics["afterNewRow"] == 336
+
+
+def test_measurement_compensation_corrects_from_the_renderers_restored_position():
+    """Maintainer fold (#8122 re-gate): the measured anchor delta is relative to the CURRENT scrollTop.
+
+    Calibration can grow the rows above the anchor by thousands of pixels, and the renderer then restores its own
+    anchor inside the wrapped render. Writing scrollTopBefore + delta discarded that restoration (Chromium at
+    390x850, 360 messages: 354 -> 259 where master moved 354 -> 352). The wrapper must correct from where the
+    render left the viewport; when the render did not move scrollTop the result is unchanged.
+    """
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+let _programmaticScroll = false;
+let _programmaticScrollSetAt = 0;
+let _lastScrollTop = 0;
+let _blankViewportRecoveryToken = 0;
+let _blankViewportRecoveryApplied = 0;
+const performance = { now: () => 1000 };
+function _deferClearProgrammaticScroll(){}
+const ROWS = [
+  { docTop: 0, docBottom: 40000 },
+  { docTop: 40000, docBottom: 40600 },
+  { docTop: 40600, docBottom: 41400 },
+];
+const container = {
+  scrollTop: 40300,
+  clientHeight: 850,
+  scrollHeight: 120000,
+  classList: { add(){}, remove(){} },
+  getBoundingClientRect(){ return { top: 0, bottom: 850 }; },
+  querySelectorAll(){ return []; },
+  querySelector(sel){
+    const m = /data-msg-idx="([0-9]+)"/.exec(String(sel));
+    if(!m) return null;
+    const r = ROWS[Number(m[1])];
+    if(!r) return null;
+    return { getBoundingClientRect(){ return { top: r.docTop - container.scrollTop, bottom: r.docBottom - container.scrollTop }; } };
+  },
+};
+function $(id){ return id === 'messages' ? container : null; }
+function _captureMessageViewportAnchor(){
+  for (let i = 0; i < ROWS.length; i++) {
+    const r = ROWS[i];
+    if (r.docBottom - container.scrollTop > 1) {
+      return { rawIdx: i, sessionIdx: i, key: '', topOffset: r.docTop - container.scrollTop,
+               topPadBefore: 0, scrollHeightAtCapture: container.scrollHeight, inputGeneration: 0 };
+    }
+  }
+  return null;
+}
+eval(extractFunc('_compensateScrollForMeasurementDelta'));
+function grow(px){ ROWS[0].docBottom += px; for (let i = 1; i < ROWS.length; i++) { ROWS[i].docTop += px; ROWS[i].docBottom += px; } }
+function anchorOffset(){ return ROWS[1].docTop - container.scrollTop; }
+const out = {};
+// 1. Calibration grows the content above the anchor by 3000 px and the renderer restores its anchor to within
+//    10 px: the wrapper must close only the remaining 10 px.
+let before = anchorOffset();
+_compensateScrollForMeasurementDelta(() => { grow(3000); container.scrollTop += 2990; });
+out.restoredDrift = anchorOffset() - before;
+// 2. Control: the render does not move scrollTop and a row above grows by 120 px.
+before = anchorOffset();
+const topBefore = container.scrollTop;
+_compensateScrollForMeasurementDelta(() => { grow(120); });
+out.plainDrift = anchorOffset() - before;
+out.plainMove = container.scrollTop - topBefore;
+console.log(JSON.stringify(out));
+"""
+    metrics = json.loads(_run_node(source))
+    assert abs(metrics["restoredDrift"]) < 2, metrics
+    assert abs(metrics["plainDrift"]) < 2, metrics
+    assert metrics["plainMove"] == 120, metrics
