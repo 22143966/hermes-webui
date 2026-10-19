@@ -98,7 +98,9 @@ def test_the_backend_draft_route_stores_the_token() -> None:
     """``/api/session/draft`` must persist ``goal_continuation_id``."""
     start = ROUTES_PY.find('if parsed.path == "/api/session/draft":')
     assert start >= 0
-    body = ROUTES_PY[start : start + 9000]
+    # Window widened 9000 -> 16000 when #7919 (draft compare-and-set retire) grew this route
+    # ahead of the projection call (offset 9439 on the combined tree).
+    body = ROUTES_PY[start : start + 16000]
     assert 'body.get("goal_continuation_id")' in body, (
         "the draft route ignores goal_continuation_id; the client persists a "
         "field the server drops (#7855 finding 1)"
