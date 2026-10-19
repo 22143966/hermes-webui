@@ -82,6 +82,8 @@
 
 ### Fixed
 
+- **Steer goes to the live Gateway run.** With the Gateway backend, Steer now forwards your message to the running turn instead of queueing it as the next one. If the connection to the Gateway drops and the run finishes before it reads the steer text, the text is replayed instead of lost. (#7919, thanks @carlotestor)
+
 - **Test suite: the mobile camera-choice test no longer fails in full runs.** `test_issue6942_mobile_camera_choice_render` started its own server with the shared test server's config path, so after earlier tests configured a provider there it auto-completed and saved onboarding, and later browser contexts skipped the request the test waited for. The test's server now uses its own config and workspace. Test-only. (PR #8382)
 
 - **Composer menus stay open when the on-screen keyboard opens on tablets.** On tablets and foldables, typing in the model picker's search box no longer snaps the model, reasoning or workspace menu shut. They close only on a real switch between phone and desktop layouts, or when the composer collapses into its compact menu. Thanks @jatinbharadia. (#7472)
