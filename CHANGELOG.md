@@ -82,6 +82,8 @@
 
 ### Fixed
 
+- **Test suite: no real DNS lookups.** The shared test network guard now blocks DNS as well as connections (IP literals and `localhost` still resolve). A real lookup in the custom-provider address check could take longer than the 4-second model-list limit on a slow CI resolver, which made `test_seeded_config_survives_a_stale_loaded_config_path` fail on unrelated PRs. (#8396)
+
 - **Tool calls without a result no longer break a conversation.** An assistant tool call whose result never arrived (an interrupted run, a crash between call and result) is now repaired the same way the Agent repairs it, so the next reply stays in the saved model context instead of being dropped, including when an older tool call had empty or broken arguments. (#7237, thanks @happy5318)
 
 - **Subagent runs stay with their parent conversation in the sidebar.** With All profiles on and a project filter such as Unassigned, delegated subagent sessions whose parent was filed in another project, or belonged to another profile, or was itself a subagent, showed up as contextless top-level "Subagent Session" rows (18 on one real install). They now follow their parent: nested when the parent is visible, hidden with it when it is filtered out, and still listed as an openable orphan when the parent is missing, compressed, or a CLI conversation. (#7771, thanks @carlotestor)
