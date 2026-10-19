@@ -337,7 +337,8 @@ def test_provider_quota_refresh_follows_each_authoritative_provider_transition()
     assert "refreshProviderQuotaIndicator(" not in sessions
     assert "refreshProviderQuotaIndicator(" not in messages
 
-    batch_clear = _between(sessions, "if(S.session&&ids.includes(S.session.session_id)){", "const remaining=await api")
+    # #8323 moved batch delete into _deleteSelectedSessionsBatch() and clears only the sessions that were deleted.
+    batch_clear = _between(sessions, "if(S.session&&deletedIds.includes(S.session.session_id)){", "const remaining=await api")
     single_clear = _between(sessions, "if(S.session&&S.session.session_id===sid){", "const remaining=await api")
     terminal_clear = _between(messages, "if(e&&e.status===404){", "const conflictActiveStream")
     assert "_syncProviderQuotaForActiveContext()" in batch_clear
