@@ -82,6 +82,8 @@
 
 ### Fixed
 
+- **A message you send while a /goal continuation is pending runs as your own turn.** The pending continuation no longer claims the next message for the goal: each continuation carries its own ID, and only that continuation is treated as goal-related. A continuation restored into the composer after a reload, or saved while a clarify question is open, keeps its ID while the text is unchanged. A regenerate no longer uses up the pending continuation, and deleting a session clears it. (#7855, part of #6885, thanks @happy5318)
+
 - **The quota chip follows the open conversation's provider.** The chip by the model picker (and the Quota pill in the phone composer) used to show the server default's numbers: a DeepSeek chat showed Codex's 5-hour window. It now shows the conversation's own provider in its units (percent windows for plans, a balance for prepaid accounts), refreshes on a conversation, provider or profile switch, and clears at once so another account's numbers never show. Thanks @sheldon-im. (#6506)
 
 - **Test suite: the mobile camera-choice test no longer fails in full runs.** `test_issue6942_mobile_camera_choice_render` started its own server with the shared test server's config path, so after earlier tests configured a provider there it auto-completed and saved onboarding, and later browser contexts skipped the request the test waited for. The test's server now uses its own config and workspace. Test-only. (PR #8382)
