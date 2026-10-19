@@ -767,8 +767,12 @@ console.log(JSON.stringify({
 
 
 def test_deferred_measurement_resumes_after_jump_settlement():
-    """Deferral must not strand the measurement chain: when the jump finishes
-    (or is cancelled), the held refresh is scheduled."""
+    """Deferral must not strand the measurement chain, and it must be released by
+    BOTH terminal paths: a successful finish (same session identity, preserved
+    pin state) and a cancel. The finish case has to actually succeed — a session
+    mismatch silently routes finish through cancellation, which would make the
+    test assert the cancel path twice and pass even if the finish-only resume
+    were removed."""
     js = UI_JS_PATH.read_text(encoding="utf-8")
     source = _extract_func_script(js) + _calibration_block(js) + """
 let scheduled = [];
@@ -782,17 +786,21 @@ let _messageVirtualScrollActive = false;
 let _messageVirtualScrollSettleTimer = 0;
 let _messageJumpScrollSettleTimer = 0;
 let _messageVirtualDeferredMeasurement = null;
-let _messageJumpScrollOwner = { generation: 7, container: {}, sessionId: 'sid-123' };
+let _messageJumpScrollOwner = null;
 let _messageJumpScrollGeneration = 7;
+// Globals production writes during settlement — they must be assignable.
+let S = { session: { session_id: 'sid-123' } };
+let _scrollPinned = true;
+let _messageUserUnpinned = true;
+let _nearBottomCount = 0;
+let _lastScrollTop = 0;
+let _lastMessageClientHeight = 600;
+let _programmaticScroll = true;
+let _programmaticScrollSetAt = 12345;
+const _newMessageCueVisible = false;
 function requestAnimationFrame(fn){ fn(); }
 function _resetMessageVirtualMeasurementBurst(){ _messageVirtualMeasurementSeenKeys = []; }
 function clearTimeout(){}
-const _scrollPinned = true;
-const _messageUserUnpinned = false;
-const _nearBottomCount = 2;
-const _lastScrollTop = 0;
-const _lastMessageClientHeight = 600;
-const _newMessageCueVisible = false;
 function _syncScrollToBottomCue(){}
 function _updateSessionStartJumpButton(){}
 function _flushDeferredActiveSessionExternalRefresh(){}
@@ -803,28 +811,319 @@ eval(extractFunc('_resumeDeferredMessageVirtualMeasurement'));
 eval(extractFunc('_scheduleMessageVirtualMeasurementRefresh'));
 eval(extractFunc('_finishMessageJumpScroll'));
 eval(extractFunc('_cancelMessageJumpScroll'));
+// Count cancellations so a "successful finish" that silently cancelled twice is
+// visible instead of indistinguishable from a real finish. Assigned, not
+// re-declared: the eval'd production declaration would otherwise win.
+const _realCancelJumpScroll = _cancelMessageJumpScroll;
+let cancelCount = 0;
+_cancelMessageJumpScroll = function(){ cancelCount++; return _realCancelJumpScroll(); };
 // Stub the render scheduler so a flushed refresh is observable.
 function _scheduleMessageVirtualizedRender(force, request){ scheduled.push(request); }
 
 const metrics = { virtualized: true, start: 0, end: 50, tailStart: 0 };
+const container = { scrollHeight: 20000, clientHeight: 600, scrollTop: 4500 };
+const preserved = { scrollPinned: true, messageUserUnpinned: true, nearBottomCount: 2 };
+function _armJump(generation){
+  _messageJumpScrollGeneration = generation;
+  _messageJumpScrollOwner = {
+    generation, container, sessionId: _messageJumpSessionId(), preserved,
+  };
+}
 // Held by the active jump owner.
+_armJump(7);
 _scheduleMessageVirtualMeasurementRefresh(metrics);
 const scheduledDuringJump = scheduled.length;
-// Settlement clears the owner and must flush the held refresh.
-_messageJumpScrollOwner.container = { scrollHeight: 20000, clientHeight: 600, scrollTop: 4500 };
+// Settlement must SUCCEED (same session id) and flush the held refresh.
 _finishMessageJumpScroll(7);
-// And a cancelled jump must not strand it either.
+const afterFinish = {
+  scheduled: scheduled.length,
+  cancels: cancelCount,
+  ownerCleared: _messageJumpScrollOwner === null,
+  // _cancelMessageJumpScroll bumps the generation; a real finish must not.
+  generation: _messageJumpScrollGeneration,
+};
+// Rearm a second jump and hold a fresh refresh, then cancel it: the cancel path
+// must flush too — without stranding the first flush.
+_armJump(8);
 _scheduleMessageVirtualMeasurementRefresh(metrics);
+const scheduledDuringSecondJump = scheduled.length;
 _cancelMessageJumpScroll();
 console.log(JSON.stringify({
   scheduledDuringJump,
+  afterFinish,
+  scheduledDuringSecondJump,
   scheduledTotal: scheduled.length,
+  cancelCount,
 }));
 """
     metrics = json.loads(_run_node(source))
     assert metrics["scheduledDuringJump"] == 0
-    # One flush from settlement + one from the cancel path.
+    # The finish really finished: owner cleared, generation untouched, zero
+    # cancellations — and it flushed the held measurement on its own.
+    assert metrics["afterFinish"]["cancels"] == 0
+    assert metrics["afterFinish"]["ownerCleared"] is True
+    assert metrics["afterFinish"]["generation"] == 7
+    assert metrics["afterFinish"]["scheduled"] == 1
+    # The second jump holds its own refresh again (nothing new scheduled)...
+    assert metrics["scheduledDuringSecondJump"] == 1
+    # ...and the cancel path flushes it as well.
+    assert metrics["cancelCount"] == 1
     assert metrics["scheduledTotal"] == 2
+
+
+def test_internal_measurement_render_is_deferred_when_jump_starts_between_frames():
+    """#7591 ownership contract, the remaining async window. The measurement
+    refresh re-checks `_messageJumpScrollOwner` in its own rAF, but that callback
+    then queues a SECOND rAF inside `_scheduleMessageVirtualizedRender` whose
+    final callback rendered without re-checking ownership. A jump that begins
+    between those two frames was interrupted by an internal measurement render
+    (queued measurement render replaces the smooth-scroll target and restores
+    another anchor, stranding the requested answer above the viewport)."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + _calibration_block(js) + """
+let frames = [];
+function requestAnimationFrame(fn){ frames.push(fn); return frames.length; }
+function runFrame(){
+  if(!frames.length) return false;
+  frames.shift()();
+  return true;
+}
+const MESSAGE_VIRTUAL_MEASUREMENT_MAX_RERENDERS = 12;
+let _messageVirtualMeasurementCycleKey = '';
+let _messageVirtualMeasurementSeenKeys = [];
+let _messageVirtualMeasurementBurstActive = false;
+let _messageVirtualScrollActive = false;
+let _messageVirtualDeferredMeasurement = null;
+let _messageJumpScrollOwner = null;
+let _messageVirtualScrollRaf = 0;
+let _messageVirtualRenderQueuedOrigin = null;
+let _messageVirtualWindowKey = 'stale';
+let _scrollbarDragActive = false;
+let _programmaticScroll = false;
+let _programmaticScrollSetAt = 0;
+let _msgNodeRecycleEnabled = false;
+let renders = [];
+function _resetMessageVirtualMeasurementBurst(){ _messageVirtualMeasurementSeenKeys = []; }
+function $(id){ return (id === 'messages' || id === 'msgInner') ? {} : null; }
+function _getVisibleMessagesWithIdx(){ return [{ rawIdx: 0, m: {} }]; }
+const LIVE_WINDOW = {
+  virtualized: true, start: 0, end: 1, topPad: 0, bottomPad: 0, total: 1, tailStart: 1,
+};
+function _currentMessageVirtualWindow(){ return LIVE_WINDOW; }
+function _messageVirtualKeepTailCount(){ return 0; }
+function _messageVirtualWindowKeyFor(){ return 'window-key'; }
+function _compensateScrollForMeasurementDelta(fn){ fn(); }
+function _deferClearProgrammaticScroll(){}
+function renderMessages(options){ renders.push(options); }
+eval(extractFunc('_messageVirtualMeasurementCycleKeyFor'));
+eval(extractFunc('_messageJumpScrollOwnsViewport'));
+eval(extractFunc('_resumeDeferredMessageVirtualMeasurement'));
+eval(extractFunc('_scheduleMessageVirtualMeasurementRefresh'));
+eval(extractFunc('_scheduleMessageVirtualizedRender'));
+
+const metrics = { virtualized: true, start: 0, end: 50, tailStart: 0 };
+// Frame 1: the measurement refresh's own rAF. Ownership is still clear, so it
+// queues frame 2 inside _scheduleMessageVirtualizedRender.
+_scheduleMessageVirtualMeasurementRefresh(metrics);
+const framesAfterSchedule = frames.length;
+runFrame();
+const framesAfterFirstFrame = frames.length;
+// The jump takes ownership BETWEEN frame 1 and frame 2.
+_messageJumpScrollOwner = { generation: 3, container: {}, sessionId: 'sid-123' };
+runFrame();
+const rendersDuringJump = renders.slice();
+const deferredDuringJump = _messageVirtualDeferredMeasurement;
+const framesAfterSecondFrame = frames.length;
+// Settlement releases ownership and must flush the held measurement.
+_messageJumpScrollOwner = null;
+_resumeDeferredMessageVirtualMeasurement();
+let guard = 0;
+while(frames.length && guard++ < 8) runFrame();
+console.log(JSON.stringify({
+  framesAfterSchedule,
+  framesAfterFirstFrame,
+  rendersDuringJump,
+  deferredHeld: deferredDuringJump === LIVE_WINDOW,
+  framesAfterSecondFrame,
+  rendersAfterSettlement: renders.slice(rendersDuringJump.length),
+}));
+"""
+    metrics = json.loads(_run_node(source))
+    assert metrics["framesAfterSchedule"] == 1
+    # The measurement refresh queued the SECOND (render) frame through
+    # _scheduleMessageVirtualizedRender — that is exactly the unguarded window.
+    assert metrics["framesAfterFirstFrame"] == 1
+    assert metrics["rendersDuringJump"] == []
+    assert metrics["deferredHeld"] is True
+    assert metrics["framesAfterSecondFrame"] == 0
+    assert metrics["rendersAfterSettlement"] == [
+        {"preserveScroll": True, "_internalMeasurement": True}
+    ]
+
+
+def test_render_messages_captures_recovery_ownership_before_its_callsite_restore():
+    """The composed regression must exercise the ACTUAL production callsite, not
+    a handwritten ordering: the real `renderMessages` cached branch runs the real
+    `_captureMessageRecoveryOwnership` -> `_scrollAfterMessageRender` ->
+    `_maybeRecoverVirtualizedBlankViewport` sequence. The restore re-arms the
+    programmatic latch, so capturing after it would read
+    `{programmatic:true}` for an internal-only render and skip the clamp (fall
+    back to the full render at scrollTop 800 instead of clamping to 4500)."""
+    js = UI_JS_PATH.read_text(encoding="utf-8")
+    source = _extract_func_script(js) + """
+// ── module state production writes ────────────────────────────────────────
+let _lastMessageRenderAt = 0;
+let _messageUserUnpinned = false;
+let _scrollPinned = true;
+let _nearBottomCount = 2;
+let _lastScrollTop = 0;
+let _lastMessageClientHeight = 600;
+let _programmaticScroll = false;
+let _programmaticScrollSetAt = 0;
+let _messageVirtualWindowKey = 'stale';
+let _sessionHtmlCacheSid = 'other-session';
+let _messageVirtualBlankClampAttempts = 0;
+let _blankViewportRecoveryToken = 0;
+let _blankViewportRecoveryApplied = 0;
+let _messageJumpScrollOwner = null;
+const _loadingSessionId = null;
+let _messageRenderWindowSid = 'sid-123';
+const performance = { now: () => 1000 };
+const window = {};
+const INFLIGHT = {};
+const document = { getElementById(){ return null; } };
+const S = { session: { session_id: 'sid-123' }, messages: [], busy: true };
+let renderCalls = [];
+let cacheDeletes = [];
+// ── direct dependencies of the cached render branch ──────────────────────
+function _resetMessageVirtualMeasurementBurst(){}
+function _resetMessageRenderWindow(){}
+function _latestPreservedCompressionTaskListMessages(){ return []; }
+function _getVisibleMessagesWithIdx(){ return [{ rawIdx: 0, m: {} }, { rawIdx: 1, m: {} }]; }
+function _currentMessageVirtualWindow(){
+  return { virtualized: true, start: 0, end: 2, topPad: 0, bottomPad: 0, total: 2, tailStart: 2 };
+}
+function _messageVirtualKeepTailCount(){ return 0; }
+function _messageVirtualWindowKeyFor(){ return 'window-key'; }
+function _messageRenderCacheSignature(){ return 'signature'; }
+function _rehydrateTransparentStreamDom(){}
+function _rehydrateDeferredWorklogsFromCache(){}
+function _wireMessageWindowLoadEarlierButton(){}
+function _updateMessageVirtualMeasurements(){}
+function requestAnimationFrame(){}
+function _deferClearProgrammaticScroll(){}
+function _maybeShowNewMessageScrollCue(){}
+function _restorePinnedMessageScrollSnapshot(){ return false; }
+function _messageViewportIntersectsRenderedRow(){ return false; }
+function _freshProgrammaticScrollActive(){
+  if(!_programmaticScroll) return false;
+  const age = performance.now() - _programmaticScrollSetAt;
+  return Number.isFinite(age) && age >= 0 && age <= 150;
+}
+function _captureMessageScrollSnapshot(){
+  // bottom > 250 keeps _scrollAfterMessageRender on the restore path.
+  return { top: 800, bottom: 1000, userUnpinned: true, pinned: false, inputGeneration: 0 };
+}
+// Rows live at fixed DOCUMENT positions; their rects move with scrollTop, so the
+// clamp lands on the nearest edge (4800 - 0.5*600 = 4500).
+const ROWS = [
+  { docTop: 4800, docBottom: 5300 },
+  { docTop: 5300, docBottom: 6800 },
+];
+const container = {
+  scrollTop: 800,
+  clientHeight: 600,
+  scrollHeight: 20000,
+  classList: { add(){}, remove(){} },
+  getBoundingClientRect(){ return { top: 0, bottom: 600 }; },
+  querySelectorAll(sel){
+    if(String(sel).indexOf('spacer') >= 0) return [];
+    if(String(sel).indexOf('msg-idx') >= 0){
+      return ROWS.map(r => ({
+        getClientRects(){ return [{ width: 100, height: 100 }]; },
+        getBoundingClientRect(){
+          return { top: r.docTop - container.scrollTop, bottom: r.docBottom - container.scrollTop };
+        },
+      }));
+    }
+    return [];
+  },
+  querySelector(sel){
+    const m = /data-msg-idx="([0-9]+)"/.exec(String(sel));
+    if(!m) return null;
+    const r = ROWS[Number(m[1])];
+    if(!r) return null;
+    return {
+      getBoundingClientRect(){
+        return { top: r.docTop - container.scrollTop, bottom: r.docBottom - container.scrollTop };
+      },
+    };
+  },
+};
+const inner = { innerHTML: '' };
+function $(id){
+  if(id === 'messages') return container;
+  if(id === 'msgInner') return inner;
+  if(id === 'emptyState') return { style: {} };
+  return null;
+}
+const _sessionHtmlCache = {
+  get(){
+    return {
+      html: '<div class="cached">cached</div>',
+      msgCount: S.messages.length,
+      renderWindowKey: 'window-key',
+      signature: 'signature',
+    };
+  },
+  delete(sid){ cacheDeletes.push(sid); },
+};
+
+eval(extractFunc('renderMessages'));
+eval(extractFunc('_captureMessageRecoveryOwnership'));
+eval(extractFunc('_restoreMessageScrollSnapshot'));
+eval(extractFunc('_scrollAfterMessageRender'));
+eval(extractFunc('_clampVirtualizedBlankViewportToRenderedEdge'));
+eval(extractFunc('_maybeRecoverVirtualizedBlankViewport'));
+// Recovery's own full/clamp render must be recorded, never recursed into.
+const _realRenderMessages = renderMessages;
+renderMessages = function(options){ renderCalls.push(options); };
+
+// ── control 1: internal-only render recovers by clamping ─────────────────
+_realRenderMessages({ preserveScroll: true, _internalMeasurement: true });
+const internalOnly = {
+  scrollTop: container.scrollTop,
+  renderCalls: renderCalls.slice(),
+  cacheDeletes: cacheDeletes.slice(),
+};
+
+// ── control 2: a genuinely foreign in-flight write must still fall back ──
+_sessionHtmlCacheSid = 'other-session';
+_messageVirtualBlankClampAttempts = 0;
+_messageVirtualWindowKey = 'stale';
+container.scrollTop = 800;
+_programmaticScroll = true;
+_programmaticScrollSetAt = performance.now();
+renderCalls = [];
+_realRenderMessages({ preserveScroll: true, _internalMeasurement: true });
+const foreignOwner = {
+  scrollTop: container.scrollTop,
+  renderCalls: renderCalls.slice(),
+};
+
+console.log(JSON.stringify({ internalOnly, foreignOwner }));
+"""
+    metrics = json.loads(_run_node(source))
+    # The render's own restore re-armed the latch, yet internal-only recovery
+    # still clamped to the nearest rendered edge instead of falling back.
+    assert metrics["internalOnly"]["scrollTop"] == 4500
+    assert metrics["internalOnly"]["renderCalls"] == [{"preserveScroll": True}]
+    assert metrics["internalOnly"]["cacheDeletes"] == ["sid-123"]
+    # A foreign write settling when the render started still escalates.
+    assert metrics["foreignOwner"]["scrollTop"] == 800
+    assert metrics["foreignOwner"]["renderCalls"] == [
+        {"preserveScroll": True, "_virtualFallback": True}
+    ]
 
 
 def test_role_calibration_freeze_requires_distinct_measured_rows():

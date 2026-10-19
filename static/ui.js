@@ -1833,6 +1833,20 @@ function _scheduleMessageVirtualizedRender(force, request){
     // unrelated render could steal (#6717 re-gate).
     const internalMeasurement=_messageVirtualRenderQueuedOrigin==='internal';
     _messageVirtualRenderQueuedOrigin=null;
+    // #7591: THIS callback is the LAST asynchronous hop of the internal
+    // measurement chain (measurement rAF -> here). The ownership re-check above
+    // runs in the first frame, so a jump that takes ownership BETWEEN the two
+    // frames used to render anyway: an internal measurement render re-derives
+    // the window from a stale key and restores its own anchor, which REPLACES
+    // the jump's smooth-scroll target and strands the requested answer above
+    // the viewport. Re-check before any compensation, programmatic-latch write
+    // or render, hold only INTERNAL work (genuine external renders must never
+    // be blanket-suppressed while a jump runs), and let finish/cancel flush it.
+    if(internalMeasurement&&typeof _messageJumpScrollOwnsViewport==='function'&&_messageJumpScrollOwnsViewport()){
+      const heldVisWithIdx=_getVisibleMessagesWithIdx();
+      _messageVirtualDeferredMeasurement=_currentMessageVirtualWindow(heldVisWithIdx,_messageVirtualKeepTailCount());
+      return;
+    }
     const liveVisWithIdx=_getVisibleMessagesWithIdx();
     const liveWindow=_currentMessageVirtualWindow(liveVisWithIdx,_messageVirtualKeepTailCount());
     const liveKey=_messageVirtualWindowKeyFor(liveWindow);
