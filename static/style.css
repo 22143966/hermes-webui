@@ -1661,11 +1661,14 @@
   .session-item.streaming .session-title-row{color:var(--text);}
   .session-text{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;overflow:hidden;}
   .session-title-row{display:flex;align-items:center;gap:6px;min-width:0;}
-  .session-title-group{display:flex;align-items:center;gap:6px;flex:1 1 auto;min-width:6ch;max-width:100%;overflow:hidden;}
-  .session-title{flex:1 1 auto;min-width:min(50%,14ch);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);user-select:none;border:0;background:transparent;padding:0;margin:0;text-align:left;font:inherit;line-height:inherit;}
-  /* Conversation identity takes priority over secondary tag chips. At normal
-     widths the title keeps a readable 14ch floor; at the 180px minimum it owns
-     half the available group and the overflow-hidden wrapper clips tail tags. */
+  /* Title first, chips after it. The group wraps and shows exactly one line (1lh = the title's
+     inherited line box), so a chip that does not fit beside the title moves, whole, to the hidden
+     second line instead of shrinking the title or being clipped mid-pill. The title itself only
+     ellipsizes when it is wider than the whole group, as it did on master when the chips lived
+     inside it. Tags stay reachable through the row tooltip and the #tag filter. */
+  .session-title-group{display:flex;flex-wrap:wrap;align-items:center;align-content:flex-start;column-gap:6px;row-gap:0;flex:1 1 auto;min-width:6ch;max-width:100%;height:1lh;overflow:hidden;}
+  .session-title-group:has(> .session-title-input){height:auto;overflow:visible;}
+  .session-title{flex:0 1 auto;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);user-select:none;border:0;background:transparent;padding:0;margin:0;text-align:left;font:inherit;line-height:inherit;}
   .session-open-control{cursor:pointer;}
   .session-open-control:focus-visible{outline:2px solid transparent;outline-offset:-2px;}
   /* Session rows need an opaque, 3:1 keyboard indicator. The shared

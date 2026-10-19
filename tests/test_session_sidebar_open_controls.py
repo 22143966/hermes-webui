@@ -364,7 +364,7 @@ def test_tagged_titles_and_focus_ring_fit_narrow_sidebar_in_browser(select_mode)
         page.wait_for_timeout(200)
 
         metrics = []
-        for width in (180, 300):
+        for width in (180, 300, 420):
             page.locator(".probe").evaluate("(el, width) => { el.style.width = width + 'px'; }", width)
             metrics.append(
                 page.locator(".session-item").evaluate(
@@ -374,18 +374,35 @@ def test_tagged_titles_and_focus_ring_fit_narrow_sidebar_in_browser(select_mode)
                       const group = row.querySelector('.session-title-group');
                       const title = row.querySelector('.session-title');
                       const tags = Array.from(row.querySelectorAll('.session-tag'));
-                      const shortTag = tags[0];
                       const rowStyle = getComputedStyle(row);
                       const titleStyle = getComputedStyle(title);
-                      const shortTagStyle = getComputedStyle(shortTag);
                       const groupRect = group.getBoundingClientRect();
-                      const shortTagRect = shortTag.getBoundingClientRect();
+                      const titleRect = title.getBoundingClientRect();
                       const rowRect = titleRow.getBoundingClientRect();
+                      const chips = tags.map(tag => {
+                        const r = tag.getBoundingClientRect();
+                        const visible = r.top < groupRect.bottom - 1;
+                        return {
+                          text: tag.textContent,
+                          visible,
+                          whole: !visible || (r.left >= groupRect.left - 1 && r.right <= groupRect.right + 1
+                                              && r.bottom <= groupRect.bottom + 1),
+                          left: r.left,
+                          right: r.right,
+                          flexShrink: getComputedStyle(tag).flexShrink,
+                          height: r.height,
+                        };
+                      });
                       return {
                         probeWidth: row.closest('.probe').getBoundingClientRect().width,
-                        titleWidth: title.getBoundingClientRect().width,
+                        groupWidth: groupRect.width,
+                        titleWidth: titleRect.width,
+                        titleRight: titleRect.right,
+                        titleTruncated: title.scrollWidth > title.clientWidth + 1,
+                        titleOnFirstLine: Math.abs(titleRect.top - groupRect.top) <= 1,
                         rowClientWidth: titleRow.clientWidth,
                         rowScrollWidth: titleRow.scrollWidth,
+                        rowHeight: rowRect.height,
                         groupInsideRow:
                           groupRect.left >= rowRect.left - 1 &&
                           groupRect.right <= rowRect.right + 1,
@@ -395,14 +412,7 @@ def test_tagged_titles_and_focus_ring_fit_narrow_sidebar_in_browser(select_mode)
                             style.overflowX === 'hidden' &&
                             style.textOverflow === 'ellipsis';
                         }),
-                        tagsFitRowHeight: tags.every(tag =>
-                          tag.getBoundingClientRect().height <= rowRect.height + 1
-                        ),
-                        shortTagFlexShrink: shortTagStyle.flexShrink,
-                        shortTagNotTruncated: shortTag.scrollWidth <= shortTag.clientWidth + 1,
-                        shortTagInsideGroup:
-                          shortTagRect.left >= groupRect.left - 1 &&
-                          shortTagRect.right <= groupRect.right + 1,
+                        chips,
                         rowBoxShadow: rowStyle.boxShadow,
                         buttonOutlineStyle: titleStyle.outlineStyle,
                       };
@@ -413,19 +423,31 @@ def test_tagged_titles_and_focus_ring_fit_narrow_sidebar_in_browser(select_mode)
         browser.close()
 
     for result in metrics:
-        title_floor = 45 if result["probeWidth"] < 200 else 90
-        assert result["titleWidth"] >= title_floor
+        # The title wins: it is only cut when it is wider than the whole group, and then it owns that width.
+        assert result["titleOnFirstLine"] is True
+        if result["titleTruncated"]:
+            assert result["titleWidth"] >= result["groupWidth"] - 1, result
         assert result["rowScrollWidth"] <= result["rowClientWidth"] + 1
         assert result["groupInsideRow"] is True
         assert result["tagsSingleLine"] is True
-        assert result["tagsFitRowHeight"] is True
-        assert result["shortTagFlexShrink"] == "0"
-        assert result["shortTagNotTruncated"] is True
-        assert result["shortTagInsideGroup"] is True
+        chips = result["chips"]
+        # A chip is either whole on the title line or hidden; never a clipped sliver.
+        assert all(c["whole"] for c in chips), chips
+        assert all(c["flexShrink"] == "0" for c in chips), chips
+        assert all(c["height"] <= result["rowHeight"] + 1 for c in chips), chips
+        # Visible chips follow the title in order, starting right after it (not pushed to the far edge).
+        visible = [c for c in chips if c["visible"]]
+        assert [c["text"] for c in visible] == [c["text"] for c in chips[: len(visible)]], chips
+        if visible:
+            assert result["titleTruncated"] is False
+            assert abs(visible[0]["left"] - result["titleRight"] - 6) <= 1.5, (visible[0], result["titleRight"])
         if not select_mode:
             assert "inset" in result["rowBoxShadow"]
             assert re.search(r"\b2px\b", result["rowBoxShadow"])
             assert result["buttonOutlineStyle"] == "solid"
+    narrow, _, wide = metrics
+    assert not any(c["visible"] for c in narrow["chips"]), narrow  # 180px: the title takes the line
+    assert any(c["visible"] for c in wide["chips"]), wide  # room to spare: chips show beside the title
 
 
 def test_pointer_focus_does_not_leave_keyboard_hover_chrome_stuck_in_browser():
