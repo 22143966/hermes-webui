@@ -21,10 +21,15 @@ These tests pin: (1) source ids are NEVER capped; (2) count ids ARE capped to to
 (5) lists at/under the cap; (6) a DB error never breaks /api/sessions; (7) a probed
 row's webui source is applied; (8) the end-to-end route regression: a stale-CLI
 JSON row whose state.db source is webui must stay visible in a WebUI-filtered sidebar
-even when it falls beyond the cap; and (9) the cap also bounds the per-row transcript
-reconciliation, not just the SQL aggregate.
+even when it falls beyond the cap; and (9) the cap bounds ONLY the two expensive
+passes — the SQL aggregation and the per-row transcript reconciliation — while the
+cheap raw/actual count, last-message timestamps and visible fallback still run for
+EVERY row (a first-append cross-surface continuation is a named, messageful
+conversation and must stay in the public payload even when fillers own the window).
 """
 from __future__ import annotations
+
+import pytest
 
 import api.models as models
 
@@ -176,14 +181,24 @@ def test_stale_cli_json_beyond_cap_stays_webui_via_real_db(monkeypatch, tmp_path
 
 # --- transcript reconciliation is part of the capped tier -------------------------
 #
-# The COUNT cap used to bound only the SQL aggregate. Every row whose state.db
-# count had grown still paid a full sidecar+state.db transcript merge to derive
-# ``visible_message_count`` (98 grown rows x 0.19s = 18.8s of a 20s /api/sessions
-# build, 307k _cached_message_key calls), so TOP_N=20 and TOP_N=300 measured the
-# same wall clock. These tests pin the merge itself to the same top-N window.
+# The COUNT cap bounds TWO things, and only two:
+#   * the SQL messages aggregation (``_read_state_db_sidebar_overrides``), and
+#   * the per-row sidecar+state.db transcript merge
+#     (``_reconciled_visible_count_for_sidebar``) — 98 grown rows x 0.19s =
+#     18.8s of a 20s /api/sessions build, 307k _cached_message_key calls, which
+#     is why TOP_N=20 and TOP_N=300 used to measure the same wall clock.
+#
+# Everything else in the overlay is CHEAP (sessions-table columns the caller
+# already fetched) and it decides whether a row is publicly visible at all, so
+# it runs for EVERY row. Gating the count repair on the window froze a
+# cross-surface continuation at message_count 0 and dropped it from
+# /api/sessions entirely — the zero-to-messageful membership case below.
+#
+# The deterministic performance oracle is unchanged: at most N transcript
+# merges per build (_test_transcript_reconciliation_capped_to_top_n pins it).
 
 
-def _grown_sessions(n):
+def _grown_sessions(n, *, archived=False):
     """n rows all reporting fewer messages than state.db (so every one would reconcile)."""
     return [
         {
@@ -193,6 +208,7 @@ def _grown_sessions(n):
             "actual_message_count": 1,
             "last_message_at": 1000.0,
             "updated_at": 1000.0,
+            "archived": archived,
         }
         for i in range(n)
     ]
@@ -230,7 +246,7 @@ def _capture_reconciled_ids(monkeypatch, n):
 
 
 def test_transcript_reconciliation_capped_to_top_n(monkeypatch):
-    """With cap N, only the top-N grown rows pay the transcript merge."""
+    """Oracle: with cap N, only the top-N grown rows pay the transcript merge."""
     monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "3")
     reconciled = _capture_reconciled_ids(monkeypatch, 10)
     sessions = _grown_sessions(10)
@@ -241,11 +257,18 @@ def test_transcript_reconciliation_capped_to_top_n(monkeypatch):
         "only the top-N rows may run the expensive transcript reconciliation; "
         f"got {sorted(reconciled)}"
     )
+    assert len(reconciled) <= 3, "the transcript-merge budget must stay bounded by the cap"
     # Rows inside the window still get the real state.db count.
     assert sessions[0]["message_count"] == 5
-    # Rows outside it keep their sidecar count until they enter the window.
-    assert [s["message_count"] for s in sessions[3:]] == [1] * 7, (
-        "capped rows must keep their sidecar count, not a stale state.db overlay"
+    # Capped-out rows still get the CHEAP authoritative count + timestamps:
+    # state.db is the cross-surface writer and a stale zero here would hide a
+    # real conversation. What they do NOT get is the authoritative visible
+    # count — that keeps the raw-delta fallback, clamped by the raw count.
+    assert [s["message_count"] for s in sessions[3:]] == [5] * 7, (
+        "capped rows must still receive the cheap raw/actual count repair"
+    )
+    assert [s["last_message_at"] for s in sessions[3:]] == [2000.0] * 7, (
+        "capped rows must still receive the cheap last-message bump"
     )
 
 
@@ -272,3 +295,331 @@ def test_cap_disabled_reconciles_every_row_through_the_entry_point(monkeypatch):
     assert sorted(reconciled) == [f"s{i}" for i in range(10)], (
         "cap<=0 must restore the uncapped (pre-fix) reconciliation behaviour"
     )
+
+
+# --- first-append cross-surface matrix (public membership) ------------------------
+#
+# default (60) and explicit 60, ordinary and archived fillers, repeated polls, and a
+# cap-disabled control. A named conversation whose first user message arrived via
+# state.db (CLI/Telegram continuation) must be publicly visible in EVERY one: its
+# state.db count is authoritative and cheap to read.
+
+
+def _first_append_sessions(fillers, *, archived_fillers=False):
+    """Newer fillers own the pre-filter top-N window; the continued row is last."""
+    rows = _grown_sessions(fillers, archived=archived_fillers)
+    for index, row in enumerate(rows):
+        row["title"] = f"Filler {index}"
+        row["message_count"] = 3
+        row["visible_message_count"] = 3
+        row["actual_message_count"] = 3
+        row["last_message_at"] = 10_000.0 - index
+        row["updated_at"] = 10_000.0 - index
+    rows.append(
+        {
+            "session_id": "CONTINUED",
+            "title": "Named conversation",
+            "message_count": 0,
+            "visible_message_count": 0,
+            "actual_message_count": 0,
+            "last_message_at": 1.0,
+            "updated_at": 1.0,
+            "archived": False,
+        }
+    )
+    return rows
+
+
+def _patch_first_append(monkeypatch, sessions, *, reconciled_visible=1):
+    reconciled = []
+
+    def _fake_reconciled(session_id):
+        reconciled.append(str(session_id))
+        return reconciled_visible
+
+    metadata = {}
+    for s in sessions:
+        sid = s["session_id"]
+        metadata[sid] = {
+            "_state_db_source": "webui",
+            "_state_db_message_count": s["message_count"],
+            "_state_db_last_message_at": s["last_message_at"],
+        }
+    metadata["CONTINUED"]["_state_db_message_count"] = 1
+    metadata["CONTINUED"]["_state_db_last_message_at"] = 20_000.0
+
+    monkeypatch.setattr(
+        models, "_reconciled_visible_count_for_sidebar", _fake_reconciled
+    )
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
+    return reconciled
+
+
+def _sidecar_row_is_public(row):
+    """Mirror of the visibility predicate.
+
+    ``static/sessions.js:_sidebarRowHasVisibleMessages`` and
+    ``routes._session_has_server_visible_messages`` both key on message_count
+    first. A named (titled) row is not dropped by the #1171 Untitled+0 filter,
+    so a repaired count is what puts it in the public payload.
+    """
+    return bool(int(row.get("message_count") or 0) > 0)
+
+
+@pytest.mark.parametrize("archived_fillers", [False, True])
+@pytest.mark.parametrize("fillers", [61, 200])
+def test_first_append_row_is_publicly_visible_at_default_cap(
+    monkeypatch, fillers, archived_fillers
+):
+    monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", raising=False)
+    sessions = _first_append_sessions(fillers, archived_fillers=archived_fillers)
+    reconciled = _patch_first_append(monkeypatch, sessions)
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    row = sessions[-1]
+    assert row["session_id"] == "CONTINUED"
+    assert _sidecar_row_is_public(row), (
+        "a cross-surface first append must make the row public even when "
+        f"top-N fillers (archived={archived_fillers}) consumed the window"
+    )
+    assert row["visible_message_count"] == 1, (
+        "the visible fallback must credit the cheap raw growth"
+    )
+    assert row["last_message_at"] == 20_000.0
+    assert "CONTINUED" not in reconciled, (
+        "the continued row is outside the top-N window, so it must not pay the merge"
+    )
+
+
+def test_first_append_row_is_publicly_visible_at_explicit_cap_60(monkeypatch):
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "60")
+    sessions = _first_append_sessions(61)
+    reconciled = _patch_first_append(monkeypatch, sessions)
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    row = sessions[-1]
+    assert _sidecar_row_is_public(row)
+    assert row["visible_message_count"] == 1
+    assert "CONTINUED" not in reconciled
+
+
+def test_first_append_row_survives_repeated_polls(monkeypatch):
+    """Poll twice: the second build sees the same resolved values (no reset, no drift)."""
+    monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", raising=False)
+    sessions = _first_append_sessions(61)
+    _patch_first_append(monkeypatch, sessions)
+
+    models._apply_sidebar_state_db_overrides(sessions)
+    first = dict(sessions[-1])
+    models._apply_sidebar_state_db_overrides(sessions)
+    second = dict(sessions[-1])
+
+    assert _sidecar_row_is_public(second)
+    assert second["message_count"] == first["message_count"] == 1
+    assert second["visible_message_count"] == first["visible_message_count"] == 1
+
+
+def test_first_append_row_matches_cap_disabled_control(monkeypatch):
+    """The cap changes cost, not the public membership of a messageful row."""
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "60")
+    capped_sessions = _first_append_sessions(61)
+    _patch_first_append(monkeypatch, capped_sessions)
+    models._apply_sidebar_state_db_overrides(capped_sessions)
+
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "0")
+    control_sessions = _first_append_sessions(61)
+    _patch_first_append(monkeypatch, control_sessions)
+    models._apply_sidebar_state_db_overrides(control_sessions)
+
+    capped = capped_sessions[-1]
+    control = control_sessions[-1]
+    for key in ("message_count", "actual_message_count", "last_message_at"):
+        assert capped[key] == control[key], (
+            f"{key} differs between the capped build and the cap-disabled control"
+        )
+    assert _sidecar_row_is_public(capped) is True
+    assert _sidecar_row_is_public(control) is True
+
+
+# --- guards that must survive the split ------------------------------------------
+
+
+def test_quiet_delegation_wakeup_still_credits_no_visible_row(monkeypatch):
+    """A capped-out pending hidden wakeup must not be resurrected as a visible row."""
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "1")
+    filler = _grown_sessions(1)[0]
+    filler["message_count"] = 3
+    filler["visible_message_count"] = 3
+    filler["actual_message_count"] = 3
+    wakeup = {
+        "session_id": "WAKEUP",
+        "message_count": 0,
+        "visible_message_count": 0,
+        "actual_message_count": 0,
+        "last_message_at": 1.0,
+        "updated_at": 1.0,
+        "pending_user_source": "delegation_wakeup",
+    }
+    sessions = [filler, wakeup]
+    metadata = {
+        "s0": {
+            "_state_db_source": "webui",
+            "_state_db_message_count": 3,
+            "_state_db_last_message_at": 10_000.0,
+        },
+        "WAKEUP": {
+            "_state_db_source": "subagent",
+            "_state_db_message_count": 1,
+            "_state_db_last_message_at": 20_000.0,
+        },
+    }
+    reconciled: list[str] = []
+    monkeypatch.setattr(
+        models,
+        "_reconciled_visible_count_for_sidebar",
+        lambda sid: reconciled.append(str(sid)),
+    )
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    row = sessions[1]
+    assert "WAKEUP" not in reconciled, "the hidden wakeup must stay outside the merge window"
+    assert row["visible_message_count"] == 0, (
+        "a pending delegation_wakeup user row is hidden provenance: it must not "
+        "raise the visible count even outside the reconcile window"
+    )
+    assert row["message_count"] == 1, "the raw count is still authoritative"
+
+
+def test_source_correction_still_applies_beyond_cap(monkeypatch):
+    """Source classification is never capped: a capped row keeps its webui source flags."""
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "1")
+    sessions = _grown_sessions(4)
+    for row in sessions:
+        row["is_cli_session"] = True
+        row["session_source"] = "cli"
+    metadata = _grown_metadata(4)
+    for entry in metadata.values():
+        entry["_state_db_source_tag"] = "webui"
+        entry["_state_db_raw_source"] = "webui"
+        entry["_state_db_session_source"] = "webui"
+        entry["_state_db_source_label"] = "WebUI"
+    monkeypatch.setattr(
+        models, "_reconciled_visible_count_for_sidebar", lambda sid: None
+    )
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    for row in sessions:
+        assert row["is_cli_session"] is False, (
+            "source classification is uncapped: a capped row must still be "
+            "reclassified from state.db"
+        )
+        assert row["session_source"] == "webui"
+        assert row["message_count"] == 5, (
+            "a webui capped row still gets the cheap count repair"
+        )
+
+
+def test_foreign_source_rows_keep_their_own_flags(monkeypatch):
+    """A foreign (cli) state.db source is never overlaid — count overlay is webui/subagent only."""
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "1")
+    sessions = _grown_sessions(3)
+    metadata = _grown_metadata(3)
+    metadata["s2"]["_state_db_source"] = "cli"
+    monkeypatch.setattr(
+        models, "_reconciled_visible_count_for_sidebar", lambda sid: None
+    )
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    assert "session_source" not in sessions[2], (
+        "a foreign (cli) source row is left untouched by the overlay"
+    )
+    assert sessions[2]["message_count"] == 1, (
+        "foreign CLI rows keep their existing count flags"
+    )
+
+
+def test_actual_count_never_regresses_through_the_fallback(monkeypatch):
+    """actual_message_count is a max, so the fallback can only raise it."""
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "1")
+    sessions = _grown_sessions(3)
+    sessions[2]["actual_message_count"] = 9
+    monkeypatch.setattr(
+        models, "_reconciled_visible_count_for_sidebar", lambda sid: None
+    )
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: _grown_metadata(3),
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    assert sessions[2]["actual_message_count"] == 9
+    assert sessions[2]["message_count"] == 5
+
+
+def test_visible_count_never_exceeds_raw_count(monkeypatch):
+    """The fallback clamps to state_count, so visible <= raw always."""
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "1")
+    sessions = _grown_sessions(3)
+    for row in sessions:
+        row["visible_message_count"] = 2
+    metadata = _grown_metadata(3)
+    for entry in metadata.values():
+        entry["_state_db_message_count"] = 4
+    monkeypatch.setattr(
+        models, "_reconciled_visible_count_for_sidebar", lambda sid: None
+    )
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    for row in sessions:
+        assert row["visible_message_count"] <= row["message_count"]
+
+
+def test_none_and_non_positive_cap_are_fully_compatible(monkeypatch):
+    """No cap (None) and a non-positive cap both leave the overlay uncapped."""
+    for cap in (None, "0", "-5"):
+        if cap is None:
+            monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", raising=False)
+        else:
+            monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", cap)
+        reconciled = _capture_reconciled_ids(monkeypatch, 10)
+        models._apply_sidebar_state_db_overrides(_grown_sessions(10))
+        assert len(reconciled) == 10, f"cap={cap} must not bound a 10-row list"
+

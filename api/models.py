@@ -8147,26 +8147,33 @@ def _apply_sidebar_state_db_override_metadata(
             # keep the conservative anti-resurrection guard and wait for a
             # newer settled state.db message before overlaying counts again.
             #
-            # The transcript reconciliation below is the expensive half of this
-            # overlay (one full sidecar+state.db merge per grown row: measured
-            # 98 rows x 0.19 s = 18.8 s of a 20 s /api/sessions build, with
-            # 307k _cached_message_key calls). ``count_session_ids`` is the
-            # existing top-N bound for this pass, so honour it here too: rows
-            # outside the cap keep their sidecar count until the history panel
-            # or the next poll brings them into the window. Without this gate
-            # the cap only limited the SQL aggregate while every grown row
-            # still paid the merge (TOP_N=20 and TOP_N=300 both measured ~13 s).
-            if (
-                state_count > current_count
-                and (state_last <= 0 or state_last > current_last)
-                and (count_session_ids is None or str(sid) in count_session_ids)
-            ):
+            # The overlay below is split by cost. The raw/actual count, the
+            # last-message timestamps and the visible fallback are all cheap
+            # (sessions-table columns already fetched by the caller's
+            # two-tier read) and they decide whether the row is *publicly
+            # visible at all*, so they must run for EVERY row: state.db is
+            # the cross-surface writer (a CLI/Telegram continuation appends
+            # there), and gating the count on the top-N window froze such a
+            # row at 0 and dropped it from /api/sessions entirely — including
+            # the case where archived fillers consume the pre-filter budget.
+            # Only the transcript reconciliation is expensive (one full
+            # sidecar+state.db merge per grown row: measured 98 rows x 0.19 s
+            # = 18.8 s of a 20 s build, 307k _cached_message_key calls), so
+            # only that call is bounded by ``count_session_ids``.
+            if state_count > current_count and (state_last <= 0 or state_last > current_last):
                 try:
                     existing_actual = max(0, int(session.get('actual_message_count') or 0))
                 except (TypeError, ValueError):
                     existing_actual = 0
                 session['message_count'] = state_count
                 session['actual_message_count'] = max(state_count, existing_actual)
+                # Set BEFORE the reconciliation attempt: it is cheap, it is
+                # monotone, and it is what makes the row discoverable. A row
+                # outside the reconcile window keeps this value (state.db is
+                # authoritative for growth) instead of a stale zero.
+                if state_last > 0:
+                    session['last_message_at'] = max(float(session.get('last_message_at') or 0), state_last)
+                    session['updated_at'] = max(float(session.get('updated_at') or 0), state_last)
                 # #7882 re-gate should-fix 3 (greptile follow-up): the visible
                 # count must follow state.db growth, but a delegation wakeup
                 # turn adds a hidden user row the Agent core appends to
@@ -8201,8 +8208,24 @@ def _apply_sidebar_state_db_override_metadata(
                     # reconciled transcript has 4). The reconciled walk is
                     # the same authority the full save uses; the raw delta
                     # remains the fallback when rows can't be read.
-                    reconciled_visible = _reconciled_visible_count_for_sidebar(
-                        session.get('session_id')
+                    #
+                    # This walk is the ONLY expensive part of the overlay, so
+                    # it is the only part bounded by ``count_session_ids``.
+                    # Outside the window the raw-delta fallback runs instead:
+                    # it still credits the cheap raw growth (so a first-append
+                    # cross-surface row becomes visible rather than staying at
+                    # zero) and it keeps the delegation-wakeup hidden-row
+                    # discount, so no hidden row is resurrected. The bounded
+                    # oracle is unchanged: at most N merges per build.
+                    in_reconcile_window = (
+                        count_session_ids is None or str(sid) in count_session_ids
+                    )
+                    reconciled_visible = (
+                        _reconciled_visible_count_for_sidebar(
+                            session.get('session_id')
+                        )
+                        if in_reconcile_window
+                        else None
                     )
                     if reconciled_visible is not None:
                         session['visible_message_count'] = min(
@@ -8219,9 +8242,6 @@ def _apply_sidebar_state_db_override_metadata(
                                 + max(0, state_count - current_count - hidden_pending_delta),
                             ),
                         )
-                if state_last > 0:
-                    session['last_message_at'] = max(float(session.get('last_message_at') or 0), state_last)
-                    session['updated_at'] = max(float(session.get('updated_at') or 0), state_last)
         title = session.get('title')
         if (
             state_db_title
