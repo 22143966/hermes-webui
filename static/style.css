@@ -3272,8 +3272,8 @@
     /* Keep the Mac traffic-light clearance without crowding phone-width controls.
        All three sizes retain their previous values when the reserve is unset or 0. */
     .app-titlebar-spacer{width:max(0px,calc(44px - var(--traffic-light-width,0px)));}
-    .app-titlebar-inner{flex:1 1 auto;gap:max(0px,calc(8px - var(--traffic-light-width,0px)));}
-    .app-titlebar-profile-label{max-width:min(80px,max(calc(80px - var(--traffic-light-width,0px)),calc(100vw - 300px - var(--traffic-light-width,0px))));}
+    .app-titlebar-inner{flex:1 1 auto;gap:min(8px,max(calc(8px - var(--traffic-light-width,0px)),4px,calc(100vw - 460px - var(--traffic-light-width,0px))));}
+    .app-titlebar-profile-label{max-width:min(80px,max(calc(80px - var(--traffic-light-width,0px)),calc(100vw - 300px - var(--traffic-light-width,0px))),clamp(0px,calc((100vw - 252px - 2*var(--traffic-light-width,0px))*100),80px));}
     .app-titlebar-title{max-width:72vw;}
     .app-titlebar-sub{font-size:9px;padding:1px 5px;}
     .app-titlebar-title.long-pressing{opacity:.6;transition:opacity .1s;}
