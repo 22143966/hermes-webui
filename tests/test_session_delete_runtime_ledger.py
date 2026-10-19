@@ -406,6 +406,68 @@ def test_row_free_session_still_runs_the_fence(tmp_path, monkeypatch):
     assert "gateway.retired_session.v1.sid" in keys
 
 
+def _fence_whose_lazy_import_fails(recorded):
+    def retire_sessions(conn, session_ids):
+        recorded.extend(session_ids)
+        conn.execute(
+            "INSERT INTO state_meta(key,value) VALUES(?,?)",
+            ("gateway.retired_session.v1." + session_ids[0], "{}"),
+        )
+        raise ModuleNotFoundError("No module named 'ruamel'")
+    return retire_sessions
+
+
+def test_fence_lazy_import_failure_degrades_like_a_missing_helper_for_row_free(tmp_path, monkeypatch):
+    """A helper that imports but cannot load the Agent's dependencies is the
+    same degrade as a missing helper: a row-free session still deletes, and no
+    half-written fence survives the failed call."""
+    import api.models as models
+
+    state_db, conn = _make_db(tmp_path)
+    try:
+        _seed_session(conn, "sid")
+        conn.commit()
+    finally:
+        conn.close()
+    _install_home(monkeypatch, tmp_path)
+    recorded = []
+    _install_retirement_stub(monkeypatch, _fence_whose_lazy_import_fails(recorded))
+
+    assert models.delete_cli_session("sid") is True
+    assert recorded == ["sid"]
+    conn = sqlite3.connect(state_db)
+    try:
+        assert conn.execute("SELECT 1 FROM sessions WHERE id='sid'").fetchone() is None
+        keys = {row[0] for row in conn.execute("SELECT key FROM state_meta")}
+    finally:
+        conn.close()
+    assert "gateway.retired_session.v1.sid" not in keys
+
+
+def test_fence_lazy_import_failure_refuses_when_rows_exist(tmp_path, monkeypatch):
+    import api.models as models
+
+    state_db, conn = _make_db(tmp_path)
+    try:
+        _seed_session(conn, "sid")
+        _seed_admission(conn, "sid", "adm-1")
+        conn.commit()
+    finally:
+        conn.close()
+    _install_home(monkeypatch, tmp_path)
+    _install_retirement_stub(monkeypatch, _fence_whose_lazy_import_fails([]))
+
+    with pytest.raises(models.SessionDeleteRefused) as excinfo:
+        models.delete_cli_session("sid")
+    assert excinfo.value.code == "runtime_ledger_unavailable"
+    conn = sqlite3.connect(state_db)
+    try:
+        assert conn.execute("SELECT 1 FROM sessions WHERE id='sid'").fetchone() is not None
+        assert conn.execute("SELECT 1 FROM session_admissions WHERE admission_id='adm-1'").fetchone() is not None
+    finally:
+        conn.close()
+
+
 def test_row_free_session_deletes_on_a_partial_ledger_schema(tmp_path, monkeypatch):
     import api.models as models
 
@@ -522,6 +584,9 @@ def test_manifest_failure_rolls_back_the_retirement(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------
 def test_real_fence_clears_restrict_rows_and_keeps_receipts(tmp_path, monkeypatch):
     pytest.importorskip("hermes_state_mutation_retirement")
+    # retire_sessions imports the rest of the Agent lazily; without its
+    # dependencies (ruamel via hermes_state_common) the fence cannot run here.
+    pytest.importorskip("tools.tool_result_storage")
     import api.models as models
 
     state_db, conn = _make_db(tmp_path)
@@ -569,6 +634,9 @@ def test_real_fence_clears_restrict_rows_and_keeps_receipts(tmp_path, monkeypatc
 )
 def test_real_fence_refuses_live_work(tmp_path, monkeypatch, seed, status, code):
     pytest.importorskip("hermes_state_mutation_retirement")
+    # retire_sessions imports the rest of the Agent lazily; without its
+    # dependencies (ruamel via hermes_state_common) the fence cannot run here.
+    pytest.importorskip("tools.tool_result_storage")
     import api.models as models
 
     state_db, conn = _make_db(tmp_path)

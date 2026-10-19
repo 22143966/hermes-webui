@@ -529,7 +529,7 @@ const LOCALES = {
     session_delete_busy: 'This conversation is still running. Stop it first.',
     session_delete_unknown_execution: 'This conversation is still finishing background work. Try again in a moment.',
     session_delete_ledger_unavailable: 'This conversation\'s runtime history cannot be cleared right now. Restart the agent and try again.',
-    session_delete_cleanup_failed: 'The conversation was deleted, but some files could not be removed. Restart the agent to finish cleanup.',
+    session_delete_cleanup_failed: 'This conversation could not be deleted; its files were kept. Restart the agent and try again.',
      reveal_in_finder: 'Reveal in File Manager',
      reveal_failed: 'Failed to reveal: ',
      copy_file_path: 'Copy file path',

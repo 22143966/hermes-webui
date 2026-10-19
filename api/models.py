@@ -15406,22 +15406,47 @@ def _retire_gateway_runtime_ledger(conn, session_ids, tables):
         return
     if not _LEDGER_TABLES.issubset(tables):
         if not _has_gateway_runtime_rows(conn, session_ids, tables):
+            logger.warning(
+                "Partial gateway ledger schema; deleting row-free session(s) %s "
+                "without the Agent's retirement fence", session_ids,
+            )
             return
         raise SessionDeleteRefused("runtime_ledger_unavailable")
     try:
         from hermes_state_mutation_retirement import retire_sessions
     except Exception as exc:
         if not _has_gateway_runtime_rows(conn, session_ids, tables):
+            logger.warning(
+                "Agent retirement helper unavailable (%s); deleting row-free "
+                "session(s) %s without the fence", exc, session_ids,
+            )
             return
         raise SessionDeleteRefused("runtime_ledger_unavailable") from exc
+    # The helper imports the rest of the Agent lazily (hermes_state_common,
+    # tools.tool_result_storage, hermes_state_local, ...). An interpreter that
+    # can import the helper but not the Agent's dependencies fails inside the
+    # call, not at the import above: same degrade, and the savepoint keeps the
+    # soft path free of a half-written fence.
+    conn.execute("SAVEPOINT gateway_fence")
     try:
         retire_sessions(conn, session_ids)
+    except ImportError as exc:
+        conn.execute("ROLLBACK TO gateway_fence")
+        conn.execute("RELEASE gateway_fence")
+        if not _has_gateway_runtime_rows(conn, session_ids, tables):
+            logger.warning(
+                "Agent retirement fence not importable here (%s); deleting "
+                "row-free session(s) %s without it", exc, session_ids,
+            )
+            return
+        raise SessionDeleteRefused("runtime_ledger_unavailable") from exc
     except Exception as exc:
         # RuntimeStoreError carries the Agent's bounded reason code.
         reason = getattr(exc, "reason", None)
         if reason in ("session_busy", "unknown_execution"):
             raise SessionDeleteRefused(reason) from exc
         raise
+    conn.execute("RELEASE gateway_fence")
 
 
 def delete_cli_session(sid) -> bool:
