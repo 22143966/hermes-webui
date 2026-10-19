@@ -8469,6 +8469,36 @@ def _installed_repair_runtime_usable():
         return False
 
 
+# The settle projection replays the Agent's argument sanitizer on a private copy; its "repaired before request"
+# warnings belong to the Agent's real request, not to this simulation.
+_SETTLE_PROJECTION_QUIET_LOGGER = logging.getLogger("api.streaming.settle_projection")
+_SETTLE_PROJECTION_QUIET_LOGGER.disabled = True
+
+
+def _tool_call_arguments_need_sanitize(rows) -> bool:
+    """True when an assistant tool call's arguments are blank, None or invalid JSON (what the installed Agent's
+    ``sanitize_tool_call_arguments`` rewrites); False for the common case so the projection skips the extra copy."""
+    for row in rows or ():
+        if not isinstance(row, dict) or row.get("role") != "assistant":
+            continue
+        calls = row.get("tool_calls")
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            function = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(function, dict):
+                continue
+            arguments = function.get("arguments")
+            if arguments is None or (isinstance(arguments, str) and not arguments.strip()):
+                return True
+            if isinstance(arguments, str):
+                try:
+                    json.loads(arguments)
+                except ValueError:
+                    return True
+    return False
+
+
 def _apply_installed_repair(rows):
     """Run the installed Agent's ``repair_message_sequence`` on ``rows`` in place.
 
@@ -8481,9 +8511,25 @@ def _apply_installed_repair(rows):
     if not _installed_repair_runtime_usable():
         return False
     try:
-        from agent.agent_runtime_helpers import repair_message_sequence
+        from agent import agent_runtime_helpers as _agent_helpers
 
-        repair_message_sequence(None, rows)
+        # The installed Agent normalizes tool-call arguments (blank/None -> "{}", corrupted JSON -> "{}" plus a
+        # stub result) BEFORE its role repair, on every request. Model that step too, or a history holding an
+        # empty-arguments call projects a prefix the Agent never returns and the settle drops the current
+        # exchange from the saved model context. Older Agents without the helper skip it.
+        sanitize = getattr(_agent_helpers, "sanitize_tool_call_arguments", None)
+        if callable(sanitize) and _tool_call_arguments_need_sanitize(rows):
+            # On its own copy: the sanitizer reads run_agent.AIAgent constants and can insert stub results, so a
+            # failure part-way must not leave a half-sanitized projection. On failure keep the repair-only
+            # projection (the behaviour before this step was modeled).
+            sanitized = copy.deepcopy(rows)
+            try:
+                sanitize(sanitized, logger=_SETTLE_PROJECTION_QUIET_LOGGER)
+            except Exception:
+                sanitized = None
+            if sanitized is not None:
+                rows[:] = sanitized
+        _agent_helpers.repair_message_sequence(None, rows)
     except Exception:
         return False
     return True

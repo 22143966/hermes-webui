@@ -470,3 +470,46 @@ def test_sync_post_api_chat_keeps_prompt_and_answer(shape, tmp_path, monkeypatch
     )
     assert reloaded is not None, "the cold reload must find the persisted session"
     _assert_current_turn_survived(reloaded, prompt, answer, f"sync/{shape}")
+
+
+# -- Maintainer fold: the installed Agent's argument sanitizer runs before its role repair ---------------------------
+# The real pre-call pipeline is sanitize_tool_call_arguments (blank/None arguments -> "{}") then
+# repair_message_sequence. The settle projection modeled only the repair, so a history holding an empty-arguments call
+# projected a prefix the Agent never returns and the current exchange was dropped from the saved model context
+# (worker and synchronous HTTP, both arguments "" and None). Codex re-gate reproduction on 2b70b08fb716.
+
+
+@pytest.fixture
+def _agent_precall_pipeline(monkeypatch):
+    native = pytest.importorskip("agent.agent_runtime_helpers", reason="hermes-agent modules not importable")
+    if not callable(getattr(native, "sanitize_tool_call_arguments", None)):
+        pytest.skip("installed Agent has no sanitize_tool_call_arguments")
+    # The sanitizer reads two AIAgent members from run_agent; stand them in instead of importing the whole Agent.
+    monkeypatch.setattr(native, "_ra", lambda: SimpleNamespace(AIAgent=SimpleNamespace(
+        _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER="[corrupted arguments]",
+        _get_tool_call_id_static=lambda tc: (tc.get("call_id") or tc.get("id")) if isinstance(tc, dict) else None)))
+    repair = native.repair_message_sequence
+
+    def precall(agent, messages):
+        native.sanitize_tool_call_arguments(messages)
+        return repair(agent, messages)
+
+    monkeypatch.setattr(sys.modules[__name__], "_installed_repair", lambda: precall)
+
+
+@pytest.mark.parametrize("path", ["worker", "sync"])
+@pytest.mark.parametrize("arguments", ["", None, '{"path": "a.txt", "content": "trunc', "{}"])
+def test_blank_tool_call_arguments_keep_the_current_exchange(path, arguments, _agent_precall_pipeline, tmp_path,
+                                                             monkeypatch):
+    call = copy.deepcopy(CALL_X)
+    call["function"]["arguments"] = arguments
+    history = [
+        {"role": "user", "content": "OLD_Q", "timestamp": 1.0},
+        {"role": "assistant", "content": "", "tool_calls": [call], "timestamp": 2.0},
+        {"role": "tool", "content": "RESULT_ONE", "tool_call_id": "call-x", "timestamp": 3.0},
+        {"role": "assistant", "content": "OLD_ANSWER", "timestamp": 4.0},
+    ]
+    send = _worker_send if path == "worker" else _sync_http_send
+    label = {"": "blank", None: "none", "{}": "control"}.get(arguments, "corrupt")
+    reloaded = send(tmp_path, monkeypatch, f"blank-args-{path}-{label}", history, "CURRENT", "CURRENT_ANSWER")
+    _assert_current_turn_survived(reloaded, "CURRENT", "CURRENT_ANSWER", f"{path}/{label}")
