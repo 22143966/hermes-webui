@@ -143,7 +143,20 @@ async function _jumpToMessage(rawIdx) {
 // _oldestIdx while a long session is paged, so the full index is translated and
 // never used as a DOM id directly. `targetSid` is the session that was clicked.
 // Resolves true once the jump is handed to the transcript's jump helper.
-async function _jumpToFullSessionMessage(fullIdx, targetSid) {
+// Same text the server's content search scans (_session_search_message_text):
+// a string content, or the text parts of a multi-part content list.
+function _searchHitMessageText(message) {
+  const content = message && typeof message === 'object' ? message.content : '';
+  if (Array.isArray(content)) {
+    return content
+      .filter(function(part) { return part && typeof part === 'object' && part.type === 'text'; })
+      .map(function(part) { return String(part.text || ''); })
+      .join(' ');
+  }
+  return String(content || '');
+}
+
+async function _jumpToFullSessionMessage(fullIdx, targetSid, query) {
   const sid = targetSid || _currentSid();
   if (!sid || !Number.isSafeInteger(fullIdx) || fullIdx < 0) return false;
   // The user may have switched (or started switching) sessions before this
@@ -164,10 +177,28 @@ async function _jumpToFullSessionMessage(fullIdx, targetSid) {
     if (!stillTarget()) return false;
     rerender = true;
   }
-  const localIdx = _messageRawIdxForSessionIndex(fullIdx);
-  if (!Number.isSafeInteger(localIdx) || localIdx < 0) return false;  // not in the loaded window
-  const msg = (S.messages || [])[localIdx];
-  if (!msg) return false;
+  let localIdx = _messageRawIdxForSessionIndex(fullIdx);
+  let expectedAbs = fullIdx;
+  const loaded = S.messages || [];
+  let msg = Number.isSafeInteger(localIdx) && localIdx >= 0 ? loaded[localIdx] : null;
+  // The server indexes the session's OWN stored messages, but the transcript can
+  // show a merged view (a compression continuation stitches its parent's archived
+  // rows in front, messaging sessions merge CLI rows), which shifts indices. With
+  // the query in hand, never highlight a message that does not contain it: fall
+  // back to the first rendered user/assistant message that does, else no jump.
+  const q = String(query || '').trim().toLowerCase();
+  if (q && !(msg && _searchHitMessageText(msg).toLowerCase().includes(q))) {
+    localIdx = -1;
+    msg = null;
+    for (let i = 0; i < loaded.length; i++) {
+      const m = loaded[i];
+      if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue;
+      if (_searchHitMessageText(m).toLowerCase().includes(q)) { localIdx = i; msg = m; break; }
+    }
+    if (!msg) return false;
+    expectedAbs = _messageSessionIndexBase() + localIdx;
+  }
+  if (!msg || !Number.isSafeInteger(localIdx) || localIdx < 0) return false;  // not in the loaded window
   const container = document.getElementById('messages');
   // Loading full history elsewhere (e.g. the outline panel) re-bases indices
   // without a re-render: a stale row with the same local id must not stand in
@@ -176,7 +207,7 @@ async function _jumpToFullSessionMessage(fullIdx, targetSid) {
     const rows = container.querySelectorAll('[data-msg-idx="' + localIdx + '"]');
     for (let i = 0; i < rows.length; i++) {
       const abs = Number(rows[i].dataset && rows[i].dataset.sessionMsgIdx);
-      if (Number.isFinite(abs) && abs !== fullIdx) { rerender = true; break; }
+      if (Number.isFinite(abs) && abs !== expectedAbs) { rerender = true; break; }
     }
   }
   if (rerender) {

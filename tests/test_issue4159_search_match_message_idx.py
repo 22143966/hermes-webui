@@ -196,6 +196,13 @@ if(scenario.truncated){
   global._oldestIdx=0;
   global._messagesTruncated=false;
 }
+// A compression continuation's display stitches its parent's archived rows in
+// front of its own, so the server's index (into its OWN messages) is shifted.
+if(scenario.stitchPrefix){
+  const pre=[];
+  for(let i=0;i<scenario.stitchPrefix;i++) pre.push({role:i%2===0?'user':'assistant',content:'archived '+i});
+  S.messages=pre.concat(S.messages);
+}
 global._messageRenderWindowSize=30;
 global._currentMessageRenderWindowSize=()=>_messageRenderWindowSize;
 global._messageRenderableMessageCount=()=>S.messages.length;
@@ -236,11 +243,11 @@ global.jumpToTurnQuestion=async(q,a)=>{
   events.push('delegate');
 };
 for(const name of ['_messageSessionIndexBase','_messageRawIdxForSessionIndex']) eval(extractFrom(uiSrc,name));
-for(const name of ['_currentSid','_expandOutlineRenderWindow','_jumpToFullSessionMessage']) eval(extractFrom(outlineSrc,name));
+for(const name of ['_currentSid','_expandOutlineRenderWindow','_searchHitMessageText','_jumpToFullSessionMessage']) eval(extractFrom(outlineSrc,name));
 (async()=>{
   let idx=scenario.idx;
   if(scenario.idxKind==='nan') idx=NaN;
-  const p=_jumpToFullSessionMessage(idx, scenario.targetSid===undefined?'a':scenario.targetSid);
+  const p=_jumpToFullSessionMessage(idx, scenario.targetSid===undefined?'a':scenario.targetSid, scenario.query);
   for(let i=0;i<20;i++){
     await new Promise(r=>setImmediate(r));
     if(scenario.switchDuringFrame&&frames.length) S.session={session_id:'b'};
@@ -459,7 +466,7 @@ global._messageVirtualScrollTopForVisibleIdx=(vis,idx,c)=>Math.max(0,idx*ROW-Mat
 global.window.setTimeout=(f)=>0;
 global._ensureAllMessagesLoaded=async()=>{events.push('ensure-all');};
 for(const name of ['_messageSessionIndexBase','_messageRawIdxForSessionIndex','_messageVisibleIndexForRawIdx','_userMessageDomId','_highlightQuestionRow','jumpToTurnQuestion']) eval(extractFrom(uiSrc,name));
-for(const name of ['_currentSid','_expandOutlineRenderWindow','_jumpToFullSessionMessage']) eval(extractFrom(outlineSrc,name));
+for(const name of ['_currentSid','_expandOutlineRenderWindow','_searchHitMessageText','_jumpToFullSessionMessage']) eval(extractFrom(outlineSrc,name));
 (async()=>{
   const targetInDomBefore=rows.some(r=>r.dataset.msgIdx===String(scenario.idx));
   const p=_jumpToFullSessionMessage(scenario.idx,'a');
@@ -577,7 +584,9 @@ def test_row_open_dispatches_jump_after_the_session_opens():
     src = _SESSIONS_JS.read_text(encoding="utf-8")
     start = src.index("const _openRowSession=async()=>{")
     body = src[start:src.index("};", start)]
-    assert body.index("await _openSidebarSession(s);") < body.index("_jumpToSessionSearchHit(s);")
+    assert body.index("await _openSidebarSession(s);") < body.index("_jumpToSessionSearchHit(s,_hitQuery);")
+    # The query is captured before the open, so the jump can confirm its target.
+    assert body.index("const _hitQuery=") < body.index("await _openSidebarSession(s);")
 
 
 def test_cross_script_wiring_goes_through_window():
@@ -587,6 +596,41 @@ def test_cross_script_wiring_goes_through_window():
     outline = _OUTLINE_JS.read_text(encoding="utf-8")
     assert "window._jumpToFullSessionMessage = _jumpToFullSessionMessage" in outline
     sessions = _SESSIONS_JS.read_text(encoding="utf-8")
-    assert "window._jumpToFullSessionMessage(idx,sid)" in sessions
+    assert "window._jumpToFullSessionMessage(idx,sid,query)" in sessions
     bare = re.findall(r"(?<![.\w])_jumpTo(?:FullSession)?Message\s*\(", sessions)
     assert not bare, "sessions.js must call the outline jump helpers via window"
+
+
+# --------------------------------------------------------------------------- #
+# Query confirmation: merged/stitched transcripts can shift indices (RM, #5106)
+# --------------------------------------------------------------------------- #
+@needs_node
+def test_query_confirms_the_indexed_target():
+    r = _run_jump(idx=2, query="needle")
+    assert r["ok"] is True
+    assert r["delegated"]["q"] == 2 and r["delegated"]["rowContent"] == "NEEDLE 2"
+
+
+@needs_node
+def test_stitched_view_falls_back_to_first_message_containing_the_query():
+    """The server indexes the continuation's own messages (NEEDLE at 2) but the
+    transcript shows 2 archived parent rows first: index 2 is 'msg 0'. The jump
+    must not highlight it; it goes to the first message containing the query."""
+    r = _run_jump(idx=2, query="Needle", stitchPrefix=2)
+    assert r["ok"] is True
+    assert r["delegated"]["q"] == 4
+    assert r["delegated"]["rowContent"] == "NEEDLE 2"
+    assert r["delegated"]["rowSessionIdx"] == 4
+
+
+@needs_node
+def test_query_absent_from_the_loaded_transcript_does_not_jump():
+    r = _run_jump(idx=2, query="not-in-this-transcript")
+    assert r["ok"] is False
+    assert r["delegated"] is None
+
+
+@needs_node
+def test_no_query_keeps_the_index_jump():
+    r = _run_jump(idx=2)
+    assert r["ok"] is True and r["delegated"]["q"] == 2

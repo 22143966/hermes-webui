@@ -8122,15 +8122,19 @@ function _sessionSearchContentPreview(session, query){
 // goes to outline.js's full-session jump (reached through window: that helper
 // lives in another script's IIFE) together with the clicked session id for the
 // session-switch guard. No/invalid index or a non-content hit: just the open.
-function _jumpToSessionSearchHit(session){
+function _jumpToSessionSearchHit(session, hitQuery){
   if(!session||session.match_type!=='content') return false;
   const idx=session.match_message_idx;
   const sid=session.session_id;
   if(!sid||!Number.isSafeInteger(idx)||idx<0) return false;
   if(typeof window==='undefined'||typeof window._jumpToFullSessionMessage!=='function') return false;
+  // The query that produced this hit, so the jump can confirm the target really
+  // contains it (merged/stitched transcripts can shift indices).
+  let query=typeof hitQuery==='string'?hitQuery.trim():'';
+  if(!query){ try{ query=((typeof $==='function'&&$('sessionSearch')&&$('sessionSearch').value)||'').trim(); }catch(_e){} }
   window.setTimeout(()=>{
     try{
-      const pending=window._jumpToFullSessionMessage(idx,sid);
+      const pending=window._jumpToFullSessionMessage(idx,sid,query);
       if(pending&&typeof pending.catch==='function') pending.catch(()=>{});
     }catch(_e){}
   },0);
@@ -11003,9 +11007,10 @@ function renderSessionListFromCache(){
     const _openRowSession=async()=>{
       if(_renamingSid) return;
       try{
+        const _hitQuery=($('sessionSearch').value||'').trim();
         if(($('sessionSearch').value||'').trim()) _hideSearchPreviewsAfterSelect=true;
         await _openSidebarSession(s);
-        _jumpToSessionSearchHit(s);
+        _jumpToSessionSearchHit(s,_hitQuery);
       }finally{
         el.classList.remove('loading');
       }
