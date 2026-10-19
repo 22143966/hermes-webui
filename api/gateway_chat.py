@@ -1209,6 +1209,10 @@ def _run_gateway_runs_api_streaming(
         state = str(status.get("status") or "").strip().lower()
         if state not in _GATEWAY_RUN_TERMINAL_STATUSES:
             return "continue", None
+        # Same order as the events relay and the reattach poller: replay steer text the Gateway accepted but the run
+        # never consumed before settling, or a turn that ends after an events EOF loses it (the browser already
+        # cleared the accepted submission).
+        _relay_gateway_pending_steer(session_id, status, put_gateway_event)
         settle_gateway_pending_run(
             session_id,
             run_id,

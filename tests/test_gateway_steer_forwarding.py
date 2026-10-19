@@ -227,3 +227,28 @@ def test_uncertain_steer_warning_is_translated_in_every_non_english_locale():
     assert locales.pop("en") == english
     assert len(locales) >= 14
     assert {k: v for k, v in locales.items() if v == english} == {}
+
+
+@pytest.mark.parametrize("state", ["completed", "failed", "cancelled"])
+def test_status_settle_after_events_eof_replays_unconsumed_gateway_steer(state):
+    """Maintainer fold (Codex re-gate): when the events stream ends without a terminal frame, the streaming relay
+    settles the turn from the durable run status. That path settled without replaying ``pending_steer``, so steer
+    text the Gateway accepted but the run never consumed was lost (the browser had already cleared it)."""
+    from tests.test_gateway_events_watchdog_7978 import partial_delta, run_turn
+
+    harness = run_turn(
+        urlopen_script=[partial_delta("Hello", seq=0)],
+        status_script=[{"status": state, "output": "done", "pending_steer": "go left"}],
+    )
+    leftovers = [d for e, d in harness["events"] if e == "pending_steer_leftover"]
+    assert leftovers == [{"session_id": "sess-watchdog-harness", "text": "go left"}], harness["events"]
+
+
+def test_status_settle_without_pending_steer_emits_no_leftover():
+    from tests.test_gateway_events_watchdog_7978 import partial_delta, run_turn
+
+    harness = run_turn(
+        urlopen_script=[partial_delta("Hello", seq=0)],
+        status_script=[{"status": "completed", "output": "done"}],
+    )
+    assert not [e for e, _ in harness["events"] if e == "pending_steer_leftover"]
