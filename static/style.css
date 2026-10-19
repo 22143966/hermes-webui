@@ -6413,6 +6413,13 @@ body code[class*="language-"],body pre[class*="language-"],body pre code[class*=
   35% { box-shadow: 0 0 0 5px var(--focus-ring); }
   100% { box-shadow: 0 0 0 0 rgba(0,0,0,0); }
 }
+/* Reduced motion: keep the "you landed here" ring, without the pulse, for as long as the class is set. */
+@media (prefers-reduced-motion: reduce) {
+  .msg-question-highlight .msg-body {
+    animation: none;
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+}
 @media (max-width: 600px) {
   .msg-question-jump-btn {
     width: 32px;

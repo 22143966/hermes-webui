@@ -1869,12 +1869,24 @@ function _messageJumpScrollBehavior(container, el){
     return distance>Math.max(1,container.clientHeight)*2?'auto':'smooth';
   }catch(_){ return 'smooth'; }
 }
+// Start the pulse on the next frame. A far jump renders and lays out the whole transcript in the same task as the
+// scroll, and an animation started inside that task takes its clock from the frame that began before it: on a
+// 240-message session the first painted frame was already 0.4-0.6 s into the 1.6 s pulse, so the ring appeared at
+// full strength and faded early. One frame later the pulse starts from zero where the user can see it.
 function _highlightQuestionRow(row){
   if(!row) return;
   row.classList.remove('msg-question-highlight');
-  void row.offsetWidth;
-  row.classList.add('msg-question-highlight');
-  window.setTimeout(()=>row.classList.remove('msg-question-highlight'),1800);
+  if(row._questionHighlightTimer) window.clearTimeout(row._questionHighlightTimer);
+  const start=()=>{
+    void row.offsetWidth;
+    row.classList.add('msg-question-highlight');
+    row._questionHighlightTimer=window.setTimeout(()=>{
+      row._questionHighlightTimer=0;
+      row.classList.remove('msg-question-highlight');
+    },1800);
+  };
+  if(typeof requestAnimationFrame==='function') requestAnimationFrame(start);
+  else start();
 }
 
 async function jumpToTurnQuestion(questionRawIdx, assistantRawIdx){
