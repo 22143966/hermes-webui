@@ -1533,7 +1533,10 @@
      (e.g. WKWebView), which swallow clicks on titlebar controls. The center inner holds the interactive,
      inline-renamable session title, so it must stay out of any drag region — the flank fillers preserve the
      full window-drag surface without covering an interactive element. Keep interactive controls out of any drag region. */
-  .app-titlebar{display:flex;align-items:center;justify-content:center;height:38px;flex-shrink:0;background:var(--sidebar);border-bottom:1px solid var(--border);padding:0 12px;padding-top:var(--app-titlebar-safe-top);padding-left:max(12px,env(safe-area-inset-left,0),var(--traffic-light-width,0px));padding-right:max(12px,env(safe-area-inset-right,0));box-sizing:content-box;font-size:12px;color:var(--muted);user-select:none;position:relative;z-index:20;}
+  /* --traffic-light-width: set by the macOS desktop wrapper (hermes-swift-mac) to the width it reserves for the
+     window controls. Reserved on BOTH sides so the centered title stays centered on the window; unset (0px)
+     in browsers and PWAs. Drag regions are the empty .app-titlebar-drag fillers only (#6059). */
+  .app-titlebar{display:flex;align-items:center;justify-content:center;height:38px;flex-shrink:0;background:var(--sidebar);border-bottom:1px solid var(--border);padding:0 12px;padding-top:var(--app-titlebar-safe-top);padding-left:max(12px,env(safe-area-inset-left,0),var(--traffic-light-width,0px));padding-right:max(12px,env(safe-area-inset-right,0),var(--traffic-light-width,0px));box-sizing:content-box;font-size:12px;color:var(--muted);user-select:none;position:relative;z-index:20;}
   .app-titlebar-left{display:flex;align-items:center;gap:4px;}
   .app-titlebar-drag{flex:1 1 0;align-self:stretch;min-width:0;-webkit-app-region:drag;}
   .app-titlebar-inner{display:flex;align-items:center;gap:8px;min-width:0;max-width:100%;justify-content:center;-webkit-app-region:no-drag;}
