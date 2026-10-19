@@ -108,8 +108,12 @@ async function _jumpToMessage(rawIdx) {
     if (!row) return;
     // Use the same smooth-scroll ownership as response jumps. Cancel delayed
     // bottom writes before scrolling, including the already-rendered-row path.
-    _beginMessageJumpScroll(document.getElementById('messages'));
-    row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    const container = document.getElementById('messages');
+    _beginMessageJumpScroll(container);
+    // Far jumps land instantly (as search and jump-to-question do) so the landing cue is seen from its start.
+    const behavior = typeof _messageJumpScrollBehavior === 'function'
+      ? _messageJumpScrollBehavior(container, row) : 'smooth';
+    row.scrollIntoView({ block: 'center', behavior: behavior });
     _flashRow(row);
   };
   if (targetRow()) {

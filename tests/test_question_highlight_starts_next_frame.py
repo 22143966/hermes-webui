@@ -112,7 +112,7 @@ def test_reduced_motion_keeps_a_static_ring_instead_of_the_pulse():
     assert block, "reduced-motion override for the jump highlight is missing"
     body = block.group(1)
     assert "animation: none;" in body
-    assert "box-shadow: 0 0 0 3px var(--focus-ring);" in body
+    assert "box-shadow: 0 0 0 3px var(--message-landing-ring);" in body
 
 
 # -- One landing cue for every jump (#5106 Fable r3) ------------------------------------------------------------------
@@ -172,10 +172,41 @@ def test_outline_jump_uses_the_transcript_landing_cue():
 def test_landing_cue_tints_the_row_and_keeps_a_static_tint_under_reduced_motion():
     assert re.search(r"\.msg-question-highlight \{\s*animation: message-landing-tint 1\.6s ease-out;\s*\}", STYLE_CSS)
     keyframes = re.search(r"@keyframes message-landing-tint \{([^@]*?)\n\}", STYLE_CSS)
-    assert keyframes and "var(--accent-bg-strong)" in keyframes.group(1)
+    assert keyframes and "var(--message-landing-tint)" in keyframes.group(1)
     reduced = re.search(
         r"@media \(prefers-reduced-motion: reduce\) \{\s*\.msg-question-highlight \{([^}]*)\}", STYLE_CSS
     )
     assert reduced, "reduced-motion override for the landing tint is missing"
     assert "animation: none;" in reduced.group(1)
-    assert "background-color: var(--accent-bg-strong);" in reduced.group(1)
+    assert "background-color: var(--message-landing-tint);" in reduced.group(1)
+
+
+# -- Fable r4 follow-ups ----------------------------------------------------------------------------------------------
+# The cue has its own tokens derived from --accent (tint ~1.4:1, ring >=3:1 in both themes; one hue in every skin),
+# assistant segments land with room for the ring, and the outline panel's far jumps land instantly like the other paths.
+
+def test_landing_cue_tokens_derive_from_accent_with_fallbacks():
+    fallback = re.search(r":root \{ --message-landing-tint: ([^;]+); --message-landing-ring: ([^;]+); \}", STYLE_CSS)
+    assert fallback and fallback.groups() == ("var(--accent-bg-strong)", "var(--focus-ring)")
+    block = STYLE_CSS[STYLE_CSS.index("@supports (color: color-mix(in srgb, red 50%, transparent)) {"):]
+    block = block[: block.index("\n}\n") + 2]
+    assert "--message-landing-tint: color-mix(in srgb, var(--accent) 30%, transparent);" in block
+    assert "--message-landing-ring: var(--accent);" in block
+    dark = block[block.index(":root.dark {"):]
+    assert "--message-landing-tint: color-mix(in srgb, var(--accent) 16%, transparent);" in dark
+    assert "--message-landing-ring: color-mix(in srgb, var(--accent) 50%, transparent);" in dark
+    pulse = re.search(r"@keyframes question-highlight-pulse \{([^@]*?)\n\}", STYLE_CSS).group(1)
+    assert "var(--message-landing-ring)" in pulse and "--focus-ring" not in pulse
+
+
+def test_jump_targets_leave_room_for_the_ring():
+    assert "#messages [data-msg-idx] { scroll-margin-top: 12px; }" in STYLE_CSS
+
+
+def test_outline_jump_uses_the_shared_scroll_behavior():
+    outline = (REPO / "static" / "outline.js").read_text(encoding="utf-8")
+    start = outline.index("const scrollToRow = function()")
+    body = outline[start:outline.index("};", start)]
+    assert "_messageJumpScrollBehavior(container, row)" in body
+    assert "row.scrollIntoView({ block: 'center', behavior: behavior });" in body
+    assert "behavior: 'smooth' }" not in body
