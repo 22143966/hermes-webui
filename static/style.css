@@ -3266,10 +3266,14 @@
     .sidebar.mobile-open{transform:translateX(0);visibility:visible;pointer-events:auto;transition:transform .25s ease,visibility 0s linear 0s;}
     .sidebar .resize-handle{display:none;}
     /* Hamburger button (in app titlebar on mobile) */
-    .app-titlebar{height:52px;justify-content:space-between;}
+    .app-titlebar{height:52px;justify-content:space-between;padding-right:max(12px,env(safe-area-inset-right,0));}
     .app-titlebar-hamburger,.app-titlebar-spacer{display:flex;}
     .app-titlebar-new-chat,.app-titlebar-reload{display:inline-flex;width:44px;height:44px;}
-    .app-titlebar-inner{flex:1 1 auto;}
+    /* Keep the Mac traffic-light clearance without crowding phone-width controls.
+       All three sizes retain their previous values when the reserve is unset or 0. */
+    .app-titlebar-spacer{width:max(0px,calc(44px - var(--traffic-light-width,0px)));}
+    .app-titlebar-inner{flex:1 1 auto;gap:max(0px,calc(8px - var(--traffic-light-width,0px)));}
+    .app-titlebar-profile-label{max-width:min(80px,max(calc(80px - var(--traffic-light-width,0px)),calc(100vw - 300px - var(--traffic-light-width,0px))));}
     .app-titlebar-title{max-width:72vw;}
     .app-titlebar-sub{font-size:9px;padding:1px 5px;}
     .app-titlebar-title.long-pressing{opacity:.6;transition:opacity .1s;}
