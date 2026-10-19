@@ -9564,7 +9564,7 @@ function renderMd(raw){
       try{
         const u=new URL(href);
         if(u.hostname&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(u.hostname)) return href;
-        const path=decodeURIComponent((u.pathname||'')+(u.search||'')+(u.hash||''));
+        const path=decodeURIComponent((u.pathname||'')+((href.match(/[?#][\s\S]*$/)||[''])[0]));
         return 'api/media?path='+encodeURIComponent(path)+'&inline=1';
       }catch(_){
         // Fail closed: an unparseable URI with an authority may hide a non-local host.

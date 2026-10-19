@@ -38,6 +38,10 @@ console.log(JSON.stringify(out));
 CASES = [
     "file:///C:/Users/me/report.png",
     "file:///C:/a#b.png",
+    "file:///tmp/a#",
+    "file:///tmp/a?",
+    "file:///tmp/a?#b.png",
+    "file:///tmp/a?x#",
     "file:///tmp/a%23b.png",
     "file:///tmp/x.png?raw=1",
     "file:///home/me/my%20report.png",
@@ -83,3 +87,15 @@ def test_local_paths_unchanged(results):
     assert _path(results["file:///tmp/a%23b.png"]["settled"]) == "/tmp/a#b.png"
     assert _path(results["file:///home/me/my%20report.png"]["settled"]) == "/home/me/my report.png"
     assert _path(results["file://localhost/C:/x.png"]["settled"]) == "/C:/x.png"
+
+
+def test_empty_delimiters_are_kept(results):
+    """URL.search/hash drop an empty '?' or '#', which would select a different file ('a#' -> 'a')."""
+    for case, expected in [
+        ("file:///tmp/a#", "/tmp/a#"),
+        ("file:///tmp/a?", "/tmp/a?"),
+        ("file:///tmp/a?#b.png", "/tmp/a?#b.png"),
+        ("file:///tmp/a?x#", "/tmp/a?x#"),
+    ]:
+        assert _path(results[case]["streaming"]) == expected, case
+        assert _path(results[case]["settled"]) == expected, case

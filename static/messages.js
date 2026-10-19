@@ -4824,9 +4824,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // file://server/share/...) are explicitly rejected — never silently
       // rewired to a local path.
       if(u.hostname&&!/^(localhost|127\.0\.0\.1|\[::1\])$/i.test(u.hostname)) return href;
-      // Keep the '?…'/'#…' suffix as part of the path, as master and the settled link converter do: a file named
-      // 'a#b.png' must not turn into 'a' while streaming.
-      const path=decodeURIComponent((u.pathname||'')+(u.search||'')+(u.hash||''))||decodeURIComponent(href.replace(/^file:\/\//i,''));
+      // Keep the raw '?…'/'#…' suffix as part of the path, as master and the settled link converter do: a file named
+      // 'a#b.png' must not turn into 'a' while streaming. Taken from the href, not URL.search/hash, which drop empty
+      // delimiters ('report#' would become 'report', a different file).
+      const path=decodeURIComponent((u.pathname||'')+((href.match(/[?#][\s\S]*$/)||[''])[0]))||decodeURIComponent(href.replace(/^file:\/\//i,''));
       // #8033: file:///C:/Users/me/x parses to '/C:/Users/me/x' — the
       // once-decoded pathname is forwarded AS-IS (no client-side strip).
       // The backend gates the drive-letter conversion on the server OS:
