@@ -4915,8 +4915,37 @@ async function _loadOlderMessages() {
 //      ensure-all calls from rapid double-clicks on Start.
 //   2. Bump _messagesGeneration before mutating S.messages so any
 //      in-flight prefetch's post-await generation check bails out.
-async function _ensureAllMessagesLoaded() {
-  if (!_messagesTruncated || !S.session) return;
+// #5106: what the transcript looked like when a full-history request went out.
+// A send pushes onto S.messages in place (same array, longer), a finished turn
+// or a reload replaces it, and a stream keeps mutating its last row; any of
+// those means the response no longer describes what the user is looking at.
+function _transcriptFreshnessSnapshot() {
+  const msgs = Array.isArray(S.messages) ? S.messages : null;
+  return {
+    msgs: msgs,
+    len: msgs ? msgs.length : -1,
+    last: msgs && msgs.length ? msgs[msgs.length - 1] : null,
+    gen: _messagesGeneration,
+    busy: !!(S.busy || S.activeStreamId),
+  };
+}
+function _transcriptIsFresh(before) {
+  const now = _transcriptFreshnessSnapshot();
+  return !before.busy && !now.busy && now.msgs === before.msgs && now.len === before.len &&
+    now.last === before.last && now.gen === before.gen;
+}
+
+// Resolves true when the complete transcript is in S.messages (already, or
+// loaded by this call) and false when it is not: no session, a failed or
+// redirected fetch, a session switch, or, with {rejectIfStale:true}, a
+// transcript that changed while the request was out. Callers the user
+// triggers directly ignore the result; the automatic search-hit jump (#5106)
+// opts in to rejectIfStale, because a reply that lands after the user sent
+// (or finished) a turn would otherwise replace the transcript and hide it.
+async function _ensureAllMessagesLoaded(opts) {
+  const rejectIfStale = !!(opts && opts.rejectIfStale);
+  if (!S.session) return false;
+  if (!_messagesTruncated) return true;
   if (_loadingOlder) {
     // A prefetch is mid-flight (between the `_loadingOlder = true` line
     // and its post-await guards). Bumping the generation token now
@@ -4929,18 +4958,22 @@ async function _ensureAllMessagesLoaded() {
     while (_loadingOlder) {
       await new Promise(resolve => setTimeout(resolve, 16));
     }
-    if (!_messagesTruncated || !S.session) return;
+    if (!S.session) return false;
+    if (!_messagesTruncated) return true;
   }
   _loadingOlder = true;
   try {
     const sid = S.session.session_id;
+    const freshness = rejectIfStale ? _transcriptFreshnessSnapshot() : null;
     const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_limit=all`, {timeoutMs:120000});
     // Guard: api() may have redirected (401) and returned undefined.
-    if (!data || !data.session) return;
+    if (!data || !data.session) return false;
     // Session may have been switched while we awaited. Bail rather than
     // overwrite the new session's messages.
-    if (!S.session || S.session.session_id !== sid) return;
-    if (_loadingSessionId !== null && _loadingSessionId !== sid) return;
+    if (!S.session || S.session.session_id !== sid) return false;
+    if (_loadingSessionId !== null && _loadingSessionId !== sid) return false;
+    // Checked before ANY mutation below (messages, tool calls, paging, counts).
+    if (freshness && !_transcriptIsFresh(freshness)) return false;
     const msgs = (data.session.messages || []).filter(m => m && m.role);
     // Bump the generation BEFORE the wholesale replace so any racing
     // prefetch (whose snapshot was taken before this call's mutex
@@ -5009,6 +5042,7 @@ async function _ensureAllMessagesLoaded() {
         delete S.session.regeneration_revision;
       }
     }
+    return true;
   } finally {
     _loadingOlder = false;
   }

@@ -225,16 +225,25 @@ global._cancelBottomSettle=()=>events.push('cancel-settle');
 global._beginMessageJumpScroll=()=>events.push('begin-jump');
 global.renderMessages=()=>{events.push('render');stamp(_oldestIdx);};
 global.api=async()=>{events.push('direct-api');return null;};
-global._ensureAllMessagesLoaded=async()=>{
+let ensureOpts=null;
+global._ensureAllMessagesLoaded=async(opts)=>{
   events.push('ensure-all');
+  ensureOpts=opts===undefined?null:opts;
   if(scenario.switchDuringLoad){
     // The user opened session b meanwhile (fully loaded, offset 0): the shared
     // loader bails, and a's index must not be applied to b's transcript.
     S.session={session_id:'b'};S.messages=FULL.slice();_oldestIdx=0;_messagesTruncated=false;
-    return;
+    return false;
   }
-  if(!_messagesTruncated) return;
+  if(scenario.staleDuringLoad){
+    // The user sent a turn while the request was out: with rejectIfStale the
+    // shared loader leaves the live transcript alone and reports false.
+    S.messages.push({role:'user',content:'NEW PROMPT'});
+    return false;
+  }
+  if(!_messagesTruncated) return true;
   S.messages=FULL.slice();_oldestIdx=0;_messagesTruncated=false;
+  return true;
 };
 let delegated=null;
 global.jumpToTurnQuestion=async(q,a)=>{
@@ -254,7 +263,7 @@ for(const name of ['_currentSid','_expandOutlineRenderWindow','_searchHitMessage
     while(frames.length) frames.shift()();
   }
   const ok=await p;
-  console.log(JSON.stringify({ok,events,delegated,oldestIdx:_oldestIdx}));
+  console.log(JSON.stringify({ok,events,delegated,oldestIdx:_oldestIdx,ensureOpts,messageCount:S.messages.length}));
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
 
@@ -297,6 +306,20 @@ def test_truncated_session_force_loads_full_history_then_jumps_to_full_index():
     assert r["delegated"]["q"] == 2
     assert r["delegated"]["rowSessionIdx"] == 2
     assert r["delegated"]["rowContent"] == "NEEDLE 2"
+    assert r["ensureOpts"] == {"rejectIfStale": True}, "the automatic load must opt in to the freshness guard"
+
+
+@needs_node
+def test_stale_full_history_reply_stops_the_jump_and_keeps_the_live_transcript():
+    """The user sends a turn while the full-history request is out. The loader
+    rejects the stale reply; the jump must stop there: no re-render, no
+    delegation, and the live (still paged) transcript keeps the new prompt."""
+    r = _run_jump(idx=2, truncated=True, staleDuringLoad=True, query="needle")
+    assert r["ok"] is False
+    assert "render" not in r["events"]
+    assert r["delegated"] is None
+    assert r["oldestIdx"] == 6
+    assert r["messageCount"] == 5  # 4-row tail + the new prompt
 
 
 @needs_node
@@ -344,6 +367,112 @@ def test_full_history_loader_is_uncapped():
     helper = outline[start:outline.index("\n}\n", start)]
     assert "msg_limit" not in helper.replace("(msg_limit=all)", "")
     assert "'msg-user-' + fullIdx" not in helper
+
+
+# The REAL shared loader from sessions.js, with a held api() reply so the test
+# can change the transcript while the full-history request is out.
+_LOADER_DRIVER = r"""
+const fs=require('fs');
+function extractFrom(source, name){
+  const start=source.search(new RegExp('(?:async\\s+)?function\\s+'+name+'\\s*\\('));
+  if(start<0) throw Error('missing '+name);
+  let i=source.indexOf('{',start),depth=1; i++;
+  while(depth&&i<source.length){if(source[i]==='{')depth++;if(source[i]==='}')depth--;i++;}
+  return source.slice(start,i);
+}
+const src=fs.readFileSync(process.argv[1],'utf8');
+const scenario=JSON.parse(process.argv[2]);
+global.window=global;
+const FULL=[];
+for(let i=0;i<10;i++) FULL.push({role:i%2===0?'user':'assistant',content:'msg '+i});
+global.S={session:{session_id:'a',message_count:10},busy:false,activeStreamId:null,messages:FULL.slice(6)};
+global._messagesTruncated=!scenario.untruncated;
+global._oldestIdx=6;
+global._loadingOlder=false;
+global._loadingSessionId=null;
+global._messagesGeneration=0;
+global._bumpMessagesGeneration=()=>{_messagesGeneration++;};
+let synced=0;
+global._syncToolCallsForLoadedMessages=()=>{synced++;};
+global._advanceVisibleBaselineForServerKnownRows=()=>{};
+let release=null, calls=0;
+global.api=()=>{calls++;return new Promise(r=>{release=()=>r({session:{session_id:'a',messages:FULL.slice(),
+  tool_calls:[],message_count:10,visible_message_count:10}});});};
+for(const name of ['_transcriptFreshnessSnapshot','_transcriptIsFresh','_ensureAllMessagesLoaded']) eval(extractFrom(src,name));
+(async()=>{
+  const p=_ensureAllMessagesLoaded(scenario.opts);
+  await new Promise(r=>setImmediate(r));
+  switch(scenario.during){
+    case 'send': S.messages.push({role:'user',content:'NEW PROMPT'});S.busy=true;break;
+    case 'sendFinished': S.messages.push({role:'user',content:'NEW PROMPT'});
+      S.messages.push({role:'assistant',content:'NEW ANSWER'});break;
+    case 'streamStarted': S.activeStreamId='stream-1';break;
+    case 'replaced': S.messages=S.messages.map(m=>Object.assign({},m));break;
+    case 'switch': S.session={session_id:'b'};break;
+  }
+  if(release) release();
+  const result=await p;
+  console.log(JSON.stringify({result,calls,contents:S.messages.map(m=>m.content),oldestIdx:_oldestIdx,
+    truncated:_messagesTruncated,synced,loadingOlder:_loadingOlder}));
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+
+
+def _run_loader(**scenario):
+    result = subprocess.run(
+        [NODE, "-e", _LOADER_DRIVER, str(_SESSIONS_JS), json.dumps(scenario)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@needs_node
+@pytest.mark.parametrize(
+    "during,tail",
+    [
+        ("send", ["msg 6", "msg 7", "msg 8", "msg 9", "NEW PROMPT"]),
+        ("sendFinished", ["msg 6", "msg 7", "msg 8", "msg 9", "NEW PROMPT", "NEW ANSWER"]),
+        ("streamStarted", ["msg 6", "msg 7", "msg 8", "msg 9"]),
+        ("replaced", ["msg 6", "msg 7", "msg 8", "msg 9"]),
+    ],
+)
+def test_loader_rejects_a_reply_that_is_stale_by_the_time_it_lands(during, tail):
+    """With rejectIfStale, a full-history reply that lands after the transcript
+    changed (a send in flight, a turn that already finished, a stream that
+    started, a reload that replaced the array) touches nothing: messages, tool
+    calls, paging and counts all stay as the user sees them."""
+    r = _run_loader(opts={"rejectIfStale": True}, during=during)
+    assert r["result"] is False
+    assert r["contents"] == tail
+    assert r["oldestIdx"] == 6
+    assert r["truncated"] is True
+    assert r["synced"] == 0
+    assert r["loadingOlder"] is False, "the mutex must be released on the reject path"
+
+
+@needs_node
+@pytest.mark.parametrize("opts", [None, {"rejectIfStale": True}])
+def test_loader_applies_a_fresh_reply_and_reports_it(opts):
+    r = _run_loader(opts=opts, during=None)
+    assert r["result"] is True
+    assert r["calls"] == 1
+    assert r["contents"] == [f"msg {i}" for i in range(10)]
+    assert r["oldestIdx"] == 0
+    assert r["truncated"] is False
+    assert r["synced"] == 1
+
+
+@needs_node
+def test_loader_reports_false_on_session_switch_and_true_when_already_full():
+    switched = _run_loader(opts={"rejectIfStale": True}, during="switch")
+    assert switched["result"] is False
+    assert switched["oldestIdx"] == 6 and switched["synced"] == 0
+    full = _run_loader(opts={"rejectIfStale": True}, untruncated=True)
+    assert full["result"] is True
+    assert full["calls"] == 0
 
 
 # --------------------------------------------------------------------------- #

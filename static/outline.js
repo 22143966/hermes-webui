@@ -172,8 +172,13 @@ async function _jumpToFullSessionMessage(fullIdx, targetSid, query) {
   if (truncated && !(S.busy || S.activeStreamId) && typeof _ensureAllMessagesLoaded === 'function') {
     // Uncapped full-history load (msg_limit=all), not a larger tail window, so a
     // match near the start of a very long session is still reachable. It resets
-    // _oldestIdx to 0, making local == full for the translation below.
-    try { await _ensureAllMessagesLoaded(); } catch (_) { return false; }
+    // _oldestIdx to 0, making local == full for the translation below. Nobody
+    // asked for this load, so the user may send (or finish) a turn while it is
+    // out: rejectIfStale makes a late reply leave the live transcript alone,
+    // and the session then just stays open without the jump.
+    let loadedAll;
+    try { loadedAll = await _ensureAllMessagesLoaded({ rejectIfStale: true }); } catch (_) { return false; }
+    if (loadedAll === false) return false;
     if (!stillTarget()) return false;
     rerender = true;
   }
