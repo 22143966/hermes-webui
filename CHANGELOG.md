@@ -550,6 +550,8 @@
 
 ### Changed
 
+- **Keyboard and screen reader users can reach conversations in the sidebar directly.** Conversation titles are now real buttons (the open one is marked as the current page), the Chat label is a heading, and a keyboard-focused row shows a clear focus ring, including in forced-colours mode and the Geist Contrast skin. Focus stays on the same conversation when the list refreshes, J/K navigation keeps working after a mouse click, and opening a conversation closes any open project or model menu. On touch screens, the first tap on a tag filters by it, a long press on a tag still opens the conversation's actions, and a swipe that starts on a tag still swipes. (#7049, thanks @sheldon-im)
+
 - **Test suite: the run-journal echo-scan scaling check no longer flakes on a busy runner,** while still failing on a genuinely quadratic rebuild. Thanks @MuhammadUsamaMX. (#8328)
 
 - **Russian: the last English strings translated.** The Profiles explainer and the Transparent Stream timestamp setting now read in Russian. Thanks @RajPabnani03. (#8001)
