@@ -436,6 +436,7 @@ function syncTopbar() {{}}
 function syncWorkspacePanelState() {{}}
 async function renderSessionList() {{}}
 async function _finalizeComposerPrefillOnBoot() {{}}
+async function _applyPendingPanelIntent() {{}}
 function startGatewaySSE() {{}}
 {refresh_helper}
 async function run(session) {{
