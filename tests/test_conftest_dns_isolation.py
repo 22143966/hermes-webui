@@ -39,5 +39,11 @@ def test_ip_literals_and_localhost_still_resolve():
     assert socket.getaddrinfo(None, 80)
 
 
+def test_zero_padded_ipv4_literals_still_resolve():
+    # The resolver answers these without DNS and the connect guard allows them, so the DNS guard must too.
+    for host in ("127.000.000.001", "010.000.000.001", "169.254.000.001", "192.000.002.001"):
+        assert socket.getaddrinfo(host, 80), host
+
+
 def test_allow_outbound_network_restores_the_real_resolver(allow_outbound_network):
     assert (socket.getaddrinfo.__module__, socket.getaddrinfo.__name__) == ("socket", "getaddrinfo")

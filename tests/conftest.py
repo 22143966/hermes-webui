@@ -760,6 +760,12 @@ def _hermes_dns_free_host(host) -> bool:
         _ipaddress.ip_address(h.split("%", 1)[0])
         return True
     except ValueError:
+        if h.count(".") == 3 and all(c in "0123456789." for c in h):
+            try:
+                _hermes_test_socket.inet_aton(h)
+                return True
+            except OSError:
+                pass
         return False
 
 
