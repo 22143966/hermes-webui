@@ -315,6 +315,20 @@ class TestWrongOwnerIsDistinguishable:
             "a 409 conflict must not publish a sidecar"
         )
 
+    def test_profile_claim_without_all_profiles_keeps_the_404(self, two_profile_world):
+        """Maintainer fold (senior re-gate): ``profile`` without ``all_profiles`` is an active-profile archive.
+
+        It used to trigger the all-profiles owner probe and answer 409 naming the owner; master and the documented
+        contract answer 404 because the CLI lookup stays active-profile-only for unqualified requests.
+        """
+        status, payload = _archive(
+            two_profile_world,
+            {"session_id": "cli_bravo_only_0001", "archived": True, "profile": "alpha"},
+        )
+        assert status == 404, f"expected 404 for an active-profile archive of a foreign session, got {status} {payload!r}"
+        assert payload.get("profile") != "bravo", "an active-profile request must not name the owning profile"
+        assert not _sidecar_exists(two_profile_world, "cli_bravo_only_0001")
+
     def test_unknown_session_with_valid_scoped_request_is_404(self, two_profile_world):
         """A genuinely absent session keeps the 404 contract."""
         status, payload = _archive(

@@ -20018,7 +20018,9 @@ def handle_post(handler, parsed) -> bool:
                 # session: the resolver above prefilters a mismatched owner to
                 # ``{}``, so without this probe the caller cannot tell
                 # "wrong profile" from "no such session" and both answered 404.
-                if _arch_profile:
+                # Only an all-profiles request may probe other profiles: a request that carries ``profile`` without
+                # ``all_profiles`` is an active-profile archive and keeps master's 404 for a foreign session.
+                if _arch_allow_all and _arch_profile:
                     _owner_meta = _lookup_cli_session_metadata(sid, all_profiles=True)
                     _owner_profile = (_owner_meta or {}).get("profile")
                     if _owner_profile and not _profiles_match(_owner_profile, _arch_profile):
