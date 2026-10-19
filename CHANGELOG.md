@@ -82,6 +82,8 @@
 
 ### Fixed
 
+- **Tool calls without a result no longer break a conversation.** An assistant tool call whose result never arrived (an interrupted run, a crash between call and result) is now repaired the same way the Agent repairs it, so the next reply stays in the saved model context instead of being dropped, including when an older tool call had empty or broken arguments. (#7237, thanks @happy5318)
+
 - **Test suite: the mobile camera-choice test no longer fails in full runs.** `test_issue6942_mobile_camera_choice_render` started its own server with the shared test server's config path, so after earlier tests configured a provider there it auto-completed and saved onboarding, and later browser contexts skipped the request the test waited for. The test's server now uses its own config and workspace. Test-only. (PR #8382)
 
 - **Composer menus stay open when the on-screen keyboard opens on tablets.** On tablets and foldables, typing in the model picker's search box no longer snaps the model, reasoning or workspace menu shut. They close only on a real switch between phone and desktop layouts, or when the composer collapses into its compact menu. Thanks @jatinbharadia. (#7472)
