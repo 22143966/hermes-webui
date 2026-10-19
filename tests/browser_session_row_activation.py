@@ -848,6 +848,23 @@ def _check_touch(page, ctx, seed, label, phone):
             fail(f"a tap on a tag opened {_opens(page)}")
         if page.evaluate("() => !!document.querySelector('.session-action-menu')"):
             fail("a tap on a tag opened the action menu")
+        # A short swipe that starts on the tag is a drag: it opens nothing and leaves the row in place.
+        page.evaluate(CLEAR_SEARCH_JS)
+        page.wait_for_timeout(300)
+        page.evaluate(COUNT_OPENS_JS)
+        _native_short_swipe(cdp, tag.bounding_box())
+        page.wait_for_timeout(SETTLE_MS)
+        if _opens(page):
+            fail(f"a short swipe starting on a tag opened {_opens(page)}")
+        shifted = page.evaluate("""(sid) => {
+          const row = document.querySelector('#sessionList .session-item[data-sid="' + sid + '"]');
+          if (!row) return 'no row';
+          const off = row.style.getPropertyValue('--session-swipe-offset').trim();
+          const swiping = ['swiping-right', 'swiping-left', 'swipe-committed'].filter(c => row.classList.contains(c));
+          return (off && off !== '0px') || swiping.length ? (off + ' ' + swiping.join(' ')).trim() : '';
+        }""", delta)
+        if shifted:
+            fail(f"a short swipe starting on a tag left the row shifted ({shifted})")
     page.evaluate(CLEAR_SEARCH_JS)
     page.wait_for_timeout(300)
 

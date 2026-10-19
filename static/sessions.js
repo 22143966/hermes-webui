@@ -10998,7 +10998,7 @@ function renderSessionListFromCache(){
       _commitSessionSwipe();
       if(_longPressMenuOpened){_gestureState='idle';return true;}
       // A tag tap filters (the chip's own click handler) and never opens the conversation.
-      if(target&&target.closest&&target.closest('.session-tag')){_gestureState='idle';return false;}
+      if(_gestureState==='pressing'&&target&&target.closest&&target.closest('.session-tag')){_gestureState='idle';return false;}
       if(_gestureState==='committed') return true;
       if(_sessionActionMenu&&!_sessionActionMenu.contains(target)){
         closeSessionActionMenu();
