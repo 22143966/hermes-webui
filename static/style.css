@@ -6424,7 +6424,7 @@ body code[class*="language-"],body pre[class*="language-"],body pre code[class*=
   }
   :root.dark {
     --message-landing-tint: color-mix(in srgb, var(--accent) 16%, transparent);
-    --message-landing-ring: color-mix(in srgb, var(--accent) 50%, transparent);
+    --message-landing-ring: color-mix(in srgb, var(--accent) 70%, transparent);
   }
 }
 /* A jump lands an assistant segment at the top edge; leave room for the ring. */

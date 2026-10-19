@@ -194,7 +194,7 @@ def test_landing_cue_tokens_derive_from_accent_with_fallbacks():
     assert "--message-landing-ring: var(--accent);" in block
     dark = block[block.index(":root.dark {"):]
     assert "--message-landing-tint: color-mix(in srgb, var(--accent) 16%, transparent);" in dark
-    assert "--message-landing-ring: color-mix(in srgb, var(--accent) 50%, transparent);" in dark
+    assert "--message-landing-ring: color-mix(in srgb, var(--accent) 70%, transparent);" in dark
     pulse = re.search(r"@keyframes question-highlight-pulse \{([^@]*?)\n\}", STYLE_CSS).group(1)
     assert "var(--message-landing-ring)" in pulse and "--focus-ring" not in pulse
 
