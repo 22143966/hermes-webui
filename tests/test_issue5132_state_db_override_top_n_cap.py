@@ -623,3 +623,215 @@ def test_none_and_non_positive_cap_are_fully_compatible(monkeypatch):
         models._apply_sidebar_state_db_overrides(_grown_sessions(10))
         assert len(reconciled) == 10, f"cap={cap} must not bound a 10-row list"
 
+
+# --- capped-out fallback invariants (#7882 cap follow-up) -------------------------
+#
+# The reconciled walk is the authority for a row inside the window. Outside it,
+# two cases used to over-count or under-count because the fallback only did raw
+# delta arithmetic:
+#
+#   * an eagerly checkpointed hidden wakeup is ALREADY excluded by the sidecar's
+#     visible count, so discounting it again undercounts the visible reply;
+#   * a truncated sidecar plus append-only state.db rows re-credits the removed
+#     suffix, because state.db has no truncation metadata to refute the shrink.
+#
+# Both are pinned here at the production function boundary (real
+# ``_apply_sidebar_state_db_override_metadata``, storage-shaped metadata).
+
+
+def _capped_filler(rows, *, cap):
+    """Fillers that own the pre-filter window, plus the row under test last."""
+    sessions = _grown_sessions(rows)
+    for index, row in enumerate(sessions):
+        row["message_count"] = 3
+        row["visible_message_count"] = 3
+        row["actual_message_count"] = 3
+        row["last_message_at"] = 10_000.0 - index
+        row["updated_at"] = 10_000.0 - index
+    return sessions
+
+
+def _capped_metadata(sessions, target, *, count, last):
+    metadata = {}
+    for row in sessions:
+        sid = row["session_id"]
+        metadata[sid] = {
+            "_state_db_source": "webui",
+            "_state_db_message_count": row["message_count"],
+            "_state_db_last_message_at": row["last_message_at"],
+        }
+    metadata[target]["_state_db_message_count"] = count
+    metadata[target]["_state_db_last_message_at"] = last
+    return metadata
+
+
+def _apply_with_fallback(monkeypatch, sessions, metadata, *, cap):
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", str(cap))
+    reconciled = []
+
+    def _fake_reconciled(session_id):
+        reconciled.append(str(session_id))
+        return None
+
+    monkeypatch.setattr(models, "_reconciled_visible_count_for_sidebar", _fake_reconciled)
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
+    models._apply_sidebar_state_db_overrides(sessions)
+    return reconciled
+
+
+def _wakeup_row(**extra):
+    row = {
+        "session_id": "WAKEUP",
+        "message_count": 2,
+        "visible_message_count": 2,
+        "actual_message_count": 2,
+        "last_message_at": 1.0,
+        "updated_at": 1.0,
+        "pending_user_message": "handoff",
+        "pending_user_source": "delegation_wakeup",
+    }
+    row.update(extra)
+    return row
+
+
+def test_capped_out_hidden_wakeup_already_in_sidecar_is_not_double_discounted(monkeypatch):
+    """Eager checkpoint: the sidecar already holds AND excludes the hidden row.
+
+    The pending hidden row is materialised in the sidecar, so ``current_visible``
+    already excludes it. Only the assistant reply since the last save shows up in
+    the state.db delta; the hidden row must not be discounted a second time.
+    """
+    sessions = _capped_filler(3, cap=2)
+    sessions.append(
+        _wakeup_row(
+            messages=[
+                {"role": "user", "content": "handoff", "_source": "delegation_wakeup"},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "reply"},
+            ]
+        )
+    )
+    metadata = _capped_metadata(sessions, "WAKEUP", count=3, last=20_000.0)
+    reconciled = _apply_with_fallback(monkeypatch, sessions, metadata, cap=2)
+
+    row = sessions[-1]
+    assert "WAKEUP" not in reconciled, "the target sits outside the cap window"
+    assert row["visible_message_count"] == 3, (
+        "2 visible in the sidecar + 1 visible reply; the materialised hidden row "
+        "must not be discounted a second time"
+    )
+    assert "messages" not in row, "the overlay must not leave the transcript on the row"
+
+
+def test_capped_out_hidden_wakeup_absent_from_sidecar_still_discounted(monkeypatch):
+    """Deferred case: the hidden row exists only in state.db, so it is still owed."""
+    sessions = _capped_filler(3, cap=2)
+    sessions.append(_wakeup_row(messages=[{"role": "assistant", "content": "done"}]))
+    metadata = _capped_metadata(sessions, "WAKEUP", count=3, last=20_000.0)
+    _apply_with_fallback(monkeypatch, sessions, metadata, cap=2)
+
+    row = sessions[-1]
+    assert row["visible_message_count"] == 2, (
+        "an unmaterialised hidden wakeup keeps its visible-count discount"
+    )
+
+
+def test_capped_out_truncated_sidecar_does_not_credit_the_removed_suffix(monkeypatch):
+    """state.db is append-only; a truncated sidecar still refutes its own suffix."""
+    sessions = _capped_filler(3, cap=2)
+    sessions.append(
+        {
+            "session_id": "TRUNC",
+            "message_count": 2,
+            "visible_message_count": 2,
+            "actual_message_count": 4,
+            "last_message_at": 5.0,
+            "updated_at": 5.0,
+            "truncation_boundary": 3.0,
+        }
+    )
+    metadata = _capped_metadata(sessions, "TRUNC", count=4, last=30_000.0)
+    reconciled = _apply_with_fallback(monkeypatch, sessions, metadata, cap=2)
+
+    row = sessions[-1]
+    assert "TRUNC" not in reconciled
+    assert row["visible_message_count"] == 2, (
+        "the removed suffix must not be re-credited from append-only state.db rows"
+    )
+    assert row["message_count"] == 4, (
+        "raw growth stays state.db-authoritative; only the visible count is refuted"
+    )
+
+
+def test_truncated_sidecar_without_growth_is_unchanged(monkeypatch):
+    """A truncation boundary alone must not shrink an already-correct row."""
+    sessions = _capped_filler(3, cap=2)
+    sessions.append(
+        {
+            "session_id": "TRUNC2",
+            "message_count": 4,
+            "visible_message_count": 2,
+            "actual_message_count": 4,
+            "last_message_at": 5000.0,
+            "updated_at": 5000.0,
+            "truncation_boundary": 3.0,
+        }
+    )
+    metadata = _capped_metadata(sessions, "TRUNC2", count=4, last=5000.0)
+    _apply_with_fallback(monkeypatch, sessions, metadata, cap=2)
+
+    assert sessions[-1]["visible_message_count"] == 2
+
+
+def test_in_window_row_still_uses_the_reconciled_walk(monkeypatch):
+    """Truncation metadata never overrides the reconciled walk inside the window."""
+    sessions = _capped_filler(1, cap=2)
+    sessions.append(
+        {
+            "session_id": "INSIDE",
+            "message_count": 2,
+            "visible_message_count": 2,
+            "actual_message_count": 2,
+            "last_message_at": 1.0,
+            "updated_at": 1.0,
+            "truncation_boundary": 3.0,
+        }
+    )
+    metadata = _capped_metadata(sessions, "INSIDE", count=4, last=20_000.0)
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "2")
+    seen = []
+
+    def _fake_reconciled(session_id):
+        seen.append(str(session_id))
+        return 3
+
+    monkeypatch.setattr(models, "_reconciled_visible_count_for_sidebar", _fake_reconciled)
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    assert "INSIDE" in seen, "a row inside the window still pays the authoritative walk"
+    assert sessions[-1]["visible_message_count"] == 3
+
+
+# --- shrink authority rides the metadata prefix ----------------------------------
+
+
+def test_metadata_prefix_carries_the_truncation_boundary():
+    """The capped-out branch only sees the metadata prefix, so it must carry it."""
+    import inspect
+
+    src = inspect.getsource(models.Session.compact)
+    assert "truncation_boundary" in src, (
+        "compact() must emit truncation_boundary or the capped-out fallback "
+        "cannot honour a persisted truncation"
+    )

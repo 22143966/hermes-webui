@@ -1634,6 +1634,10 @@ _SIDEBAR_HEAVY_METADATA_FIELDS = (
     'composer_draft',
     'process_wakeup_pause',
     'share_token',
+    # The overlay reads this one to decide whether a pending hidden wakeup is
+    # already materialised in the sidecar (#7882 cap follow-up), so the sidebar
+    # payload cannot drop the transcript before that check runs.
+    'messages',
 )
 
 
@@ -2479,6 +2483,11 @@ class Session:
             'last_message_at': last_message_at,
             'transcript_generation': self.transcript_generation,
             'transcript_generation_baseline': self.transcript_generation_baseline,
+            # A capped-out sidebar row cannot afford the reconciled walk, so
+            # the overlay needs the sidecar's own shrink authority from the
+            # metadata prefix: a truncated sidecar plus append-only state.db
+            # rows must not re-credit the removed suffix (#7882 cap follow-up).
+            **({'truncation_boundary': self.truncation_boundary} if self.truncation_boundary else {}),
             'pinned': self.pinned,
             'archived': self.archived,
             'project_id': self.project_id,
@@ -8197,6 +8206,23 @@ def _apply_sidebar_state_db_override_metadata(
                     pending_source = str(
                         session.get('pending_user_source') or ''
                     ).strip().lower()
+                    # A pending hidden wakeup is only owed a visible-count
+                    # discount when it did NOT materialise in the sidecar. An
+                    # eager checkpoint already wrote (and excluded) the row, so
+                    # the sidecar's own visible count reflects it; discounting
+                    # again when the visible reply lands undercounts by one.
+                    pending_hidden_materialized = (
+                        pending_source == 'delegation_wakeup'
+                        and _pending_hidden_row_materialized(session)
+                    )
+                    # The sidebar payload strips the compact transcript right
+                    # after the overlay (#7882 cap follow-up: only the hidden
+                    # materialisation check above needs it).
+                    session.pop('messages', None)
+                    # Shrink authority for the capped-out branch: the sidecar
+                    # metadata prefix carries the truncation boundary (state.db
+                    # is append-only and cannot refute it).
+                    truncation_boundary = session.get('truncation_boundary') or 0
                     # #7882 re-gate round-3 must-fix 2: derive the visible
                     # total from the reconciled, provenance-stamped rows for
                     # the owning profile instead of delta arithmetic. The
@@ -8233,13 +8259,39 @@ def _apply_sidebar_state_db_override_metadata(
                         )
                     else:
                         # The outer guard already ensures state_count > current_count.
-                        hidden_pending_delta = 1 if pending_source == 'delegation_wakeup' else 0
+                        #
+                        # Two cheap invariants keep the fallback honest without
+                        # the reconciled walk:
+                        #
+                        # 1. A hidden row the sidecar ALREADY materialised (an
+                        #    eager-checkpointed delegation wakeup) is already
+                        #    discounted by ``current_visible``; subtracting it
+                        #    again when the delta is the visible reply
+                        #    undercounts. Only a hidden row that produced no
+                        #    sidecar message is still owed a discount.
+                        # 2. A truncated sidecar is authoritative for its own
+                        #    shrink: append-only state.db rows must not
+                        #    re-credit a removed suffix. With a truncation
+                        #    boundary the delta is not evidence of visible
+                        #    growth at all.
+                        #    state.db carries no truncation metadata, so this
+                        #    branch never credits growth the sidecar refutes.
+                        if truncation_boundary:
+                            hidden_pending_delta = 0
+                            growth = 0
+                        else:
+                            hidden_pending_delta = (
+                                1
+                                if pending_source == 'delegation_wakeup'
+                                and not pending_hidden_materialized
+                                else 0
+                            )
+                            growth = max(0, state_count - current_count - hidden_pending_delta)
                         session['visible_message_count'] = min(
                             state_count,
                             max(
                                 current_visible,
-                                current_visible
-                                + max(0, state_count - current_count - hidden_pending_delta),
+                                current_visible + growth,
                             ),
                         )
         title = session.get('title')
@@ -12210,6 +12262,43 @@ def _native_image_leading_text(message):
             return None
         parts.append(text)
     return None
+
+
+def _pending_hidden_row_materialized(session) -> bool:
+    """True when the sidecar already holds the pending hidden wakeup row.
+
+    The eager-save checkpoint writes the delegation wakeup user turn into the
+    sidecar BEFORE streaming starts, stamped with ``_source`` (and
+    ``_active_turn_token``) by ``_checkpoint_user_message_for_eager_session_save``.
+    In that case ``visible_message_count`` in the sidebar metadata already
+    discounts the row, so the overlay's raw-delta fallback must not subtract it
+    a second time. Without the checkpoint the row exists only in state.db and
+    the discount is still owed.
+
+    Reads the metadata-only payload's ``messages`` list when present (the
+    caller builds sidebar rows from ``to_dict(sidebar_metadata_only=True)``,
+    which keeps a compact transcript). An absent transcript is treated as "not
+    materialized": the discount is the conservative anti-resurrection branch.
+    """
+    if not isinstance(session, dict):
+        return False
+    messages = session.get('messages')
+    if not isinstance(messages, list) or not messages:
+        return False
+    pending_text = ' '.join(str(session.get('pending_user_message') or '').split())
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if not is_hidden_transcript_row(message):
+            continue
+        if str(message.get('_source') or '').strip().lower() != 'delegation_wakeup':
+            continue
+        if pending_text:
+            content = ' '.join(str(message.get('content') or '').split())
+            if content != pending_text:
+                continue
+        return True
+    return False
 
 
 def _stamp_pending_source_for_display(session, state_messages):
