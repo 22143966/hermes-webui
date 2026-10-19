@@ -8167,12 +8167,34 @@ def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
     concurrent poll (#5132). The cap is env-configurable and fails open; rows
     beyond it keep their JSON message-count/last-message until the history panel
     opens (lazily corrected, exactly as with the lineage cap #4638).
+
+    Three cost tiers, default limits and their reasons:
+
+    * ``message-latest`` — the ``sessions.message_count`` column plus the
+      ``messages`` ``GROUP BY`` that yields the latest timestamp — runs for the
+      top ``HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N`` rows (default ``300``, the
+      documented and previously shipped value). It decides which rows are
+      recent at all, so shrinking it to a smaller paint window silently froze
+      the sort order of settled conversations.
+    * ``reconcile`` — the transcript walk, the measured 1.5 s-per-board cost,
+      runs for the top ``HERMES_WEBUI_STATE_DB_OVERRIDE_RECONCILE_TOP_N`` rows
+      (default ``60``), plus any row carrying a truncation boundary (its
+      visible count is only authoritative when re-walked). A row outside it
+      falls back to the cheap raw-delta arithmetic, never to a fabricated total.
+    * everything else (source/title, the cheap count/timestamp repair, the
+      hidden-row discount) runs for every row.
     """
     import os as _os
     try:
-        _cap = int(_os.environ.get("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "60"))
+        _cap = int(_os.environ.get("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "300"))
     except (TypeError, ValueError):
-        _cap = 60
+        _cap = 300
+    try:
+        _reconcile_cap = int(
+            _os.environ.get("HERMES_WEBUI_STATE_DB_OVERRIDE_RECONCILE_TOP_N", "60")
+        )
+    except (TypeError, ValueError):
+        _reconcile_cap = 60
     all_ids = {str(s.get('session_id')) for s in sessions if s.get('session_id')}
     if _cap > 0 and len(sessions) > _cap:
         count_ids = {str(s.get('session_id')) for s in sessions[:_cap] if s.get('session_id')}
@@ -8186,17 +8208,42 @@ def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
         )
     except Exception:
         return
-    _apply_sidebar_state_db_override_metadata(sessions, metadata, count_ids)
+    _apply_sidebar_state_db_override_metadata(
+        sessions, metadata, count_ids, reconcile_cap=_reconcile_cap
+    )
 
 
 def _apply_sidebar_state_db_override_metadata(
     sessions: list[dict],
     metadata: dict[str, dict],
     count_session_ids: set[str] | None = None,
+    reconcile_cap: int | None = None,
 ) -> None:
-    # ``count_session_ids`` bounds the per-row transcript reconciliation to the
-    # top-N rows (None = no cap). Metadata-only overrides still apply to every
-    # row: they are free and the sidebar source filter depends on them.
+    # ``count_session_ids`` bounds the SQL count/timestamp tier to the top-N
+    # rows (None = no cap). ``reconcile_cap`` bounds the transcript walk to a
+    # smaller top-N window (None/0 = no extra bound, every counted row walks):
+    # the walk is the expensive part, the SQL tier is not. Metadata-only
+    # overrides still apply to every row: they are free and the sidebar source
+    # filter depends on them.
+    reconcile_ids = count_session_ids
+    if reconcile_cap is not None and reconcile_cap > 0:
+        selected = {str(s.get('session_id')) for s in sessions[:reconcile_cap] if s.get('session_id')}
+        reconcile_ids = selected if count_session_ids is None else (selected & count_session_ids)
+    memo_token = _SIDEBAR_RECONCILE_MEMO.set({})
+    try:
+        _apply_sidebar_state_db_override_rows(
+            sessions, metadata, count_session_ids, reconcile_ids
+        )
+    finally:
+        _SIDEBAR_RECONCILE_MEMO.reset(memo_token)
+
+
+def _apply_sidebar_state_db_override_rows(
+    sessions: list[dict],
+    metadata: dict[str, dict],
+    count_session_ids: set[str] | None,
+    reconcile_ids: set[str] | None,
+) -> None:
     for session in sessions:
         sid = session.get('session_id')
         if sid not in metadata:
@@ -8267,8 +8314,23 @@ def _apply_sidebar_state_db_override_metadata(
             # Only the transcript reconciliation is expensive (one full
             # sidecar+state.db merge per grown row: measured 98 rows x 0.19 s
             # = 18.8 s of a 20 s build, 307k _cached_message_key calls), so
-            # only that call is bounded by ``count_session_ids``.
-            if state_count > current_count and (state_last <= 0 or state_last > current_last):
+            # only that call is bounded by ``reconcile_ids``.
+            latest_replaceable = (
+                state_last > 0
+                and state_count >= current_count
+                and state_last > current_last
+            )
+            if latest_replaceable and state_count <= current_count:
+                try:
+                    existing_actual = max(0, int(session.get('actual_message_count') or 0))
+                except (TypeError, ValueError):
+                    existing_actual = 0
+                session['actual_message_count'] = max(state_count, existing_actual)
+                session['last_message_at'] = float(state_last)
+                session['updated_at'] = max(
+                    float(session.get('updated_at') or 0), float(state_last)
+                )
+            if state_count > current_count:
                 try:
                     existing_actual = max(0, int(session.get('actual_message_count') or 0))
                 except (TypeError, ValueError):
@@ -8335,19 +8397,30 @@ def _apply_sidebar_state_db_override_metadata(
                     # remains the fallback when rows can't be read.
                     #
                     # This walk is the ONLY expensive part of the overlay, so
-                    # it is the only part bounded by ``count_session_ids``.
-                    # Outside the window the raw-delta fallback runs instead:
-                    # it still credits the cheap raw growth (so a first-append
-                    # cross-surface row becomes visible rather than staying at
-                    # zero) and it keeps the delegation-wakeup hidden-row
-                    # discount, so no hidden row is resurrected. The bounded
-                    # oracle is unchanged: at most N merges per build.
+                    # it is bounded by ``reconcile_ids`` (the top-N paint window
+                    # plus every truncation-bearing row, whose authoritative
+                    # count only exists inside the walk). Outside it the
+                    # raw-delta fallback runs instead: it still credits the
+                    # cheap raw growth (so a first-append cross-surface row
+                    # becomes visible rather than staying at zero) and it keeps
+                    # the delegation-wakeup hidden-row discount, so no hidden
+                    # row is resurrected. The bounded oracle therefore stays at
+                    # N merges per build, and the memo makes the second poll on
+                    # a settled board free for every row it did walk.
                     in_reconcile_window = (
-                        count_session_ids is None or str(sid) in count_session_ids
+                        reconcile_ids is None
+                        or str(sid) in reconcile_ids
+                        or bool(truncation_boundary)
                     )
                     reconciled_visible = (
                         _reconciled_visible_count_for_sidebar(
-                            session.get('session_id')
+                            session.get('session_id'),
+                            expected_state_count=state_count,
+                            expected_last_message_at=state_last or None,
+                            fresh_if_unchanged_state_count=(
+                                current_count,
+                                current_visible,
+                            ),
                         )
                         if in_reconcile_window
                         else None
@@ -12073,7 +12146,24 @@ def get_state_db_regeneration_tail_snapshot(
         return None
 
 
-def _reconciled_visible_count_for_sidebar(sid) -> int | None:
+# Per-call memo for the sidebar transcript reconciliation (#8368). The overlay
+# walks the sidecar+state.db transcript of every grown row, and a settled board
+# whose state.db has stopped advancing used to pay one 1.5 s walk per poll for
+# the same answer. Each ``_apply_sidebar_state_db_overrides`` call sets a fresh
+# token here, so a memo entry can never outlive the request that created it:
+# key ``(session_id, state.db message count)`` -> reconciled visible count.
+_SIDEBAR_RECONCILE_MEMO: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    'sidebar_reconcile_memo', default=None
+)
+
+
+def _reconciled_visible_count_for_sidebar(
+    sid,
+    *,
+    expected_state_count: int | None = None,
+    expected_last_message_at: float | None = None,
+    fresh_if_unchanged_state_count: tuple[int, int] | None = None,
+) -> int | None:
     """Count visible rows in the reconciled sidecar+state.db transcript.
 
     The sidebar growth overlay's authority for ``visible_message_count``
@@ -12093,6 +12183,23 @@ def _reconciled_visible_count_for_sidebar(sid) -> int | None:
     single session being overlaid (the growth guard already limits this to
     rows whose count actually advanced), not a full transcript walk per
     sidebar poll.
+
+    Two optional bounds keep that per-poll cost bounded across a whole board
+    without letting a caller outside the transcript window pay it:
+
+    * ``expected_state_count`` / ``expected_last_message_at``: the overlay
+      already read both columns from the ``sessions`` table. A transcript that
+      answers a different pair is a different revision (a tool row landed
+      between the two reads), so the walk is refused (``None``) instead of
+      stamping a visible count that disagrees with the raw count it is clamped
+      by. Unknown expectations skip the check, they never fail it.
+    * ``fresh_if_unchanged_state_count`` = ``(previous_state_count,
+      previous_visible_count)``: while state.db has not advanced past
+      ``previous_state_count``, the previously reconciled visible count still
+      holds, so the read and the merge are skipped and that value is returned
+      at the cost of one metadata-only load. The memo lives only for this call
+      of the overlay (:data:`_SIDEBAR_RECONCILE_MEMO`), so it cannot go stale
+      across polls.
     """
     if not sid:
         return None
@@ -12113,6 +12220,24 @@ def _reconciled_visible_count_for_sidebar(sid) -> int | None:
         sidecar_messages = list(getattr(session, 'messages', None) or [])
     except Exception:
         return None
+    if fresh_if_unchanged_state_count is not None:
+        # The sidecar was read: a settled transcript whose state.db append
+        # already happened before the save needs no second walk this poll.
+        try:
+            previous_state_count, previous_visible_count = fresh_if_unchanged_state_count
+            memo_state_count = int(previous_state_count)
+            memo_visible_count = int(previous_visible_count)
+        except (TypeError, ValueError):
+            pass
+        else:
+            memo = _SIDEBAR_RECONCILE_MEMO.get()
+            memo_key = (str(sid), memo_state_count)
+            if (
+                isinstance(memo, dict)
+                and memo_visible_count >= 0
+                and memo.get(memo_key) == memo_visible_count
+            ):
+                return memo_visible_count
     try:
         state_messages = get_state_db_session_messages(
             str(sid),
@@ -12138,6 +12263,23 @@ def _reconciled_visible_count_for_sidebar(sid) -> int | None:
         return None
     if not sidecar_messages and not state_messages:
         return None
+    if expected_state_count is not None or expected_last_message_at is not None:
+        built_count, built_last = _state_db_shape_of_messages(state_messages)
+        if (
+            expected_state_count is not None
+            and built_count is not None
+            and built_count != expected_state_count
+        ):
+            # The transcript moved between the overlay's SQL read and this
+            # detailed read: its visible count no longer describes the row the
+            # caller is overlaying.
+            return None
+        if (
+            expected_last_message_at is not None
+            and built_last is not None
+            and float(built_last) > float(expected_last_message_at) + 0.000001
+        ):
+            return None
     try:
         stamped = _stamp_pending_source_for_display(session, state_messages)
     except Exception:
@@ -12157,10 +12299,88 @@ def _reconciled_visible_count_for_sidebar(sid) -> int | None:
         return None
     if not merged:
         return None
-    return sum(
+    visible = sum(
         1 for m in merged
         if isinstance(m, dict) and not is_hidden_transcript_row(m)
     )
+    boundary = getattr(session, 'truncation_boundary', None)
+    if not sidecar_messages and _boundary_lies_above_every_state_row(boundary, state_messages):
+        # Truncated session with an empty sidecar, and every state.db row sits
+        # BELOW the cutoff: none of them is the removed suffix. The sidecar is
+        # what keeps the rows this turn owns, and on this shape it keeps none —
+        # so the transcript this session will render starts past the cutoff, and
+        # the rows below it are rows the user already deleted.
+        boundary_ts = _message_exact_timestamp_details({'timestamp': boundary})[0]
+        kept = sum(
+            1 for m in merged
+            if isinstance(m, dict)
+            and not is_hidden_transcript_row(m)
+            and (_message_exact_timestamp_details(m)[0] or 0) > boundary_ts
+        )
+        visible = min(visible, kept)
+    memo = _SIDEBAR_RECONCILE_MEMO.get()
+    if isinstance(memo, dict):
+        # Remember the answer under the revision it was derived from, so the
+        # next poll on this board can skip the walk while state.db is unchanged.
+        built_count, _built_last = _state_db_shape_of_messages(state_messages)
+        if built_count is not None:
+            memo[(str(sid), int(built_count))] = visible
+    return visible
+
+
+def _boundary_lies_above_every_state_row(boundary, state_messages) -> bool:
+    """True when *boundary* is older than every timestamped state.db row.
+
+    The merge can only refute a state.db row against the cutoff when the
+    sidecar has rows to anchor it (it compares the cutoff with the sidecar's
+    newest timestamp). With an empty sidecar that anchor is missing, so this
+    answers whether there is any row left to refute at all: if the cutoff sits
+    below every row, none of them is the removed suffix.
+    """
+    boundary_ts, boundary_valid = _message_exact_timestamp_details(
+        {'timestamp': boundary}
+    )
+    if not boundary_valid or boundary_ts is None or boundary_ts <= 0:
+        return False
+    oldest = None
+    for message in state_messages or []:
+        if not isinstance(message, dict):
+            continue
+        timestamp, valid = _message_exact_timestamp_details(message)
+        if not valid or timestamp is None:
+            continue
+        if oldest is None or timestamp < oldest:
+            oldest = timestamp
+    return oldest is not None and boundary_ts < oldest
+
+
+def _state_db_shape_of_messages(messages) -> tuple[int | None, float | None]:
+    """``(count, max timestamp)`` of freshly read state.db rows, as SQL sees it.
+
+    The overlay reads both columns in one GROUP BY; the detailed read below
+    fetches the same rows through a different path. Comparing the two refuses a
+    visible count derived from a revision the caller did not overlay. Unknown
+    values (no timestamp column, unparseable timestamp) answer ``None``, which
+    makes the caller skip the check rather than fail it.
+    """
+    if not isinstance(messages, list):
+        return None, None
+    last_at = None
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        raw = message.get('_ts')
+        if raw is None:
+            raw = message.get('timestamp')
+        try:
+            candidate = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            continue
+        if candidate is None or not math.isfinite(candidate):
+            continue
+        if last_at is None or candidate > last_at:
+            last_at = candidate
+    return len(messages), last_at
 
 
 def get_state_db_session_summary(sid, *, profile=None) -> dict:

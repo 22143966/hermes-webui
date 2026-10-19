@@ -64,12 +64,14 @@ def test_source_classification_is_never_capped(monkeypatch):
     )
 
 
-def test_count_aggregation_capped_to_top_n_default_60(monkeypatch):
+def test_count_aggregation_capped_to_top_n_default_300(monkeypatch):
     seen = _capture_probed_ids(monkeypatch)
     monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", raising=False)
     models._apply_sidebar_state_db_overrides(_sessions(1000))
-    assert seen["count_ids"] == {f"s{i}" for i in range(60)}, (
-        "The expensive message-count aggregation must be capped to the top-60"
+    assert seen["count_ids"] == {f"s{i}" for i in range(300)}, (
+        "The message-count/latest-timestamp aggregation keeps the documented "
+        "top-300 default: shrinking it to the paint window froze the sort "
+        "order of settled conversations past the window"
     )
 
 
@@ -97,9 +99,28 @@ def test_unparseable_cap_falls_back_to_default(monkeypatch):
     seen = _capture_probed_ids(monkeypatch)
     monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "not-a-number")
     models._apply_sidebar_state_db_overrides(_sessions(1000))
-    assert seen["count_ids"] == {f"s{i}" for i in range(60)}, (
-        "An unparseable cap must fall back to the default 60, not crash"
+    assert seen["count_ids"] == {f"s{i}" for i in range(300)}, (
+        "An unparseable cap must fall back to the default 300, not crash"
     )
+
+
+def test_reconcile_tier_default_is_sixty(monkeypatch):
+    """The transcript walk keeps its own, smaller window: it is the real cost."""
+    monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_RECONCILE_TOP_N", raising=False)
+    reconciled = _capture_reconciled_ids(monkeypatch, 1000)
+    models._apply_sidebar_state_db_overrides(_grown_sessions(1000))
+    assert sorted(reconciled) == sorted(f"s{i}" for i in range(60)), (
+        "only the top-60 grown rows may pay the transcript merge"
+    )
+
+
+def test_reconcile_tier_is_env_configurable(monkeypatch):
+    monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", raising=False)
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_RECONCILE_TOP_N", "5")
+    reconciled = _capture_reconciled_ids(monkeypatch, 20)
+    models._apply_sidebar_state_db_overrides(_grown_sessions(20))
+    assert sorted(reconciled) == sorted(f"s{i}" for i in range(5))
 
 
 def test_list_under_cap_counts_everything(monkeypatch):
@@ -229,7 +250,7 @@ def _capture_reconciled_ids(monkeypatch, n):
     """Patch the expensive per-row merge and record which session ids it was asked for."""
     reconciled: list[str] = []
 
-    def _fake_reconciled(session_id):
+    def _fake_reconciled(session_id, **_bounds):
         reconciled.append(str(session_id))
         return None
 
@@ -333,7 +354,7 @@ def _first_append_sessions(fillers, *, archived_fillers=False):
 def _patch_first_append(monkeypatch, sessions, *, reconciled_visible=1):
     reconciled = []
 
-    def _fake_reconciled(session_id):
+    def _fake_reconciled(session_id, **_bounds):
         reconciled.append(str(session_id))
         return reconciled_visible
 
@@ -518,7 +539,7 @@ def test_source_correction_still_applies_beyond_cap(monkeypatch):
         entry["_state_db_session_source"] = "webui"
         entry["_state_db_source_label"] = "WebUI"
     monkeypatch.setattr(
-        models, "_reconciled_visible_count_for_sidebar", lambda sid: None
+        models, "_reconciled_visible_count_for_sidebar", lambda sid, **_bounds: None
     )
     monkeypatch.setattr(
         models,
@@ -547,7 +568,7 @@ def test_foreign_source_rows_keep_their_own_flags(monkeypatch):
     metadata = _grown_metadata(3)
     metadata["s2"]["_state_db_source"] = "cli"
     monkeypatch.setattr(
-        models, "_reconciled_visible_count_for_sidebar", lambda sid: None
+        models, "_reconciled_visible_count_for_sidebar", lambda sid, **_bounds: None
     )
     monkeypatch.setattr(
         models,
@@ -572,7 +593,7 @@ def test_actual_count_never_regresses_through_the_fallback(monkeypatch):
     sessions = _grown_sessions(3)
     sessions[2]["actual_message_count"] = 9
     monkeypatch.setattr(
-        models, "_reconciled_visible_count_for_sidebar", lambda sid: None
+        models, "_reconciled_visible_count_for_sidebar", lambda sid, **_bounds: None
     )
     monkeypatch.setattr(
         models,
@@ -597,7 +618,7 @@ def test_visible_count_never_exceeds_raw_count(monkeypatch):
     for entry in metadata.values():
         entry["_state_db_message_count"] = 4
     monkeypatch.setattr(
-        models, "_reconciled_visible_count_for_sidebar", lambda sid: None
+        models, "_reconciled_visible_count_for_sidebar", lambda sid, **_bounds: None
     )
     monkeypatch.setattr(
         models,
@@ -669,7 +690,7 @@ def _apply_with_fallback(monkeypatch, sessions, metadata, *, cap):
     monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", str(cap))
     reconciled = []
 
-    def _fake_reconciled(session_id):
+    def _fake_reconciled(session_id, **_bounds):
         reconciled.append(str(session_id))
         return None
 
@@ -803,7 +824,10 @@ def test_capped_out_truncated_sidecar_does_not_credit_the_removed_suffix(monkeyp
     reconciled = _apply_with_fallback(monkeypatch, sessions, metadata, cap=2)
 
     row = sessions[-1]
-    assert "TRUNC" not in reconciled
+    assert "TRUNC" in reconciled, (
+        "a truncation-bearing row outside the paint window is still re-walked: "
+        "its authoritative visible count only exists inside the walk"
+    )
     assert row["visible_message_count"] == 2, (
         "the removed suffix must not be re-credited from append-only state.db rows"
     )
@@ -850,7 +874,7 @@ def test_in_window_row_still_uses_the_reconciled_walk(monkeypatch):
     monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "2")
     seen = []
 
-    def _fake_reconciled(session_id):
+    def _fake_reconciled(session_id, **_bounds):
         seen.append(str(session_id))
         return 3
 
@@ -879,3 +903,204 @@ def test_metadata_prefix_carries_the_truncation_boundary():
         "compact() must emit truncation_boundary or the capped-out fallback "
         "cannot honour a persisted truncation"
     )
+
+# --- the walk is paid once per revision, not once per poll ------------------------
+
+
+def _memo_walk(monkeypatch, calls):
+    """Patch the walk so each call is recorded and the real memo path is used."""
+
+    def _walk(session_id, **bounds):
+        calls.append((str(session_id), bounds))
+        from api.models import _SIDEBAR_RECONCILE_MEMO
+
+        memo = _SIDEBAR_RECONCILE_MEMO.get()
+        if isinstance(memo, dict):
+            memo[(str(session_id), int(bounds.get("expected_state_count") or 0))] = 4
+        return 4
+
+    monkeypatch.setattr(models, "_reconciled_visible_count_for_sidebar", _walk)
+
+
+def test_memo_skips_the_walk_when_state_db_has_not_advanced(monkeypatch):
+    """Second poll on a settled board: same sidecar, no new state.db row, no walk."""
+    calls = []
+    sessions = _grown_sessions(2)
+    for row in sessions:
+        row["visible_message_count"] = 4
+    metadata = _grown_metadata(2)
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "0")
+    _memo_walk(monkeypatch, calls)
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
+    monkeypatch.setattr(models.Session, "load_metadata_only", _fake_stub_sidecar)
+    monkeypatch.setattr(
+        models, "get_state_db_session_messages", lambda sid, **kw: _fake_state_rows()
+    )
+
+    models._apply_sidebar_state_db_overrides(sessions)
+    first_walks = len(calls)
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    assert first_walks == 2, "the first poll reconciles every grown row"
+    assert len(calls) == first_walks, (
+        "a settled row whose state.db count did not move must not be re-walked"
+    )
+    assert [row["visible_message_count"] for row in sessions] == [4, 4]
+
+
+def test_walk_takes_its_own_memo_path_end_to_end(monkeypatch):
+    """Poll five times: one transcript walk, then the memo answers every poll."""
+    sessions = _grown_sessions(1)
+    # s0's sidecar is one row behind state.db, which is what the overlay's
+    # growth guard needs before it reads the transcript at all.
+    sessions[0]["message_count"] = 4
+    sessions[0]["actual_message_count"] = 4
+    sessions[0]["last_message_at"] = 1000.0
+    sessions[0]["updated_at"] = 1000.0
+    sessions[0]["visible_message_count"] = 4
+    metadata = {
+        "s0": {
+            "_state_db_source": "webui",
+            "_state_db_message_count": 5,
+            "_state_db_last_message_at": 2003.0,
+        }
+    }
+    reads = []
+
+    def _counting_state_read(sid, **kwargs):
+        reads.append(str(sid))
+        return _fake_state_rows()
+
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "0")
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
+    # A real (well, stand-in) sidecar object: the walk reads it before it reads
+    # state.db, so a metadata-only stub would answer every poll identically.
+    monkeypatch.setattr(models.Session, "load_metadata_only", _fake_stub_sidecar)
+    monkeypatch.setattr(models, "get_state_db_session_messages", _counting_state_read)
+
+    for _ in range(5):
+        models._apply_sidebar_state_db_overrides(sessions)
+
+    assert sessions[0]["visible_message_count"] == 5, (
+        "the merged transcript (4 rows) is reported, clamped by the raw count"
+    )
+    assert reads == ["s0"], (
+        "one transcript read for five polls: after the first walk the memo "
+        "answers every poll whose state.db count has not moved"
+    )
+
+
+def _fake_stub_sidecar(sid, **kwargs):
+    class _Stub:
+        _loaded_metadata_only = False
+        messages = [
+            {"role": "user", "content": f"m{index}", "timestamp": 1000.0 + index}
+            for index in range(4)
+        ]
+        profile = None
+        truncation_watermark = None
+        truncation_boundary = None
+        pending_user_source = None
+        pending_started_at = None
+        pending_user_message = None
+
+    return _Stub()
+
+
+def _fake_state_rows():
+    return [
+        {"role": "user", "content": f"m{index}", "timestamp": 1000.0 + index}
+        for index in range(4)
+    ]
+
+
+def test_walk_refuses_a_revision_the_row_did_not_overlay(monkeypatch):
+    """A transcript that moved since the SQL read cannot vouch for the row."""
+    calls = []
+    sessions = _grown_sessions(1)
+    sessions[0]["visible_message_count"] = 1
+    metadata = {
+        "s0": {
+            "_state_db_source": "webui",
+            "_state_db_message_count": 5,
+            "_state_db_last_message_at": 2000.0,
+        }
+    }
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "0")
+    _memo_walk(monkeypatch, calls)
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
+    monkeypatch.setattr(models.Session, "load_metadata_only", _fake_stub_sidecar)
+    # The detailed read now answers five rows, the sixth landed in between.
+    monkeypatch.setattr(
+        models,
+        "get_state_db_session_messages",
+        lambda sid, **kw: [
+            {"role": "user", "content": f"m{index}", "timestamp": 1000.0 + index}
+            for index in range(5)
+        ],
+    )
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    assert len(calls) == 1, "the row is inside the window, so it is walked once"
+    assert calls[0][1]["expected_state_count"] == 5, (
+        "the walk receives the revision the overlay aggregated"
+    )
+    # And a transcript that answers a different revision is refused: no memo
+    # entry is written for it, so the next poll walks again instead of trusting
+    # a count derived from rows the row never had.
+    from api.models import _SIDEBAR_RECONCILE_MEMO
+
+    assert _SIDEBAR_RECONCILE_MEMO.get() in (None, {})
+
+
+def test_reconcile_cap_leaves_the_latest_timestamp_tier_alone(monkeypatch):
+    """A row past the reconcile window still sees a newer latest-message time."""
+    sessions = _grown_sessions(3)
+    for index, row in enumerate(sessions):
+        row["visible_message_count"] = 1
+        row["last_message_at"] = 100.0
+        row["updated_at"] = 100.0
+    metadata = {
+        row["session_id"]: {
+            "_state_db_source": "webui",
+            "_state_db_message_count": 1,
+            "_state_db_last_message_at": 900.0 + index,
+        }
+        for index, row in enumerate(sessions)
+    }
+    metadata["s0"]["_state_db_message_count"] = 3
+    metadata["s0"]["_state_db_last_message_at"] = 1100.0
+    metadata["s1"]["_state_db_last_message_at"] = 1200.0
+    monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", raising=False)
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_RECONCILE_TOP_N", "1")
+    reconciled = _capture_reconciled_ids(monkeypatch, 3)
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    assert reconciled == ["s0"], "only the paint window pays the transcript merge"
+    assert sessions[2]["last_message_at"] == 902.0, (
+        "the latest-message tier keeps the documented top-300 default, so a "
+        "settled conversation still rises to the top"
+    )
+
