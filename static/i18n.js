@@ -13005,7 +13005,6 @@ const LOCALES = {
     settings_extensions_installed_loading: '正在載入已安裝的擴充功能…',
     settings_extensions_copy_diagnostics: '複製診斷',
     settings_extensions_trust_model_label: '信任模型',
-    status_messages_total: '訊息總數',
     settings_extensions_trust_model_text: '擴充功能執行在 WebUI 瀏覽器源，可存取與本會話相同的已驗證 API。設定與擴充功能自有的儲存僅存在於瀏覽器內，不應存放機密。僅載入可信的本地擴充功能目錄；停用擴充功能會在重新載入後對已注入的資源生效。',
     settings_extensions_runtime_title: '擴充功能執行時',
     settings_extensions_runtime_status_from: '狀態來自 /api/extensions/status；切換會為已安裝的 manifest 項保存本地覆蓋。',
