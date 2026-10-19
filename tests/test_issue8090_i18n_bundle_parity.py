@@ -111,7 +111,6 @@ def test_russian_bundle_translates_visible_placeholders():
 def test_profile_concept_values_differ_from_english():
     """Non-en bundles must carry real translations (not copied English)
     for the profile-concept keys used by the profiles panel."""
-    en = KEY_RE and re.search(r"^  en: \{", I18N_JS, re.M)
 
     def value(loc: str, key: str) -> str | None:
         m = re.search(rf"^\s*{key}:\s*'((?:[^'\\]|\\.)*)'", BLOCKS[loc], re.M)
