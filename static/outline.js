@@ -137,6 +137,65 @@ async function _jumpToMessage(rawIdx) {
   } catch (_) {}
 }
 
+// Content-search jump (#4159, hardened in #5106). `fullIdx` is the server's
+// `match_message_idx`: an index into the COMPLETE transcript. Rendered rows are
+// stamped with LOCAL indices (msg-user-<localIdx>, data-msg-idx) offset by
+// _oldestIdx while a long session is paged, so the full index is translated and
+// never used as a DOM id directly. `targetSid` is the session that was clicked.
+// Resolves true once the jump is handed to the transcript's jump helper.
+async function _jumpToFullSessionMessage(fullIdx, targetSid) {
+  const sid = targetSid || _currentSid();
+  if (!sid || !Number.isSafeInteger(fullIdx) || fullIdx < 0) return false;
+  // The user may have switched (or started switching) sessions before this
+  // fired: never apply one session's match index to another's transcript.
+  const stillTarget = function() {
+    if (_currentSid() !== sid) return false;
+    return typeof _loadingSessionId === 'undefined' || _loadingSessionId === null || _loadingSessionId === sid;
+  };
+  if (!stillTarget()) return false;
+  let rerender = false;
+  const truncated = (typeof _messagesTruncated !== 'undefined' && !!_messagesTruncated) ||
+    _messageSessionIndexBase() > 0;
+  if (truncated && !(S.busy || S.activeStreamId) && typeof _ensureAllMessagesLoaded === 'function') {
+    // Uncapped full-history load (msg_limit=all), not a larger tail window, so a
+    // match near the start of a very long session is still reachable. It resets
+    // _oldestIdx to 0, making local == full for the translation below.
+    try { await _ensureAllMessagesLoaded(); } catch (_) { return false; }
+    if (!stillTarget()) return false;
+    rerender = true;
+  }
+  const localIdx = _messageRawIdxForSessionIndex(fullIdx);
+  if (!Number.isSafeInteger(localIdx) || localIdx < 0) return false;  // not in the loaded window
+  const msg = (S.messages || [])[localIdx];
+  if (!msg) return false;
+  const container = document.getElementById('messages');
+  // Loading full history elsewhere (e.g. the outline panel) re-bases indices
+  // without a re-render: a stale row with the same local id must not stand in
+  // for the target, so re-render first when its absolute index disagrees.
+  if (!rerender && container) {
+    const rows = container.querySelectorAll('[data-msg-idx="' + localIdx + '"]');
+    for (let i = 0; i < rows.length; i++) {
+      const abs = Number(rows[i].dataset && rows[i].dataset.sessionMsgIdx);
+      if (Number.isFinite(abs) && abs !== fullIdx) { rerender = true; break; }
+    }
+  }
+  if (rerender) {
+    _cancelBottomSettle();
+    _beginMessageJumpScroll(container);
+    _expandOutlineRenderWindow();
+    if (typeof renderMessages === 'function') renderMessages({ preserveScroll: true });
+    await new Promise(function(resolve) { requestAnimationFrame(resolve); });
+    if (!stillTarget()) return false;
+  }
+  // Delegate to the transcript's virtualization-aware jump: it materializes a
+  // target outside the virtual window before scrolling, and resolves assistant
+  // segments as well as user rows. A user hit passes no assistant index so the
+  // row itself is centred and highlighted.
+  if (typeof jumpToTurnQuestion !== 'function') return false;
+  await jumpToTurnQuestion(localIdx, msg.role === 'user' ? -1 : localIdx);
+  return true;
+}
+
 // Brief highlight flash on a message row after jumping.
 function _flashRow(row) {
   if (!row) return;
@@ -241,6 +300,9 @@ function toggleOutlinePanel() {
 
 // Jump target exposed on window so inline onclick handlers can reach it.
 window._outlineJump = _jumpToMessage;
+// Full-session-index jump for the sidebar content-search click (sessions.js);
+// exported because this IIFE is otherwise unreachable from other scripts.
+window._jumpToFullSessionMessage = _jumpToFullSessionMessage;
 window.applyConversationOutlinePreference = applyConversationOutlinePreference;
 
 // Re-render after renderMessages() if the panel is open and the session
