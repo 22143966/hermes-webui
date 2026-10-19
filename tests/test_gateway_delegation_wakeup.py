@@ -32,7 +32,7 @@ class FakeDB:
     def add(cls, sid, deleg_id):
         rid = len(cls.rows) + 1
         cls.rows[rid] = {"id": rid, "session_id": sid, "content": f"[ASYNC DELEGATION COMPLETE — {deleg_id}]\nresult",
-                         "consumed": False, "lease": None}
+                         "consumed": False, "lease": None, "ts": cls.clock[0]}
         return rid
 
     def _pending(self, sid):
@@ -100,6 +100,7 @@ def env(tmp_path, monkeypatch):
                         lambda _p, sid, prof: sid if (sessions / f"{sid}.json").is_file()
                         and gdw._sidecar_profile_matches(sessions / f"{sid}.json", prof) else None)
     monkeypatch.setattr(gdw, "_profile_state_dbs", lambda: [("default", db_path)])
+    monkeypatch.setattr(gdw, "_row_timestamps", lambda _p, ids: {i: FakeDB.rows[i]["ts"] for i in ids}, raising=False)
     monkeypatch.setattr(gdw, "_profile_uses_gateway", lambda _p: True)
     gdw._BACKOFF.clear()
     monkeypatch.setattr(bp, "_session_has_active_turn", lambda _sid: False)
@@ -219,7 +220,7 @@ def test_profile_without_gateway_backend_is_skipped(env, monkeypatch):
 def test_poller_starts_when_only_a_named_profile_uses_the_gateway(monkeypatch):
     monkeypatch.setattr("api.gateway_chat.webui_gateway_chat_enabled", lambda *_a, **_k: False)
     monkeypatch.setattr(gdw, "_session_db_cls", lambda: FakeDB)
-    for name in gdw._REQUIRED_API:
+    for name in gdw._LEASE_API:
         assert callable(getattr(FakeDB, name))
     monkeypatch.setattr(gdw, "_loop", lambda: gdw._STOP.wait(5))
     try:
@@ -291,11 +292,13 @@ def test_non_webui_session_is_ignored(env):
 
 
 class _OldAgentDB:
-    def claim_caller_history_deliveries(self, sid):
-        raise AssertionError("must not fall back to the final claim")
+    """Upstream hermes-agent main: delivery rows and a writer, but no reserve/commit/release API."""
 
-    def release_caller_history_deliveries(self, sid, ids):
-        pass
+    def append_delegation_delivery(self, *_a, **_k):
+        raise AssertionError("the poller never writes deliveries")
+
+    def _execute_write(self, fn, **_k):
+        raise AssertionError("must not lease rows without the Agent's lease API")
 
 
 def test_poller_inert_on_agent_without_reserve_commit(monkeypatch):
@@ -477,9 +480,9 @@ def test_pending_scan_uses_rowid_high_water_mark(tmp_path):
     db = tmp_path / "s.db"
     conn = sqlite3.connect(db)
     conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, display_kind TEXT,"
-                 " display_metadata TEXT, timestamp REAL)")
+                 " display_metadata TEXT, timestamp REAL, active INTEGER NOT NULL DEFAULT 1)")
     meta = json.dumps({"delegation_id": "d"})
-    conn.executemany("INSERT INTO messages VALUES (?,?,?,?,?,?)",
+    conn.executemany("INSERT INTO messages VALUES (?,?,?,?,?,?,1)",
                      [(i, "plain", "user", None, None, 1.0) for i in range(1, 50)]
                      + [(50, "sidA", "user", "async_delegation_complete", meta, 1.0)])
     conn.commit()
@@ -488,7 +491,7 @@ def test_pending_scan_uses_rowid_high_water_mark(tmp_path):
     conn.execute("UPDATE messages SET display_metadata = json_set(display_metadata, '$.caller_history_consumed', 1)")
     conn.commit()
     assert gdw._pending_session_ids(db, 0) == [] and gdw._FLOOR[str(db)] == 51
-    conn.execute("INSERT INTO messages VALUES (51, 'sidB', 'user', 'hidden', ?, 1.0)", (meta,))
+    conn.execute("INSERT INTO messages VALUES (51, 'sidB', 'user', 'hidden', ?, 1.0, 1)", (meta,))
     conn.commit()
     conn.close()
     assert gdw._pending_session_ids(db, 0) == ["sidB"]
@@ -557,7 +560,7 @@ def _agent_schema_db(path):
 
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT,"
-                 " display_kind TEXT, display_metadata TEXT, timestamp REAL)")
+                 " display_kind TEXT, display_metadata TEXT, timestamp REAL, active INTEGER NOT NULL DEFAULT 1)")
     conn.execute("CREATE INDEX idx_messages_session ON messages(session_id, timestamp)")
     conn.execute("CREATE INDEX idx_messages_session_id ON messages(session_id, id)")
     return conn
@@ -576,8 +579,9 @@ def test_unowned_session_row_does_not_pin_the_floor(env, tmp_path, monkeypatch):
     db = tmp_path / "agent.db"
     conn = _agent_schema_db(db)
     meta = json.dumps({"delegation_id": "d"})
-    conn.execute("INSERT INTO messages VALUES (5, 'ghost', 'user', 'async_delegation_complete', ?, 1.0)", (meta,))
-    conn.executemany("INSERT INTO messages VALUES (?, 'plain', 'user', NULL, NULL, 1.0)", [(i,) for i in range(6, 20)])
+    conn.execute("INSERT INTO messages (id, session_id, role, display_kind, display_metadata, timestamp) VALUES (5, 'ghost', 'user', 'async_delegation_complete', ?, 1.0)", (meta,))
+    conn.executemany("INSERT INTO messages (id, session_id, role, display_kind, display_metadata, timestamp)"
+                     " VALUES (?, 'plain', 'user', NULL, NULL, 1.0)", [(i,) for i in range(6, 20)])
     conn.commit()
     conn.close()
     monkeypatch.setattr(gdw, "_pending_session_ids", _REAL["pending"])
@@ -643,8 +647,9 @@ def test_unreadable_sidecar_is_retried_not_marked_unowned(env, tmp_path, monkeyp
     db = tmp_path / "agent.db"
     conn = _agent_schema_db(db)
     meta = json.dumps({"delegation_id": "d"})
-    conn.execute("INSERT INTO messages VALUES (5, 'sid1', 'user', 'async_delegation_complete', ?, 1.0)", (meta,))
-    conn.executemany("INSERT INTO messages VALUES (?, 'plain', 'user', NULL, NULL, 1.0)", [(i,) for i in range(6, 20)])
+    conn.execute("INSERT INTO messages (id, session_id, role, display_kind, display_metadata, timestamp) VALUES (5, 'sid1', 'user', 'async_delegation_complete', ?, 1.0)", (meta,))
+    conn.executemany("INSERT INTO messages (id, session_id, role, display_kind, display_metadata, timestamp)"
+                     " VALUES (?, 'plain', 'user', NULL, NULL, 1.0)", [(i,) for i in range(6, 20)])
     conn.commit()
     conn.close()
     sidecar = tmp_path / "sessions" / "sid1.json"
@@ -659,3 +664,107 @@ def test_unreadable_sidecar_is_retried_not_marked_unowned(env, tmp_path, monkeyp
     sidecar.write_text(good)
     FakeDB.add("sid1", "d")
     assert gdw.poll_once(0) == 1
+
+
+def _clear(sid="sid1"):
+    """What /api/session/clear does: truncate_session_at_keep(s, 0) + save, under the session lock."""
+    from api.config import _get_session_agent_lock
+    from api.models import get_session
+    from api.session_ops import truncate_session_at_keep
+
+    with _get_session_agent_lock(sid):
+        s = get_session(sid)
+        truncate_session_at_keep(s, 0)
+        s.save()
+
+
+def test_result_cleared_before_the_poll_is_retired_not_woken(env):
+    """Review MUST-FIX 2: a WebUI clear drops the delegation results that were already pending."""
+    import time as _t
+
+    calls, _ = env
+    FakeDB.rows.clear()
+    rid = FakeDB.add("sid1", "OLD_RESULT_F2")
+    FakeDB.rows[rid]["ts"] = _t.time() - 5
+    _clear()
+    assert gdw.poll_once(0) == 0 and calls == []
+    assert FakeDB.rows[rid]["consumed"] and not _context()
+    new = FakeDB.add("sid1", "NEW_RESULT")  # a result delivered after the clear still wakes
+    FakeDB.rows[new]["ts"] = _t.time() + 5
+    assert gdw.poll_once(0) == 1
+    assert [m["_delegation_delivery_id"] for m in _context() if m.get("_source") == "process_wakeup"] == [new]
+
+
+def test_clear_between_reserve_and_admission_publishes_nothing(env, monkeypatch):
+    """Review MUST-FIX 2.3: on_admitted re-checks the clear cutoff under the session lock."""
+    import time as _t
+
+    calls, _ = env
+    FakeDB.rows.clear()
+    rid = FakeDB.add("sid1", "OLD_RESULT_F2")
+    FakeDB.rows[rid]["ts"] = _t.time() - 5
+    real_reserve = FakeDB.reserve_caller_history_deliveries
+
+    def reserve_then_clear(self, *a, **k):
+        out = real_reserve(self, *a, **k)
+        _clear()
+        return out
+
+    monkeypatch.setattr(FakeDB, "reserve_caller_history_deliveries", reserve_then_clear)
+
+    def admit_raises(sid, prompt, source="process_wakeup", on_admitted=None):
+        calls.append(sid)
+        _admit(sid, "s", on_admitted)
+        return {"stream_id": "s"}
+
+    monkeypatch.setattr("api.routes.start_session_turn", admit_raises)
+    assert gdw.poll_once(0) == 0 and calls == ["sid1"]
+    assert not _context() and Session.load("sid1").delegation_reservation is None
+    assert FakeDB.rows[rid]["consumed"] and FakeDB.rows[rid]["lease"] is None
+    assert (str(gdw._profile_state_dbs()[0][1]), "sid1") not in gdw._BACKOFF
+
+
+def test_rewound_delivery_row_is_not_scanned(tmp_path):
+    """Review MUST-FIX 2: an Agent rewind soft-deletes the row (active = 0); it is no longer pending."""
+    db = tmp_path / "agent.db"
+    conn = _agent_schema_db(db)
+    meta = json.dumps({"delegation_id": "d"})
+    conn.execute("INSERT INTO messages VALUES (5, 'sid1', 'user', 'async_delegation_complete', ?, 1.0, 0)", (meta,))
+    conn.execute("INSERT INTO messages VALUES (6, 'sid2', 'user', 'async_delegation_complete', ?, 1.0, 1)", (meta,))
+    conn.commit()
+    conn.close()
+    gdw._FLOOR.pop(str(db), None)
+    assert gdw._pending_session_ids(db, 0) == ["sid2"]
+
+
+def test_session_that_gains_a_sidecar_is_not_left_behind_the_floor(env, tmp_path, monkeypatch):
+    """Review MUST-FIX 3: a session cached as unowned and then imported must still be woken."""
+    import sqlite3
+
+    calls, _ = env
+    db = tmp_path / "agent.db"
+    conn = _agent_schema_db(db)
+    meta = json.dumps({"delegation_id": "d"})
+    conn.execute("INSERT INTO messages (id, session_id, role, display_kind, display_metadata, timestamp)"
+                 " VALUES (5, 'late', 'user', 'async_delegation_complete', ?, 1.0)", (meta,))
+    conn.executemany("INSERT INTO messages (id, session_id, role, display_kind, display_metadata, timestamp)"
+                     " VALUES (?, 'plain', 'user', NULL, NULL, 1.0)", [(i,) for i in range(6, 20)])
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(gdw, "_pending_session_ids", _REAL["pending"])
+    monkeypatch.setattr(gdw, "_profile_state_dbs", lambda: [("default", db)])
+    monkeypatch.setattr(gdw, "_UNOWNED", {})
+    monkeypatch.setattr(gdw, "_FLOOR", {})
+    assert gdw.poll_once(0) == 0 and "late" in gdw._UNOWNED[str(db)]
+    assert gdw.poll_once(0) == 0 and gdw._FLOOR[str(db)] == 20  # floor moved past the unowned row
+    Session(session_id="late", messages=[{"role": "user", "content": "go"}]).save()  # imported
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO messages (id, session_id, role, display_kind, display_metadata, timestamp)"
+                 " VALUES (20, 'late', 'user', 'async_delegation_complete', ?, 1.0)", (meta,))
+    conn.commit()
+    conn.close()
+    FakeDB.add("late", "d")
+    assert gdw.poll_once(0) == 1 and calls[-1]["sid"] == "late"
+    assert "late" not in gdw._UNOWNED[str(db)]
+    # The rescan reaches the row the floor had already skipped (row 5 is still pending in state.db).
+    assert gdw._pending_session_ids(db, 0) == ["late"] and gdw._FLOOR[str(db)] == 5

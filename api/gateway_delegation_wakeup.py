@@ -25,6 +25,8 @@ retried by the next poll. A restart before settlement reattaches the run and
 settles it, or the lease expires and the next poll retries. Refused wakes, and
 wakes the Gateway never accepted, back off per session.
 Without reserve+commit the poller stays inert.
+Rows rewound away (``active = 0``) are never scanned, and rows that predate the
+session's last clear/truncation (``delegation_cutoff_ts``) are retired, not published.
 """
 from __future__ import annotations
 
@@ -42,7 +44,7 @@ RESERVATION_OWNER = "hermes-webui"
 RESERVATION_TTL_S = 120.0
 WAKE_PROMPT = ("[IMPORTANT: A delegated subagent finished. Its result is already in your "
                "conversation history above; review it and continue the task.]")
-_REQUIRED_API = ("reserve_caller_history_deliveries", "commit_caller_history_deliveries",
+_LEASE_API = ("reserve_caller_history_deliveries", "commit_caller_history_deliveries",
                  "release_caller_history_deliveries")
 # Rows older than this at first sight are left for the next user turn to fold.
 MAX_ROW_AGE_S = 6 * 3600
@@ -56,7 +58,7 @@ _UNOWNED: dict[str, set[str]] = {}  # db -> state sids with no WebUI sidecar of 
 
 _PENDING_SQL = (
     "SELECT session_id, MIN(id) FROM messages NOT INDEXED WHERE id >= ? AND role = 'user'"
-    " AND display_kind IN ('async_delegation_complete', 'hidden')"
+    " AND display_kind IN ('async_delegation_complete', 'hidden') AND COALESCE(active, 1) = 1"
     " AND coalesce(json_extract(display_metadata, '$.delegation_id'), '') != ''"
     " AND json_extract(display_metadata, '$.caller_history_consumed') IS NULL"
     " AND timestamp >= ? GROUP BY session_id"
@@ -104,7 +106,7 @@ def _claim_api_available() -> bool:
         cls = _session_db_cls()
     except Exception:
         return False
-    return all(callable(getattr(cls, name, None)) for name in _REQUIRED_API)
+    return all(callable(getattr(cls, name, None)) for name in _LEASE_API)
 
 
 class OwnershipUnknown(Exception):
@@ -158,6 +160,41 @@ def _live_webui_sid(webui_sid: str, profile: str) -> str | None:
     return tip if sidecar is not None and sidecar.is_file() and _sidecar_profile_matches(sidecar, profile) else None
 
 
+class ClearedSinceReserve(Exception):
+    """The session was cleared/truncated between reserve and admission: publish nothing."""
+
+
+def _cutoff(webui_sid: str) -> float:
+    """Time of the session's last clear/truncation (0 when never): older delivery rows are retired."""
+    from api.config import _get_session_agent_lock
+    from api.models import get_session
+
+    with _get_session_agent_lock(webui_sid):
+        return float(getattr(get_session(webui_sid), "delegation_cutoff_ts", None) or 0.0)
+
+
+def _row_timestamps(db_path: Path, ids) -> dict:
+    import sqlite3
+
+    ids = [int(i) for i in ids]
+    if not ids:
+        return {}
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+    try:
+        return dict(conn.execute(f"SELECT id, timestamp FROM messages WHERE id IN ({','.join('?' * len(ids))})",
+                                 ids).fetchall())
+    finally:
+        conn.close()
+
+
+def _stale_ids(db_path: Path, rows: list[dict], cutoff: float) -> list:
+    """Ids of *rows* written at or before *cutoff* (the session was cleared after them)."""
+    if cutoff <= 0 or not rows:
+        return []
+    ts = _row_timestamps(db_path, [r["id"] for r in rows])
+    return [r["id"] for r in rows if float(ts.get(r["id"]) or 0.0) <= cutoff]
+
+
 def _start_wakeup(webui_sid: str, on_admitted) -> bool:
     """True once the wake turn is persisted as the session's pending turn."""
     from api.routes import start_session_turn
@@ -165,6 +202,8 @@ def _start_wakeup(webui_sid: str, on_admitted) -> bool:
     try:
         resp = start_session_turn(webui_sid, WAKE_PROMPT, source="process_wakeup",
                                   on_admitted=on_admitted) or {}
+    except ClearedSinceReserve:
+        return False
     except Exception:
         logger.warning("gateway delegation wakeup raised for %s", webui_sid, exc_info=True)
         return False
@@ -304,8 +343,11 @@ def _claim_and_wake(db_path: Path, state_sid: str, webui_sid: str) -> int:
         return 0
     db = _session_db_cls()(db_path)
     try:
+        cutoff = _cutoff(webui_sid)
         reserved = db.reserve_caller_history_deliveries(state_sid, RESERVATION_OWNER, RESERVATION_TTL_S)
-        rows = [r for r in reserved if isinstance(r.get("content"), str) and r["content"].strip()]
+        stale = set(_stale_ids(db_path, reserved, cutoff))  # cleared away since: retire, never publish
+        rows = [r for r in reserved if isinstance(r.get("content"), str) and r["content"].strip()
+                and r["id"] not in stale]
         blank = [r["id"] for r in reserved if r not in rows]
         if blank:  # nothing to deliver: settle them as the Gateway fold would
             db.commit_caller_history_deliveries(blank, RESERVATION_OWNER)
@@ -315,11 +357,21 @@ def _claim_and_wake(db_path: Path, state_sid: str, webui_sid: str) -> int:
                  "owner": RESERVATION_OWNER}
 
         def on_admitted(s, stream_id):
+            # Under the session lock: a clear since the reserve must not publish pre-clear results.
+            if float(getattr(s, "delegation_cutoff_ts", None) or 0.0) != cutoff:
+                raise ClearedSinceReserve(webui_sid)
             _publish_results(s, rows, {**lease, "stream_id": stream_id})
 
         if _start_wakeup(webui_sid, on_admitted):
             return 1  # the wake turn's worker settles the lease and the back-off
         # Not admitted: nothing was published (or the launch rollback removed it).
+        now_cutoff = _cutoff(webui_sid)
+        if now_cutoff != cutoff:
+            retired = _stale_ids(db_path, rows, now_cutoff)
+            if retired:
+                db.commit_caller_history_deliveries(retired, RESERVATION_OWNER)
+            db.release_caller_history_deliveries(reservation_token=lease["token"], owner=RESERVATION_OWNER)
+            return 0  # cleared, not refused: no back-off; later rows go out on the next poll
         db.release_caller_history_deliveries(reservation_token=lease["token"], owner=RESERVATION_OWNER)
         _record_outcome(lease, accepted=False)
         return 0
@@ -341,6 +393,10 @@ def poll_once(since: float) -> int:
             try:
                 webui_sid = _webui_session_id(db_path, sid, profile)
                 if webui_sid:
+                    unowned = _UNOWNED.get(str(db_path))
+                    if unowned and sid in unowned:  # gained a sidecar since (import): its rows pin the floor again
+                        unowned.discard(sid)
+                        _FLOOR.pop(str(db_path), None)  # rescan once; the floor already moved past its rows
                     webui_sid = _live_webui_sid(webui_sid, profile)
                     if webui_sid:
                         woken += _claim_and_wake(db_path, sid, webui_sid)
