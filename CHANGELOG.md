@@ -82,6 +82,8 @@
 
 ### Fixed
 
+- **Terminal keeps your keystrokes in order.** Keys typed into the composer terminal are now sent one request at a time per shell, with anything typed meanwhile queued and sent next, so fast typing or a paste followed by Enter can no longer reach the shell out of order. Long pastes are split under the server's size limit, and unsent keys are dropped when the terminal is closed or restarted. Thanks @grzezlo. (#8341)
+
 - **Windows: starting the WebUI again reports "already running".** When our own WebUI already listens on the port, Windows can refuse the second bind with a permission error (WSAEACCES) instead of "address in use"; the launcher now recognises its own server behind that error. Thanks @Thanatos9404. (#8301, #8137)
 
 - **Faster session switching on code-heavy chats.** The copy-button pass marks code blocks it has already handled, so re-rendering a cached transcript no longer re-walks every code block to add nothing. Thanks @MuhammadUsamaMX. (#8309, #2168)
