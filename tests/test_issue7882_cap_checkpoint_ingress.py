@@ -572,3 +572,43 @@ def test_reload_keeps_the_fact_only_while_it_names_the_pending_turn(monkeypatch,
     reloaded.pending_user_source = None
     reloaded.pending_started_at = None
     assert reloaded.compact().get("_pending_hidden_wakeup_at") is None
+
+
+def test_a_reload_drops_the_fact_once_the_hidden_row_is_gone(
+    tmp_path, monkeypatch,
+):
+    """A stale fact must not survive a reload that replaced the hidden row.
+
+    The fact excuses a discount, so it may only live while the row it names is
+    really in the transcript. ``Session.compact()`` re-emits it and an index
+    rebuild can persist that compact payload, so validating on load without
+    looking at the transcript lets a replaced row keep the excuse forever --
+    the sidebar then undercounts by one. Loading must check the row.
+    """
+    from api import models
+
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
+
+    payload = {
+        "session_id": "reload",
+        "title": "Reload",
+        "workspace": str(tmp_path),
+        "model": "test-model",
+        "message_count": 2,
+        "pending_user_message": "Do the task.",
+        "pending_started_at": 500.0,
+        "pending_user_source": "delegation_wakeup",
+        "_pending_hidden_wakeup_at": 500.0,
+        # The hidden delegation-wakeup row is NOT here: it was replaced.
+        "messages": [
+            {"role": "user", "content": "Do the task.", "timestamp": 500.0},
+            {"role": "assistant", "content": "Done.", "timestamp": 501.0},
+        ],
+    }
+
+    session = models.Session(**payload)
+
+    assert session._pending_hidden_wakeup_at is None, (
+        "a reload whose transcript no longer holds the named hidden row must "
+        "drop the fact; keeping it excuses a discount that is still owed"
+    )

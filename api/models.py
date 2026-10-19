@@ -1837,8 +1837,13 @@ class Session:
         # the sidecar keeps the fact, a leftover fact from a finished turn does
         # not come back.
         self._pending_hidden_wakeup_at = kwargs.get('_pending_hidden_wakeup_at')
+        # Validate against the loaded transcript (``self.messages`` is assigned
+        # above): the fact excuses a discount, so it may only survive while the
+        # row it names is really here. An index rebuild that reloads a sidecar
+        # whose hidden row was replaced would otherwise carry the stale fact
+        # forward and undercount by one.
         self._pending_hidden_wakeup_at = _validated_pending_hidden_wakeup_at(
-            self, require_row=False
+            self, require_row=True
         )
         self._webui_pending_user_timestamp_identity = (
             _validated_webui_pending_user_timestamp_identity(
