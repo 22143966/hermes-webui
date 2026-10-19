@@ -1693,15 +1693,28 @@ function _scheduleMessageVirtualizedRender(force, request){
 const _renderCache = new Map();
 const _renderCacheMax = 300;
 function _clearRenderCache(){ _renderCache.clear(); }
+// Two independent 32-bit multiplicative hashes over every UTF-16 unit of `text` (~64 bits together). Used for
+// long render-cache keys: the key must change whenever ANY character changes.
+function _renderCacheTextHash(text){
+  let a=0x811c9dc5, b=0x9e3779b9;
+  for(let i=0;i<text.length;i++){
+    const c=text.charCodeAt(i);
+    a=Math.imul(a^c,16777619)>>>0;
+    b=Math.imul(b^c,0x5bd1e995)>>>0;
+    b=(b^(b>>>15))>>>0;
+  }
+  return a.toString(36)+'.'+b.toString(36);
+}
 function _renderCacheKey(text, isUser){
   // Fold render_user_markdown state into user-message keys so toggling the
   // setting invalidates cached plain-text renders (#3870).
   const p = isUser ? (window._renderUserMarkdown ? 'um' : 'u') : 'a';
   // Short content: use the full string as key (cheap Map lookup).
-  // Long content: length + prefix + suffix is good enough — collisions on
-  // 20-char prefix+suffix are vanishingly rare for chat messages.
   if(text.length <= 500) return p + ':' + text;
-  return p + ':' + text.length + ':' + text.slice(0,20) + ':' + text.slice(-20);
+  // Long content: length + a hash of the whole text. The old length + first/last 20 characters key collided for
+  // equal-length messages that differ only in the middle (templated reports, regenerated answers, edited code),
+  // and the second message then displayed the first one's body.
+  return p + ':' + text.length + ':' + _renderCacheTextHash(text);
 }
 function _getCachedRender(text, isUser){
   const key = _renderCacheKey(text, isUser);
@@ -3220,7 +3233,17 @@ else _initMediaPlaybackObserver();
 setTimeout(_initMediaPlaybackObserver,0);
 
 // ── Ambient provider quota indicator (#1766) ────────────────────────────────
-let _providerQuotaRefreshInFlight=false;
+// A provider switch can complete before an older account-quota request returns.
+// Only the newest request may update the composer; otherwise an old Codex result
+// can reappear while the active conversation uses another provider.
+let _providerQuotaRefreshSeq=0;
+let _providerQuotaContextIdentity;
+// profile|provider whose numbers the chip currently shows (null when cleared). A refetch for the same
+// profile and provider keeps them visible instead of blanking the chip until the response arrives.
+let _providerQuotaRenderedKey=null;
+function _providerQuotaProfileKey(){
+  return (typeof S!=='undefined'&&S&&S.activeProfile)?String(S.activeProfile):'';
+}
 
 function _formatQuotaMoneyShort(value){
   const n=Number(value);
@@ -3257,62 +3280,105 @@ function _providerQuotaIndicatorText(status){
   }
   return null;
 }
+function clearProviderQuotaIndicator(){
+  _providerQuotaRenderedKey=null;
+  const chip=$('providerQuotaChip');
+  const label=$('providerQuotaChipLabel');
+  const mobileAction=$('composerMobileQuotaAction');
+  const mobileLabel=$('composerMobileQuotaLabel');
+  if(chip){chip.hidden=true;chip.removeAttribute('title');}
+  if(label) label.textContent='';
+  if(mobileAction){mobileAction.hidden=true;mobileAction.removeAttribute('title');}
+  if(mobileLabel) mobileLabel.textContent='';
+}
 function renderProviderQuotaIndicator(status){
   const chip=$('providerQuotaChip');
   const label=$('providerQuotaChipLabel');
   const mobileAction=$('composerMobileQuotaAction');
   const mobileLabel=$('composerMobileQuotaLabel');
-  if(!chip||!label) return;
+  if(!chip||!label){
+    clearProviderQuotaIndicator();
+    return;
+  }
   // Hide entirely when the user has disabled the ambient quota chip in Settings.
   // Boot defaults this on; an explicit false preference suppresses it.
   if(window._showQuotaChip!==true){
-    chip.hidden=true;
-    label.textContent='';
-    chip.removeAttribute('title');
-    if(mobileAction){mobileAction.style.display='none';mobileAction.removeAttribute('title');}
-    if(mobileLabel) mobileLabel.textContent='';
+    clearProviderQuotaIndicator();
     return;
   }
   const text=_providerQuotaIndicatorText(status);
   if(!text||status.status!=='available'||(!status.quota&&!status.account_limits)){
-    chip.hidden=true;
-    label.textContent='';
-    chip.removeAttribute('title');
-    if(mobileAction){mobileAction.style.display='none';mobileAction.removeAttribute('title');}
-    if(mobileLabel) mobileLabel.textContent='';
+    clearProviderQuotaIndicator();
     return;
   }
   label.textContent=text.label;
   chip.title=text.title;
-  chip.hidden=false;
-  if(mobileAction){mobileAction.style.display='';mobileAction.title=text.title;}
   if(mobileLabel) mobileLabel.textContent=text.label;
+  if(mobileAction) mobileAction.title=text.title;
+  chip.hidden=false;
+  if(mobileAction) mobileAction.hidden=false;
 }
-async function refreshProviderQuotaIndicator(){
+async function refreshProviderQuotaIndicator(providerId){
+  const requestSeq=++_providerQuotaRefreshSeq;
+  const provider=String(providerId||'').trim();
+  const requestKey=_providerQuotaProfileKey()+'|'+provider;
+  // Clear before the request when the profile or provider changes, so the old account's numbers are not
+  // visible or keyboard-reachable meanwhile. A same-account refetch (session switch, tab return) keeps them.
+  // An unspecified provider means "the server's current default", which can change underneath, so it always clears.
+  if(!provider||requestKey!==_providerQuotaRenderedKey) clearProviderQuotaIndicator();
   // Short-circuit before the fetch when the chip is disabled — no point asking
   // the server for quota data the UI will throw away.
-  if(window._showQuotaChip!==true){
-    const chip=$('providerQuotaChip');
-    if(chip){chip.hidden=true;chip.removeAttribute('title');}
-    const mobileAction=$('composerMobileQuotaAction');
-    if(mobileAction){mobileAction.style.display='none';mobileAction.removeAttribute('title');}
-    const mobileLabel=$('composerMobileQuotaLabel');
-    if(mobileLabel) mobileLabel.textContent='';
-    return;
-  }
-  if(_providerQuotaRefreshInFlight) return;
-  _providerQuotaRefreshInFlight=true;
+  if(window._showQuotaChip!==true){clearProviderQuotaIndicator();return;}
+  const query=provider?'?provider='+encodeURIComponent(provider):'';
   try{
-    const status=await api('/api/provider/quota');
+    const status=await api('/api/provider/quota'+query);
+    if(requestSeq!==_providerQuotaRefreshSeq) return;
     renderProviderQuotaIndicator(status);
+    const chip=$('providerQuotaChip');
+    _providerQuotaRenderedKey=(chip&&!chip.hidden)?requestKey:null;
   }catch(_e){
-    renderProviderQuotaIndicator(null);
-  }finally{
-    _providerQuotaRefreshInFlight=false;
+    if(requestSeq!==_providerQuotaRefreshSeq) return;
+    clearProviderQuotaIndicator();
+  }
+}
+// Resolve the provider that should drive the composer quota request.
+// Prefers the active session's provider; when the composer is empty, falls
+// back to the retained empty-composer model override so a non-default provider
+// selected before opening a conversation still scopes the quota request.
+function _currentQuotaProvider(){
+  if(typeof S!=='undefined'&&S&&S.session){
+    return S.session.model_provider||null;
+  }
+  if(typeof _readEmptyComposerModelOverride==='function'){
+    const override=_readEmptyComposerModelOverride();
+    if(override&&override.model_provider) return override.model_provider;
+  }
+  return null;
+}
+// Keep account-quota state aligned with the authoritative session/composer
+// context without turning syncTopbar() into a high-frequency network poll.
+// Session identity is part of the key so switching between conversations is a
+// real refresh even when both use the same provider. Explicit visibility and
+// Settings refreshes intentionally bypass this de-duplication.
+function _syncProviderQuotaForActiveContext(){
+  if(typeof S==='undefined'||!S||S._bootReady!==true) return;
+  const provider=_currentQuotaProvider();
+  const providerIdentity=String(provider||'').trim();
+  // Quota is per profile (the route binds the profile env), so the active profile is part of the identity.
+  const profileIdentity='profile:'+_providerQuotaProfileKey()+'|';
+  const contextIdentity=profileIdentity+(S.session
+    ? 'session:'+String(S.session.session_id||'')+'|provider:'+providerIdentity
+    : 'composer|provider:'+providerIdentity);
+  if(contextIdentity===_providerQuotaContextIdentity) return;
+  _providerQuotaContextIdentity=contextIdentity;
+  if(typeof refreshProviderQuotaIndicator==='function'){
+    void refreshProviderQuotaIndicator(provider);
   }
 }
 window.addEventListener('visibilitychange',()=>{
-  if(document.visibilityState==='visible'&&typeof refreshProviderQuotaIndicator==='function') refreshProviderQuotaIndicator();
+  if(document.visibilityState==='visible'&&typeof refreshProviderQuotaIndicator==='function'){
+    void refreshProviderQuotaIndicator(_currentQuotaProvider());
+  }
 });
 
 // Dynamic model labels -- populated by populateModelDropdown(), fallback to static map
@@ -13521,6 +13587,7 @@ function syncTopbar(){
     if(_profileLabel) _profileLabel.textContent=S.activeProfile||'default';
     const _titleLabel=$('titlebarProfileLabel');
     if(_titleLabel) _titleLabel.textContent=S.activeProfile||'default';
+    if(typeof _syncProviderQuotaForActiveContext==='function') _syncProviderQuotaForActiveContext();
     return;
   }
   const sessionTitle=S.session.title||t('untitled');
@@ -13648,6 +13715,7 @@ function syncTopbar(){
   if(profileLabel) profileLabel.textContent=S.activeProfile||'default';
   const titleLabel=$('titlebarProfileLabel');
   if(titleLabel) titleLabel.textContent=S.activeProfile||'default';
+  if(typeof _syncProviderQuotaForActiveContext==='function') _syncProviderQuotaForActiveContext();
 }
 
 function msgContent(m){
@@ -18627,9 +18695,9 @@ window._bindHermesExtensionMessageActions=function(){
 // constant-allocation cost: strings are streamed char-by-char (no copy) and
 // object fields are walked key-by-key so only scalar string forms are ever
 // allocated — no integral JSON.stringify() of a whole payload, and no
-// head/tail slice copies. _renderCacheKey's length+edges shortcut is only
-// safe for the render-window geometry key, where equal span+edges means
-// equal window; here equal signature must mean equal CONTENT.
+// head/tail slice copies. Equal signature must mean equal CONTENT (the
+// per-message _renderCacheKey hashes every character of long bodies for the
+// same reason).
 function _addBoundedHash(add, value, depth){
   if(value==null){ add('null'); return; }
   const t=typeof value;
