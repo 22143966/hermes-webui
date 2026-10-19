@@ -6405,8 +6405,17 @@ body code[class*="language-"],body pre[class*="language-"],body pre code[class*=
   transform: translateY(-1px);
   outline: none;
 }
+/* Landing cue for every jump to a message (search hit, jump-to-question, outline): the row tint the outline
+   panel used, held briefly and faded, plus the ring on the bubble. One idiom for every jump path. */
+.msg-question-highlight {
+  animation: message-landing-tint 1.6s ease-out;
+}
 .msg-question-highlight .msg-body {
   animation: question-highlight-pulse 1.6s ease-out;
+}
+@keyframes message-landing-tint {
+  0%, 30% { background-color: var(--accent-bg-strong); }
+  100% { background-color: transparent; }
 }
 @keyframes question-highlight-pulse {
   0% { box-shadow: 0 0 0 0 var(--focus-ring); }
@@ -6415,6 +6424,10 @@ body code[class*="language-"],body pre[class*="language-"],body pre code[class*=
 }
 /* Reduced motion: keep the "you landed here" ring, without the pulse, for as long as the class is set. */
 @media (prefers-reduced-motion: reduce) {
+  .msg-question-highlight {
+    animation: none;
+    background-color: var(--accent-bg-strong);
+  }
   .msg-question-highlight .msg-body {
     animation: none;
     box-shadow: 0 0 0 3px var(--focus-ring);

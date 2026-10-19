@@ -1874,7 +1874,8 @@ function _messageJumpScrollBehavior(container, el){
 // 240-message session the first painted frame was already 0.4-0.6 s into the 1.6 s pulse, so the ring appeared at
 // full strength and faded early. One frame later the pulse starts from zero where the user can see it.
 function _highlightQuestionRow(row){
-  if(!row) return;
+  // Cosmetic: never let the landing cue throw inside a jump that owns the scroll.
+  if(!row||!row.classList) return;
   row.classList.remove('msg-question-highlight');
   if(row._questionHighlightTimer) window.clearTimeout(row._questionHighlightTimer);
   const start=()=>{
@@ -1909,6 +1910,9 @@ async function jumpToTurnQuestion(questionRawIdx, assistantRawIdx){
       for(const seg of segs){
         if(seg.getClientRects().length>0){
           seg.scrollIntoView({block:'start',behavior:_messageJumpScrollBehavior(container,seg)});
+          // Assistant targets (search hits in a reply, jump to the start of a response) get the same landing
+          // cue as question rows; without it half of all content hits landed silently (#5106 Fable r3).
+          _highlightQuestionRow(seg);
           return true;
         }
       }

@@ -235,6 +235,9 @@ async function _jumpToFullSessionMessage(fullIdx, targetSid, query) {
 // Brief highlight flash on a message row after jumping.
 function _flashRow(row) {
   if (!row) return;
+  // One landing cue for every jump: the outline panel, search hits and jump-to-question all use the
+  // transcript's highlight (row tint plus ring, started on the next frame, static under reduced motion).
+  if (typeof _highlightQuestionRow === 'function') { _highlightQuestionRow(row); return; }
   row.classList.remove('outline-jump-flash');
   void row.offsetWidth;   // reflow to restart animation
   row.classList.add('outline-jump-flash');

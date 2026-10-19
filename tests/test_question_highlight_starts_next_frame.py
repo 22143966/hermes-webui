@@ -106,10 +106,76 @@ def test_without_request_animation_frame_the_highlight_is_applied_immediately():
 
 def test_reduced_motion_keeps_a_static_ring_instead_of_the_pulse():
     block = re.search(
-        r"@media \(prefers-reduced-motion: reduce\) \{\s*\.msg-question-highlight \.msg-body \{([^}]*)\}",
+        r"@media \(prefers-reduced-motion: reduce\) \{[^@]*?\.msg-question-highlight \.msg-body \{([^}]*)\}",
         STYLE_CSS,
     )
     assert block, "reduced-motion override for the jump highlight is missing"
     body = block.group(1)
     assert "animation: none;" in body
     assert "box-shadow: 0 0 0 3px var(--focus-ring);" in body
+
+
+# -- One landing cue for every jump (#5106 Fable r3) ------------------------------------------------------------------
+# Assistant targets (a search hit inside a reply, "jump to the start of this response") used to land with no cue, and
+# the outline panel used its own tint while search/jump-to-question used a faint ring. Every path now uses the
+# transcript highlight: the outline's row tint plus the ring, started on the next frame.
+
+_JUMP_DRIVER = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+function extract(name) {
+  const start = src.search(new RegExp('(async\\s+)?function\\s+' + name + '\\s*\\('));
+  if (start < 0) throw Error('missing ' + name);
+  let i = src.indexOf('{', start), depth = 1; i++;
+  while (depth && i < src.length) { if (src[i] === '{') depth++; if (src[i] === '}') depth--; i++; }
+  return src.slice(start, i);
+}
+global.window = global;
+const highlighted = [], scrolled = [];
+const seg = { id: 'seg', getClientRects: () => [1], scrollIntoView: (o) => scrolled.push(['seg', o.block]) };
+const row = { id: 'row', scrollIntoView: (o) => scrolled.push(['row', o.block]) };
+const container = { querySelectorAll: () => [seg] };
+global.$ = (id) => id === 'messages' ? container : null;
+global.document = { getElementById: (id) => id === 'msg-user-3' ? row : null };
+global._userMessageDomId = (i) => 'msg-user-' + i;
+global._cancelBottomSettle = () => {};
+global._beginMessageJumpScroll = () => {};
+global._messageJumpScrollBehavior = () => 'auto';
+global._highlightQuestionRow = (el) => highlighted.push(el.id);
+eval(extract('jumpToTurnQuestion'));
+(async () => {
+  await jumpToTurnQuestion(3, 4);
+  const assistant = { highlighted: highlighted.slice(), scrolled: scrolled.slice() };
+  highlighted.length = 0; scrolled.length = 0;
+  await jumpToTurnQuestion(3, -1);
+  console.log(JSON.stringify({ assistant, question: { highlighted, scrolled } }));
+})().catch(e => { console.error(e); process.exitCode = 1; });
+"""
+
+
+@needs_node
+def test_assistant_jump_target_gets_the_landing_cue():
+    result = subprocess.run([NODE, "-e", _JUMP_DRIVER, str(UI_JS)], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    r = json.loads(result.stdout)
+    assert r["assistant"] == {"highlighted": ["seg"], "scrolled": [["seg", "start"]]}, r
+    assert r["question"] == {"highlighted": ["row"], "scrolled": [["row", "center"]]}, r
+
+
+def test_outline_jump_uses_the_transcript_landing_cue():
+    outline = (REPO / "static" / "outline.js").read_text(encoding="utf-8")
+    start = outline.index("function _flashRow(row)")
+    body = outline[start:outline.index("\n}\n", start)]
+    assert "if (typeof _highlightQuestionRow === 'function') { _highlightQuestionRow(row); return; }" in body
+
+
+def test_landing_cue_tints_the_row_and_keeps_a_static_tint_under_reduced_motion():
+    assert re.search(r"\.msg-question-highlight \{\s*animation: message-landing-tint 1\.6s ease-out;\s*\}", STYLE_CSS)
+    keyframes = re.search(r"@keyframes message-landing-tint \{([^@]*?)\n\}", STYLE_CSS)
+    assert keyframes and "var(--accent-bg-strong)" in keyframes.group(1)
+    reduced = re.search(
+        r"@media \(prefers-reduced-motion: reduce\) \{\s*\.msg-question-highlight \{([^}]*)\}", STYLE_CSS
+    )
+    assert reduced, "reduced-motion override for the landing tint is missing"
+    assert "animation: none;" in reduced.group(1)
+    assert "background-color: var(--accent-bg-strong);" in reduced.group(1)
