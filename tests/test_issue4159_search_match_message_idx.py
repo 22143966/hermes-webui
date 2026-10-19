@@ -29,6 +29,7 @@ against small deterministic stubs.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -497,3 +498,95 @@ def test_virtualized_assistant_target_outside_dom_is_materialized():
     assert r["targetInDomBefore"] is False
     assert any(e.startswith("render@") for e in r["events"])
     assert "scroll:11:start" in r["events"]
+
+
+# --------------------------------------------------------------------------- #
+# sessions.js: the search-result click dispatches the jump
+# --------------------------------------------------------------------------- #
+_CLICK_DRIVER = r"""
+const fs=require('fs');
+const source=fs.readFileSync(process.argv[1],'utf8');
+const scenario=JSON.parse(process.argv[2]);
+function extract(name){
+  const start=source.search(new RegExp('function\\s+'+name+'\\s*\\('));
+  if(start<0) throw Error('missing '+name);
+  let i=source.indexOf('{',start),depth=1; i++;
+  while(depth&&i<source.length){if(source[i]==='{')depth++;if(source[i]==='}')depth--;i++;}
+  return source.slice(start,i);
+}
+global.window=global;
+const timers=[], calls=[];
+window.setTimeout=(f)=>{timers.push(f);return timers.length;};
+if(scenario.helper==='ok') window._jumpToFullSessionMessage=(idx,sid)=>{calls.push([idx,sid]);return Promise.resolve(true);};
+if(scenario.helper==='throws') window._jumpToFullSessionMessage=()=>{calls.push('threw');throw new Error('boom');};
+if(scenario.helper==='rejects') window._jumpToFullSessionMessage=()=>{calls.push('rejected');return Promise.reject(new Error('boom'));};
+eval(extract('_jumpToSessionSearchHit'));
+(async()=>{
+  const scheduled=_jumpToSessionSearchHit(scenario.session);
+  while(timers.length) timers.shift()();
+  await new Promise(r=>setImmediate(r));
+  console.log(JSON.stringify({scheduled,calls}));
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+
+
+def _run_click(session, helper="ok"):
+    result = subprocess.run(
+        [NODE, "-e", _CLICK_DRIVER, str(_SESSIONS_JS), json.dumps({"session": session, "helper": helper})],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@needs_node
+def test_content_hit_click_dispatches_full_session_jump_with_clicked_sid():
+    r = _run_click({"session_id": "s1", "match_type": "content", "match_message_idx": 4})
+    assert r == {"scheduled": True, "calls": [[4, "s1"]]}
+
+
+@needs_node
+@pytest.mark.parametrize(
+    "session",
+    [
+        {"session_id": "s1", "match_type": "title"},
+        {"session_id": "s1"},
+        {"session_id": "s1", "match_type": "content"},
+        {"session_id": "s1", "match_type": "content", "match_message_idx": None},
+        {"session_id": "s1", "match_type": "content", "match_message_idx": "4"},
+        {"session_id": "s1", "match_type": "content", "match_message_idx": -1},
+        {"session_id": "s1", "match_type": "content", "match_message_idx": 2.5},
+        {"match_type": "content", "match_message_idx": 4},
+    ],
+    ids=["title-hit", "plain-row", "no-idx", "null-idx", "string-idx", "negative", "fractional", "no-sid"],
+)
+def test_non_content_or_invalid_hit_only_opens_the_session(session):
+    assert _run_click(session) == {"scheduled": False, "calls": []}
+
+
+@needs_node
+@pytest.mark.parametrize("helper", ["missing", "throws", "rejects"])
+def test_jump_failures_never_break_the_open(helper):
+    r = _run_click({"session_id": "s1", "match_type": "content", "match_message_idx": 1}, helper=helper)
+    assert r["scheduled"] is (helper != "missing")
+
+
+def test_row_open_dispatches_jump_after_the_session_opens():
+    src = _SESSIONS_JS.read_text(encoding="utf-8")
+    start = src.index("const _openRowSession=async()=>{")
+    body = src[start:src.index("};", start)]
+    assert body.index("await _openSidebarSession(s);") < body.index("_jumpToSessionSearchHit(s);")
+
+
+def test_cross_script_wiring_goes_through_window():
+    """_jumpToFullSessionMessage lives inside outline.js's IIFE, so sessions.js
+    can only reach it through the window export (a bare call is a silent no-op,
+    the bug that sank the original #4224)."""
+    outline = _OUTLINE_JS.read_text(encoding="utf-8")
+    assert "window._jumpToFullSessionMessage = _jumpToFullSessionMessage" in outline
+    sessions = _SESSIONS_JS.read_text(encoding="utf-8")
+    assert "window._jumpToFullSessionMessage(idx,sid)" in sessions
+    bare = re.findall(r"(?<![.\w])_jumpTo(?:FullSession)?Message\s*\(", sessions)
+    assert not bare, "sessions.js must call the outline jump helpers via window"

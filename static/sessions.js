@@ -8117,6 +8117,26 @@ function _sessionSearchContentPreview(session, query){
   return preview||'';
 }
 
+// #4159/#5106: once a content-search hit's session has opened, scroll to the
+// matched message and flash it. match_message_idx is a FULL-session index, so it
+// goes to outline.js's full-session jump (reached through window: that helper
+// lives in another script's IIFE) together with the clicked session id for the
+// session-switch guard. No/invalid index or a non-content hit: just the open.
+function _jumpToSessionSearchHit(session){
+  if(!session||session.match_type!=='content') return false;
+  const idx=session.match_message_idx;
+  const sid=session.session_id;
+  if(!sid||!Number.isSafeInteger(idx)||idx<0) return false;
+  if(typeof window==='undefined'||typeof window._jumpToFullSessionMessage!=='function') return false;
+  window.setTimeout(()=>{
+    try{
+      const pending=window._jumpToFullSessionMessage(idx,sid);
+      if(pending&&typeof pending.catch==='function') pending.catch(()=>{});
+    }catch(_e){}
+  },0);
+  return true;
+}
+
 function _sessionSearchAddIdCandidate(candidates, seen, value){
   const raw=String(value||'').trim();
   if(!raw) return;
@@ -10985,6 +11005,7 @@ function renderSessionListFromCache(){
       try{
         if(($('sessionSearch').value||'').trim()) _hideSearchPreviewsAfterSelect=true;
         await _openSidebarSession(s);
+        _jumpToSessionSearchHit(s);
       }finally{
         el.classList.remove('loading');
       }
