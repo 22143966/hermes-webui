@@ -646,9 +646,9 @@ os.execv = _pytest_session_safe_execv
 # socket.getaddrinfo: DNS is network, and an unbounded lookup on a slow CI
 # resolver is as harmful as a connect. Only IP literals and localhost resolve;
 # every other name fails at once with socket.gaierror, the way an unresolvable
-# name does.  Tests that deliberately
-# attempt outbound (only test_dns_resolution_failure today) opt back in
-# explicitly via the `allow_outbound_network` fixture below.
+# name does. Only the isolation tests themselves (test_conftest_network_isolation.py,
+# test_conftest_dns_isolation.py) opt back in, via the `allow_outbound_network`
+# fixture below; everything else mocks the network.
 #
 # Allowed destinations (silent pass-through):
 #   - 127.0.0.0/8     loopback
@@ -662,9 +662,12 @@ os.execv = _pytest_session_safe_execv
 #   - 203.0.113.0/24  RFC5737 TEST-NET-3 (used as documentation IPs in tests)
 #   - hostnames `localhost`, `*.local`, `*.test`, `*.example`, `*.example.com`
 #     `*.example.net`, `*.example.org`, `*.invalid` (RFC2606/6761 reserved)
+#     at the connect layer. Under the DNS guard only `localhost` and
+#     `*.localhost` (and IP literals) resolve: a test that connects to one of
+#     the other reserved names must stub socket.getaddrinfo itself.
 #
 # A test that opts in via the `allow_outbound_network` fixture sees the real
-# socket.create_connection.
+# socket.create_connection, socket.socket.connect and socket.getaddrinfo.
 import socket as _hermes_test_socket
 _REAL_CREATE_CONNECTION = _hermes_test_socket.create_connection
 _REAL_SOCKET_CONNECT = _hermes_test_socket.socket.connect
@@ -799,7 +802,7 @@ def allow_outbound_network(monkeypatch):
     than a module-global toggle on CI runners where wrapper-closure
     lookup semantics can surprise.
 
-    Use sparingly. Today zero tests in the repo call this — the previous
+    Use sparingly. Only the isolation tests themselves use it; the previous
     test_dns_resolution_failure case was rewritten to mock socket.getaddrinfo
     instead, which is fully hermetic.
     """
