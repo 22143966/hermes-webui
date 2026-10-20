@@ -1131,6 +1131,61 @@ def test_r4_status_waiting_for_approval_surfaces_approval_card_once():
     assert harness["status"].calls == 2
 
 
+def test_r4_status_card_survives_without_capability_when_payload_carries_generation():
+    """A generation-fenced gateway never advertises ``approval_identity_v1``.
+
+    Its approval payload still carries an exact per-prompt id and the
+    ``execution_generation`` the respond endpoint validates, which is a
+    stronger identity than the capability flag. The status-card recovery must
+    ride that generation, otherwise a reattach after a restart drops the card
+    and the parked run can never be answered.
+    """
+    import api.config as api_config
+    from api import route_approvals as ra
+
+    # The harness reuses one session key; another test's parked card would
+    # otherwise be the queue head and be the payload surfaced here.
+    with ra._lock:
+        ra._pending.pop("sess-watchdog-harness", None)
+
+    clock = FakeClock()
+    approval_payload = {
+        "prompt_id": "prompt-r4-gen",
+        "execution_generation": 3,
+        "tool": "shell",
+        "command": "ls -la /tmp",
+        "description": "list files",
+        "risk_level": "high",
+        "choices": ["once", "deny"],
+    }
+    harness = run_turn(
+        clock=clock,
+        urlopen_script=[
+            FakeSseResponse(keepalive() * 4, end="eof", clock=clock, advance_per_line=60.0),
+            FakeSseResponse(keepalive() * 4, end="eof", clock=clock, advance_per_line=60.0),
+            FakeSseResponse(
+                sse_frame(0, {"event": "run.completed", "output": "after approval"}),
+                end="eof",
+            ),
+        ],
+        status_script=[
+            {"status": "waiting_for_approval", "approval": dict(approval_payload)},
+            {"status": "waiting_for_approval", "approval": dict(approval_payload)},
+        ],
+        extra_patches=[
+            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
+        ],
+    )
+    result = harness["result"]
+    assert result[0] == "after approval", (
+        f"run must finalize after the approval lane, got {result!r}")
+    approvals = [payload for name, payload in harness["events"] if name == "approval"]
+    assert len(approvals) == 1, (
+        f"exactly one approval card expected from the durable status, got {len(approvals)}: "
+        f"{approvals!r}")
+    assert approvals[0]["approval_id"] == "prompt-r4-gen", approvals[0]
+
+
 def _approval_request_frame(seq, appr_id, command):
     return sse_frame(seq, {
         "event": "approval.request",

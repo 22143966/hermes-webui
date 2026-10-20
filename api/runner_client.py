@@ -79,10 +79,32 @@ class HttpRunnerClient:
     def cancel_run(self, run_id: str) -> dict[str, Any]:
         return self._post(f"/v1/runs/{urllib.parse.quote(str(run_id), safe='')}/cancel", {})
 
-    def respond_approval(self, run_id: str, approval_id: str, choice: str) -> dict[str, Any]:
+    def respond_approval(
+        self,
+        run_id: str,
+        approval_id: str,
+        choice: str,
+        *,
+        execution_generation: int | None = None,
+    ) -> dict[str, Any]:
+        """Answer one pending run approval.
+
+        Gateways that bind a prompt to an execution generation (the canonical
+        Runs API contract) accept exactly ``{request_id, execution_generation,
+        choice}``; older gateways accept ``{choice, approval_id}``. The caller
+        picks the shape from what the gateway itself sent in the approval
+        payload, never from a capability guess: a generation is only ever
+        forwarded when the gateway published one for this exact prompt.
+        """
+        payload: dict[str, Any] = {"choice": choice}
+        if approval_id and execution_generation is not None:
+            payload["request_id"] = approval_id
+            payload["execution_generation"] = execution_generation
+        else:
+            payload["approval_id"] = approval_id
         return self._post(
             f"/v1/runs/{urllib.parse.quote(str(run_id), safe='')}/approval",
-            {"choice": choice, "approval_id": approval_id},
+            payload,
         )
 
     def respond_clarify(self, run_id: str, clarify_id: str, response: str) -> dict[str, Any]:

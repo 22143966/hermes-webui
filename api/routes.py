@@ -12537,6 +12537,7 @@ from api.route_approvals import (  # noqa: F401 — re-exports for backward comp
     _approval_sse_notify_locked,
     _approval_sse_notify,
     _GATEWAY_AGENT_IDENTITY_V1,
+    _GATEWAY_EXECUTION_GENERATION,
     _GATEWAY_MIRROR_FLAG,
     _GATEWAY_MIRROR_TOKEN,
     _gateway_mirror_entry_token,
@@ -31086,6 +31087,48 @@ def _gateway_approval_failure(
     return payload, status
 
 
+def _gateway_run_prompt(
+    base_url: str,
+    api_key: str,
+    run_id: str,
+    approval_id: str,
+) -> tuple[str, int, list[str]] | None:
+    """Read the prompt a run is currently waiting on, straight from the gateway.
+
+    A mirror the UI rebuilt for itself (a ``gwrun:`` head) carries no execution
+    generation, and any card synthesised from the live queue carries no
+    ``choices``. The run projection answers both for every card, whatever route
+    produced it, so one refresh covers them all.
+    """
+    from api.runner_client import HttpRunnerClient
+
+    try:
+        run = HttpRunnerClient(base_url=base_url, api_key=api_key).get_run(run_id)
+    except Exception:  # noqa: BLE001 - a failed refresh must never break the relay
+        logger.debug("gateway run prompt refresh failed for %s", run_id, exc_info=True)
+        return None
+    controls = run.get("pending_controls") if isinstance(run, dict) else None
+    prompts = [
+        prompt
+        for prompt in (controls or [])
+        if isinstance(prompt, dict)
+        and prompt.get("kind") == "approval"
+        and type(prompt.get("execution_generation")) is int
+    ]
+    match = next(
+        (prompt for prompt in prompts if str(prompt.get("prompt_id") or "") == approval_id),
+        None,
+    )
+    if match is None and len(prompts) == 1:
+        # A local id the gateway never issued, and exactly one prompt pending:
+        # the run can only be waiting on this one.
+        match = prompts[0]
+    if match is None:
+        return None
+    choices = [c for c in (match.get("choices") or []) if isinstance(c, str)]
+    return str(match.get("prompt_id") or ""), int(match["execution_generation"]), choices
+
+
 def _relay_gateway_run_approval(
     sid: str,
     mirror: dict,
@@ -31099,7 +31142,6 @@ def _relay_gateway_run_approval(
     Both the approval-card endpoint and the ordinary session-YOLO endpoint use
     this chokepoint so one tab cannot retire another tab's parked remote run.
     """
-    from api.config import gateway_supports_approval_identity_v1
     from api.gateway_chat import gateway_run_endpoint
     from api.runner_client import HttpRunnerClient, RunnerClientError
 
@@ -31143,9 +31185,53 @@ def _relay_gateway_run_approval(
             )
 
         base_url, api_key = gateway_run_endpoint(run_id)
-        identity_v1 = bool(current_mirror.get(_GATEWAY_AGENT_IDENTITY_V1)) and (
-            gateway_supports_approval_identity_v1(base_url, api_key)
-        )
+        # The identity decision was made once, when the gateway's own payload
+        # was interpreted: a mirror flagged v1 either carried an exact
+        # per-prompt id plus its execution generation, or came from a gateway
+        # advertising the capability. Re-asking /v1/capabilities here would
+        # re-open the very gap this fixes (the capability is not published by
+        # gateways that do fence prompts by generation).
+        identity_v1 = bool(current_mirror.get(_GATEWAY_AGENT_IDENTITY_V1))
+        execution_generation = current_mirror.get(_GATEWAY_EXECUTION_GENERATION)
+        if type(execution_generation) is not int:
+            execution_generation = None
+        # The card's own projection is the fast path; the run projection is the
+        # authority when the card was rebuilt locally (a ``gwrun:`` head, or a
+        # mirror reconstituted from the live queue) and carries neither a
+        # generation nor the choices the gateway will accept.
+        prompt_id = approval_id
+        choices = current_mirror.get("choices")
+        choices = [c for c in choices if isinstance(c, str)] if isinstance(choices, list) else []
+        if execution_generation is None:
+            resolved = _gateway_run_prompt(base_url, api_key, run_id, approval_id)
+            if resolved is not None:
+                prompt_id, execution_generation, resolved_choices = resolved
+                identity_v1 = True
+                choices = resolved_choices or choices
+        if identity_v1 and choices and choice not in choices:
+            # The gateway offers fewer choices than the stale card shows;
+            # forwarding this one is a guaranteed 400 that hides its cause.
+            # WARNING, not INFO: the app configures no logging level, so INFO is
+            # dropped by the default root logger and a stuck click stays blind.
+            logger.warning(
+                "gateway approval relay rejected: run=%s prompt=%s choice=%s offered=%s",
+                run_id,
+                prompt_id,
+                choice,
+                ",".join(choices),
+            )
+            return _gateway_approval_failure(
+                sid,
+                choice,
+                code="approval_choice_not_offered",
+                error=(
+                    f"The gateway does not accept '{choice}' for this prompt "
+                    f"(offers: {', '.join(choices)}). Reload the session and answer "
+                    "the card that is currently shown."
+                ),
+                status=400,
+                enable_yolo=enable_yolo,
+            )
         if not identity_v1:
             run_head = gateway_pending_mirror(sid, run_id=run_id)
             if not run_head or str(run_head.get("approval_id") or "").strip() != approval_id:
@@ -31158,22 +31244,71 @@ def _relay_gateway_run_approval(
                     enable_yolo=enable_yolo,
                 )
 
+        def _respond(reply_prompt_id: str, reply_generation) -> str | None:
+            try:
+                # Constructed per send: a misconfigured base must raise inside
+                # this try, or it escapes the relay and falls through to the
+                # legacy path as a false success.
+                HttpRunnerClient(base_url=base_url, api_key=api_key).respond_approval(
+                    run_id,
+                    reply_prompt_id if identity_v1 else "",
+                    choice,
+                    **(
+                        {"execution_generation": reply_generation}
+                        if identity_v1 and reply_generation is not None
+                        else {}
+                    ),
+                )
+                return None
+            except (RunnerClientError, ValueError) as exc:
+                return str(exc)
+
         yolo_transition = begin_session_yolo_transition(sid) if enable_yolo else None
-        relay_error = None
         relay_succeeded = False
+        already_resolved = False
         try:
-            HttpRunnerClient(base_url=base_url, api_key=api_key).respond_approval(
-                run_id,
-                approval_id if identity_v1 else "",
-                choice,
-            )
-            relay_succeeded = True
-        except (RunnerClientError, ValueError) as exc:
-            relay_error = str(exc)
+            relay_error = _respond(prompt_id, execution_generation)
+            if relay_error is not None and "approval_not_pending" in relay_error:
+                # The mirror outlived the prompt it was built from: the run has
+                # since parked a newer one (fresh prompt id, newer generation).
+                # Re-project from the run's own pending_controls and answer that
+                # instead of replaying the dead prompt on every click.
+                resolved = _gateway_run_prompt(base_url, api_key, run_id, approval_id)
+                if resolved is not None:
+                    live_prompt_id, live_generation, live_choices = resolved
+                    if (live_prompt_id, live_generation) != (prompt_id, execution_generation):
+                        prompt_id, execution_generation = live_prompt_id, live_generation
+                        identity_v1 = True
+                        choices = live_choices or choices
+                        relay_error = _respond(prompt_id, execution_generation)
+                else:
+                    # No pending control left for this run: the second click of a
+                    # double click, or a stale card in another tab. The answer the
+                    # user wanted is already in effect, so this is an idempotent
+                    # replay, not a failure — 502 here painted a red error on an
+                    # approval that had just succeeded.
+                    already_resolved = True
+            relay_succeeded = relay_error is None or already_resolved
         finally:
             finish_session_yolo_transition(sid, yolo_transition, succeeded=relay_succeeded)
 
-        if relay_error is not None:
+        # One line per relayed click: the body shape is what decides 200 vs 400,
+        # and the client never surfaced it, so a stuck 400 was undiagnosable.
+        logger.warning(
+            "gateway approval relay: run=%s prompt=%s choice=%s generation=%s "
+            "identity_v1=%s body=%s result=%s",
+            run_id,
+            prompt_id,
+            choice,
+            execution_generation,
+            identity_v1,
+            "request_id+execution_generation+choice"
+            if identity_v1 and execution_generation is not None
+            else "approval_id+choice",
+            relay_error or "ok",
+        )
+
+        if relay_error is not None and not already_resolved:
             return _gateway_approval_failure(
                 sid,
                 choice,
@@ -31197,6 +31332,7 @@ def _relay_gateway_run_approval(
             "ok": True,
             "choice": choice,
             "relayed": True,
+            **({"already_resolved": True} if already_resolved else {}),
             **(
                 {"yolo_enabled": bool(is_session_yolo_enabled(sid))}
                 if enable_yolo

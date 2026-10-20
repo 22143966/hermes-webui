@@ -68,6 +68,7 @@ _GATEWAY_MIRROR_TOKEN = "_gateway_mirror_token"
 _GATEWAY_MIRROR_RETAINED = "_gateway_mirror_retained"
 _GATEWAY_ENTRY_DATA_TOKEN_KEY = "_webui_mirror_token"
 _GATEWAY_AGENT_IDENTITY_V1 = "_gateway_agent_identity_v1"
+_GATEWAY_EXECUTION_GENERATION = "_gateway_execution_generation"
 _gateway_relay_owners: dict[tuple[str, str], str] = {}
 _yolo_transition_lock = threading.Lock()
 _yolo_transitions: dict[str, dict] = {}
