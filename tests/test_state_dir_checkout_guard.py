@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFTEST = REPO_ROOT / "tests" / "conftest.py"
 
@@ -32,6 +34,8 @@ _PROBE = (
 def _run_probe(tmp_path: Path, state_dir_value: str) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["HERMES_WEBUI_TEST_STATE_DIR"] = state_dir_value
+    # A runner-exported state ROOT would re-anchor the fallback outside tmp_path.
+    env.pop("HERMES_WEBUI_TEST_STATE_ROOT", None)
     # Keep the default under a temp root that is outside the real home tree, and
     # out of this machine's TMPDIR (which may itself live under ~/.hermes).
     env["TMPDIR"] = str(tmp_path / "tmp")
@@ -61,3 +65,34 @@ def test_state_dir_pointing_at_the_checkout_is_refused(tmp_path):
     out = _run_probe(tmp_path, str(REPO_ROOT))
     assert out.returncode != 0
     assert "REFUSING TO RUN" in out.stderr
+
+
+# Maintainer follow-up on #8414 (release review): the session fixture rmtrees the
+# state dir at setup and teardown, so a value INSIDE the checkout (``tests``,
+# ``static``, a relative path) wiped that directory on master. Refuse it too.
+@pytest.mark.parametrize("value", ["tests", "static", "./tests", "tests/state-inside"])
+def test_state_dir_inside_the_checkout_is_refused(tmp_path, value):
+    out = _run_probe(tmp_path, value)
+    assert out.returncode != 0
+    assert "REFUSING TO RUN" in out.stderr
+
+
+def test_absolute_path_inside_the_checkout_is_refused(tmp_path):
+    out = _run_probe(tmp_path, str(REPO_ROOT / "static"))
+    assert out.returncode != 0
+    assert "REFUSING TO RUN" in out.stderr
+
+
+def test_whitespace_only_state_dir_env_falls_back(tmp_path):
+    out = _run_probe(tmp_path, "   ")
+    assert out.returncode == 0, out.stderr
+    resolved = Path(out.stdout.strip()).resolve()
+    assert REPO_ROOT not in resolved.parents and resolved != REPO_ROOT
+    assert (tmp_path / "tmp").resolve() in resolved.parents
+
+
+def test_explicit_state_dir_outside_the_checkout_is_honoured(tmp_path):
+    target = tmp_path / "explicit-state"
+    out = _run_probe(tmp_path, str(target))
+    assert out.returncode == 0, out.stderr
+    assert Path(out.stdout.strip()).resolve() == target.resolve()
