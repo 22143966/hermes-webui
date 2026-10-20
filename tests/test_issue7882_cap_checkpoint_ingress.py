@@ -27,7 +27,7 @@ import sqlite3
 import time
 from collections import OrderedDict
 from io import BytesIO
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 import pytest
 
