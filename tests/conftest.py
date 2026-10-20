@@ -128,10 +128,24 @@ import tempfile as _tempfile
 _TEST_STATE_ROOT = pathlib.Path(
     os.getenv('HERMES_WEBUI_TEST_STATE_ROOT', _tempfile.gettempdir())
 ) / 'hermes-webui-tests'
-TEST_STATE_DIR = pathlib.Path(os.getenv(
-    'HERMES_WEBUI_TEST_STATE_DIR',
-    str(_TEST_STATE_ROOT / _auto_state_dir_name(REPO_ROOT, TEST_PORT))
-)).resolve()
+# ``os.getenv(name, default)`` returns "" (not the default) when the variable is
+# exported but empty, and ``Path("").resolve()`` is the CURRENT DIRECTORY — so a
+# bare ``HERMES_WEBUI_TEST_STATE_DIR=`` pointed the test state dir at the checkout
+# and teardown rmtree'd the repo. Treat an empty value as unset.
+TEST_STATE_DIR = pathlib.Path(
+    os.getenv('HERMES_WEBUI_TEST_STATE_DIR')
+    or str(_TEST_STATE_ROOT / _auto_state_dir_name(REPO_ROOT, TEST_PORT))
+).resolve()
+
+# Belt and braces for an explicit value: never let teardown delete the checkout
+# or anything above it.
+if TEST_STATE_DIR == REPO_ROOT or TEST_STATE_DIR in REPO_ROOT.parents:
+    raise RuntimeError(
+        f"REFUSING TO RUN: test state dir {TEST_STATE_DIR} is the repo checkout "
+        f"({REPO_ROOT}) or one of its parents, so teardown would delete the "
+        f"repository. Unset HERMES_WEBUI_TEST_STATE_DIR (defaults to a temp dir) "
+        f"or point it somewhere else."
+    )
 
 # Production-proximity guard: refuse to run if the resolved test state dir lands
 # inside the REAL Hermes home tree — a misconfigured HERMES_WEBUI_TEST_STATE_DIR
