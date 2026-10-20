@@ -1842,8 +1842,19 @@ class Session:
         # row it names is really here. An index rebuild that reloads a sidecar
         # whose hidden row was replaced would otherwise carry the stale fact
         # forward and undercount by one.
+        #
+        # ``load_metadata_only`` is the one intentionally transcript-less
+        # ingress: it substitutes ``messages=[]`` on purpose, so an empty array
+        # there proves nothing about the row and the loader passes
+        # ``_pending_hidden_wakeup_transcript_absent=True`` to keep the fact
+        # (#7882 re-gate finding 1). Shrinks stay covered there by the
+        # transcript-independent ``truncation_boundary`` authority that rides
+        # the same metadata prefix.
         self._pending_hidden_wakeup_at = _validated_pending_hidden_wakeup_at(
-            self, require_row=True
+            self,
+            require_row=not kwargs.get(
+                '_pending_hidden_wakeup_transcript_absent', False
+            ),
         )
         self._webui_pending_user_timestamp_identity = (
             _validated_webui_pending_user_timestamp_identity(
@@ -2392,6 +2403,13 @@ class Session:
             parsed['messages'] = []
             parsed['tool_calls'] = []
             parsed = _apply_session_draft_overlay(parsed, sid)
+            # This loader skips the transcript on PURPOSE, so an empty
+            # ``messages`` is no evidence that the checkpointed row vanished.
+            # Without this the eager-checkpoint fact is dropped on every
+            # missing-index / metadata-stub ingress and the capped-out sidebar
+            # undercounts the continued conversation by one (#7882 re-gate
+            # finding 1).
+            parsed['_pending_hidden_wakeup_transcript_absent'] = True
             session = cls(**parsed)
             sidecar_message_count = _parse_nonnegative_int(parsed.get('message_count'))
             index_message_count = None
@@ -7558,6 +7576,16 @@ def _refresh_index_rows_from_sidecar_metadata(
             continue
         compact = sidecar.compact(include_runtime=True)
         refreshed = dict(session)
+        # #7882 re-gate finding 2: the checkpoint fact must come from the
+        # CURRENT sidecar, never from the older index row. The index row can
+        # hold a fact stamped by a previous eager checkpoint; keeping it while
+        # the sidecar describes a newer deferred turn lets the stale fact vouch
+        # for a turn it never named and overcounts the visible total. So drop
+        # the index row's fact and re-apply it only when ``compact()`` emits it
+        # -- which it does only while the fact names the turn pending now.
+        # ``pending_user_source`` keeps flowing through the field copy below:
+        # the overlay needs it to know a hidden row is still owed its discount.
+        refreshed.pop('_pending_hidden_wakeup_at', None)
         for key in (
             'message_count', 'updated_at', 'last_message_at', 'title', 'workspace',
             'model', 'model_provider', 'created_at', 'pinned', 'archived', 'project_id',
@@ -7565,10 +7593,14 @@ def _refresh_index_rows_from_sidecar_metadata(
             'raw_source', 'session_source', 'source_label', 'active_stream_id',
             'has_pending_user_message', 'pending_user_message', 'pending_started_at',
             'visible_message_count',
+            'pending_user_source',
         ):
             value = compact.get(key)
             if value is not None:
                 refreshed[key] = value
+        compact_fact = compact.get('_pending_hidden_wakeup_at')
+        if compact_fact is not None:
+            refreshed['_pending_hidden_wakeup_at'] = compact_fact
         try:
             refreshed['message_count'] = max(
                 int(session.get('message_count') or 0),
