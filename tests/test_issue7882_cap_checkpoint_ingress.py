@@ -23,7 +23,6 @@ window, and the target row capped out — the schedule the maintainer replayed.
 from __future__ import annotations
 
 import json
-import sys
 import sqlite3
 import time
 from collections import OrderedDict
@@ -831,7 +830,6 @@ def test_stale_index_fact_does_not_vouch_for_a_newer_deferred_turn(monkeypatch, 
     # What the writer publishes for this transcript: the visible count excludes
     # hidden rows (the same predicate ``save`` uses) and only rows that exist,
     # so the removed eager wakeup row no longer absorbs a discount.
-    from api.models import is_hidden_transcript_row as _hidden
     sidecar["visible_message_count"] = sum(
         1 for m in sidecar.get("messages") or [] if not _hidden(m)
     )
