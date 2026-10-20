@@ -82,6 +82,8 @@
 
 ### Fixed
 
+- **Insights cache hit rate is no longer stuck at or below 50%.** Cache reads are already counted inside input tokens, so the rate now divides cache reads by the full prompt total, in the daily chart and the per-model and overall figures. Thanks @balabommablock-cpu. (#8372, fixes #8345)
+
 - **Long messages no longer show another message's text.** The render cache identified messages over 500 characters by their length plus their first and last 20 characters, so two equal-length messages from the same template (status reports, cron summaries, regenerated answers) shared an entry and the second displayed the first one's body. Long messages are now keyed on a hash of the whole text. Saved data was never affected. (#8387)
 
 - **Tool calls without a result no longer break a conversation.** An assistant tool call whose result never arrived (an interrupted run, a crash between call and result) is now repaired the same way the Agent repairs it, so the next reply stays in the saved model context instead of being dropped, including when an older tool call had empty or broken arguments. (#7237, thanks @happy5318)
