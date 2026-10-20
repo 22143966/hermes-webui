@@ -796,7 +796,7 @@ def _read_jsonl(path: Path) -> tuple[list[dict], list[dict]]:
     text = _read_run_file_text(path)
     if text is None:
         return events, malformed
-    lines = text.splitlines()
+    lines = _split_lines_newline_only(text)
     for line_no, raw in enumerate(lines, start=1):
         if not raw.strip():
             continue
@@ -2011,20 +2011,32 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
     # archive removal and the live-directory removal so no publication can
     # interleave a sweep anywhere inside the deletion window.
     with _session_lock_for(root, sid):
+        # Remove the LIVE journal directory FIRST and the archives SECOND.
+        # `_session_lock_for` is a threading lock: it excludes a sweep in THIS
+        # process and nothing else. Another WebUI process sharing the state dir
+        # (an old and a new process overlapping across a restart) can sweep
+        # mid-delete. With the live tree removed first a sweep cannot start
+        # archiving it; with the archive removal SECOND, an in-flight
+        # publication — even one paused mid-archive after compressing — still
+        # lands before that step removes it. Archive-first left a readable
+        # `.jsonl.gz` behind whenever a sweep ran between the two steps (a
+        # "deleted" session whose transcript still read back).
+        #
+        # A path-based ``shutil.rmtree`` here is check-then-use: the existence
+        # check resolves the pathname, then the recursive delete resolves it
+        # AGAIN, so a directory swapped to a symlink in between makes rmtree
+        # destroy a foreign tree. The journal root is pinned (O_NOFOLLOW), the
+        # session entry is opened relative to it with O_NOFOLLOW, and the tree is
+        # then cleared fd-relatively and removed by name from the pinned root.
+        removed = _remove_live_session_tree(root, sid)
         # Remove the session's archives through PINNED, no-follow handles: a
         # symlinked `_run_journal_archive` (or a symlinked session dir inside it)
         # would otherwise make this delete a foreign directory. When the handles
         # cannot be acquired, nothing inside that root is trusted, so the archive
-        # side is left alone and only the live journal is removed.
+        # side is left alone. Run this even when the live tree was already
+        # absent (`removed` reports only the live side) — a "deleted" session
+        # must not leave recoverable transcripts on disk.
         _remove_archive_session_tree(root, sid)
-        # Remove the LIVE journal directory the same way. A path-based
-        # ``shutil.rmtree`` here is check-then-use: the existence check resolves
-        # the pathname, then the recursive delete resolves it AGAIN, so a
-        # directory swapped to a symlink in between makes rmtree destroy a
-        # foreign tree. The journal root is pinned (O_NOFOLLOW), the session
-        # entry is opened relative to it with O_NOFOLLOW, and the tree is then
-        # cleared fd-relatively and removed by name from the pinned root.
-        removed = _remove_live_session_tree(root, sid)
         if not removed:
             return False
     # Evict any writer locks the removed runs left behind. `_lock_for` keys are
@@ -3770,6 +3782,55 @@ def _recover_archive_claims(session_root: Path) -> None:
             pass
 
 
+def _session_sidecar_keeps_run(session_root: Path, session_id: str, run_id: str) -> bool:
+    """True while the persisted session still needs this run's journal.
+
+    A crash or restart leaves ``active_stream_id`` / ``pending_user_message``
+    set on the session sidecar, and the answer is recovered lazily on the
+    session's next full load (``_repair_stale_pending`` ->
+    ``_append_journaled_partial_output``). Until then the run journal — possibly
+    already archived — holds the ONLY copy, so an archive-TTL prune must keep
+    it. The same applies while any message still carries the recovery marker or
+    a retry pointer at this run.
+
+    Fail closed: a sidecar that exists but is not a plain, readable, parseable
+    file keeps the archive (an unreadable reference is UNKNOWN, not absent).
+    Only a CONFIRMED missing sidecar — the session was deleted, so nothing can
+    ever recover from the archive — lets the prune proceed.
+    """
+    sidecar = session_root / f"{session_id}.json"
+    try:
+        st = sidecar.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if not stat.S_ISREG(st.st_mode):
+        return True
+    try:
+        raw = sidecar.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return True
+    if not isinstance(data, dict):
+        return True
+    if str(data.get("active_stream_id") or "") == run_id:
+        return True
+    for message in data.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("_pending_journal_recovery"):
+            return True
+        if str(message.get("_journal_retry_stream_id") or "") == run_id:
+            return True
+    return False
+
+
 def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, counters: dict) -> None:
     """Delete archived runs older than the archive TTL (the ONLY destructive step).
 
@@ -3899,6 +3960,13 @@ def _prune_run_journal_archive(session_root: Path, caps: dict, now: float, count
                                 _live_run_state_locked(live_root, name, run_stem, holder)
                                 != "absent"
                             ):
+                                continue
+                            # The live file may be gone while the SESSION still
+                            # needs the run: a crash or restart leaves the
+                            # sidecar pointing at it and the answer is recovered
+                            # lazily on the session's next full load. The
+                            # archive is the only remaining copy until then.
+                            if _session_sidecar_keeps_run(session_root, name, run_stem):
                                 continue
                             # Identity is re-asserted inside the unlink (see
                             # `_prune_archive_entry`): a name republished since

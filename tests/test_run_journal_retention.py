@@ -3195,3 +3195,121 @@ def test_prune_claim_restoration_is_serialized(tmp_path):
     finally:
         os.close(cleanup_fd)
         os.close(hold_fd)
+
+
+# ── 19th re-gate: archive TTL vs pending recovery + delete ordering ──────────
+
+
+def _write_session_sidecar(root: Path, sid: str, **fields) -> Path:
+    """Persisted session sidecar carrying the fields the prune guard reads."""
+    path = root / f"{sid}.json"
+    data = {"session_id": sid, "title": "t", "messages": []}
+    data.update(fields)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def _archive_run_for_ttl(root: Path, sid: str, rid: str) -> Path:
+    """Archive a run exactly like a real sweep (writer rows + real sweep)."""
+    _write_run(root, sid, rid, events=[("token", {"text": "ONLY ANSWER"})], mtime_age_days=30)
+    counters = _sweep(root)  # default caps -> the TTL cap archives the run
+    assert counters["archived_files"] == 1, counters
+    archive = _archive_path(root, sid, rid)
+    assert archive.exists()
+    stale = time.time() - 30 * 86400.0
+    os.utime(archive, (stale, stale))
+    return archive
+
+
+@pytest.mark.parametrize(
+    "shape", ["active-stream", "pending-recovery-message", "retry-stream-id"]
+)
+def test_archive_ttl_keeps_an_archive_the_session_still_references(tmp_path, monkeypatch, shape):
+    sid, rid = "s1", "run1"
+    archive = _archive_run_for_ttl(tmp_path, sid, rid)
+    if shape == "active-stream":
+        _write_session_sidecar(tmp_path, sid, active_stream_id=rid, pending_user_message="Question")
+    elif shape == "pending-recovery-message":
+        _write_session_sidecar(
+            tmp_path,
+            sid,
+            messages=[{"role": "assistant", "content": "partial", "_pending_journal_recovery": True}],
+        )
+    else:
+        _write_session_sidecar(
+            tmp_path,
+            sid,
+            messages=[{"role": "assistant", "content": "partial", "_journal_retry_stream_id": rid}],
+        )
+    monkeypatch.setenv(rj._RETENTION_ARCHIVE_TTL_ENV, "7")
+    counters = _sweep(tmp_path)
+    assert counters["pruned_archives"] == 0, counters
+    assert archive.exists()
+    # The archive is the only copy left; the lazy recovery must still find it.
+    read = rj.read_run_events(sid, rid, session_dir=tmp_path, validated_recovery=True)
+    assert any(e["payload"].get("text") == "ONLY ANSWER" for e in read["events"]), read
+
+
+def test_archive_ttl_prune_fails_closed_on_unparseable_sidecar(tmp_path, monkeypatch):
+    sid, rid = "s1", "run1"
+    archive = _archive_run_for_ttl(tmp_path, sid, rid)
+    (tmp_path / f"{sid}.json").write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv(rj._RETENTION_ARCHIVE_TTL_ENV, "7")
+    counters = _sweep(tmp_path)
+    assert counters["pruned_archives"] == 0, counters
+    assert archive.exists()
+
+
+def test_archive_ttl_prune_proceeds_when_sidecar_is_absent(tmp_path, monkeypatch):
+    sid, rid = "s1", "run1"
+    archive = _archive_run_for_ttl(tmp_path, sid, rid)
+    assert not (tmp_path / f"{sid}.json").exists()
+    monkeypatch.setenv(rj._RETENTION_ARCHIVE_TTL_ENV, "7")
+    counters = _sweep(tmp_path)
+    assert counters["pruned_archives"] == 1, counters
+    assert not archive.exists()
+
+
+@requires_fork
+def test_delete_run_journal_removes_live_before_archives_under_cross_process_sweep(tmp_path):
+    sid, rid = "delete-me", "run1"
+    _write_run(tmp_path, sid, rid, events=[("token", {"text": "PRIVATE TRANSCRIPT"})], mtime_age_days=15)
+
+    ctx = multiprocessing.get_context("fork")
+    go = ctx.Event()
+    finished = ctx.Event()
+
+    def _sweep_in_child(go_evt, done_evt):
+        go_evt.wait(10)
+        rj.sweep_run_journal(session_dir=tmp_path, ttl_days=14)
+        done_evt.set()
+
+    proc = ctx.Process(target=_sweep_in_child, args=(go, finished))
+    proc.start()  # forked BEFORE the delete: shares no locks, reads the same tree
+
+    real_remove = rj._remove_live_session_tree
+
+    def _hooked(session_root, session_id):
+        go.set()
+        finished.wait(10)
+        return real_remove(session_root, session_id)
+
+    rj._remove_live_session_tree = _hooked
+    try:
+        removed = rj.delete_run_journal(sid, session_dir=tmp_path)
+    finally:
+        rj._remove_live_session_tree = real_remove
+        proc.join(10)
+    assert removed is True
+    assert not _archive_path(tmp_path, sid, rid).exists()
+    assert not (tmp_path / rj.RUN_JOURNAL_DIR_NAME / sid).exists()
+    assert rj.read_run_events(sid, rid, session_dir=tmp_path)["events"] == []
+
+
+def test_plain_read_keeps_separator_rows_whole(tmp_path):
+    sid, rid = "s1", "run1"
+    path = _write_run(tmp_path, sid, rid, events=[("token", {"text": "a\u2028b"})], terminal=False)
+    events, malformed = rj._read_jsonl(path)
+    assert [e["seq"] for e in events] == [1], (events, malformed)
+    assert malformed == []
+    assert events[0]["payload"]["text"] == "a\u2028b"
