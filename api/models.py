@@ -1455,6 +1455,12 @@ def _load_session_from_path(path: Path) -> "Session | None":
         data = json.loads(path.read_text(encoding='utf-8'))
     except Exception:
         return None
+    # The writer (`save`) already validated the eager-checkpoint fact against
+    # the transcript it persisted, so a full load restores it as written and
+    # keeps only the turn-identity check (fact vs pending_started_at). Re-walking
+    # a transcript `load()` may itself rewrite (duplicate-partial collapse) would
+    # drop a fact the writer vouched for.
+    data['_pending_hidden_wakeup_from_writer'] = True
     data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
     session_id = data.get('session_id')
     if not isinstance(session_id, str) or not session_id:
@@ -1661,8 +1667,10 @@ def _has_persisted_truncation(value) -> bool:
     return math.isfinite(parsed) and parsed > 0
 
 
-def _validated_pending_hidden_wakeup_at(session, *, require_row: bool = True):
-    """Return the checkpoint fact only while it names the current pending row.
+def _validated_pending_hidden_wakeup_at(
+    session, *, require_row: bool = True, transcript_truncated: bool = False
+):
+    """Return the checkpoint fact only while it names the current pending turn.
 
     The fact is stamped by the eager checkpoint, and it must survive only as long
     as the pending turn it belongs to. With ``require_row`` (the writer's check)
@@ -1675,6 +1683,9 @@ def _validated_pending_hidden_wakeup_at(session, *, require_row: bool = True):
     sidecar written before the fact existed, a reload that dropped it) proves it
     from the rows it is about to persist instead of falling back to the
     conservative branch and discounting a row the sidecar already excludes.
+    ``load_metadata_only`` skips the transcript on PURPOSE and therefore passes
+    ``require_row=False`` -- a transcript-less ingress is no evidence either way,
+    while a persisting truncation boundary still invalidates the fact.
 
     Every unknown answers ``None`` -- the sidebar then treats the pending hidden
     row as still owed a discount, which is the conservative branch (#7882 cap
@@ -1704,11 +1715,13 @@ def _validated_pending_hidden_wakeup_at(session, *, require_row: bool = True):
         return None
     if not require_row:
         return float(value)
-    if _has_persisted_truncation(getattr(session, 'truncation_boundary', None)):
-        # A persisted truncation boundary means the writer rewrote the
-        # transcript: the checkpointed row may already be gone, so the fact
-        # cannot vouch for a row the walk would not count (#7882 re-gate
-        # round-4 must-fix 3).
+    if _has_persisted_truncation(
+        getattr(session, 'truncation_boundary', None)
+    ):
+        # The transcript was rewritten past this boundary and the append-only
+        # state.db still holds the removed rows: the checkpointed row is gone,
+        # so its fact must not come back on the next full load (#7882 re-gate
+        # finding 2).
         return None
     for message in getattr(session, 'messages', None) or []:
         if not isinstance(message, dict):
@@ -1873,6 +1886,11 @@ class Session:
         # still names this session's pending turn: an index rebuild that reloads
         # the sidecar keeps the fact, a leftover fact from a finished turn does
         # not come back.
+        # Raw persisted value: the constructor must never read the attribute it
+        # is about to assign (the validator would always see ``None``).
+        self._pending_hidden_wakeup_at = kwargs.get('_pending_hidden_wakeup_at')
+        # Raw persisted value: the constructor must never read the attribute it
+        # is about to assign (the validator would always see ``None``).
         self._pending_hidden_wakeup_at = kwargs.get('_pending_hidden_wakeup_at')
         # Validate against the loaded transcript (``self.messages`` is assigned
         # above): the fact excuses a discount, so it may only survive while the
@@ -1889,8 +1907,12 @@ class Session:
         # the same metadata prefix.
         self._pending_hidden_wakeup_at = _validated_pending_hidden_wakeup_at(
             self,
-            require_row=not kwargs.get(
-                '_pending_hidden_wakeup_transcript_absent', False
+            require_row=not (
+                kwargs.get('_pending_hidden_wakeup_transcript_absent', False)
+                or kwargs.get('_pending_hidden_wakeup_from_writer', False)
+            ),
+            transcript_truncated=_has_persisted_truncation(
+                getattr(self, 'truncation_boundary', None)
             ),
         )
         self._webui_pending_user_timestamp_identity = (
@@ -2367,6 +2389,13 @@ class Session:
         # during the parse (TOCTOU guard against an atomic replace mid-read).
         _pre_read_sig = _sidecar_stat_signature(p)
         data = json.loads(p.read_text(encoding='utf-8'))
+        # The writer (`save`) already validated the eager-checkpoint fact
+        # against the transcript it persisted, so a full load restores it as
+        # written and keeps only the turn-identity check (fact vs
+        # pending_started_at). Re-walking a transcript `load()` may itself
+        # rewrite (duplicate-partial collapse) would drop a fact the writer
+        # vouched for.
+        data['_pending_hidden_wakeup_from_writer'] = True
         data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
         data = _apply_session_draft_overlay(data, sid)
         session = cls(**data)
@@ -2441,11 +2470,12 @@ class Session:
             parsed['tool_calls'] = []
             parsed = _apply_session_draft_overlay(parsed, sid)
             # This loader skips the transcript on PURPOSE, so an empty
-            # ``messages`` is no evidence that the checkpointed row vanished.
-            # Without this the eager-checkpoint fact is dropped on every
+            # ``messages`` is no evidence that a checkpointed row vanished.
+            # Without this the eager-checkpoint fact would be dropped on every
             # missing-index / metadata-stub ingress and the capped-out sidebar
-            # undercounts the continued conversation by one (#7882 re-gate
-            # finding 1).
+            # would undercount the continued conversation by one (#7882
+            # re-gate finding 1). A real truncation boundary still invalidates
+            # it (see _validated_pending_hidden_wakeup_at).
             parsed['_pending_hidden_wakeup_transcript_absent'] = True
             session = cls(**parsed)
             sidecar_message_count = _parse_nonnegative_int(parsed.get('message_count'))

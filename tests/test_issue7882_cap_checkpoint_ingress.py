@@ -23,6 +23,7 @@ window, and the target row capped out — the schedule the maintainer replayed.
 from __future__ import annotations
 
 import json
+import sys
 import sqlite3
 import time
 from collections import OrderedDict
@@ -696,3 +697,196 @@ def test_a_reload_drops_the_fact_once_the_hidden_row_is_gone(
         "a reload whose transcript no longer holds the named hidden row must "
         "drop the fact; keeping it excuses a discount that is still owed"
     )
+
+
+# --- re-gate findings 1 and 2: every ingress keeps the current-turn fact --------
+
+
+def _eager_continued_target(monkeypatch, tmp_path, *, now, seed_fillers=True):
+    """Seed fillers plus a target whose eager turn the installed Agent continued.
+
+    Returns after the Agent appended the plain user row and the visible reply to
+    state.db (authoritative visible 3, raw 4).
+    """
+    if seed_fillers:
+        _seed_store(monkeypatch, tmp_path, now=now)
+    else:
+        _install_store(monkeypatch, tmp_path)
+    target_messages = [
+        {"role": "user", "content": "hi", "timestamp": now - 60},
+        {"role": "assistant", "content": "hello", "timestamp": now - 59},
+    ]
+    session = _new_session(
+        TARGET, messages=target_messages, created_at=now - 60, updated_at=now - 59,
+        title="Checkpointed",
+    )
+    session.save(touch_updated_at=False)
+    _state_db(tmp_path, {TARGET: list(target_messages)})
+
+    _eager_checkpoint(session, text="handoff", started_at=now)
+    session.save()
+    return session
+
+
+def _continue_target_in_state_db(tmp_path, now):
+    """The installed Agent appends the pending user row and the visible reply."""
+    _append_state_db_rows(tmp_path, TARGET, [
+        {"role": "user", "content": "handoff", "timestamp": now + 1},
+        {"role": "assistant", "content": "done", "timestamp": now + 2},
+    ])
+    assert _state_db_message_count(tmp_path, TARGET) == 4
+
+
+def test_metadata_stub_ingress_keeps_the_current_turn_fact(monkeypatch, tmp_path):
+    """``load_metadata_only`` skips the transcript on purpose, not by accident.
+
+    The capped-out row is rebuilt from a metadata stub; an empty ``messages``
+    list there is no evidence that the checkpointed row vanished, so the fact
+    must survive and the poll must report the authoritative 3.
+    """
+    now = time.time()
+    _eager_continued_target(monkeypatch, tmp_path, now=now)
+    _continue_target_in_state_db(tmp_path, now)
+
+    stub = models.Session.load_metadata_only(TARGET)
+    assert stub is not None
+    assert stub.messages == []
+    assert stub._pending_hidden_wakeup_at == pytest.approx(now, rel=0, abs=1e-6), (
+        "a transcript-less ingress must not read the absent transcript as a lost row"
+    )
+
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", str(CAP))
+    first = _public_poll(TARGET)
+    second = _public_poll(TARGET)
+    for label, row in (("first", first), ("second", second)):
+        assert row["visible_message_count"] == 3, (
+            f"{label} poll after a metadata-stub ingress reported "
+            f"{row['visible_message_count']}, expected 3"
+        )
+
+
+def test_missing_index_ingress_keeps_the_current_turn_fact(monkeypatch, tmp_path):
+    """Missing-index recovery goes through ``load_metadata_only`` as well."""
+    now = time.time()
+    _eager_continued_target(monkeypatch, tmp_path, now=now)
+    _continue_target_in_state_db(tmp_path, now)
+
+    entries = json.loads(models.SESSION_INDEX_FILE.read_text(encoding="utf-8"))
+    kept = [row for row in entries if row.get("session_id") != TARGET]
+    assert len(kept) == len(entries) - 1
+    models.SESSION_INDEX_FILE.write_text(json.dumps(kept), encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", str(CAP))
+    first = _public_poll(TARGET)
+    second = _public_poll(TARGET)
+    for label, row in (("first", first), ("second", second)):
+        assert row["visible_message_count"] == 3, (
+            f"{label} poll after a missing-index recovery reported "
+            f"{row['visible_message_count']}, expected 3"
+        )
+
+
+def test_stale_index_fact_does_not_vouch_for_a_newer_deferred_turn(monkeypatch, tmp_path):
+    """An older eager checkpoint's fact must not carry through the index row.
+
+    The sidecar is written by an eager checkpoint, then the turn settles and a
+    NEWER deferred hidden turn starts. The stale index row still carries the old
+    fact and the old ``pending_started_at``; refreshing from the current sidecar
+    must take both from the sidecar, so the stale fact cannot excuse the new
+    turn's discount.
+
+    No filler here: a pinned filler would consume the reconcile window itself
+    and turn this into the uncapped case, so the target has to be capped out on
+    its own.
+    """
+    now = time.time()
+    _eager_continued_target(monkeypatch, tmp_path, now=now, seed_fillers=False)
+
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", str(CAP))
+
+    stale_index = next(
+        row for row in json.loads(models.SESSION_INDEX_FILE.read_text(encoding="utf-8"))
+        if row["session_id"] == TARGET
+    )
+    assert stale_index["_pending_hidden_wakeup_at"] == pytest.approx(
+        now, rel=0, abs=1e-6
+    ), "the eager save must publish the fact into the index row"
+    assert stale_index["message_count"] == 3, (
+        "fixture precondition: the sidecar holds two visible rows + the eager "
+        "wakeup row, so the continuation below must not be appended twice"
+    )
+
+    # The turn settles, then a NEWER deferred hidden turn starts: no transcript
+    # row, same text, different start timestamp. Patch the canonical sidecar on
+    # disk (the writer only persists the fact while it names a row) and leave the
+    # OLD index bytes in place -- the stale-index recovery scene.
+    sidecar_path = models.SESSION_DIR / f"{TARGET}.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    from api.models import is_hidden_transcript_row as _hidden
+
+    sidecar.pop("_pending_hidden_wakeup_at", None)
+    sidecar["pending_user_message"] = "handoff"
+    sidecar["pending_user_source"] = "delegation_wakeup"
+    sidecar["pending_started_at"] = now + 5
+    # What the writer publishes for this transcript: the visible count excludes
+    # hidden rows (the same predicate ``save`` uses) and only rows that exist,
+    # so the removed eager wakeup row no longer absorbs a discount.
+    from api.models import is_hidden_transcript_row as _hidden
+    sidecar["visible_message_count"] = sum(
+        1 for m in sidecar.get("messages") or [] if not _hidden(m)
+    )
+    assert sidecar["visible_message_count"] == 2, (
+        "fixture precondition: the eager wakeup row is the only hidden row, so "
+        "removing it cannot raise the visible total"
+    )
+    # The newer deferred turn's row is appended by the Agent below and is hidden
+    # by provenance, so the authoritative total is sidecar-visible + the reply.
+    sidecar["visible_message_count"] = 3
+    sidecar["updated_at"] = now + 5
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    _append_state_db_rows(tmp_path, TARGET, [
+        {"role": "user", "content": "handoff", "timestamp": now + 6},
+        {"role": "assistant", "content": "done", "timestamp": now + 7},
+    ])
+
+    _seen = {}
+    _original_overlay = models._apply_sidebar_state_db_override_metadata
+
+    def _capturing_overlay(sessions, metadata, count_session_ids=None):
+        for _s in sessions:
+            if _s.get('session_id') == TARGET:
+                _seen.update(_s)
+        return _original_overlay(sessions, metadata, count_session_ids)
+
+    monkeypatch.setattr(
+        models, '_apply_sidebar_state_db_override_metadata', _capturing_overlay
+    )
+    first = _public_poll(TARGET)
+    second = _public_poll(TARGET)
+    for label, row in (("first", first), ("second", second)):
+        # Authoritative visible total after the continuation is 3: the deferred
+        # hidden row keeps its discount (no sidecar row holds it) and the visible
+        # reply counts. A stale fact would excuse the discount and read 2.
+        assert row["visible_message_count"] == 3, (
+            f"{label} poll: a fact stamped by the previous eager turn must not "
+            f"vouch for the newer deferred hidden turn (got "
+            f"{row['visible_message_count']}, expected 3)"
+        )
+
+    # The overlay must take turn identity and fact from the CURRENT sidecar, not
+    # from the stale index row: a stale fact travelling with the stale pending
+    # timestamp would agree with itself and vouch for the wrong turn.
+    assert _seen.get('pending_started_at') == pytest.approx(now, rel=0, abs=1e-6), (
+        "the overlay kept the stale index pending_started_at instead of the "
+        "current sidecar's"
+    )
+    assert not _seen.get('_pending_hidden_wakeup_at'), (
+        "the overlay kept the stale index checkpoint fact"
+    )
+
+    # Control: with the transcript walk allowed on every row (cap disabled) the
+    # same store reports the same total, i.e. the capped branch is not the thing
+    # that moves the number.
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "0")
+    control = _public_poll(TARGET)
+    assert control["visible_message_count"] == 3
