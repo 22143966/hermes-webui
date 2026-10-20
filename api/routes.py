@@ -9503,6 +9503,12 @@ def _lookup_gateway_session_identity(session_id: str) -> dict:
     return metadata if isinstance(metadata, dict) else {}
 
 
+# Background sources with no bounded pass of their own never reach the default
+# projection, so a session the user explicitly opens from one of them is looked
+# up through that source's own view instead (#8265 review on #8349).
+_CLI_LOOKUP_FALLBACK_SOURCES = ("oneshot",)
+
+
 def _lookup_cli_session_metadata(session_id: str, *, all_profiles: bool = False) -> dict:
     if not session_id:
         return {}
@@ -9510,6 +9516,10 @@ def _lookup_cli_session_metadata(session_id: str, *, all_profiles: bool = False)
         for row in get_cli_sessions(all_profiles=all_profiles):
             if row.get("session_id") == session_id:
                 return row
+        for source in _CLI_LOOKUP_FALLBACK_SOURCES:
+            for row in get_cli_sessions(source, all_profiles=all_profiles):
+                if row.get("session_id") == session_id:
+                    return row
     except Exception:
         return {}
     return {}
