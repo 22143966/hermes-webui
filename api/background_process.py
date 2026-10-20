@@ -1333,6 +1333,57 @@ def _mark_registry_completion_consumed(process_id: str) -> None:
         )
 
 
+def _completion_observed_by_agent(process_id: str) -> bool:
+    """True when the agent already READ this completion in the running turn.
+
+    The two read paths on the agent side write two different marks (#8363):
+
+      * ``process(action="wait")`` / ``process(action="log")`` add the id to
+        the registry's ``_completion_consumed`` set — read here through the
+        public ``is_completion_consumed()`` (the same cross-A/B dedupe key
+        ``_mark_registry_completion_consumed`` writes).
+      * a read-only ``process(action="poll")`` adds the id to the separate
+        private ``_poll_observed`` set, deliberately NOT to
+        ``_completion_consumed`` (a status check must not suppress the
+        watcher's turn), so it is read duck-typed.
+
+    Best-effort and fail-open: an absent registry (pure WebUI unit-test
+    contexts), a renamed private attribute, or any registry error means "not
+    observed", which keeps the previous deliver-once behaviour. The deferred
+    branch no longer pre-marks the shared key, so a marker found here can only
+    come from a real read (or from another drain that genuinely delivered the
+    duplicate copy).
+    """
+    if not process_id:
+        return False
+    try:
+        from tools.process_registry import process_registry as _pr
+    except Exception:
+        return False
+    try:
+        if _pr.is_completion_consumed(process_id):
+            return True
+    except Exception:
+        logger.debug(
+            "is_completion_consumed read failed for %r while checking a "
+            "deferred wakeup",
+            process_id,
+            exc_info=True,
+        )
+    try:
+        poll_observed = getattr(_pr, "_poll_observed", None)
+        if poll_observed is not None and process_id in poll_observed:
+            return True
+    except Exception:
+        logger.debug(
+            "_poll_observed read failed for %r while checking a deferred "
+            "wakeup",
+            process_id,
+            exc_info=True,
+        )
+    return False
+
+
 # ── xsession wakeup misroute defense-in-depth (Option 3) ───────────────────
 # Option 1 (api/streaming._set_turn_session_identity) is the ROOT fix: it binds
 # the per-turn session identity to a contextvar so a notify_on_complete spawn
@@ -1899,14 +1950,13 @@ def _process_one(evt: dict) -> None:
     payload = _build_payload(evt, session_id)
     _emit_bg_task_complete_events_coalesced(session_id, payload)
     _cfg.PENDING_BG_TASK_COMPLETIONS.add(session_id)
-    # Mark the event consumed in the agent's process registry so the REAL
-    # merged PR #2279's next-turn drain
-    # (api/streaming._drain_webui_process_notifications) treats this process_id
-    # as already-delivered and does not re-fire a wakeup (B-first order).
-    # This is the SHARED upstream dedupe key (see _mark_registry_completion_
-    # consumed for the coupling contract + why a future rename now fails loud).
-    if process_id:
-        _mark_registry_completion_consumed(process_id)
+    # NOTE: the registry consumed-marker is NOT set here any more. Whether the
+    # completion is delivered NOW (idle branch) or later (defer branch) is
+    # decided below, and only the branch that actually delivers may set the
+    # shared key: pre-marking the defer path made a genuine wait/log/poll read
+    # indistinguishable from the drain's own bookkeeping, so a completion the
+    # agent had already read still woke it again at turn teardown (#8363).
+    # See _mark_registry_completion_consumed for the coupling contract.
 
     # ── Option Z (PRIMARY): server-side wakeup, NO browser round-trip ──────
     # The SSE emit above is now demoted to a pure live-view layer (an open tab
@@ -1938,27 +1988,42 @@ def _process_one(evt: dict) -> None:
         # prior _build_payload used).
         wakeup_prompt_raw = format_wakeup_prompt(evt)
         wakeup_prompt = wakeup_prompt_raw.strip() if wakeup_prompt_raw else ""
-        if wakeup_prompt:
-            if _session_has_active_turn(session_id):
-                # Defer-path fix: persist the prompt so a turn-teardown
-                # idle-hook can redeliver it once the session goes idle.
-                # The OLD behavior only logged + left a bare
-                # PENDING_BG_TASK_COMPLETIONS session flag; the prompt was
-                # discarded and the next-turn drain reads completion_queue
-                # (already emptied by THIS drain thread), so for an
-                # autonomous agent with no next user turn the wakeup was
-                # lost forever. process_id is already in
-                # BG_TASK_COMPLETE_EVENTS_SEEN + the registry
-                # _completion_consumed marker (set above), so persisting it
-                # here cannot cause a double-fire — the atomic claim in
-                # ``claim_deferred_wakeups`` guarantees exactly one delivery.
-                record_deferred_wakeup(session_id, process_id, wakeup_prompt)
-                logger.debug(
-                    "server-side wakeup deferred: turn active for session %s "
-                    "(persisted for turn-teardown idle-hook redelivery)",
-                    session_id,
-                )
-            else:
+        if wakeup_prompt and _session_has_active_turn(session_id):
+            # Defer-path fix: persist the prompt so a turn-teardown
+            # idle-hook can redeliver it once the session goes idle.
+            # The OLD behavior only logged + left a bare
+            # PENDING_BG_TASK_COMPLETIONS session flag; the prompt was
+            # discarded and the next-turn drain reads completion_queue
+            # (already emptied by THIS drain thread), so for an
+            # autonomous agent with no next user turn the wakeup was
+            # lost forever.
+            #
+            # #8363: the shared registry consumed-marker is deliberately NOT
+            # set on this branch. The agent may still read the completion in
+            # the turn that is running right now (``process(action="wait")``,
+            # ``log`` or ``poll``); pre-marking made that real read look like
+            # this drain's own bookkeeping, so the teardown hook could not
+            # tell it apart and woke the agent again for a completion it had
+            # already acted on. The event was already popped from the shared
+            # completion_queue by this drain, so the next-turn drain has no
+            # copy to re-deliver; a duplicate enqueue it does deliver marks
+            # itself. The atomic claim in ``claim_deferred_wakeups`` still
+            # guarantees exactly one delivery of the persisted prompt.
+            record_deferred_wakeup(session_id, process_id, wakeup_prompt)
+            logger.debug(
+                "server-side wakeup deferred: turn active for session %s "
+                "(persisted for turn-teardown idle-hook redelivery)",
+                session_id,
+            )
+        else:
+            # Delivered now: the idle branch (Option Z) starts the turn, and a
+            # completion with no wakeup body is never redelivered by us. Both
+            # are a real delivery, so claim the SHARED upstream dedupe key the
+            # merged PR #2279 next-turn drain reads (B-first order) — see
+            # _mark_registry_completion_consumed for the coupling contract.
+            if process_id:
+                _mark_registry_completion_consumed(process_id)
+            if wakeup_prompt:
                 # Idle-path sibling of the F1 (409/teardown) fix: pass
                 # ``process_id`` so that if this idle wakeup's daemon thread
                 # loses the per-session lock race and 409s, the re-defer in
@@ -1974,6 +2039,11 @@ def _process_one(evt: dict) -> None:
         logger.warning(
             "server-side wakeup dispatch failed for session %s", session_id, exc_info=True
         )
+        # Nothing was delivered by the failed dispatch; keep the shared key
+        # closed so the next-turn drain cannot present the same completion a
+        # second time as a wakeup.
+        if process_id:
+            _mark_registry_completion_consumed(process_id)
 
 
 def record_deferred_wakeup(session_id: str, process_id: str, wakeup_prompt: str) -> bool:
@@ -2123,6 +2193,10 @@ def drain_deferred_wakeups_for_session(
     teardown (or the next-turn drain) delivers them. Only the teardown of the
     LAST active stream for the session claims + fires.
 
+    Read-at-delivery check (#8363): an entry whose completion the finished turn
+    already read (``wait``/``log``/``poll``) is dropped instead of redelivered —
+    the agent acted on it, a second wakeup would only cost an empty turn.
+
     Returns the number of wakeup turns started (0 when nothing pending or the
     session is still busy). Best-effort — never raises into the streaming
     teardown thread; the actual turn is started on the same throwaway daemon
@@ -2155,6 +2229,26 @@ def drain_deferred_wakeups_for_session(
                 "PENDING discard failed for session %s", session_id, exc_info=True
             )
         started = 0
+        # #8363: only a completion the agent has NOT already read may wake it.
+        # The turn that just ended may have read this completion itself
+        # (``process(action="wait")`` / ``log`` → the registry's shared
+        # ``_completion_consumed``; ``poll`` → its private ``_poll_observed``).
+        # The mark is read at DELIVERY time, and the defer branch no longer
+        # sets the shared key itself, so a mark here means a real observation
+        # (or a duplicate copy another drain actually delivered) — never this
+        # drain's own bookkeeping.
+        unread = [
+            e
+            for e in entries
+            if not _completion_observed_by_agent(str((e or {}).get("process_id") or ""))
+        ]
+        if len(unread) != len(entries):
+            logger.debug(
+                "turn-teardown idle-hook dropped %d deferred wakeup(s) for "
+                "session %s already read in the finished turn",
+                len(entries) - len(unread),
+                session_id,
+            )
         # Greptile P1 fix: do NOT fire one daemon-threaded wakeup per entry in
         # a tight loop. Each ``_start_server_side_wakeup_turn`` spawns a daemon
         # thread that races for the per-session agent lock; only ONE can win,
@@ -2165,7 +2259,7 @@ def drain_deferred_wakeups_for_session(
         # (or next-turn drain) delivers the next one — one wakeup per turn,
         # which matches the single-prompt-per-turn design and the
         # BG_TASK_COMPLETE_EVENTS_SEEN dedup (no double-fire).
-        leftover = [e for e in entries if str((e or {}).get("wakeup_prompt") or "").strip()]
+        leftover = [e for e in unread if str((e or {}).get("wakeup_prompt") or "").strip()]
         if leftover:
             first = leftover[0]
             # Re-defer entries 2..N BEFORE starting the first turn, so they are

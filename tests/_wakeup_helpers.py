@@ -26,6 +26,10 @@ class FakeProcessRegistry:
     def __init__(self):
         self._lock = threading.Lock()
         self._completion_consumed: set[str] = set()
+        # `process(action="poll")` records its read-only observation here, NOT
+        # in `_completion_consumed` (upstream tools/process_registry.py). The
+        # WebUI deferred-wakeup delivery check (#8363) reads both.
+        self._poll_observed: set[str] = set()
         self.completion_queue: queue.Queue = queue.Queue()
         self._procs: dict[str, types.SimpleNamespace] = {}
 

@@ -35,6 +35,8 @@ import queue
 import threading
 import types
 
+import pytest
+
 
 # --------------------------------------------------------------------------
 # Fakes / fixtures (mirrors test_process_complete_ab_coexistence +
@@ -48,6 +50,10 @@ class _FakeProcessRegistry:
     def __init__(self):
         self._lock = threading.Lock()
         self._completion_consumed: set[str] = set()
+        # `process(action="poll")` records a read-only observation here (NOT in
+        # `_completion_consumed`), mirroring tools/process_registry.py. The
+        # deferred-wakeup delivery check (#8363) reads both marks.
+        self._poll_observed: set[str] = set()
         self.completion_queue: queue.Queue = queue.Queue()
         self._procs: dict[str, types.SimpleNamespace] = {}
 
@@ -255,12 +261,18 @@ def test_idle_completion_still_fires_once(monkeypatch):
 
 
 def test_next_user_turn_drain_and_teardown_hook_dont_double_fire(monkeypatch):
-    """If a user turn DOES come, the next-turn drain
-    (_drain_webui_process_notifications) must NOT also deliver the deferred
-    completion: _process_one set BG_TASK_COMPLETE_EVENTS_SEEN AND the registry
-    _completion_consumed marker BEFORE the defer, and it consumed the
-    completion_queue event, so the next-turn drain has nothing to fire. The
-    teardown idle-hook then delivers it exactly once. Total deliveries == 1.
+    """If a user turn DOES come, the completion must still be delivered exactly
+    once: ``_process_one`` consumed the completion_queue event, so the next-turn
+    drain has no copy of its own to fire, and the teardown idle-hook delivers
+    the persisted prompt.
+
+    The defer branch deliberately no longer pre-marks the registry
+    ``_completion_consumed`` key (#8363): pre-marking made a real
+    wait/log/poll read indistinguishable from the drain's own bookkeeping. A
+    duplicate queue copy (kill_process racing the reader thread) is therefore
+    delivered AND marked by the next-turn drain itself; the teardown hook must
+    then drop the prompt instead of waking the agent for a completion it has
+    already received — total deliveries stays exactly 1.
     """
     from api import background_process as bp, config as cfg
     from api import streaming as st
@@ -279,30 +291,41 @@ def test_next_user_turn_drain_and_teardown_hook_dont_double_fire(monkeypatch):
             cfg.ACTIVE_RUNS[stream_id] = {"session_id": sid}
 
         bp._process_one(_completion_evt("proc-shared-1", sid))
-        # Shared dedupe contract: _process_one marked it seen + registry-
-        # consumed before deferring.
+        # B's own private seen-set still dedupes duplicate enqueues inside this
+        # module, but the SHARED registry key must stay unset while the prompt
+        # is merely deferred (#8363).
         assert "proc-shared-1" in cfg.BG_TASK_COMPLETE_EVENTS_SEEN[sid]
-        assert fake.is_completion_consumed("proc-shared-1")
+        assert not fake.is_completion_consumed("proc-shared-1"), (
+            "the defer branch pre-marked the shared consumed key again — a "
+            "wait/log/poll read in the running turn can no longer be told "
+            "apart from the drain's own mark"
+        )
         assert sid in cfg.DEFERRED_PROCESS_WAKEUPS
 
-        # A user turn comes: the next-turn drain runs. Even if a duplicate
-        # event were re-queued (kill_process race), the SEEN + consumed gate
-        # makes it a no-op — it must NOT deliver the deferred wakeup.
-        fake.completion_queue.put(_completion_evt("proc-shared-1", sid))
+        # A user turn comes: the next-turn drain finds an empty queue (this
+        # drain already popped the event) → it must NOT deliver the prompt the
+        # teardown hook owns.
         notifications = st._drain_webui_process_notifications(sid)
         assert notifications == [], (
             "next-turn drain double-delivered a completion the defer path owns"
         )
 
-        # That user turn ends → its teardown fires the deferred wakeup ONCE.
+        # Kill-process race: a duplicate copy of the same event exists on the
+        # queue. The next-turn drain may deliver THAT copy (and marks it
+        # itself); what must not happen is a second delivery at teardown.
+        fake.completion_queue.put(_completion_evt("proc-shared-1", sid))
+        delivered_by_next_turn = len(st._drain_webui_process_notifications(sid))
+        assert delivered_by_next_turn in (0, 1)
+
+        # That user turn ends → its teardown runs the deferred idle-hook.
         cfg.unregister_active_run(stream_id)
         started = bp.drain_deferred_wakeups_for_session(sid)
-        assert started == 1
-        assert _wait_for_wakeup(holder)
-        assert len(holder["calls"]) == 1, (
-            "deferred wakeup delivered more than once across next-turn drain "
-            "+ teardown hook"
+        assert _wait_for_wakeup(holder) is (started == 1)
+        assert delivered_by_next_turn + started == 1, (
+            "the same completion was delivered twice across next-turn drain "
+            f"+ teardown hook (drain={delivered_by_next_turn}, started={started})"
         )
+        assert len(holder["calls"]) == started
     finally:
         with cfg.ACTIVE_RUNS_LOCK:
             cfg.ACTIVE_RUNS.pop(stream_id, None)
@@ -676,5 +699,163 @@ def test_idle_path_409_redefer_carries_process_id_and_dedups(monkeypatch):
             "because the idle-path re-defer lost its process_id"
         )
     finally:
+        bp.unregister_process_session(sid)
+        _reset_cfg_state()
+
+
+# --------------------------------------------------------------------------
+# Tests 9-12 — #8363: a completion the agent already READ in the still-active
+# turn must not wake it again when that turn ends. `wait`/`log` mark the
+# registry's shared `_completion_consumed` set, `poll` marks its private
+# `_poll_observed` set; the defer branch pre-marks NEITHER, so the teardown
+# hook can read the real observation at delivery time.
+# --------------------------------------------------------------------------
+
+
+def _defer_while_turn_active(monkeypatch, *, sid, stream_id, process_id, fake):
+    """Shared arrange step: active turn + one completion → deferred entry."""
+    from api import background_process as bp, config as cfg
+
+    bp.register_process_session(sid, sid)
+    with cfg.ACTIVE_RUNS_LOCK:
+        cfg.ACTIVE_RUNS[stream_id] = {"session_id": sid}
+    bp._process_one(_completion_evt(process_id, sid))
+    assert bp._session_has_active_turn(sid) is True
+    with cfg.DEFERRED_PROCESS_WAKEUPS_LOCK:
+        entries = list(cfg.DEFERRED_PROCESS_WAKEUPS.get(sid) or [])
+    assert [e.get("process_id") for e in entries] == [process_id]
+    return bp, cfg
+
+
+def test_defer_branch_does_not_premark_shared_consumed_key(monkeypatch):
+    """Merely deferring must leave the shared registry key untouched: it is the
+    only signal the teardown hook has for a REAL wait/log/poll read (#8363).
+    """
+    fake = _FakeProcessRegistry()
+    fake.register("proc-nopre-1", "sess-nopre")
+    _install_fake_registry(monkeypatch, fake)
+    _reset_cfg_state()
+    sid, stream_id = "sess-nopre", "stream-nopre-1"
+    try:
+        _defer_while_turn_active(
+            monkeypatch, sid=sid, stream_id=stream_id,
+            process_id="proc-nopre-1", fake=fake,
+        )
+        assert not fake.is_completion_consumed("proc-nopre-1")
+        assert "proc-nopre-1" not in fake._poll_observed
+    finally:
+        from api import background_process as bp, config as cfg
+        with cfg.ACTIVE_RUNS_LOCK:
+            cfg.ACTIVE_RUNS.pop(stream_id, None)
+        bp.unregister_process_session(sid)
+        _reset_cfg_state()
+
+
+@pytest.mark.parametrize("reader", ["wait", "log", "poll"])
+def test_read_in_active_turn_suppresses_deferred_wakeup(monkeypatch, reader):
+    """wait / log / poll in the same turn → NO wakeup after that turn ends."""
+    fake = _FakeProcessRegistry()
+    fake.register("proc-read-1", "sess-read")
+    _install_fake_registry(monkeypatch, fake)
+    _reset_cfg_state()
+    holder = _install_fake_start_session_turn(monkeypatch)
+
+    sid, stream_id = "sess-read", "stream-read-1"
+    try:
+        bp, cfg = _defer_while_turn_active(
+            monkeypatch, sid=sid, stream_id=stream_id,
+            process_id="proc-read-1", fake=fake,
+        )
+        # The agent reads the completion while the turn is still running.
+        if reader == "poll":
+            fake._poll_observed.add("proc-read-1")
+        else:  # wait / log share the consumed marker upstream
+            fake._completion_consumed.add("proc-read-1")
+
+        cfg.unregister_active_run(stream_id)
+        started = bp.drain_deferred_wakeups_for_session(sid)
+
+        assert started == 0, (
+            f"a completion already read via process(action={reader!r}) still "
+            "started a wakeup turn"
+        )
+        assert holder["event"].wait(timeout=0.5) is False
+        assert holder["calls"] == []
+        # The read entry is consumed, not silently re-deferred for later.
+        assert sid not in cfg.DEFERRED_PROCESS_WAKEUPS
+    finally:
+        from api import background_process as bp, config as cfg
+        with cfg.ACTIVE_RUNS_LOCK:
+            cfg.ACTIVE_RUNS.pop(stream_id, None)
+        bp.unregister_process_session(sid)
+        _reset_cfg_state()
+
+
+def test_unread_completion_still_wakes_exactly_once(monkeypatch):
+    """The counterpart control: no read in the turn → exactly one wakeup."""
+    fake = _FakeProcessRegistry()
+    fake.register("proc-unread-1", "sess-unread")
+    _install_fake_registry(monkeypatch, fake)
+    _reset_cfg_state()
+    holder = _install_fake_start_session_turn(monkeypatch)
+
+    sid, stream_id = "sess-unread", "stream-unread-1"
+    try:
+        bp, cfg = _defer_while_turn_active(
+            monkeypatch, sid=sid, stream_id=stream_id,
+            process_id="proc-unread-1", fake=fake,
+        )
+        cfg.unregister_active_run(stream_id)
+        assert bp.drain_deferred_wakeups_for_session(sid) == 1
+        assert _wait_for_wakeup(holder)
+        assert len(holder["calls"]) == 1
+        assert "proc-unread-1" in holder["calls"][0]["message"]
+        assert holder["calls"][0]["message"].startswith("[IMPORTANT: Background process")
+        # Only the unread entry is delivered; a second drain is a no-op.
+        assert bp.drain_deferred_wakeups_for_session(sid) == 0
+        assert len(holder["calls"]) == 1
+        assert sid not in cfg.DEFERRED_PROCESS_WAKEUPS
+    finally:
+        from api import background_process as bp, config as cfg
+        with cfg.ACTIVE_RUNS_LOCK:
+            cfg.ACTIVE_RUNS.pop(stream_id, None)
+        bp.unregister_process_session(sid)
+        _reset_cfg_state()
+
+
+def test_only_unread_entries_of_a_batch_wake(monkeypatch):
+    """Two completions deferred in one turn; only the unread one wakes."""
+    fake = _FakeProcessRegistry()
+    fake.register("proc-batch-1", "sess-batch")
+    fake.register("proc-batch-2", "sess-batch")
+    _install_fake_registry(monkeypatch, fake)
+    _reset_cfg_state()
+    holder = _install_fake_start_session_turn(monkeypatch)
+
+    sid, stream_id = "sess-batch", "stream-batch-1"
+    try:
+        from api import background_process as bp, config as cfg
+
+        bp.register_process_session(sid, sid)
+        with cfg.ACTIVE_RUNS_LOCK:
+            cfg.ACTIVE_RUNS[stream_id] = {"session_id": sid}
+        bp._process_one(_completion_evt("proc-batch-1", sid))
+        bp._process_one(_completion_evt("proc-batch-2", sid))
+        assert len(cfg.DEFERRED_PROCESS_WAKEUPS.get(sid, [])) == 2
+
+        # The agent read the first completion only.
+        fake._completion_consumed.add("proc-batch-1")
+
+        cfg.unregister_active_run(stream_id)
+        assert bp.drain_deferred_wakeups_for_session(sid) == 1
+        assert _wait_for_wakeup(holder)
+        assert len(holder["calls"]) == 1
+        assert "proc-batch-2" in holder["calls"][0]["message"]
+        # The read one was dropped, not re-deferred for a later teardown.
+        assert sid not in cfg.DEFERRED_PROCESS_WAKEUPS
+    finally:
+        from api import background_process as bp, config as cfg
+        with cfg.ACTIVE_RUNS_LOCK:
+            cfg.ACTIVE_RUNS.pop(stream_id, None)
         bp.unregister_process_session(sid)
         _reset_cfg_state()
