@@ -888,3 +888,54 @@ def test_stale_index_fact_does_not_vouch_for_a_newer_deferred_turn(monkeypatch, 
     monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "0")
     control = _public_poll(TARGET)
     assert control["visible_message_count"] == 3
+
+
+# --- the constructor must see the boundary it is storing (re-gate should-fix) ------
+
+
+def test_constructor_drops_the_fact_when_a_truncation_boundary_is_persisted():
+    """A full load must validate the fact against the boundary it stores.
+
+    The validator reads ``session.truncation_boundary``, so it cannot run before
+    the constructor assigns that attribute: it used to, which made the dead
+    ``transcript_truncated`` argument look meaningful while it was always false. The
+    behaviour pinned here is the one ``save`` already enforced -- a truncated
+    sidecar never emits the fact -- so the persisted payload is unchanged; only
+    the in-memory value on a full load now agrees with it.
+    """
+    now = time.time()
+    transcript = [
+        {"role": "user", "content": "hi", "timestamp": now - 60},
+        {"role": "assistant", "content": "hello", "timestamp": now - 59},
+        {
+            "role": "user",
+            "content": "handoff",
+            "_source": "delegation_wakeup",
+            "timestamp": now,
+        },
+    ]
+
+    def build(boundary):
+        return models.Session(
+            session_id=TARGET,
+            title="Session",
+            workspace="/tmp",
+            model="test-model",
+            messages=[dict(message) for message in transcript],
+            created_at=now - 60,
+            updated_at=now - 59,
+            pending_user_message="handoff",
+            pending_user_source="delegation_wakeup",
+            pending_started_at=now,
+            truncation_boundary=boundary,
+            _pending_hidden_wakeup_at=now,
+        )
+
+    kept = build(None)
+    assert kept._pending_hidden_wakeup_at == pytest.approx(now, rel=0, abs=1e-6), (
+        "a full load without a truncation boundary must keep the fact"
+    )
+    dropped = build(float(now - 57.5))
+    assert dropped._pending_hidden_wakeup_at is None, (
+        "a full load of a truncated sidecar kept a fact whose row may be gone"
+    )

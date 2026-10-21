@@ -1667,9 +1667,7 @@ def _has_persisted_truncation(value) -> bool:
     return math.isfinite(parsed) and parsed > 0
 
 
-def _validated_pending_hidden_wakeup_at(
-    session, *, require_row: bool = True, transcript_truncated: bool = False
-):
+def _validated_pending_hidden_wakeup_at(session, *, require_row: bool = True):
     """Return the checkpoint fact only while it names the current pending turn.
 
     The fact is stamped by the eager checkpoint, and it must survive only as long
@@ -1683,9 +1681,13 @@ def _validated_pending_hidden_wakeup_at(
     sidecar written before the fact existed, a reload that dropped it) proves it
     from the rows it is about to persist instead of falling back to the
     conservative branch and discounting a row the sidecar already excludes.
+
+    A persisted truncation boundary still invalidates the fact: the rewrite may
+    already have removed that row (#7882 re-gate finding 2).
     ``load_metadata_only`` skips the transcript on PURPOSE and therefore passes
-    ``require_row=False`` -- a transcript-less ingress is no evidence either way,
-    while a persisting truncation boundary still invalidates the fact.
+    ``require_row=False``: a transcript-less ingress is no evidence either way,
+    so the fact survives it (#7882 re-gate finding 1, pinned by the
+    metadata-stub and missing-index tests).
 
     Every unknown answers ``None`` -- the sidebar then treats the pending hidden
     row as still owed a discount, which is the conservative branch (#7882 cap
@@ -1887,34 +1889,9 @@ class Session:
         # the sidecar keeps the fact, a leftover fact from a finished turn does
         # not come back.
         # Raw persisted value: the constructor must never read the attribute it
-        # is about to assign (the validator would always see ``None``).
+        # is about to assign (the validator would always see ``None``). Validated
+        # below, once ``truncation_boundary`` is assigned.
         self._pending_hidden_wakeup_at = kwargs.get('_pending_hidden_wakeup_at')
-        # Raw persisted value: the constructor must never read the attribute it
-        # is about to assign (the validator would always see ``None``).
-        self._pending_hidden_wakeup_at = kwargs.get('_pending_hidden_wakeup_at')
-        # Validate against the loaded transcript (``self.messages`` is assigned
-        # above): the fact excuses a discount, so it may only survive while the
-        # row it names is really here. An index rebuild that reloads a sidecar
-        # whose hidden row was replaced would otherwise carry the stale fact
-        # forward and undercount by one.
-        #
-        # ``load_metadata_only`` is the one intentionally transcript-less
-        # ingress: it substitutes ``messages=[]`` on purpose, so an empty array
-        # there proves nothing about the row and the loader passes
-        # ``_pending_hidden_wakeup_transcript_absent=True`` to keep the fact
-        # (#7882 re-gate finding 1). Shrinks stay covered there by the
-        # transcript-independent ``truncation_boundary`` authority that rides
-        # the same metadata prefix.
-        self._pending_hidden_wakeup_at = _validated_pending_hidden_wakeup_at(
-            self,
-            require_row=not (
-                kwargs.get('_pending_hidden_wakeup_transcript_absent', False)
-                or kwargs.get('_pending_hidden_wakeup_from_writer', False)
-            ),
-            transcript_truncated=_has_persisted_truncation(
-                getattr(self, 'truncation_boundary', None)
-            ),
-        )
         self._webui_pending_user_timestamp_identity = (
             _validated_webui_pending_user_timestamp_identity(
                 self, kwargs.get('_webui_pending_user_timestamp_identity')
@@ -1956,6 +1933,16 @@ class Session:
         )
         self.truncation_watermark = truncation_watermark
         self.truncation_boundary = truncation_boundary
+        # Validate the fact only now: the check reads ``truncation_boundary``,
+        # which is fresh from this call's argument, and a truncated transcript
+        # means the checkpointed row may already be gone.
+        self._pending_hidden_wakeup_at = _validated_pending_hidden_wakeup_at(
+            self,
+            require_row=not (
+                kwargs.get('_pending_hidden_wakeup_transcript_absent', False)
+                or kwargs.get('_pending_hidden_wakeup_from_writer', False)
+            ),
+        )
         self.clear_generation = clear_generation
         self.intentional_shrink_generation = intentional_shrink_generation
         self.transcript_generation = max(0, _parse_nonnegative_int(transcript_generation) or 0)
