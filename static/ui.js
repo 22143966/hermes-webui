@@ -3672,8 +3672,9 @@ function _openImgLightboxWithNav(src, alt, images, index) {
   fitBtn.innerHTML = _mermaidViewerIcon('fit');
   fitBtn.onclick = e => { e.stopPropagation(); if(lb._zoom && lb._zoom.fit) lb._zoom.fit(); };
   lb.appendChild(viewport);
-  lb.appendChild(cls);
+  // Fit sits LEFT of close, so it comes first in the DOM: Tab order then matches the visual order.
   lb.appendChild(fitBtn);
+  lb.appendChild(cls);
   // Prev/Next navigation — store index and images on lb so a single set of
   // handlers reads live values without closure churn on every nav.
   lb._navIndex = index;

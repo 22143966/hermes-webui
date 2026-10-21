@@ -944,8 +944,11 @@
       var box = await openBox(IMG_W, IMG_H);
       var fit = box.fitBtn.getBoundingClientRect();
       var close = box.closeBtn.getBoundingClientRect();
-      assert_(Math.abs(fit.width - 36) <= 0.5, "Fit circle measured width " + fit.width + " != 36");
-      assert_(Math.abs(fit.height - 36) <= 0.5, "Fit circle measured height " + fit.height + " != 36");
+      // 36px circle for a fine pointer, 44px tap target on a coarse one (maintainer fold, Fable UX gate:
+      // WCAG/HIG minimum). These contexts emulate touch, so matchMedia decides which size applies.
+      var want = window.matchMedia("(pointer:coarse)").matches ? 44 : 36;
+      assert_(Math.abs(fit.width - want) <= 0.5, "Fit circle measured width " + fit.width + " != " + want);
+      assert_(Math.abs(fit.height - want) <= 0.5, "Fit circle measured height " + fit.height + " != " + want);
       assert_(Math.abs(fit.width - close.width) <= 0.5 && Math.abs(fit.height - close.height) <= 0.5,
         "Fit must match the close circle: fit " + fit.width + "x" + fit.height + " close " + close.width + "x" + close.height);
       assert_(Math.abs(fit.top - close.top) <= 0.5, "Fit and close must share a top edge: " + fit.top + " vs " + close.top);
@@ -982,8 +985,11 @@
       var box = await openBox(IMG_W, IMG_H);
       var fit = box.fitBtn.getBoundingClientRect();
       var close = box.closeBtn.getBoundingClientRect();
-      assert_(Math.abs(fit.width - 36) <= 0.5, "mobile Fit circle measured width " + fit.width + " != 36");
-      assert_(Math.abs(fit.height - 36) <= 0.5, "mobile Fit circle measured height " + fit.height + " != 36");
+      var want = window.matchMedia("(pointer:coarse)").matches ? 44 : 36;
+      assert_(Math.abs(fit.width - want) <= 0.5, "mobile Fit circle measured width " + fit.width + " != " + want);
+      assert_(Math.abs(fit.height - want) <= 0.5, "mobile Fit circle measured height " + fit.height + " != " + want);
+      // A near-miss on Fit must not land on close: keep a real gap between the two targets.
+      assert_(close.left - fit.right >= 11.5, "mobile Fit/close gap " + (close.left - fit.right) + "px < 12");
       assert_(Math.abs(fit.width - close.width) <= 0.5 && Math.abs(fit.height - close.height) <= 0.5,
         "mobile Fit must match the close circle: fit " + fit.width + "x" + fit.height + " close " + close.width + "x" + close.height);
       assert_(Math.abs(fit.top - close.top) <= 0.5, "mobile Fit and close must share a top edge: " + fit.top + " vs " + close.top);

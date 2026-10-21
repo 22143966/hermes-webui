@@ -929,10 +929,12 @@ class TestComposedGeometry:
     def test_fit_button_is_keyboard_reachable_with_focus_visible(self, composed):
         page = composed.desktop_page
         assert page.evaluate("() => window.__composedOpenFit()") is True
-        # Park focus on the sibling control, then move with a real Tab press so
-        # Chromium applies the keyboard-modality :focus-visible heuristic.
+        # Park focus on the sibling control, then move with a real keyboard press so
+        # Chromium applies the keyboard-modality :focus-visible heuristic. Fit sits
+        # left of close and precedes it in the DOM (maintainer fold: Tab order
+        # follows the visual order), so Shift+Tab from close reaches Fit.
         page.evaluate("() => document.querySelector('.img-lightbox-close').focus()")
-        page.keyboard.press("Tab")
+        page.keyboard.press("Shift+Tab")
         measured = page.evaluate(
             """() => {
                 const fit = document.querySelector('.img-lightbox-fit');
@@ -946,12 +948,14 @@ class TestComposedGeometry:
                     outlineStyle: style.outlineStyle,
                     width: box.width,
                     height: box.height,
+                    coarse: window.matchMedia('(pointer:coarse)').matches,
                 };
             }"""
         )
-        assert measured["active"] is True, "Tab from the close button must reach the Fit button"
+        assert measured["active"] is True, "Shift+Tab from the close button must reach the Fit button"
         assert measured["focusVisible"] is True, "keyboard focus must produce a :focus-visible state"
         assert measured["outlineStyle"] != "none", "focus-visible must render an outline"
         assert measured["outlineWidth"] >= 2, f"focus outline too thin: {measured['outlineWidth']}"
-        assert abs(measured["width"] - 36) <= 0.5, f"focused Fit circle width {measured['width']} != 36"
-        assert abs(measured["height"] - 36) <= 0.5, f"focused Fit circle height {measured['height']} != 36"
+        want = 44 if measured["coarse"] else 36  # 44px tap target on a coarse pointer (maintainer fold)
+        assert abs(measured["width"] - want) <= 0.5, f"focused Fit circle width {measured['width']} != {want}"
+        assert abs(measured["height"] - want) <= 0.5, f"focused Fit circle height {measured['height']} != {want}"

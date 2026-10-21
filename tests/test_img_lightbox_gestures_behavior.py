@@ -198,6 +198,32 @@ class TestKeyboardAndButton:
         assert "env(safe-area-inset-" in rule
 
 
+    def test_coarse_pointer_targets_are_44px_with_a_gap(self):
+        """Maintainer fold (Fable UX gate): touch targets meet the 44px minimum and Fit moves left so the two
+        controls keep a 12px gap (20px close inset + 44px close + 12px gap = 76px)."""
+        css = STYLE.read_text(encoding="utf-8")
+        # Anchored to the lightbox rule itself: style.css has several other @media (pointer:coarse) blocks.
+        m = re.search(
+            r"@media \(pointer:coarse\)\{\s*"
+            r"\.img-lightbox-close,\.img-lightbox-fit\{width:44px;height:44px;\}\s*"
+            r"\.img-lightbox-fit\{right:max\(76px,calc\(env\(safe-area-inset-right,0px\) \+ 76px\)\);\}\s*\}",
+            css,
+        )
+        assert m, "coarse-pointer block sizing both lightbox controls to 44px with the 76px Fit offset not found"
+
+    def test_hover_is_visible_and_shared_by_both_controls(self):
+        """A darker hover on the near-black scrim was invisible; both controls lighten to the same mid-grey."""
+        css = STYLE.read_text(encoding="utf-8")
+        for sel in ("close", "fit"):
+            # The base rule starts its line; skin overrides start with :root[data-skin=...].
+            m = re.search(r"^\s*\.img-lightbox-" + sel + r":hover\{([^}]*)\}", css, re.M)
+            assert m, f"base .img-lightbox-{sel}:hover rule not found"
+            assert "rgba(72,72,78,.88)" in m.group(1), f".img-lightbox-{sel}:hover must lighten, got {m.group(1)}"
+        assert ".img-lightbox-close:focus-visible{outline:2px solid rgba(255,255,255,.85);outline-offset:2px;}" in css
+        for skin in ("nous", "neon", "neon-soft", "neon-paint", "verdigris"):
+            assert f'[data-skin="{skin}"] .img-lightbox-fit:hover' in css, f"{skin} skin themes close but not Fit"
+
+
 class TestResizeCleanup:
     def test_resize_handler_and_timer_cleaned_on_close(self):
         src = UI.read_text(encoding="utf-8")
