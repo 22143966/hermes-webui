@@ -5,6 +5,8 @@
 
 ### Added
 
+- **Pinch, pan and zoom in the image lightbox.** An enlarged chat image can now be pinched to zoom and panned with two fingers on touch screens, zoomed with the mouse wheel at the cursor and dragged on desktop, and zoomed or reset with `+`, `-` and `F` on the keyboard. A Fit button next to close returns it to fit, the zoom carries across previous/next images, and the image can no longer be dragged out of view. An edge swipe inside the open lightbox no longer opens the session drawer behind it, and keyboard focus now moves into the dialog. A maintainer fold makes both buttons 44×44 on touch screens with a gap between them, gives them a hover state you can see over the dark backdrop and over bright images (the close button in the diagram lightbox included), and keeps Tab order in visual order. Thanks @silent-reader-cn. (#6896)
+
 - **Insights: pick an exact date range.** The period menu has a Custom range… option with Start and End date pickers (labelled, translated in all 15 languages), so usage, cost and model numbers can cover any window, not just the presets. Today is always selectable, and typing a date no longer clears the field. Thanks @silent-reader-cn. (#6970)
 
 - **Kanban Scheduled column.** Scheduled tasks get their own board column, and the task editor, task detail and bulk
