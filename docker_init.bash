@@ -484,17 +484,62 @@ if [ -f /app/scripts/docker_venv_python.py ] && command -v python3 >/dev/null 2>
   esac
 fi
 
-# A venv built on an older interpreter than the staged agent requires can never
-# import it, and `.deps_installed` would make the install below skip and pin the
-# broken environment across every subsequent restart. Rebuild instead.
+# Rebuild <venv_dir> on <python> ("-" = uv's default) without losing a working
+# venv: the old one is moved aside and deleted only once the replacement exists.
+# Returns 0 when rebuilt; 1 when uv could not create the new venv (offline, or
+# UV_PYTHON_DOWNLOADS=never and the interpreter is missing) and the old venv was
+# put back; 2 when neither worked. A venv that cannot be renamed (a mount
+# point) falls back to delete-then-create.
+rebuild_agent_venv() {
+  _rv_dir="$1"
+  _rv_py="$2"
+  _rv_prev="$1.previous"
+  rm -rf "$_rv_prev"
+  if [ -e "$_rv_prev" ] || ! mv -T "$_rv_dir" "$_rv_prev" 2>/dev/null; then
+    rm -rf "$_rv_dir"
+    _rv_prev=""
+  fi
+  _rv_ok=0
+  if [ "$_rv_py" != "-" ]; then
+    UV_PYTHON="$_rv_py" uv venv "$_rv_dir" && _rv_ok=1
+  else
+    uv venv "$_rv_dir" && _rv_ok=1
+  fi
+  if [ "$_rv_ok" = 1 ]; then
+    [ -z "$_rv_prev" ] || rm -rf "$_rv_prev"
+    return 0
+  fi
+  if [ -n "$_rv_prev" ]; then
+    rm -rf "$_rv_dir"
+    mv -T "$_rv_prev" "$_rv_dir" || return 2
+    return 1
+  fi
+  return 2
+}
+
+# A venv built on an interpreter the staged agent cannot use can never import
+# it, and `.deps_installed` would make the install below skip and pin the
+# broken environment across every subsequent restart. Rebuild instead, but keep
+# the existing venv until the new one exists, so a failed interpreter fetch
+# still boots WebUI (the readiness check below then reports the agent).
 if [ "$_venv_action" = "rebuild" ]; then
   echo ""; echo "== Existing virtual environment cannot satisfy the staged agent — rebuilding"
-  rm -rf /app/venv
-  rm -f /app/venv/.deps_installed
-  _venv_action="create"
+  _rv_rc=0
+  rebuild_agent_venv /app/venv "$_venv_python" || _rv_rc=$?
+  case "$_rv_rc" in
+    0) _venv_action="rebuilt" ;;
+    1)
+      echo "!! Could not create a virtual environment on Python $_venv_python (no network, or uv downloads disabled?)."
+      echo "!! Kept the existing virtual environment; the agent will not import until that interpreter is available."
+      _venv_action="reuse"
+      ;;
+    *) error_exit "Failed to rebuild the virtual environment on Python $_venv_python" ;;
+  esac
 fi
 
-if [ "$_venv_action" = "reuse" ] && [ -f /app/venv/bin/python3 ]; then
+if [ "$_venv_action" = "rebuilt" ]; then
+  echo "-- Rebuilt the virtual environment on Python $_venv_python"
+elif [ "$_venv_action" = "reuse" ] && [ -f /app/venv/bin/python3 ]; then
   echo ""; echo "== Existing virtual environment found — reusing (fast restart)"
 else
   echo ""; echo "== Creating new virtual environment"

@@ -474,11 +474,18 @@ def test_docker_init_passes_the_requested_version_to_uv():
 
 
 def test_docker_init_rebuild_path_drops_the_deps_marker():
-    """Without removing `.deps_installed` the rebuild skips its own install."""
+    """Without dropping `.deps_installed` the rebuild skips its own install.
+
+    The rebuild now creates a fresh venv through `rebuild_agent_venv` (which
+    keeps the old one until the new one exists), so the marker is absent from
+    the rebuilt venv by construction; the bash behaviour is pinned in
+    tests/test_issue8113_venv_rebuild_keeps_previous.py.
+    """
     plan_pos = INIT_SH.find("docker_venv_python.py")
     rebuild_pos = INIT_SH.find('if [ "$_venv_action" = "rebuild" ]; then')
-    marker_pos = INIT_SH.find("rm -f /app/venv/.deps_installed")
+    call_pos = INIT_SH.find("rebuild_agent_venv /app/venv", rebuild_pos)
+    install_guard_pos = INIT_SH.find("if [ -f /app/venv/.deps_installed ]; then")
     assert rebuild_pos != -1, "no rebuild branch — a reused 3.12 venv would stay broken"
-    assert marker_pos != -1, "rebuild path must remove the fast-restart marker"
+    assert call_pos != -1, "the rebuild branch must replace the venv with a fresh one"
     assert plan_pos < rebuild_pos, "the plan must be computed before the rebuild branch"
-    assert rebuild_pos < marker_pos, "the marker must be removed inside the rebuild branch"
+    assert rebuild_pos < call_pos < install_guard_pos, "the venv must be rebuilt before the fast-restart guard"
