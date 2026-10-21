@@ -3488,7 +3488,9 @@ def _sweep_session_entries(
                         over_size = True
                 if over_ttl or over_count or over_size:
                     if session_refs is None:
-                        session_refs = _session_sidecar_run_refs(session_root, session_journal_dir.name)
+                        session_refs = _session_sidecar_run_refs(
+                            session_root, session_journal_dir.name, any_marker_keeps_all=False
+                        )
                     if session_refs is _KEEP_ALL_RUNS or name[: -len(".jsonl")] in session_refs:
                         counters["retained_referenced"] += 1
                     else:
@@ -3794,11 +3796,15 @@ def _recover_archive_claims(session_root: Path) -> None:
 _KEEP_ALL_RUNS = object()
 
 
-def _session_sidecar_run_refs(session_root: Path, session_id: str):
+def _session_sidecar_run_refs(session_root: Path, session_id: str, *, any_marker_keeps_all: bool = True):
     """The run ids the persisted session still needs, read once: a set, or ``_KEEP_ALL_RUNS``.
 
-    ``_KEEP_ALL_RUNS`` when any message carries the recovery marker, or when the sidecar exists but is not a plain,
-    readable, parseable file (an unreadable reference is UNKNOWN, not absent). An empty set only for a CONFIRMED
+    ``_KEEP_ALL_RUNS`` when the sidecar exists but is not a plain, readable, parseable file (an unreadable reference
+    is UNKNOWN, not absent), and for a recovery marker: any marker when ``any_marker_keeps_all`` (the archive-TTL
+    prune guard's long-standing rule), otherwise only a marker without a ``_journal_retry_stream_id``. The lazy
+    retry reads exactly that run, in every release since the marker gained the id, so a marker WITH the id adds just
+    that run: a marker can stay flagged forever behind a later normal assistant turn (the retry stops at that turn),
+    and keep-all would then switch the live-journal caps off for the session. An empty set only for a CONFIRMED
     missing sidecar, or one that references no run. See ``_session_sidecar_keeps_run`` for why each field counts.
     """
     sidecar = session_root / f"{session_id}.json"
@@ -3829,9 +3835,9 @@ def _session_sidecar_run_refs(session_root: Path, session_id: str):
     for message in data.get("messages") or []:
         if not isinstance(message, dict):
             continue
-        if message.get("_pending_journal_recovery"):
-            return _KEEP_ALL_RUNS
         retry = str(message.get("_journal_retry_stream_id") or "")
+        if message.get("_pending_journal_recovery") and (any_marker_keeps_all or not retry):
+            return _KEEP_ALL_RUNS
         if retry:
             refs.add(retry)
     return frozenset(refs)
