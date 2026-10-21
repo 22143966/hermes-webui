@@ -1893,8 +1893,17 @@ def _config_url_may_belong_to_a_profile(profiles_mod, process_home) -> bool:
     if not override or _env_value_is_profile_sourced(profiles_mod, "HERMES_CONFIG_PATH", override):
         return True
     cfg_dir = _safe_resolve(Path(override).expanduser()).parent
-    if _same_profile_home(cfg_dir, process_home) or cfg_dir.parent.name == "profiles":
-        return True  # a file inside a profile home is that profile's configuration
+    if _same_profile_home(cfg_dir, process_home):
+        return True  # the process profile's own home
+    try:
+        roots = [_safe_resolve(Path(profiles_mod.get_hermes_home_for_profile("")).expanduser() / "profiles")]
+        canonical = getattr(profiles_mod, "_profiles_root", None)
+        if callable(canonical):
+            roots.append(_safe_resolve(Path(canonical())))
+    except Exception:
+        return True  # fail closed
+    if any(cfg_dir.is_relative_to(root) for root in roots):
+        return True  # a file inside a named profile home is that profile's configuration
     raw = _load_yaml_config_file_raw(Path(override).expanduser(), _copy=False)
     raw_url = str(raw.get("webui_gateway_base_url") or "") if isinstance(raw, dict) else ""
     for ref in _re.findall(r"\$\{([^}]+)\}", raw_url):

@@ -2390,3 +2390,37 @@ def test_8432_the_process_profiles_own_config_url_without_a_config_path_is_not_s
 
     assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/alpha-own-cfg", "alpha-alias")
 
+
+def test_8432_an_operator_config_under_some_other_profiles_dir_is_shared(tmp_path, monkeypatch):
+    """Codex r4: an operator file at /operator/profiles/shared-gateway/config.yaml is outside the Hermes profiles root;
+    a directory merely NAMED "profiles" does not make it a profile's (master 200, a name heuristic gave 401)."""
+    import api.config as config
+
+    envs = {"default": {}, "alpha": {"API_SERVER_KEY": "alpha-local-key"},
+            "beta": {"HERMES_WEBUI_GATEWAY_API_KEY": "beta-remote-key"}}
+    homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    _mirror_named_process_profile(monkeypatch, homes, envs)
+    operator = tmp_path / "operator" / "profiles" / "shared-gateway" / "config.yaml"
+    operator.parent.mkdir(parents=True)
+    operator.write_text('webui_gateway_base_url: "https://gw.example/operator"\n', encoding="utf-8")
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(operator))
+    monkeypatch.setattr(config, "get_config", lambda: {"webui_gateway_base_url": "https://gw.example/operator"})
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("https://gw.example/operator", "beta-remote-key")
+
+
+def test_8432_a_config_inside_another_named_profile_home_is_not_shared(tmp_path, monkeypatch):
+    """A HERMES_CONFIG_PATH inside <root>/profiles/<name> is that profile's configuration, not operator config."""
+    import api.config as config
+
+    envs = {"default": {}, "alpha": {"HERMES_WEBUI_GATEWAY_API_KEY": "alpha-alias"}, "beta": {"API_SERVER_KEY": "beta-key"}}
+    homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    _mirror_named_process_profile(monkeypatch, homes, envs)
+    gamma_cfg = homes["default"] / "profiles" / "gamma" / "config.yaml"
+    gamma_cfg.parent.mkdir(parents=True)
+    gamma_cfg.write_text('webui_gateway_base_url: "http://gw.local/gamma-cfg"\n', encoding="utf-8")
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(gamma_cfg))
+    monkeypatch.setattr(config, "get_config", lambda: {"webui_gateway_base_url": "http://gw.local/gamma-cfg"})
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/gamma-cfg", "alpha-alias")
+
