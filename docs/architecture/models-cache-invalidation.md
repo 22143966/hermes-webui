@@ -85,6 +85,38 @@ the same `st_mtime_ns` and the same `st_size`. Keyed on `(mtime_ns, size)`
 alone, that generation is indistinguishable from the old one and the previous
 catalog is served back.
 
+### Generation fence
+
+The stat identity says *which bytes* were parsed. It does not say *which
+catalog generation* they belonged to, and those are not the same thing: a
+rebuild is not guaranteed to change any part of the stat key. A same-size
+rewrite inside the coarse-clock mtime tick, on a filesystem that reissues the
+freed inode, produces a file whose `(st_mtime_ns, st_size, st_ino, st_dev)` is
+identical to the pre-rebuild one.
+
+So the entry also carries the catalog generation (`_models_rebuild_seq`) that
+was current when the payload was parsed, and that generation fences the entry
+on both sides:
+
+- The **producer** captures the generation before it opens the file and
+  publishes its entry only while that generation is still current. An
+  invalidation that lands during the parse supersedes the bytes it parsed, so
+  those bytes are never published.
+- The **consumer** rejects an entry whose generation is no longer current, and
+  drops it rather than leaving it resident.
+
+Both are required, and neither alone is sufficient.
+`invalidate_models_cache()` clears the slot *before* it advances the
+generation, so a producer that captured the old generation can publish into
+that gap — the entry is published while the generation is still current, and
+the generation advances afterwards. Only the consumer's own check rejects it.
+
+This matters because the epoch guard in `get_available_models_for_session_visit()`
+cannot catch it: `disk_epoch` is read *after* the freshness precheck, so it
+already holds the post-invalidation value and compares equal to the current
+one. The generation fence is the only thing that distinguishes the
+pre-invalidation catalog from the rebuilt one at that point.
+
 ### Consume-once ownership
 
 The slot is **consume-once**: a hit clears the slot before returning, and every
@@ -106,6 +138,12 @@ GIL, so without the full-scope lock two threads can both enter, both pass
 validation, and both return the same object, which would make the consume step a
 no-op in exactly the case it exists for. The producer's slot write takes the
 same lock.
+
+A visit served from the *memory* cache never reaches the loader that would
+consume the precheck's parse, so it drops the slot instead. Without that, the
+abandoned entry keeps a whole parsed catalog resident (about 2.2 MB at 5,000
+models) and an unrelated later read can pick it up — which is what breaks the
+"never outlives a single session visit" rule above.
 
 `None` in the payload slot is a real answer — "this file parsed, but not to a
 dict" — and is distinct from `_MODELS_DISK_PAYLOAD_UNSET`, which means "no memo
@@ -185,6 +223,14 @@ correctness bug, not a missed optimization: a test that seeded its own provider
 saw a previous test's catalog win because the memory cache was cleared while
 the memo was not.
 
+Clearing the slot is not sufficient on its own, because the slot is cleared
+*before* the generation advances. A producer that parsed the pre-invalidation
+file can publish into that gap, and the stat identity of the rebuilt file can
+still match the published entry. The
+[generation fence](#generation-fence) is what closes that window: the
+published entry records the generation it was parsed under, and both the
+producer and the consumer refuse to hand out a superseded generation.
+
 Credential eviction is part of the same epoch-reset critical section as memory
 invalidation, before rebuild admission reopens. Full invalidation clears all
 profile pools; provider invalidation removes the original and canonical provider
@@ -248,10 +294,19 @@ the single-use slot), a same-size `os.replace` rewrite is not served from the
 memo, `invalidate_models_cache()` drops the slot, and the single-parse fast path
 still works for an unchanged file.
 
+`tests/test_issue8302_models_cache_memo_invalidation_epoch.py` covers the
+generation fence and the memo's lifetime: an invalidation that overlaps a
+session visit's precheck must not let the visit serve the pre-invalidation
+catalog (the rebuild keeps the file's stat identity identical, so only the
+generation can tell the two apart), a memo entry from a superseded generation is
+never served, and a visit served from the memory cache drops the precheck parse
+instead of leaving a parsed catalog resident.
+
 `tests/test_issue8302_models_cache_memo_contract_doc.py` covers this document:
-it names the memo under "What is cached", records its file key, consume-once
-ownership and invalidation rules, and re-checks every `api/config.py` symbol the
-contract names so the doc cannot drift away from the code.
+it names the memo under "What is cached", records its file key, generation
+fence, consume-once ownership and invalidation rules, and re-checks every
+`api/config.py` symbol the contract names so the doc cannot drift away from the
+code.
 
 ## References
 

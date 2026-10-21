@@ -81,6 +81,28 @@ def test_parse_memo_consume_once_ownership_is_documented():
     assert "mutate" in flat, "the ownership rule must say callers mutate what they receive"
 
 
+def test_parse_memo_generation_fence_is_documented():
+    """The generation fence must be written down, with both of its sides.
+
+    The stat identity says which bytes were parsed; it does not say which
+    catalog generation they belonged to, because a rebuild is not guaranteed
+    to change any part of that key. So the entry also carries the catalog
+    generation, and the producer AND the consumer each refuse a superseded
+    generation. Both sides are required: invalidation clears the slot before
+    it advances the generation, so a producer can publish into that gap.
+    """
+    text = _contract_text()
+    fence = _section(text, "### Generation fence")
+    for term in (
+        "_models_rebuild_seq",
+        "generation",
+        "producer",
+        "consumer",
+        "gap",
+    ):
+        assert term in fence, f"the generation fence must document {term!r}; section was:\n{fence}"
+
+
 def test_parse_memo_invalidation_rules_are_documented():
     """Invalidation must state that the memo is a cache that gets dropped.
 
@@ -93,6 +115,24 @@ def test_parse_memo_invalidation_rules_are_documented():
     assert "_models_disk_payload_memo" in invalidation, (
         "invalidation must state the memo's own drop rule; section was:\n"
         f"{invalidation}"
+    )
+
+
+def test_parse_memo_lifetime_rule_is_documented():
+    """The memo's lifetime must be stated: a visit may not leave it resident.
+
+    A visit served from the in-memory cache never reaches the loader that
+    would consume the precheck's parse, so it drops the slot instead. Without
+    that, an abandoned entry keeps a whole parsed catalog resident and an
+    unrelated later read can pick it up.
+    """
+    text = _contract_text()
+    flat = " ".join(text.split())
+    assert "never outlives a single session visit" in flat, (
+        "the doc must state that the memo does not outlive a session visit"
+    )
+    assert "memory" in flat and "cache" in flat, (
+        "the doc must name the memory-cache-hit case that abandons the parse"
     )
 
 

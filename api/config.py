@@ -8627,13 +8627,40 @@ def _is_loadable_disk_cache(cache: object) -> bool:
 # payload object, which is exactly the shared-mutable-catalog aliasing the
 # consume step exists to prevent.
 #
+# The entry ALSO carries the catalog generation (``_models_rebuild_seq``) that
+# was current when the payload was parsed. A catalog invalidation advances
+# that generation, so an entry parsed before one describes the PRE-invalidation
+# catalog. The file's stat identity cannot detect that on its own — a rebuild
+# is not guaranteed to change ANY part of that key (same coarse-clock mtime
+# tick, same size, and a filesystem that reissues the freed inode) — so the
+# generation travels with the entry and fences it. The producer refuses to
+# publish an entry whose generation is no longer current, and the consumer
+# rejects one whose generation no longer matches. BOTH are required:
+# ``invalidate_models_cache()`` clears the slot BEFORE it advances the
+# generation, so a producer can publish into that gap and only the consumer's
+# check can catch it.
+#
 # ``None`` in the payload slot means "the file parsed, but not to a dict" — a
 # real answer, distinct from "no memo entry". An unreadable/unparseable file
 # takes a different route: the read raises, the memo slot is CLEARED, and the
 # next reader retries from scratch.
 _MODELS_DISK_PAYLOAD_UNSET = object()
-_models_disk_payload_memo: tuple[str, int, int, int, int, dict | None] | None = None
+# (path, st_mtime_ns, st_size, st_ino, st_dev, catalog generation, payload)
+_models_disk_payload_memo: tuple[str, int, int, int, int, int, dict | None] | None = None
 _models_disk_payload_memo_lock = threading.Lock()
+
+
+def _clear_models_disk_payload_memo() -> None:
+    """Drop the one-slot parse memo (a no-op when the slot is already empty).
+
+    Callers that abandon a parse without consuming it MUST go through here, so
+    the memo cannot keep a whole parsed catalog resident past the visit that
+    produced it. The memo lock is a leaf — nothing is acquired while it is
+    held — so this is safe to call while holding the catalog lock.
+    """
+    global _models_disk_payload_memo
+    with _models_disk_payload_memo_lock:
+        _models_disk_payload_memo = None
 
 
 def _read_models_cache_disk_payload(cache_path: Path) -> dict | None:
@@ -8643,6 +8670,10 @@ def _read_models_cache_disk_payload(cache_path: Path) -> dict | None:
     unreadable/unparseable (which also clears the memo).
     """
     global _models_disk_payload_memo
+    # Capture the catalog generation BEFORE the parse. An invalidation that
+    # lands while this read is in flight advances the generation, and the
+    # bytes parsed here then describe the PRE-invalidation catalog.
+    generation = _models_rebuild_seq
     try:
         with open(cache_path, encoding="utf-8") as f:
             # fstat describes the bytes json.load is about to parse, so the
@@ -8650,14 +8681,25 @@ def _read_models_cache_disk_payload(cache_path: Path) -> dict | None:
             st = os.fstat(f.fileno())
             payload = json.load(f)
     except Exception:
-        with _models_disk_payload_memo_lock:
-            _models_disk_payload_memo = None
+        _clear_models_disk_payload_memo()
         return None
     if not isinstance(payload, dict):
         payload = None
-    entry = (str(cache_path), st.st_mtime_ns, st.st_size, st.st_ino, st.st_dev, payload)
+    entry = (
+        str(cache_path),
+        st.st_mtime_ns,
+        st.st_size,
+        st.st_ino,
+        st.st_dev,
+        generation,
+        payload,
+    )
     with _models_disk_payload_memo_lock:
-        _models_disk_payload_memo = entry
+        # Publish only while the generation this parse belongs to is still
+        # current. A catalog invalidation that landed during the parse
+        # supersedes these bytes, and a reader must never be handed them.
+        if generation == _models_rebuild_seq:
+            _models_disk_payload_memo = entry
     return payload
 
 
@@ -8697,7 +8739,7 @@ def _memoized_models_cache_disk_payload(cache_path: Path):
         memo = _models_disk_payload_memo
         if memo is None:
             return _MODELS_DISK_PAYLOAD_UNSET
-        path_str, mtime_ns, size, ino, dev, payload = memo
+        path_str, mtime_ns, size, ino, dev, generation, payload = memo
         if path_str != str(cache_path):
             return _MODELS_DISK_PAYLOAD_UNSET
         try:
@@ -8705,6 +8747,22 @@ def _memoized_models_cache_disk_payload(cache_path: Path):
         except OSError:
             return _MODELS_DISK_PAYLOAD_UNSET
         if (st.st_mtime_ns, st.st_size, st.st_ino, st.st_dev) != (mtime_ns, size, ino, dev):
+            return _MODELS_DISK_PAYLOAD_UNSET
+        # Generation fence, checked AFTER the stat so that an invalidation
+        # landing during the stat() is still caught. The stat identity alone
+        # cannot tell a pre-invalidation catalog from the rebuilt one: a
+        # rebuild is not guaranteed to change any part of that key. The
+        # generation can, because an invalidation always advances it.
+        #
+        # The producer refuses to publish a stale generation, but it cannot
+        # cover this window: ``invalidate_models_cache()`` clears the slot
+        # BEFORE it advances the generation, so a producer can publish into
+        # that gap. This check is what catches it.
+        if generation != _models_rebuild_seq:
+            # The entry belongs to a superseded catalog generation. It can
+            # never be served, so drop it rather than keep a parsed catalog
+            # resident.
+            _models_disk_payload_memo = None
             return _MODELS_DISK_PAYLOAD_UNSET
         _models_disk_payload_memo = None
         return payload
@@ -9411,9 +9469,7 @@ def _invalidate_models_catalog_epoch(*, delete_disk: bool = True, provider_id: s
     # caller's in-place edits would corrupt it for every reader after it.
     # Invalidating the memory cache while leaving the parse memo populated is
     # therefore not a no-op: the memo is the one cache that survives here.
-    global _models_disk_payload_memo
-    with _models_disk_payload_memo_lock:
-        _models_disk_payload_memo = None
+    _clear_models_disk_payload_memo()
     with _models_cache_disk_commit_lock:
         with _cache_build_cv:
             _allocate_models_rebuild_seq()
@@ -12264,6 +12320,17 @@ def get_available_models_for_session_visit() -> dict:
             cached = _get_fresh_memory_models_cache(now_mono)
             if cached is not None:
                 _mark("memory_cache_hit")
+                # The freshness precheck above parsed the durable cache into
+                # the one-slot parse memo, but this visit is served from
+                # memory and never reaches the loader that would consume it.
+                # Drop the entry so the memo cannot keep a whole parsed
+                # catalog resident (2.2 MB at 5000 models) past the visit
+                # that produced it, and so an unrelated later read cannot
+                # consume a parse this visit abandoned.
+                #
+                # The memo lock is a leaf, so taking it under the catalog lock
+                # cannot invert the commit -> catalog order.
+                _clear_models_disk_payload_memo()
                 _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
                 return cached
         _mark("memory_cache_miss_loading_disk")
