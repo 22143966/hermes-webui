@@ -64,6 +64,10 @@ STUBS = """
 install_venv_dependencies() {
   [ "${FAKE_DEPS_FAIL:-0}" = 1 ] && return 1
   mkdir -p "$_agent_stage" && echo new > "$_agent_stage/marker"
+  if [ "${FAKE_STAGE_READONLY_FAIL:-0}" = 1 ]; then
+    chmod -R a-w "$_agent_stage"  # a copy of the :ro source that failed before its chmod -R u+w
+    return 1
+  fi
   touch "$_agent_venv/.deps_installed"
 }
 ensure_hindsight_client_docker_dependency() {
@@ -189,8 +193,15 @@ def test_a_rebuild_without_a_named_interpreter_uses_uvs_default(tmp_path):
         {"FAKE_DEPS_FAIL": "1"},
         {"FAKE_HINDSIGHT_FAIL": "1"},
         {"FAKE_UV_VERSION": "3.13.4"},
+        {"FAKE_STAGE_READONLY_FAIL": "1"},
     ],
-    ids=["uv-venv-fails", "dependency-install-fails", "hindsight-install-fails", "uv-picks-an-inadmissible-python"],
+    ids=[
+        "uv-venv-fails",
+        "dependency-install-fails",
+        "hindsight-install-fails",
+        "uv-picks-an-inadmissible-python",
+        "read-only-half-copied-stage",
+    ],
 )
 def test_any_failure_before_the_commit_restores_the_working_venv(tmp_path, fake):
     """The #8360 gate's offline case: `uv venv` succeeds, the dependency install does not."""

@@ -606,8 +606,17 @@ restore_previous_agent_venv() {
     mv -T "$_agent_venv_prev" "$_agent_venv" || return 1
   fi
   if [ -e "$_agent_stage_prev" ]; then
-    if ! { rm -rf "$_agent_stage" && mv -T "$_agent_stage_prev" "$_agent_stage"; }; then
-      echo "!! WARNING: could not restore the previous staged hermes-agent source at $_agent_stage"
+    # A half-copied replacement can still carry the :ro source's mode 555.
+    if [ -e "$_agent_stage" ]; then
+      chmod -R u+w "$_agent_stage" 2>/dev/null
+      rm -rf "$_agent_stage"
+    fi
+    if [ -e "$_agent_stage" ] || ! mv -T "$_agent_stage_prev" "$_agent_stage"; then
+      # The restored venv's editable install points here: keep the journal so
+      # the next start retries, and boot on the venv meanwhile.
+      echo "!! WARNING: could not restore the previous staged hermes-agent source at $_agent_stage;"
+      echo "!! the agent may not import until the next start retries it."
+      return 0
     fi
   fi
   rm -f "$_agent_venv_journal"
