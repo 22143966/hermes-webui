@@ -2633,10 +2633,13 @@
     .img-lightbox-fit:hover{background:rgba(72,72,78,.88);border-color:rgba(255,255,255,.55);}
     .img-lightbox-fit svg{width:18px;height:18px;display:block;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}
     .img-lightbox-fit:focus-visible{outline:2px solid rgba(255,255,255,.85);outline-offset:2px;}
-    /* Touch: 44px targets (WCAG/HIG minimum) with a 12px gap so a near-miss on Fit cannot close a zoomed image. */
+    /* Touch: 44px targets (WCAG/HIG minimum) with a 12px gap so a near-miss on Fit cannot close a zoomed image. The
+       Mermaid lightbox reuses the close button, so its toolbar keeps clear of the larger target (44px + 12px gap);
+       otherwise a tap on Reset view at 320px lands on close. */
     @media (pointer:coarse){
       .img-lightbox-close,.img-lightbox-fit{width:44px;height:44px;}
       .img-lightbox-fit{right:max(76px,calc(env(safe-area-inset-right,0px) + 76px));}
+      .mermaid-viewer--lightbox .mermaid-viewer-toolbar{padding-right:calc(max(20px,env(safe-area-inset-right,0px)) + 56px);}
     }
   .img-lightbox-nav{position:absolute;top:50%;transform:translateY(-50%);width:44px;height:44px;border:none;border-radius:50%;background:rgba(255,255,255,.12);color:#fff;font-size:28px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s,opacity .15s;z-index:1;opacity:.6;}
   .img-lightbox-nav:hover{background:rgba(255,255,255,.28);opacity:1;}

@@ -206,10 +206,13 @@ class TestKeyboardAndButton:
         m = re.search(
             r"@media \(pointer:coarse\)\{\s*"
             r"\.img-lightbox-close,\.img-lightbox-fit\{width:44px;height:44px;\}\s*"
-            r"\.img-lightbox-fit\{right:max\(76px,calc\(env\(safe-area-inset-right,0px\) \+ 76px\)\);\}\s*\}",
+            r"\.img-lightbox-fit\{right:max\(76px,calc\(env\(safe-area-inset-right,0px\) \+ 76px\)\);\}\s*"
+            r"\.mermaid-viewer--lightbox \.mermaid-viewer-toolbar\{padding-right:calc\(max\(20px,"
+            r"env\(safe-area-inset-right,0px\)\) \+ 56px\);\}\s*\}",
             css,
         )
-        assert m, "coarse-pointer block sizing both lightbox controls to 44px with the 76px Fit offset not found"
+        assert m, ("coarse-pointer block sizing both lightbox controls to 44px with the 76px Fit offset, and keeping "
+                   "the Mermaid lightbox toolbar clear of the larger close button, not found")
 
     def test_hover_is_visible_and_shared_by_both_controls(self):
         """A darker hover on the near-black scrim was invisible; both controls lighten to the same mid-grey."""
