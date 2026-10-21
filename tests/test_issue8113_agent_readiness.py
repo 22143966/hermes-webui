@@ -20,10 +20,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 HELPER_PATH = REPO / "scripts" / "docker_venv_python.py"
@@ -203,9 +206,26 @@ def test_docker_init_readiness_runs_after_the_dependency_install():
 # ── read-only staged-source handling ─────────────────────────────────────────
 
 
-def _agent(tmp_path: Path, name: str, *, reqs: bool = True) -> Path:
+@pytest.fixture(params=[0o022, 0o002], ids=["umask022", "umask002"])
+def ambient_umask(request):
+    """Run a positive fixture under both common umasks.
+
+    CI and most hosts use 0022, but 0002 (per-user groups) is common too and
+    makes a plain ``mkdir`` 0775 — which the real trust check correctly rejects
+    as group-writable. Positive fixtures must not depend on which one is set.
+    """
+    previous = os.umask(request.param)
+    try:
+        yield request.param
+    finally:
+        os.umask(previous)
+
+
+def _agent(tmp_path: Path, name: str, *, reqs: bool = True, mode: int = 0o755) -> Path:
+    """An Agent-shaped source directory with an explicit, trusted mode."""
     d = tmp_path / name
     d.mkdir()
+    d.chmod(mode)
     if reqs:
         (d / "requirements.txt").write_text("python-dotenv==1.2.2\n", encoding="utf-8")
     else:
@@ -224,9 +244,20 @@ def _install_dir_prefers_staged_copy(tmp_path):
         return _agent_install_dir(mount)
 
 
-def test_auto_install_targets_the_writable_staged_copy(tmp_path):
+def test_auto_install_targets_the_writable_staged_copy(tmp_path, ambient_umask):
     """The `:ro` mount can never satisfy the install that would fix #8113."""
     assert _install_dir_prefers_staged_copy(tmp_path).name == "hermes-agent-src"
+
+
+def test_auto_install_still_rejects_a_group_writable_stage(tmp_path):
+    """Explicit fixture modes must not paper over the production trust check."""
+    from api.startup import _agent_install_dir
+
+    mount = _agent(tmp_path, "hermes-agent")
+    staged = _agent(tmp_path, "hermes-agent-src", mode=0o775)
+    env = {"HERMES_WEBUI_AGENT_STAGE_DIR": str(staged)}
+    with patch.dict("os.environ", env, clear=False):
+        assert _agent_install_dir(mount) == mount
 
 
 def test_auto_install_falls_back_to_the_mount_without_a_stage_dir(tmp_path):
