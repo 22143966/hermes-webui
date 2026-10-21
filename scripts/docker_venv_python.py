@@ -9,19 +9,31 @@ agent silently fails to import while the container still reports healthy.
 Two things have to line up for the fix to hold, so this module answers both
 questions in one place:
 
-1. *Which* interpreter does the staged agent actually require? The answer comes
-   from the highest ``python_version >= '3.x'`` gate across its dependencies —
-   ``requires-python`` alone is not authoritative, because the agent still
-   declares ``>=3.11`` while gating its core deps on 3.14.
+1. *Which* interpreters does the staged agent accept? Two constraints apply
+   together: the complete ``requires-python`` range (lower *and* upper bounds,
+   exclusions, wildcards) and the highest ``python_version >= '3.x'`` gate
+   across its dependencies — ``requires-python`` alone is not sufficient,
+   because the agent still declares ``>=3.11,<3.15`` while gating its core deps
+   on 3.14, and the gate alone is not sufficient either, because it says
+   nothing about the declared maximum.
 2. *Does the existing venv still satisfy that?* A restart reuses
    ``/app/venv`` and skips the install when ``.deps_installed`` is present, so a
-   venv on the wrong interpreter has to be rebuilt explicitly — otherwise it
-   pins the broken state across every subsequent restart.
+   venv on an inadmissible interpreter has to be rebuilt explicitly — otherwise
+   it pins the broken state across every subsequent restart. A venv that is
+   already admissible is kept, and when *no* interpreter is admissible the venv
+   is left alone rather than deleted for a rebuild that cannot succeed.
 
 Contract with ``docker_init.bash``: stdout is exactly ``"<action> <python>"``
 where action is ``create`` / ``reuse`` / ``rebuild`` and python is
 ``major.minor`` or ``-``. Anything unreadable or unparseable fails closed to
 ``reuse -`` so a staging problem never blocks container startup.
+
+The ``requires-python`` comparator is self-contained on purpose: this script
+runs on the base image's bare interpreter before any venv exists, where
+``packaging`` is not guaranteed to be importable. It implements
+``packaging.specifiers.SpecifierSet`` semantics for plain release numbers
+(the form interpreter bounds take) and is pinned to that oracle by the tests;
+any other syntax is reported as unparseable rather than approximated.
 """
 
 from __future__ import annotations
@@ -38,10 +50,12 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only on <3.11
 
 # `python_version >= '3.14'` inside a PEP 508 environment marker.
 _GATE_RE = re.compile(r"python_version\s*>=\s*['\"](\d+)\.(\d+)['\"]")
-# `requires-python = ">=3.11,<3.15"` — the `<\` bound is exclusive, so the
-# highest admissible minor is one below it. `[^<>]*` allows the separating
-# comma between the two bounds without swallowing a different operator.
-_REQUIRES_RE = re.compile(r">=\s*(\d+)\.(\d+)[^<>]*<\s*(\d+)\.(\d+)")
+# `requires-python = "..."`, for the no-tomllib / unparseable-TOML fallback.
+_REQUIRES_PYTHON_RE = re.compile(r"""^\s*requires-python\s*=\s*["']([^"']*)["']""", re.MULTILINE)
+# One clause of a `requires-python` specifier, restricted to plain release
+# numbers: `>=3.11`, `<3.15`, `!=3.12.*`, `~=3.11`. Pre/post/dev/local
+# versions, epochs and `===` are deliberately not matched (see module doc).
+_CLAUSE_RE = re.compile(r"^\s*(~=|==|!=|<=|>=|<|>)\s*(\d+(?:\.\d+)*)(\.\*)?\s*$")
 
 DEPS_MARKER = ".deps_installed"
 
@@ -84,30 +98,142 @@ def _from_dependencies(pyproject_text: str) -> tuple[int, int] | None:
     return best
 
 
-def _from_requires_python(pyproject_text: str) -> tuple[int, int] | None:
-    """Highest minor admitted by an exclusive upper bound, if one is declared."""
-    match = _REQUIRES_RE.search(pyproject_text)
-    if not match:
+def _requires_python(pyproject_text: str) -> object:
+    """The raw ``[project] requires-python`` value, or None when not declared."""
+    if tomllib is not None:
+        try:
+            data = tomllib.loads(pyproject_text)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            project = data.get("project")
+            return project.get("requires-python") if isinstance(project, dict) else None
+    match = _REQUIRES_PYTHON_RE.search(pyproject_text)
+    return match.group(1) if match else None
+
+
+def _parse_requires_python(spec: object) -> list[tuple[str, tuple[int, ...], bool]] | None:
+    """``[(operator, release, is_wildcard), ...]``, or None if not evaluable here.
+
+    Empty clauses are skipped exactly as ``SpecifierSet`` skips them, so ``""``
+    admits every interpreter.
+    """
+    if not isinstance(spec, str):
         return None
-    upper_major, upper_minor = int(match.group(3)), int(match.group(4))
-    return (upper_major, upper_minor - 1) if upper_minor > 0 else (upper_major, 0)
+    clauses = []
+    for part in spec.split(","):
+        if not part.strip():
+            continue
+        match = _CLAUSE_RE.match(part)
+        if not match:
+            return None
+        operator, number, wildcard = match.group(1), match.group(2), bool(match.group(3))
+        release = tuple(int(piece) for piece in number.split("."))
+        if wildcard and operator not in ("==", "!="):
+            return None  # `>=3.*` is not a valid PEP 440 specifier
+        if operator == "~=" and (wildcard or len(release) < 2):
+            return None  # `~=3` is not a valid PEP 440 specifier
+        clauses.append((operator, release, wildcard))
+    return clauses
+
+
+def _clause_admits(operator: str, release: tuple[int, ...], wildcard: bool, version: tuple[int, ...]) -> bool:
+    if wildcard:
+        # Prefix match: zero-pad the candidate to the prefix length, then compare.
+        padded = version + (0,) * (len(release) - len(version))
+        matched = padded[: len(release)] == release
+        return matched if operator == "==" else not matched
+    if operator == "~=":
+        # `~=3.11.2` is `>=3.11.2, ==3.11.*`.
+        return _clause_admits(">=", release, False, version) and _clause_admits("==", release[:-1], True, version)
+    # Release comparison with zero padding: 3.14 == 3.14.0.
+    width = max(len(release), len(version))
+    left = version + (0,) * (width - len(version))
+    right = release + (0,) * (width - len(release))
+    return {
+        "==": left == right,
+        "!=": left != right,
+        "<=": left <= right,
+        ">=": left >= right,
+        "<": left < right,
+        ">": left > right,
+    }[operator]
+
+
+def requires_python_admits(spec: str, version: tuple[int, ...]) -> bool | None:
+    """Whether a ``requires-python`` specifier admits ``version``.
+
+    Mirrors ``packaging.specifiers.SpecifierSet(spec).contains(version)`` for
+    final releases; returns None for syntax outside the supported subset.
+    """
+    clauses = _parse_requires_python(spec)
+    if clauses is None:
+        return None
+    return all(_clause_admits(op, release, wildcard, tuple(version)) for op, release, wildcard in clauses)
 
 
 def required_agent_python(pyproject_text: str) -> tuple[int, int] | None:
-    """Interpreter version the staged agent's dependencies require, or None.
+    """Lowest interpreter the staged agent's dependency gates need, or None.
 
-    Dependency gates win over ``requires-python``: the agent declares
-    ``requires-python = ">=3.11,<3.15"`` while gating its core set on 3.14, and
-    trusting the former is precisely what produced the 3.12 venv in #8113.
+    This is a floor, not the whole answer: the agent declares
+    ``requires-python = ">=3.11,<3.15"`` while gating its core set on 3.14, so
+    the gate is what rules out the base image's 3.12 (#8113), and the declared
+    range is what rules out anything at or above 3.15 — see
+    :func:`agent_python_constraints`.
     """
     try:
-        gated = _from_dependencies(pyproject_text)
-        if gated is not None:
-            return gated
-        return _from_requires_python(pyproject_text)
+        return _from_dependencies(pyproject_text)
     except Exception:
         # Unknown input is not a licence to guess (GUIDELINES rule 3).
         return None
+
+
+def agent_python_constraints(pyproject_text: str):
+    """``(requires-python clauses, dependency gate)`` for the staged agent, or None.
+
+    None means there is nothing to enforce — no declared range and no gate — or
+    that the declared range cannot be evaluated; either way the caller keeps
+    today's behaviour rather than rebuild against bounds it cannot respect.
+    """
+    try:
+        gate = _from_dependencies(pyproject_text)
+        declared = _requires_python(pyproject_text)
+        clauses = [] if declared is None else _parse_requires_python(declared)
+        if clauses is None or (not clauses and gate is None):
+            return None
+        return clauses, gate
+    except Exception:
+        return None
+
+
+def python_admitted(constraints, version: tuple[int, int]) -> bool:
+    """Whether an interpreter satisfies the declared range *and* the gate."""
+    clauses, gate = constraints
+    if gate is not None and tuple(version[:2]) < gate:
+        return False
+    return all(_clause_admits(op, release, wildcard, tuple(version)) for op, release, wildcard in clauses)
+
+
+def select_agent_python(constraints, base_python: tuple[int, int]) -> tuple[int, int] | None:
+    """The admissible interpreter to build on, nearest the base image's; None if none is.
+
+    The base interpreter wins whenever it is admissible (no download). Otherwise
+    the nearest admissible minor is chosen (the newer of two equally near ones),
+    so a 3.14 floor over a 3.12 base resolves to 3.14, not to anything newer,
+    and a `<3.12` ceiling resolves to 3.11. Every minor above the highest one a
+    clause or the gate mentions behaves like the first of them, so the search
+    window is finite and complete.
+    """
+    clauses, gate = constraints
+    major = gate[0] if gate is not None else (base_python[0] or 3)
+    anchor = base_python[1] if base_python[0] == major else (gate[1] if gate is not None else 0)
+    bounds = [anchor] + [release[1] for _, release, _ in clauses if release[0] == major and len(release) > 1]
+    if gate is not None:
+        bounds.append(gate[1])
+    for minor in sorted(range(max(bounds) + 2), key=lambda m: (abs(m - anchor), -m)):
+        if python_admitted(constraints, (major, minor)):
+            return (major, minor)
+    return None
 
 
 def venv_python_version(venv_dir: Path) -> tuple[int, int] | None:
@@ -135,43 +261,62 @@ def plan_agent_venv(
     """Decide whether to create, reuse or rebuild the Docker agent venv.
 
     ``base_python`` is the interpreter the venv would otherwise silently
-    inherit; it is reported back for diagnostics only. ``clear_deps_marker``
+    inherit; it is preferred whenever the agent admits it. ``clear_deps_marker``
     tells the caller to drop ``.deps_installed`` so a rebuilt venv actually
     reinstalls instead of inheriting the fast-restart skip.
+
+    ``python`` is the interpreter the venv runs on after the plan, or None for
+    "the base image's, nothing to pin". A rebuild always names its interpreter:
+    leaving that choice to uv's default discovery could re-select the very
+    interpreter being replaced.
     """
-    required: tuple[int, int] | None = None
+    constraints = None
     try:
         if pyproject_path.is_file():
-            required = required_agent_python(
+            constraints = agent_python_constraints(
                 pyproject_path.read_text(encoding="utf-8", errors="replace")
             )
     except OSError:
-        required = None
+        constraints = None
 
     has_venv = (venv_dir / "bin" / "python3").exists()
 
-    if required is None:
+    if constraints is None:
         # Nothing authoritative to enforce: keep today's behaviour exactly.
         return {
             "action": "reuse" if has_venv else "create",
             "python": None,
             "clear_deps_marker": False,
             "required": None,
+            "constrained": False,
             "base_python": base_python,
         }
 
-    action = "create"
-    if has_venv:
-        current = venv_python_version(venv_dir)
-        # Only an interpreter older than the gate is incompatible; anything at
-        # or above it is left alone (an operator may deliberately pin higher).
-        action = "reuse" if current is not None and current >= required else "rebuild"
+    target = select_agent_python(constraints, base_python)
+    current = venv_python_version(venv_dir) if has_venv else None
+
+    if current is not None and python_admitted(constraints, current):
+        # Already admissible — even if a fresh container would pick another
+        # interpreter, an operator's in-range choice is not torn down.
+        action, python = "reuse", current
+    elif has_venv and target is None:
+        # Nothing admissible to rebuild onto: deleting this venv would only
+        # trade a degraded-but-running WebUI for a slower, equally broken boot.
+        action, python = "reuse", None
+    elif has_venv:
+        action, python = "rebuild", target
+    else:
+        action, python = "create", target
+
+    if python == base_python and action != "rebuild":
+        python = None
 
     return {
         "action": action,
-        "python": required,
+        "python": python,
         "clear_deps_marker": action == "rebuild",
-        "required": required,
+        "required": target,
+        "constrained": True,
         "base_python": base_python,
     }
 
@@ -267,7 +412,10 @@ def main(argv: list[str]) -> int:
         print("usage: docker_venv_python.py <pyproject> <venv_dir> <major.minor>", file=sys.stderr)
         return 2
     pyproject_path, venv_dir, base = Path(argv[1]), Path(argv[2]), argv[3]
-    base_python = _parse_version(base) or (0, 0)
+    # The planner prefers the base interpreter when the agent admits it, so an
+    # unreadable argument falls back to the interpreter running this script —
+    # docker_init.bash runs it with the same `python3` it measured.
+    base_python = _parse_version(base) or (sys.version_info[0], sys.version_info[1])
 
     plan = plan_agent_venv(pyproject_path, venv_dir, base_python)
 
@@ -278,9 +426,15 @@ def main(argv: list[str]) -> int:
             "an unreadable interpreter" if current is None else "Python {}.{}".format(*current)
         )
         print(
-            "-- existing venv uses {} but the staged agent requires Python {}; rebuilding".format(
+            "-- existing venv uses {}, which the staged agent does not accept; rebuilding on Python {}".format(
                 current_txt, version
             ),
+            file=sys.stderr,
+        )
+    elif plan["constrained"] and plan["required"] is None:
+        print(
+            "-- no interpreter satisfies both the staged agent's requires-python and its "
+            "dependency gates; leaving the venv as found",
             file=sys.stderr,
         )
     elif plan["action"] == "create" and plan["python"] is not None:
@@ -291,7 +445,7 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
     else:
-        print("-- no interpreter constraint to enforce; leaving the venv as found", file=sys.stderr)
+        print("-- no interpreter change needed for the staged agent", file=sys.stderr)
 
     print(f"{plan['action']} {version}")
     return 0

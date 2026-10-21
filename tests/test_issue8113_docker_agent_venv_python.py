@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 HELPER_PATH = REPO / "scripts" / "docker_venv_python.py"
 
@@ -80,12 +82,6 @@ def test_required_version_comes_from_the_highest_dependency_gate():
     assert dvp.required_agent_python(AGENT_PYPROJECT_314) == (3, 14)
 
 
-def test_required_version_falls_back_to_requires_python_upper_bound():
-    """With no version gates, honour the agent's own ceiling."""
-    pyproject = '[project]\nname="x"\nrequires-python = ">=3.11,<3.14"\ndependencies = ["click"]\n'
-    assert dvp.required_agent_python(pyproject) == (3, 13)
-
-
 def test_required_version_is_none_without_any_constraint():
     """No gates and no usable ceiling must not invent a version."""
     pyproject = '[project]\nname="x"\nrequires-python = ">=3.11"\ndependencies = ["click"]\n'
@@ -144,18 +140,39 @@ def test_reused_compatible_venv_still_takes_the_fast_path(tmp_path):
     assert plan["clear_deps_marker"] is False
 
 
-def test_reused_venv_on_a_newer_compatible_version_is_still_reused(tmp_path):
-    """Only an *incompatible* interpreter forces a rebuild.
+def test_reused_venv_above_the_exclusive_upper_bound_is_rebuilt(tmp_path):
+    """`<3.15` is exclusive: a 3.15 venv is outside what the agent accepts.
 
-    `requires-python = ">=3.11,<3.15"` admits any 3.x above the gate, so a
-    3.15+ venv must not be torn down on the strength of an exact match.
+    Clearing the 3.14 dependency gate is necessary, not sufficient — pip would
+    refuse the agent itself on 3.15 (`requires-python` mismatch), so the venv
+    has to move back inside the declared range.
     """
     agent = _agent_dir(tmp_path, AGENT_PYPROJECT_314)
     venv_dir = _make_venv(tmp_path, "3.15.1")
 
     plan = dvp.plan_agent_venv(agent / "pyproject.toml", venv_dir, base_python=(3, 12))
 
+    assert plan["action"] == "rebuild"
+    assert plan["python"] == (3, 14)
+    assert plan["clear_deps_marker"] is True
+
+
+def test_reused_venv_inside_the_range_and_above_the_gate_is_kept(tmp_path):
+    """Only an interpreter outside the admissible set forces a rebuild.
+
+    With the range widened to `<3.16`, a 3.15 venv clears both the gate and the
+    declared bounds, so an operator's higher pin must not be torn down just
+    because it is not the exact interpreter a fresh container would pick.
+    """
+    pyproject = AGENT_PYPROJECT_314.replace('">=3.11,<3.15"', '">=3.11,<3.16"')
+    assert ',<3.16"' in pyproject
+    agent = _agent_dir(tmp_path, pyproject)
+    venv_dir = _make_venv(tmp_path, "3.15.1")
+
+    plan = dvp.plan_agent_venv(agent / "pyproject.toml", venv_dir, base_python=(3, 12))
+
     assert plan["action"] == "reuse"
+    assert plan["clear_deps_marker"] is False
 
 
 def test_legacy_agent_leaves_the_base_image_alone(tmp_path):
@@ -200,6 +217,180 @@ def test_venv_without_pyvenv_cfg_is_treated_as_incompatible(tmp_path):
     assert plan["action"] == "rebuild"
 
 
+# ── the complete requires-python range, on creation and on reuse ─────────────
+
+# `requires-python` alone carries the floor here: there are no dependency gates.
+AGENT_PYPROJECT_LOWER_BOUND_ONLY = """
+[project]
+name = "hermes-agent"
+requires-python = ">=3.14"
+dependencies = ["python-dotenv==1.2.2", "pydantic==2.13.4"]
+"""
+
+# The dependency gate asks for 3.14 but the declared range stops below it, so
+# no interpreter satisfies both — there is nothing safe to rebuild onto.
+AGENT_PYPROJECT_UNSATISFIABLE = """
+[project]
+name = "hermes-agent"
+requires-python = ">=3.11,<3.14"
+dependencies = ["python-dotenv==1.2.2; python_version >= '3.14'"]
+"""
+
+
+def _range_pyproject(requires_python: str) -> str:
+    return f'[project]\nname="x"\nrequires-python = "{requires_python}"\ndependencies = ["click"]\n'
+
+
+def test_lower_bound_only_range_rebuilds_an_older_venv(tmp_path):
+    """`>=3.14` with no upper bound is still a constraint a 3.12 venv fails."""
+    agent = _agent_dir(tmp_path, AGENT_PYPROJECT_LOWER_BOUND_ONLY)
+    venv_dir = _make_venv(tmp_path, "3.12.15")
+    (venv_dir / ".deps_installed").write_text("", encoding="utf-8")
+
+    plan = dvp.plan_agent_venv(agent / "pyproject.toml", venv_dir, base_python=(3, 12))
+
+    assert plan["action"] == "rebuild"
+    assert plan["python"] == (3, 14)
+    assert plan["clear_deps_marker"] is True
+
+
+def test_lower_bound_only_range_creates_on_an_admissible_interpreter(tmp_path):
+    agent = _agent_dir(tmp_path, AGENT_PYPROJECT_LOWER_BOUND_ONLY)
+
+    plan = dvp.plan_agent_venv(agent / "pyproject.toml", tmp_path / "absent", base_python=(3, 12))
+
+    assert plan["action"] == "create"
+    assert plan["python"] == (3, 14)
+
+
+def test_supported_existing_interpreter_is_kept_below_an_upper_bound(tmp_path):
+    """An upper bound is not a target: a 3.12 venv inside `<3.14` stays put.
+
+    Treating the highest admitted minor (3.13) as a floor would tear down a
+    venv the agent already accepts and pay a full reinstall on every upgrade.
+    """
+    agent = _agent_dir(tmp_path, _range_pyproject(">=3.11,<3.14"))
+    venv_dir = _make_venv(tmp_path, "3.12.15")
+    (venv_dir / ".deps_installed").write_text("", encoding="utf-8")
+
+    plan = dvp.plan_agent_venv(agent / "pyproject.toml", venv_dir, base_python=(3, 12))
+
+    assert plan["action"] == "reuse"
+    assert plan["python"] is None
+    assert plan["clear_deps_marker"] is False
+
+
+def test_existing_venv_above_the_upper_bound_is_rebuilt_on_the_admissible_base(tmp_path):
+    """The rebuild names its interpreter explicitly, even when it is the base.
+
+    Leaving it to uv's default discovery could re-select the very interpreter
+    being replaced (a managed 3.14 fetched by an earlier plan).
+    """
+    agent = _agent_dir(tmp_path, _range_pyproject(">=3.11,<3.14"))
+    venv_dir = _make_venv(tmp_path, "3.14.2")
+
+    plan = dvp.plan_agent_venv(agent / "pyproject.toml", venv_dir, base_python=(3, 12))
+
+    assert plan["action"] == "rebuild"
+    assert plan["python"] == (3, 12)
+
+
+def test_fresh_container_honours_an_upper_bound_below_the_base(tmp_path):
+    agent = _agent_dir(tmp_path, _range_pyproject(">=3.10,<3.12"))
+
+    plan = dvp.plan_agent_venv(agent / "pyproject.toml", tmp_path / "absent", base_python=(3, 12))
+
+    assert plan["action"] == "create"
+    assert plan["python"] == (3, 11)
+
+
+def test_unsatisfiable_constraints_keep_the_existing_venv(tmp_path):
+    """No admissible interpreter: do not delete a working environment first.
+
+    Rebuilding onto the gate would violate `requires-python` (pip refuses the
+    agent) and rebuilding onto anything else cannot satisfy the gate, so the
+    only outcome of `rm -rf /app/venv` would be a slower, equally broken boot.
+    """
+    agent = _agent_dir(tmp_path, AGENT_PYPROJECT_UNSATISFIABLE)
+    venv_dir = _make_venv(tmp_path, "3.12.15")
+    (venv_dir / ".deps_installed").write_text("", encoding="utf-8")
+
+    plan = dvp.plan_agent_venv(agent / "pyproject.toml", venv_dir, base_python=(3, 12))
+
+    assert plan["action"] == "reuse"
+    assert plan["python"] is None
+    assert plan["clear_deps_marker"] is False
+
+
+def test_unsatisfiable_constraints_create_on_the_base_image(tmp_path):
+    agent = _agent_dir(tmp_path, AGENT_PYPROJECT_UNSATISFIABLE)
+
+    plan = dvp.plan_agent_venv(agent / "pyproject.toml", tmp_path / "absent", base_python=(3, 12))
+
+    assert plan["action"] == "create"
+    assert plan["python"] is None
+
+
+def test_unparseable_requires_python_fails_closed_to_reuse(tmp_path):
+    """An unreadable range cannot be respected, so it must not drive a rebuild."""
+    pyproject = AGENT_PYPROJECT_314.replace('">=3.11,<3.15"', '"about 3.14"')
+    assert '"about 3.14"' in pyproject
+    agent = _agent_dir(tmp_path, pyproject)
+    venv_dir = _make_venv(tmp_path, "3.12.15")
+
+    plan = dvp.plan_agent_venv(agent / "pyproject.toml", venv_dir, base_python=(3, 12))
+
+    assert plan["action"] == "reuse"
+    assert plan["python"] is None
+
+
+# The helper runs on the base image's bare interpreter before any venv exists,
+# where `packaging` is not guaranteed to be importable, so it carries its own
+# comparator. Pin it to packaging's SpecifierSet over the shapes interpreter
+# bounds actually take.
+_ORACLE_SPECS = [
+    ">=3.11,<3.15",
+    ">=3.14",
+    "<3.14",
+    "<=3.13",
+    ">3.12",
+    ">3.14.0",
+    "<3.14.2",
+    "==3.12",
+    "==3.14.0",
+    "!=3.12",
+    "==3.14.*",
+    "==3.*",
+    "!=3.13.*",
+    "~=3.11",
+    "~=3.11.2",
+    ">=3",
+    ">=3.11, !=3.12.*, <3.15",
+    " >= 3.11 , < 3.15 ",
+    ">=3.11,",
+    "",
+]
+_ORACLE_VERSIONS = [
+    (3, 9), (3, 10), (3, 11), (3, 11, 2), (3, 11, 5), (3, 12), (3, 12, 0), (3, 12, 1),
+    (3, 13), (3, 14), (3, 14, 1), (3, 14, 2), (3, 15), (3, 16), (4, 0),
+]
+
+
+@pytest.mark.parametrize("spec", _ORACLE_SPECS)
+def test_requires_python_comparator_matches_packaging(spec):
+    specifiers = pytest.importorskip("packaging.specifiers")
+    oracle = specifiers.SpecifierSet(spec)
+    for version in _ORACLE_VERSIONS:
+        text = ".".join(str(part) for part in version)
+        assert dvp.requires_python_admits(spec, version) is oracle.contains(text), (spec, text)
+
+
+@pytest.mark.parametrize("spec", ["===3.14", ">=3.14.0b1", "3.14", ">=3.*", "~=3", ">=3.14;", "about 3.14"])
+def test_requires_python_syntax_outside_the_comparator_is_unparseable(spec):
+    """Anything the comparator cannot evaluate exactly is reported, not guessed."""
+    assert dvp.requires_python_admits(spec, (3, 14)) is None
+
+
 # ── the CLI docker_init.bash actually calls ──────────────────────────────────
 
 
@@ -234,6 +425,32 @@ def test_cli_is_silent_when_no_agent_is_staged(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "reuse -"
+
+
+def _cli_plan(pyproject: Path, venv_dir: Path) -> str:
+    result = subprocess.run(
+        [sys.executable, str(HELPER_PATH), str(pyproject), str(venv_dir), "3.12"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+def test_cli_rebuilds_a_venv_below_a_lower_bound_only_range(tmp_path):
+    agent = _agent_dir(tmp_path, AGENT_PYPROJECT_LOWER_BOUND_ONLY)
+    venv_dir = _make_venv(tmp_path, "3.12.15")
+
+    assert _cli_plan(agent / "pyproject.toml", venv_dir) == "rebuild 3.14"
+
+
+def test_cli_keeps_the_venv_when_no_interpreter_is_admissible(tmp_path):
+    """`reuse -` is the shell contract for \"leave /app/venv exactly as found\"."""
+    agent = _agent_dir(tmp_path, AGENT_PYPROJECT_UNSATISFIABLE)
+    venv_dir = _make_venv(tmp_path, "3.12.15")
+
+    assert _cli_plan(agent / "pyproject.toml", venv_dir) == "reuse -"
 
 
 # ── docker_init.bash wiring ──────────────────────────────────────────────────
