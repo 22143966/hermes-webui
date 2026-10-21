@@ -50,9 +50,12 @@ class _FakeProcessRegistry:
     def __init__(self):
         self._lock = threading.Lock()
         self._completion_consumed: set[str] = set()
-        # `process(action="poll")` records a read-only observation here (NOT in
-        # `_completion_consumed`), mirroring tools/process_registry.py. The
-        # deferred-wakeup delivery check (#8363) reads both marks.
+        # `process(action="poll")` records its read-only PREVIEW observation
+        # here (NOT in `_completion_consumed`), mirroring
+        # tools/process_registry.py: poll returns only the final 1000 chars, so
+        # it is not consumption and must not suppress the autonomous wakeup
+        # (#8363). The WebUI delivery check reads ONLY the public
+        # `is_completion_consumed` contract.
         self._poll_observed: set[str] = set()
         self.completion_queue: queue.Queue = queue.Queue()
         self._procs: dict[str, types.SimpleNamespace] = {}
@@ -704,11 +707,13 @@ def test_idle_path_409_redefer_carries_process_id_and_dedups(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# Tests 9-12 — #8363: a completion the agent already READ in the still-active
-# turn must not wake it again when that turn ends. `wait`/`log` mark the
-# registry's shared `_completion_consumed` set, `poll` marks its private
-# `_poll_observed` set; the defer branch pre-marks NEITHER, so the teardown
-# hook can read the real observation at delivery time.
+# Tests 9+ — #8363: a completion the agent already CONSUMED in the still-active
+# turn must not wake it again when that turn ends. `wait`/`log` set the
+# producer's public `is_completion_consumed` contract; a read-only `poll` only
+# returns a 1000-character preview and must NOT suppress the autonomous
+# wakeup (the producer's own watcher drains with `skip_poll_observed=False`).
+# The defer branch pre-marks NEITHER, so the teardown hook reads the real
+# consumption at delivery time.
 # --------------------------------------------------------------------------
 
 
@@ -729,7 +734,7 @@ def _defer_while_turn_active(monkeypatch, *, sid, stream_id, process_id, fake):
 
 def test_defer_branch_does_not_premark_shared_consumed_key(monkeypatch):
     """Merely deferring must leave the shared registry key untouched: it is the
-    only signal the teardown hook has for a REAL wait/log/poll read (#8363).
+    only signal the teardown hook has for a REAL wait/log read (#8363).
     """
     fake = _FakeProcessRegistry()
     fake.register("proc-nopre-1", "sess-nopre")
@@ -751,9 +756,9 @@ def test_defer_branch_does_not_premark_shared_consumed_key(monkeypatch):
         _reset_cfg_state()
 
 
-@pytest.mark.parametrize("reader", ["wait", "log", "poll"])
+@pytest.mark.parametrize("reader", ["wait", "log"])
 def test_read_in_active_turn_suppresses_deferred_wakeup(monkeypatch, reader):
-    """wait / log / poll in the same turn → NO wakeup after that turn ends."""
+    """wait / log in the same turn → NO wakeup after that turn ends."""
     fake = _FakeProcessRegistry()
     fake.register("proc-read-1", "sess-read")
     _install_fake_registry(monkeypatch, fake)
@@ -767,10 +772,8 @@ def test_read_in_active_turn_suppresses_deferred_wakeup(monkeypatch, reader):
             process_id="proc-read-1", fake=fake,
         )
         # The agent reads the completion while the turn is still running.
-        if reader == "poll":
-            fake._poll_observed.add("proc-read-1")
-        else:  # wait / log share the consumed marker upstream
-            fake._completion_consumed.add("proc-read-1")
+        # wait / log both land on the producer's consumed contract.
+        fake._completion_consumed.add("proc-read-1")
 
         cfg.unregister_active_run(stream_id)
         started = bp.drain_deferred_wakeups_for_session(sid)
@@ -782,6 +785,51 @@ def test_read_in_active_turn_suppresses_deferred_wakeup(monkeypatch, reader):
         assert holder["event"].wait(timeout=0.5) is False
         assert holder["calls"] == []
         # The read entry is consumed, not silently re-deferred for later.
+        assert sid not in cfg.DEFERRED_PROCESS_WAKEUPS
+    finally:
+        from api import background_process as bp, config as cfg
+        with cfg.ACTIVE_RUNS_LOCK:
+            cfg.ACTIVE_RUNS.pop(stream_id, None)
+        bp.unregister_process_session(sid)
+        _reset_cfg_state()
+
+
+def test_poll_preview_does_not_suppress_deferred_wakeup(monkeypatch):
+    """A read-only poll is a PREVIEW, not consumption: the wakeup still fires.
+
+    Producer contract (``tools.process_registry.ProcessRegistry.poll``): poll
+    returns only ``_output_tail(session, 1000)`` — the final 1000 characters —
+    and records the private ``_poll_observed`` set, deliberately NOT
+    ``is_completion_consumed``. Its own upstream comment says a status check
+    "must not suppress the watcher's autonomous delivery turn", and the
+    producer's autonomous watcher drains with ``skip_poll_observed=False``.
+    This WebUI wakeup is that autonomous delivery: suppressing it on a preview
+    would silently drop whatever lies beyond the preview, so a longer result
+    would never reach the agent automatically.
+    """
+    fake = _FakeProcessRegistry()
+    fake.register("proc-poll-1", "sess-poll")
+    _install_fake_registry(monkeypatch, fake)
+    _reset_cfg_state()
+    holder = _install_fake_start_session_turn(monkeypatch)
+
+    sid, stream_id = "sess-poll", "stream-poll-1"
+    try:
+        bp, cfg = _defer_while_turn_active(
+            monkeypatch, sid=sid, stream_id=stream_id,
+            process_id="proc-poll-1", fake=fake,
+        )
+        # The agent only saw the truncated preview this turn.
+        fake._poll_observed.add("proc-poll-1")
+
+        cfg.unregister_active_run(stream_id)
+        assert bp.drain_deferred_wakeups_for_session(sid) == 1, (
+            "a poll preview suppressed the autonomous wakeup — a result longer "
+            "than the preview would never be delivered automatically"
+        )
+        assert _wait_for_wakeup(holder)
+        assert len(holder["calls"]) == 1
+        assert "proc-poll-1" in holder["calls"][0]["message"]
         assert sid not in cfg.DEFERRED_PROCESS_WAKEUPS
     finally:
         from api import background_process as bp, config as cfg
@@ -858,4 +906,158 @@ def test_only_unread_entries_of_a_batch_wake(monkeypatch):
         with cfg.ACTIVE_RUNS_LOCK:
             cfg.ACTIVE_RUNS.pop(stream_id, None)
         bp.unregister_process_session(sid)
+        _reset_cfg_state()
+
+# --------------------------------------------------------------------------
+# Tests 14+ — #8363 review case 2: a REJECTED idle start must keep its retry.
+#
+# The idle branch of `_process_one` claims the shared registry consumed key
+# BEFORE the start is accepted (that claim is the cross-A/B transport dedupe,
+# not an observation). If the start is then rejected — 409 race, 5xx, or a
+# raised launch — `_start_server_side_wakeup_turn` re-defers the prompt, but
+# the retry used to be dropped at turn teardown: the read-at-delivery check saw
+# the drain's OWN claim and reported the completion as already read, although no
+# process read and no accepted agent turn ever happened. These tests drive the
+# SECOND drain and assert it actually starts the retry.
+# --------------------------------------------------------------------------
+
+
+def _install_sequenced_start_session_turn(monkeypatch, outcomes):
+    """Patch ``api.routes.start_session_turn`` with a scripted outcome list.
+
+    ``outcomes`` is consumed in call order: an ``int`` is the ``_status`` to
+    return, an exception instance is raised instead. The last outcome repeats.
+    Returns the same ``holder`` shape as ``_install_fake_start_session_turn``.
+    """
+    import api.routes as _routes
+
+    holder = {"calls": [], "event": threading.Event()}
+
+    def _fake(session_id, message, *, source="process_wakeup", process_id="", **extra):
+        holder["calls"].append(
+            {
+                "session_id": session_id,
+                "message": message,
+                "source": source,
+                "process_id": process_id,
+            }
+        )
+        holder["event"].set()
+        index = min(len(holder["calls"]) - 1, len(outcomes) - 1)
+        outcome = outcomes[index]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return {
+            "stream_id": f"fake-stream-{len(holder['calls'])}",
+            "session_id": session_id,
+            "_status": outcome,
+        }
+
+    monkeypatch.setattr(_routes, "start_session_turn", _fake, raising=True)
+    return holder
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [409, 500, RuntimeError("launch exploded")],
+    ids=["rejected-409", "rejected-500", "raised-start"],
+)
+def test_rejected_idle_dispatch_retry_is_delivered_by_next_drain(
+    monkeypatch, failure
+):
+    """The idle-branch retry must survive the read-at-delivery filter.
+
+    Arrange: idle session, completion arrives, the first server-side start is
+    rejected (409 / 5xx / raised), which re-defers the prompt with
+    ``consumed_claimed_by_dispatch`` provenance. Act: the next turn teardown
+    runs the idle-hook drain. Assert: exactly one wakeup starts — the same
+    behaviour current master had, and the reason automatic continuation is not
+    lost for a rejected dispatch.
+
+    Asserting only that the retry was queued is not enough: the bug is that the
+    queue is drained and the entry silently discarded as "already read".
+    """
+    from api import background_process as bp, config as cfg
+
+    fake = _FakeProcessRegistry()
+    fake.register("proc-retry-1", "sess-retry")
+    _install_fake_registry(monkeypatch, fake)
+    _reset_cfg_state()
+    # First attempt is rejected, the retry (second call) is accepted.
+    holder = _install_sequenced_start_session_turn(monkeypatch, [failure, 200])
+
+    sid = "sess-retry"
+    bp.register_process_session(sid, sid)
+    try:
+        assert bp._session_has_active_turn(sid) is False
+        bp._process_one(_completion_evt("proc-retry-1", sid))
+
+        assert _wait_for_wakeup(holder), "idle-branch wakeup never attempted"
+        assert _wait_for(
+            lambda: bool(cfg.DEFERRED_PROCESS_WAKEUPS.get(sid))
+        ), "rejected idle dispatch did not re-defer the prompt — it was lost"
+        entries = cfg.DEFERRED_PROCESS_WAKEUPS[sid]
+        assert [e.get("process_id") for e in entries] == ["proc-retry-1"]
+        # The rejected dispatch re-deferred WITH its transport-claim provenance
+        # and did NOT clear the shared key (another legitimate wait/log mark
+        # could be the same bit — never blind-clear it).
+        assert entries[0].get("consumed_claimed_by_dispatch") is True
+        assert fake.is_completion_consumed("proc-retry-1")
+
+        # THE regression assertion: the second drain actually starts the retry.
+        holder["event"].clear()
+        assert bp.drain_deferred_wakeups_for_session(sid) == 1, (
+            "the rejected idle start was drained and dropped as already read "
+            "instead of being retried"
+        )
+        assert _wait_for_wakeup(holder), "the retry never reached start_session_turn"
+        assert len(holder["calls"]) == 2
+        assert holder["calls"][1]["message"].startswith(
+            "[IMPORTANT: Background process"
+        )
+        assert sid not in cfg.DEFERRED_PROCESS_WAKEUPS
+    finally:
+        bp.unregister_process_session(sid)
+        _reset_cfg_state()
+
+
+def test_plain_deferred_retry_without_dispatch_provenance_still_respects_read(
+    monkeypatch,
+):
+    """The provenance bypass is scoped: a plain retry (no dispatch claim) whose
+    completion was consumed is still dropped, and an unread one still wakes.
+
+    Guards against over-broadly ignoring the consumed key for every retry.
+    """
+    from api import background_process as bp, config as cfg
+
+    fake = _FakeProcessRegistry()
+    fake.register("proc-plain-1", "sess-plain-read")
+    fake.register("proc-plain-2", "sess-plain-unread")
+    _install_fake_registry(monkeypatch, fake)
+    _reset_cfg_state()
+    holder = _install_fake_start_session_turn(monkeypatch)
+
+    try:
+        for sid, pid in (
+            ("sess-plain-read", "proc-plain-1"),
+            ("sess-plain-unread", "proc-plain-2"),
+        ):
+            bp.register_process_session(sid, sid)
+            assert bp.record_deferred_wakeup(sid, pid, f"wakeup for {pid}")
+        # A plain retry: no `consumed_claimed_by_dispatch` provenance.
+        assert not any(
+            e.get("consumed_claimed_by_dispatch")
+            for e in cfg.DEFERRED_PROCESS_WAKEUPS["sess-plain-read"]
+        )
+
+        fake._completion_consumed.add("proc-plain-1")
+        assert bp.drain_deferred_wakeups_for_session("sess-plain-read") == 0
+        assert bp.drain_deferred_wakeups_for_session("sess-plain-unread") == 1
+        assert _wait_for_wakeup(holder)
+        assert len(holder["calls"]) == 1
+        assert "proc-plain-2" in holder["calls"][0]["message"]
+    finally:
+        bp.unregister_process_session("sess-plain-read")
+        bp.unregister_process_session("sess-plain-unread")
         _reset_cfg_state()
