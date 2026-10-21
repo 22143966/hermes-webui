@@ -9551,12 +9551,22 @@ def _lookup_gateway_session_identity(session_id: str) -> dict:
     return metadata if isinstance(metadata, dict) else {}
 
 
+# Sources kept out of the default projection with no bounded pass of their own.
+# A session the user explicitly opens from one of them is resolved by id, so it
+# stays reachable however many newer runs exist (#8265 review on #8349).
+_CLI_LOOKUP_FALLBACK_SOURCES = ("oneshot",)
+
+
 def _lookup_cli_session_metadata(session_id: str, *, all_profiles: bool = False) -> dict:
     if not session_id:
         return {}
     try:
         for row in get_cli_sessions(all_profiles=all_profiles):
             if row.get("session_id") == session_id:
+                return row
+        for source in _CLI_LOOKUP_FALLBACK_SOURCES:
+            row = get_cli_session_by_id(session_id, source, all_profiles=all_profiles)
+            if row:
                 return row
     except Exception:
         return {}
@@ -12161,6 +12171,7 @@ def _keep_latest_messaging_session_per_source(
 
 from api.models import (
     Session,
+    get_cli_session_by_id,
     get_session,
     get_session_profile_readonly,
     get_session_for_scan,
@@ -21573,18 +21584,22 @@ def _handle_list_dir(handler, parsed):
     if not sid:
         return bad(handler, "session_id is required")
     webui_session = None
+    cli_owner_profile = None
     try:
         s = get_session(sid)
         webui_session = s
         workspace = s.workspace
     except KeyError:
-        # Fallback for CLI sessions not loaded in WebUI memory
+        # Fallback for CLI sessions not loaded in WebUI memory. Resolved through
+        # the same lookup as open/pin/rename, so a session outside the default
+        # sidebar window (an opened one-shot run, #8265) is found too. The active
+        # profile is tried first; a session owned by another profile is checked
+        # against that profile's trusted workspaces.
         try:
-            cli_meta = None
-            for cs in get_cli_sessions():
-                if cs["session_id"] == sid:
-                    cli_meta = cs
-                    break
+            cli_meta = _lookup_cli_session_metadata(sid)
+            if not cli_meta:
+                cli_meta = _lookup_cli_session_metadata(sid, all_profiles=True)
+                cli_owner_profile = cli_meta.get("profile") if cli_meta else None
             if not cli_meta:
                 return bad(handler, "Session not found", 404)
             workspace = cli_meta.get("workspace", "")
@@ -21592,6 +21607,8 @@ def _handle_list_dir(handler, parsed):
             return bad(handler, "Session not found", 404)
     try:
         _list_profile = getattr(webui_session, "profile", None)
+        if webui_session is None and cli_owner_profile:
+            _list_profile = cli_owner_profile
         if webui_session is None:
             try:
                 workspace = resolve_trusted_workspace(workspace, profile=_list_profile)
@@ -27516,8 +27533,14 @@ def _start_chat_stream_for_session(
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
+    on_admitted=None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn.
+
+    ``on_admitted(session, stream_id)`` runs under the session lock once this
+    turn has won the active-stream check, before the pending state is saved, so
+    whatever it writes is published atomically with the admitted turn (and
+    rolled back with it if the launch fails).
 
     ``process_id``/``retry_attempt``/``rearm_deferred_wakeup`` are the
     process-wakeup delivery identity threaded down from
@@ -27699,6 +27722,8 @@ def _start_chat_stream_for_session(
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)
                 try:
+                    if on_admitted is not None:
+                        on_admitted(s, stream_id)
                     _prepare_chat_start_session_for_stream(
                         s,
                         msg=msg,
@@ -28003,6 +28028,7 @@ def _start_run(
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
+    on_admitted=None,
 ):
     """Shared start-run helper for /api/chat/start and start_session_turn.
 
@@ -28091,6 +28117,7 @@ def _start_run(
                 process_id=process_id,
                 retry_attempt=retry_attempt,
                 rearm_deferred_wakeup=rearm_deferred_wakeup,
+                on_admitted=on_admitted,
             )
 
         def _legacy_adapter_factory():
@@ -28143,6 +28170,7 @@ def _start_run(
         process_id=process_id,
         retry_attempt=retry_attempt,
         rearm_deferred_wakeup=rearm_deferred_wakeup,
+        on_admitted=on_admitted,
     )
 
 
@@ -28205,8 +28233,11 @@ def start_session_turn(
     process_id: str = "",
     retry_attempt: int = 0,
     rearm_deferred_wakeup: bool = False,
+    on_admitted=None,
 ):
     """Start a server-side agent turn for ``session_id`` with ``message``.
+
+    ``on_admitted`` is forwarded to ``_start_chat_stream_for_session``.
 
     Option Z primary wakeup entrypoint. This is the minimal, HTTP-handler-free
     core that ``/api/chat/start`` already reaches via ``_handle_chat_start`` →
@@ -28406,6 +28437,7 @@ def start_session_turn(
         process_id=process_id,
         retry_attempt=retry_attempt,
         rearm_deferred_wakeup=rearm_deferred_wakeup,
+        on_admitted=on_admitted,
     )
 
     # ── Defect B: live-view of server-initiated turns ──────────────────────
@@ -29589,6 +29621,7 @@ def _handle_chat_sync(handler, body):
             )
             from api.streaming import (
                 _WEBUI_PROGRESS_PROMPT,
+                _add_supported_run_conversation_kwarg,
                 _active_turn_boundary,
                 _assign_stable_message_ids,
                 _dedupe_replayed_context_messages,
@@ -29666,7 +29699,7 @@ def _handle_chat_sync(handler, body):
                 _agent_replay_projection
             )
 
-            result = agent.run_conversation(
+            _sync_run_kwargs = dict(
                 user_message=workspace_ctx + msg,
                 system_message=workspace_system_msg,
                 # Threaded to the settle's replay dedupe so only rows the
@@ -29688,6 +29721,13 @@ def _handle_chat_sync(handler, body):
                 task_id=s.session_id,
                 persist_user_message=msg,
             )
+            # #8436 maintainer fold: the sync route calls run_conversation directly (not through
+            # _build_run_conversation_kwargs), so give it the same signature-gated title-only input:
+            # the Agent titles state.db from the submitted prompt, not the [Workspace::v1: ...] prefix.
+            _add_supported_run_conversation_kwarg(
+                agent.run_conversation, _sync_run_kwargs, "title_user_message", msg,
+            )
+            result = agent.run_conversation(**_sync_run_kwargs)
     finally:
         # Same as the streaming worker's teardown: mirror the workspace into the
         # Agent-created state.db row on every exit, including a raised turn.
