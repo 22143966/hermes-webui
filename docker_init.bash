@@ -409,11 +409,77 @@ mkdir -p "${UV_CACHE_DIR}" || error_exit "Failed to create ${UV_CACHE_DIR} direc
 test -w "${UV_CACHE_DIR}" || error_exit "${UV_CACHE_DIR} is not writable by hermeswebui"
 
 cd /app
-if [ -f /app/venv/bin/python3 ]; then
+
+# The staged agent source decides which interpreter the venv needs (#8113), so
+# it is discovered before the venv is created or reused. Previously this lookup
+# lived inside the dependency-install branch below, which meant the venv was
+# already built on the base image's interpreter by the time we knew the agent
+# required a newer one.
+_agent_paths=(
+  "/home/hermeswebui/.hermes/hermes-agent"
+  "/opt/hermes"
+)
+_agent_src=""
+for _p in "${_agent_paths[@]}"; do
+  if [ -d "$_p" ] && [ -f "$_p/pyproject.toml" ]; then
+    _agent_src="$_p"
+    break
+  fi
+done
+
+# `auto_install_agent_deps()` (api/startup.py) installs from the writable staged
+# copy rather than the read-only agent mount, which cannot satisfy setuptools'
+# egg_info step under the documented `:ro` compose mounts (#8113). Exported here,
+# before the fast-restart guard, so `server.py` inherits it on the recovery path
+# even when the staging block below is skipped and the copy already exists.
+export HERMES_WEBUI_AGENT_STAGE_DIR="/app/hermes-agent-src"
+
+# Ask the staged agent which interpreter it actually requires instead of
+# inheriting the base image's. A bare `uv venv` pins whatever /app/venv ends up
+# with, and every dependency gated on a newer `python_version` is then silently
+# dropped from the install — the container still starts healthy while
+# `run_agent` fails to import.
+_venv_action="reuse"
+_venv_python="-"
+if [ -f /app/scripts/docker_venv_python.py ] && command -v python3 >/dev/null 2>&1; then
+  _agent_pyproject=""
+  if [ -n "$_agent_src" ]; then
+    _agent_pyproject="$_agent_src/pyproject.toml"
+  fi
+  _base_py="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "0.0")"
+  # Default to today's behaviour ("reuse") if the helper is unreadable, so a
+  # packaging problem can never be what stops the container from booting.
+  _venv_plan="$(python3 /app/scripts/docker_venv_python.py "$_agent_pyproject" /app/venv "$_base_py" 2>/dev/null || echo "reuse -")"
+  _venv_action="${_venv_plan%% *}"
+  _venv_python="${_venv_plan##* }"
+  case "$_venv_action" in
+    create|reuse|rebuild) ;;
+    *) _venv_action="reuse"; _venv_python="-" ;;
+  esac
+fi
+
+# A venv built on an older interpreter than the staged agent requires can never
+# import it, and `.deps_installed` would make the install below skip and pin the
+# broken environment across every subsequent restart. Rebuild instead.
+if [ "$_venv_action" = "rebuild" ]; then
+  echo ""; echo "== Existing virtual environment cannot satisfy the staged agent — rebuilding"
+  rm -rf /app/venv
+  rm -f /app/venv/.deps_installed
+  _venv_action="create"
+fi
+
+if [ "$_venv_action" = "reuse" ] && [ -f /app/venv/bin/python3 ]; then
   echo ""; echo "== Existing virtual environment found — reusing (fast restart)"
 else
   echo ""; echo "== Creating new virtual environment"
-  uv venv venv
+  if [ "$_venv_python" != "-" ]; then
+    # UV_PYTHON makes uv fetch/select that interpreter rather than inheriting
+    # the base image's.
+    UV_PYTHON="$_venv_python" uv venv venv \
+      || error_exit "Failed to create the virtual environment on Python $_venv_python"
+  else
+    uv venv venv
+  fi
 fi
 export VIRTUAL_ENV=/app/venv
 test -d /app/venv
@@ -445,17 +511,8 @@ else
   test -x /app/venv/bin/pip
 
   echo ""; echo "== Adding hermes-agent's pyproject.toml base dependencies to the virtual environment"
-  _agent_paths=(
-    "/home/hermeswebui/.hermes/hermes-agent"
-    "/opt/hermes"
-  )
-  _agent_src=""
-  for _p in "${_agent_paths[@]}"; do
-    if [ -d "$_p" ] && [ -f "$_p/pyproject.toml" ]; then
-      _agent_src="$_p"
-      break
-    fi
-  done
+  # `$_agent_src` was already resolved above the venv decision (#8113) — that
+  # lookup is what selects the interpreter, so it must not be repeated here.
   if [ -n "$_agent_src" ]; then
     if [ -w "$_agent_src" ]; then
       echo ""
@@ -490,6 +547,8 @@ else
     # with "Permission denied" even though `_stage_src` itself was created
     # writable by hermeswebui. Re-add owner-write on the staged tree after the
     # copy so the build dir is genuinely writable, not just owned by us.
+    # (HERMES_WEBUI_AGENT_STAGE_DIR is exported above the venv decision so the
+    # recovery path inherits it on a fast restart too.)
     _stage_src="/app/hermes-agent-src"
     rm -rf "$_stage_src"
     mkdir -p "$_stage_src"
@@ -498,6 +557,7 @@ else
         --exclude='*.egg-info' --exclude='build' --exclude='dist' \
         --exclude='__pycache__' --exclude='.git' \
         --exclude='.playwright' \
+        --exclude='.install.lock' \
         "$_agent_src"/ "$_stage_src"/ \
         || error_exit "Failed to stage hermes-agent source to writable build dir"
     else
@@ -507,6 +567,7 @@ else
         || error_exit "Failed to copy hermes-agent source to writable build dir"
       rm -rf "$_stage_src"/*.egg-info "$_stage_src"/build "$_stage_src"/dist 2>/dev/null || true
       rm -rf "$_stage_src"/.playwright 2>/dev/null || true
+      rm -rf "$_stage_src"/.install.lock "$_stage_src"/tools/.install.lock 2>/dev/null || true
       find "$_stage_src" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
     fi
     chmod -R u+w "$_stage_src" \
@@ -530,6 +591,29 @@ else
 fi
 
 ensure_hindsight_client_docker_dependency
+
+# #8113 readiness: before #8113 the container reached "listening on
+# https://0.0.0.0:8787" and /health 200 while the agent was unimportable, so a
+# dropped core dependency was effectively silent. Import the agent's critical
+# dependency with the venv's own interpreter and say so loudly on failure.
+# This never aborts startup — the WebUI still serves without the agent.
+if [ -n "$_agent_src" ] && [ -f /app/scripts/docker_venv_python.py ] && command -v python3 >/dev/null 2>&1; then
+  echo ""; echo "== Verifying the Hermes agent's critical imports"
+  _verify_expected="${_venv_python:-0.0}"
+  if [ "$_verify_expected" = "-" ]; then _verify_expected="0.0"; fi
+  if _verify_detail="$(python3 /app/scripts/docker_venv_python.py --verify /app/venv "$_verify_expected" 2>&1)"; then
+    echo "-- Hermes agent critical imports verified"
+  else
+    echo ""
+    echo "!! WARNING: the Hermes agent is installed but is NOT importable."
+    echo "!!   ${_verify_detail}"
+    echo "!! Agent features (model auto-detection, personality routing, CLI session"
+    echo "!! imports) will be unavailable even though this container is healthy."
+    echo "!! The usual cause is a dependency set resolved for the wrong Python"
+    echo "!! version — see https://github.com/nesquena/hermes-webui/issues/8113"
+    echo ""
+  fi
+fi
 
 echo ""; echo "== Running hermes-webui"
 cd /app; python server.py || error_exit "hermes-webui failed or exited with an error"
