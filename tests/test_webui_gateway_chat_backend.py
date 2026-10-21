@@ -2161,6 +2161,7 @@ def _mirror_named_process_profile(monkeypatch, homes, envs, process="alpha"):
         monkeypatch.delenv(key)
     monkeypatch.setattr(profiles, "_loaded_profile_env_keys", set())
     monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME", "")
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME_DOTENV", {})
     profiles._reload_dotenv(proc_home)
     assert set(envs[process]) <= profiles._loaded_profile_env_keys
     monkeypatch.setattr(profiles, "get_process_profile_home", lambda: proc_home)
@@ -2199,7 +2200,9 @@ def test_8432_the_process_profile_still_reads_its_own_env_fresh(tmp_path, monkey
     homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
     _mirror_named_process_profile(monkeypatch, homes, envs)
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gw.local/alpha-preloaded")
-    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME", str(tmp_path / "base" / "profiles" / "alpha"))
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME", str(homes["alpha"]))
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME_DOTENV",
+                        {"HERMES_WEBUI_GATEWAY_BASE_URL": "http://gw.local/alpha-preloaded"})
     envs["alpha"]["API_SERVER_KEY"] = "rotated-key"
 
     assert gateway_chat._gateway_endpoint_for_profile("alpha") == ("http://gw.local/alpha-preloaded", "rotated-key")
@@ -2241,7 +2244,9 @@ def test_8432_a_url_a_shell_launcher_preloaded_from_a_named_profile_home_is_not_
     homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
     _mirror_named_process_profile(monkeypatch, homes, envs)
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gw.local/alpha-preloaded")
-    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME", str(tmp_path / "base" / "profiles" / "alpha"))
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME", str(homes["alpha"]))
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME_DOTENV",
+                        {"HERMES_WEBUI_GATEWAY_BASE_URL": "http://gw.local/alpha-preloaded"})
 
     assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/alpha-preloaded", "alpha-alias")
 
@@ -2294,4 +2299,94 @@ def test_8432_invariant_no_other_profiles_key_reaches_the_process_profiles_url(t
     for profile in (*others, ""):
         url, key = gateway_chat._gateway_endpoint_for_profile(profile)
         assert not (url == "http://gw.local/alpha" and key in foreign), (profile, url, key)
+
+
+def test_8432_a_launcher_url_under_a_named_launch_home_stays_shared(tmp_path, monkeypatch):
+    """HERMES_HOME names alpha's home, but the URL is the launcher's own export (alpha's .env never set it): it is
+    shared, so beta keeps master's pair (that URL with beta's own key), never alpha's local key (Codex r3, 200->401)."""
+    import api.profiles as profiles
+
+    envs = {"default": {}, "alpha": {"API_SERVER_KEY": "alpha-local-key"},
+            "beta": {"HERMES_WEBUI_GATEWAY_API_KEY": "beta-remote-key"}}
+    homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    _mirror_named_process_profile(monkeypatch, homes, envs)
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "https://gw.example/remote")
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME", str(homes["alpha"]))
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME_DOTENV", {"API_SERVER_KEY": "alpha-local-key"})
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("https://gw.example/remote", "beta-remote-key")
+
+
+def test_8432_a_url_the_root_launch_home_preloaded_is_shared(tmp_path, monkeypatch):
+    import api.profiles as profiles
+
+    envs = {"default": {}, "alpha": {"API_SERVER_KEY": "alpha-local-key"}, "beta": {"API_SERVER_KEY": "beta-key"}}
+    homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    _mirror_named_process_profile(monkeypatch, homes, envs)
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gw.local/root")
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME", str(profiles.get_hermes_home_for_profile("")))
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME_DOTENV", {"HERMES_WEBUI_GATEWAY_BASE_URL": "http://gw.local/root"})
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/root", "beta-key")
+
+
+def _operator_config(tmp_path, monkeypatch, url):
+    import os
+
+    import api.config as config
+
+    operator = tmp_path / "etc" / "operator.yaml"
+    operator.parent.mkdir(exist_ok=True)
+    operator.write_text(f'webui_gateway_base_url: "{url}"\n', encoding="utf-8")
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(operator))
+    expanded = url.replace("${GW_HOST}", os.environ.get("GW_HOST", "${GW_HOST}"))
+    monkeypatch.setattr(config, "get_config", lambda: {"webui_gateway_base_url": expanded})
+    return operator
+
+
+def test_8432_an_operator_config_outside_every_profile_home_is_shared(tmp_path, monkeypatch):
+    """A launcher-provided HERMES_CONFIG_PATH outside every profile home is operator configuration: beta keeps
+    master's pair, its own key on that URL (Codex r3, 200->401)."""
+    envs = {"default": {}, "alpha": {"API_SERVER_KEY": "alpha-local-key"},
+            "beta": {"HERMES_WEBUI_GATEWAY_API_KEY": "beta-remote-key"}}
+    homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    _mirror_named_process_profile(monkeypatch, homes, envs)
+    _operator_config(tmp_path, monkeypatch, "https://gw.example/operator")
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("https://gw.example/operator", "beta-remote-key")
+
+
+def test_8432_an_operator_config_url_filled_from_a_profile_env_is_not_shared(tmp_path, monkeypatch):
+    envs = {"default": {}, "alpha": {"GW_HOST": "alpha-gw.local", "HERMES_WEBUI_GATEWAY_API_KEY": "alpha-alias"},
+            "beta": {"API_SERVER_KEY": "beta-key"}}
+    homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    _mirror_named_process_profile(monkeypatch, homes, envs)
+    _operator_config(tmp_path, monkeypatch, "http://${GW_HOST}:8642")
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://alpha-gw.local:8642", "alpha-alias")
+
+
+def test_8432_a_config_path_a_profile_env_chose_is_not_shared(tmp_path, monkeypatch):
+    envs = {"default": {}, "alpha": {"HERMES_WEBUI_GATEWAY_API_KEY": "alpha-alias"}, "beta": {"API_SERVER_KEY": "beta-key"}}
+    homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    operator = tmp_path / "etc" / "alpha-chosen.yaml"
+    envs["alpha"]["HERMES_CONFIG_PATH"] = str(operator)
+    _mirror_named_process_profile(monkeypatch, homes, envs)
+    _operator_config(tmp_path, monkeypatch, "http://gw.local/alpha-chosen")
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(operator))
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/alpha-chosen", "alpha-alias")
+
+
+def test_8432_the_process_profiles_own_config_url_without_a_config_path_is_not_shared(tmp_path, monkeypatch):
+    """No HERMES_CONFIG_PATH: the ambient config IS the named process profile's own config.yaml."""
+    import api.config as config
+
+    envs = {"default": {}, "alpha": {"HERMES_WEBUI_GATEWAY_API_KEY": "alpha-alias"}, "beta": {"API_SERVER_KEY": "beta-key"}}
+    homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    _mirror_named_process_profile(monkeypatch, homes, envs)
+    monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(config, "get_config", lambda: {"webui_gateway_base_url": "http://gw.local/alpha-own-cfg"})
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/alpha-own-cfg", "alpha-alias")
 
