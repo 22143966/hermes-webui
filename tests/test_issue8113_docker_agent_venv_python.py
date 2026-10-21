@@ -483,9 +483,81 @@ def test_docker_init_rebuild_path_drops_the_deps_marker():
     """
     plan_pos = INIT_SH.find("docker_venv_python.py")
     rebuild_pos = INIT_SH.find('if [ "$_venv_action" = "rebuild" ]; then')
-    call_pos = INIT_SH.find("rebuild_agent_venv /app/venv", rebuild_pos)
+    call_pos = INIT_SH.find('rebuild_agent_venv "$_venv_python"', rebuild_pos)
     install_guard_pos = INIT_SH.find("if [ -f /app/venv/.deps_installed ]; then")
     assert rebuild_pos != -1, "no rebuild branch — a reused 3.12 venv would stay broken"
     assert call_pos != -1, "the rebuild branch must replace the venv with a fresh one"
     assert plan_pos < rebuild_pos, "the plan must be computed before the rebuild branch"
     assert rebuild_pos < call_pos < install_guard_pos, "the venv must be rebuilt before the fast-restart guard"
+
+# ── #8360 gate: the micro version decides `requires-python` ─────────────────
+
+PATCH_FLOOR_PYPROJECT = """
+[project]
+name = "hermes-agent"
+requires-python = ">=3.12.1,<3.15"
+dependencies = ["click>=8.1"]
+"""
+
+
+def test_venv_version_keeps_the_micro_release(tmp_path):
+    assert dvp.venv_python_version(_make_venv(tmp_path / "a", "3.12.13.final.0")) == (3, 12, 13)
+    plain = tmp_path / "b" / "venv"
+    (plain / "bin").mkdir(parents=True)
+    (plain / "pyvenv.cfg").write_text("home = /usr/bin\nversion = 3.12.13\n", encoding="utf-8")
+    assert dvp.venv_python_version(plain) == (3, 12, 13)
+
+
+def test_an_admissible_patch_release_is_reused_not_rebuilt(tmp_path):
+    """Python 3.12.13 satisfies `>=3.12.1`; reading it as 3.12.0 rebuilt it onto 3.13."""
+    agent = _agent_dir(tmp_path, PATCH_FLOOR_PYPROJECT)
+    venv_dir = _make_venv(tmp_path, "3.12.13.final.0")
+    plan = dvp.plan_agent_venv(agent / "pyproject.toml", venv_dir, base_python=(3, 12, 13))
+    assert plan["action"] == "reuse"
+    assert plan["python"] is None
+
+
+def test_an_admissible_base_patch_release_is_selected(tmp_path):
+    constraints = dvp.agent_python_constraints(PATCH_FLOOR_PYPROJECT)
+    assert dvp.select_agent_python(constraints, (3, 12, 13)) == (3, 12, 13)
+    # A base below the floor is not admissible; the nearest minor that is wins.
+    assert dvp.select_agent_python(constraints, (3, 12, 0)) == (3, 13)
+
+
+def test_cli_keeps_the_base_micro_release(tmp_path):
+    agent = _agent_dir(tmp_path, PATCH_FLOOR_PYPROJECT)
+    result = subprocess.run(
+        [sys.executable, str(HELPER_PATH), str(agent / "pyproject.toml"), str(tmp_path / "absent"), "3.12.13"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "create -", "the base 3.12.13 is admissible: no interpreter to pin"
+
+
+@pytest.mark.parametrize(
+    "version_info,expected",
+    [("3.14.2.final.0", 0), ("3.13.9.final.0", 1), ("3.15.0.final.0", 1)],
+)
+def test_cli_admits_checks_the_interpreter_uv_installed(tmp_path, version_info, expected):
+    agent = _agent_dir(tmp_path, AGENT_PYPROJECT_314)
+    venv_dir = _make_venv(tmp_path, version_info)
+    result = subprocess.run(
+        [sys.executable, str(HELPER_PATH), "--admits", str(agent / "pyproject.toml"), str(venv_dir)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == expected, result.stderr
+
+
+def test_cli_admits_anything_when_no_agent_is_staged(tmp_path):
+    venv_dir = _make_venv(tmp_path, "3.12.13.final.0")
+    result = subprocess.run(
+        [sys.executable, str(HELPER_PATH), "--admits", str(tmp_path / "nope.toml"), str(venv_dir)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr

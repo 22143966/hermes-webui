@@ -231,13 +231,21 @@ def select_agent_python(constraints, base_python: tuple[int, int]) -> tuple[int,
     if gate is not None:
         bounds.append(gate[1])
     for minor in sorted(range(max(bounds) + 2), key=lambda m: (abs(m - anchor), -m)):
-        if python_admitted(constraints, (major, minor)):
-            return (major, minor)
+        # The base interpreter is a concrete release: judge it by its full
+        # version, so 3.12.13 satisfies `>=3.12.1` (#8360 gate). Any other
+        # minor is a request uv resolves later; rebuild_agent_venv re-checks the
+        # interpreter uv actually installed (``--admits``).
+        candidate = tuple(base_python) if (major, minor) == tuple(base_python[:2]) else (major, minor)
+        if python_admitted(constraints, candidate):
+            return candidate
     return None
 
 
-def venv_python_version(venv_dir: Path) -> tuple[int, int] | None:
-    """Major.minor of an existing venv, from its ``pyvenv.cfg``.
+def venv_python_version(venv_dir: Path) -> tuple[int, ...] | None:
+    """Release of an existing venv's interpreter (major, minor[, micro]), from ``pyvenv.cfg``.
+
+    The micro version is kept: a ``requires-python`` such as ``>=3.12.1`` is
+    decided by it.
 
     Returns None when the venv is absent or structurally unusable, which the
     caller treats as incompatible rather than as "no venv".
@@ -247,10 +255,10 @@ def venv_python_version(venv_dir: Path) -> tuple[int, int] | None:
         text = cfg.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    match = re.search(r"^\s*version_info\s*=\s*(\d+)\.(\d+)", text, re.MULTILINE)
+    match = re.search(r"^\s*version(?:_info)?\s*=\s*(\d+)\.(\d+)(?:\.(\d+))?", text, re.MULTILINE)
     if not match:
         return None
-    return (int(match.group(1)), int(match.group(2)))
+    return tuple(int(part) for part in match.groups() if part is not None)
 
 
 def plan_agent_venv(
@@ -298,7 +306,7 @@ def plan_agent_venv(
     if current is not None and python_admitted(constraints, current):
         # Already admissible — even if a fresh container would pick another
         # interpreter, an operator's in-range choice is not torn down.
-        action, python = "reuse", current
+        action, python = "reuse", tuple(current[:2])
     elif has_venv and target is None:
         # Nothing admissible to rebuild onto: deleting this venv would only
         # trade a degraded-but-running WebUI for a slower, equally broken boot.
@@ -308,7 +316,7 @@ def plan_agent_venv(
     else:
         action, python = "create", target
 
-    if python == base_python and action != "rebuild":
+    if python is not None and action != "rebuild" and tuple(python) == tuple(base_python[: len(python)]):
         python = None
 
     return {
@@ -351,7 +359,7 @@ def check_critical_imports(venv_dir: Path, expected: tuple[int, int] | None = No
         )
 
     current = venv_python_version(venv_dir)
-    current_txt = "an unknown Python" if current is None else "Python {}.{}".format(*current)
+    current_txt = "an unknown Python" if current is None else "Python " + _version_text(current)
 
     try:
         result = subprocess.run(
@@ -380,12 +388,45 @@ def check_critical_imports(venv_dir: Path, expected: tuple[int, int] | None = No
     )
 
 
-def _parse_version(text: str) -> tuple[int, int] | None:
+def _version_text(version) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def _parse_version(text: str) -> tuple[int, ...] | None:
+    """``3.12`` or ``3.12.13`` -> (3, 12[, 13]); None when unreadable."""
     try:
-        major, minor = text.split(".")[:2]
-        return (int(major), int(minor))
+        parts = text.strip().split(".")
+        if len(parts) not in (2, 3):
+            return None
+        return tuple(int(part) for part in parts)
     except (ValueError, AttributeError):
         return None
+
+
+def _run_admits(argv: list[str]) -> int:
+    """``docker_venv_python.py --admits <pyproject> <venv_dir>``.
+
+    Exit 0 when the venv's interpreter satisfies the staged agent's declared
+    range and dependency gate (or there is nothing to enforce), 1 otherwise.
+    rebuild_agent_venv uses it on the interpreter uv actually installed.
+    """
+    if len(argv) != 4:
+        print("usage: docker_venv_python.py --admits <pyproject> <venv_dir>", file=sys.stderr)
+        return 2
+    pyproject_path, venv_dir = Path(argv[2]), Path(argv[3])
+    try:
+        text = pyproject_path.read_text(encoding="utf-8", errors="replace") if pyproject_path.is_file() else ""
+    except OSError:
+        text = ""
+    constraints = agent_python_constraints(text) if text else None
+    if constraints is None:
+        return 0
+    current = venv_python_version(venv_dir)
+    if current is not None and python_admitted(constraints, current):
+        return 0
+    found = "an unreadable interpreter" if current is None else "Python " + _version_text(current)
+    print(f"-- {venv_dir} runs {found}, which the staged agent does not accept", file=sys.stderr)
+    return 1
 
 
 def _run_verify(argv: list[str]) -> int:
@@ -407,9 +448,11 @@ def _run_verify(argv: list[str]) -> int:
 def main(argv: list[str]) -> int:
     if len(argv) >= 2 and argv[1] == "--verify":
         return _run_verify(argv)
+    if len(argv) >= 2 and argv[1] == "--admits":
+        return _run_admits(argv)
 
     if len(argv) != 4:
-        print("usage: docker_venv_python.py <pyproject> <venv_dir> <major.minor>", file=sys.stderr)
+        print("usage: docker_venv_python.py <pyproject> <venv_dir> <major.minor[.micro]>", file=sys.stderr)
         return 2
     pyproject_path, venv_dir, base = Path(argv[1]), Path(argv[2]), argv[3]
     # The planner prefers the base interpreter when the agent admits it, so an
@@ -419,11 +462,11 @@ def main(argv: list[str]) -> int:
 
     plan = plan_agent_venv(pyproject_path, venv_dir, base_python)
 
-    version = "-" if plan["python"] is None else "{}.{}".format(*plan["python"])
+    version = "-" if plan["python"] is None else _version_text(plan["python"])
     if plan["action"] == "rebuild":
         current = venv_python_version(venv_dir)
         current_txt = (
-            "an unreadable interpreter" if current is None else "Python {}.{}".format(*current)
+            "an unreadable interpreter" if current is None else "Python " + _version_text(current)
         )
         print(
             "-- existing venv uses {}, which the staged agent does not accept; rebuilding on Python {}".format(
@@ -439,8 +482,8 @@ def main(argv: list[str]) -> int:
         )
     elif plan["action"] == "create" and plan["python"] is not None:
         print(
-            "-- no usable venv; creating on Python {} (base image interpreter is {}.{})".format(
-                version, base_python[0], base_python[1]
+            "-- no usable venv; creating on Python {} (base image interpreter is {})".format(
+                version, _version_text(base_python)
             ),
             file=sys.stderr,
         )
