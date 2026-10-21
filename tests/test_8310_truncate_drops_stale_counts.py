@@ -1,18 +1,21 @@
-"""#8310 maintainer fold: Session.save() keeps the in-memory metadata counts aligned with the sidecar.
+"""#8310 maintainer fold: truncation drops the load-time sidecar counts.
 
-compact() prefers the load-time ``_metadata_message_count`` over the live array. Before this fold, save() wrote the
-new counts to disk but left the load-time values on the object, so the clear route (truncate to zero, save, return
-``s.compact()``) answered with the pre-clear total. #8310's /status card shows a "Total messages" row whenever that
-total differs from the visible count, which turned the stale scalar into a phantom "Messages 0, Total 6" until the
+compact() prefers the load-time ``_metadata_message_count`` over the live array. The clear route (truncate to zero,
+save, return ``s.compact()``) therefore answered with the pre-clear total, and #8310's /status card, which shows a
+"Total messages" row whenever the raw and visible counts differ, rendered a phantom "Messages 0, Total 6" until the
 next session load.
+
+The fold drops the counts in ``truncate_session_at_keep`` (the helper the clear and truncate routes share), so
+compact() counts the live array as it does for a never-loaded session. An earlier version of the fold refreshed the
+counts inside ``Session.save()``; Codex reproduced that a delayed older save could then write a stale count back over
+a newer one, and that state.db recovery copies messages without counts. The last test pins that save() assigns
+neither count.
 """
 from __future__ import annotations
 
 import json
 from io import BytesIO
 from types import SimpleNamespace
-
-import pytest
 
 
 def _seed_session_dir(monkeypatch, tmp_path):
@@ -62,6 +65,7 @@ def test_clear_response_reports_zero_totals_for_a_loaded_session(monkeypatch, tm
     models.SESSIONS.clear()  # the route loads from disk, caching the load-time counts (6 raw / 5 visible)
 
     loaded = models.Session.load("f8310clear")
+    assert loaded is not None
     assert loaded.compact()["message_count"] == 6
     assert loaded.compact()["visible_message_count"] == 5
     models.SESSIONS.clear()
@@ -73,32 +77,33 @@ def test_clear_response_reports_zero_totals_for_a_loaded_session(monkeypatch, tm
     assert session["visible_message_count"] == 0
 
 
-def test_save_refreshes_counts_after_an_in_memory_append(monkeypatch, tmp_path):
-    models = _seed_session_dir(monkeypatch, tmp_path)
-    models.Session(session_id="f8310grow", messages=_rows()[:2]).save()
-    loaded = models.Session.load("f8310grow")
-    assert loaded.compact()["message_count"] == 2
+def test_truncate_helper_drops_the_load_time_counts(monkeypatch, tmp_path):
+    from api.session_ops import truncate_session_at_keep
 
-    loaded.messages.append({"id": "u9", "role": "user", "content": "more", "timestamp": 9.0})
+    models = _seed_session_dir(monkeypatch, tmp_path)
+    models.Session(session_id="f8310trunc", messages=_rows()).save()
+    loaded = models.Session.load("f8310trunc")
+    assert loaded is not None
+    assert loaded._metadata_message_count == 6
+
+    truncate_session_at_keep(loaded, 4)
+    assert loaded._metadata_message_count is None
+    assert loaded._metadata_visible_message_count is None
+    compact = loaded.compact()
+    assert compact["message_count"] == 4
+    assert compact["visible_message_count"] == 3  # the hidden wakeup row stays out of the visible count
+
     loaded.save()
-    assert loaded.compact()["message_count"] == 3
-    assert loaded._metadata_message_count == 3
-    assert loaded._metadata_visible_message_count == 3
+    reloaded = models.Session.load("f8310trunc")
+    assert reloaded is not None
+    assert reloaded.compact()["message_count"] == 4
 
 
-def test_a_failed_write_keeps_the_previous_counts(monkeypatch, tmp_path):
+def test_save_assigns_no_counts_to_the_object(monkeypatch, tmp_path):
+    """save() must not stamp counts onto the live object: a delayed older save would race a stale value back."""
     models = _seed_session_dir(monkeypatch, tmp_path)
-    models.Session(session_id="f8310fail", messages=_rows()).save()
-    loaded = models.Session.load("f8310fail")
-    assert loaded._metadata_message_count == 6
-
-    def boom(*_a, **_k):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(models, "_replace_session_sidecar", boom)
-    loaded.messages = loaded.messages[:2]
-    with pytest.raises(OSError):
-        loaded.save()
-    # Nothing was persisted, so the object must not claim the new count.
-    assert loaded._metadata_message_count == 6
-    assert loaded._metadata_visible_message_count == 5
+    fresh = models.Session(session_id="f8310fresh", messages=_rows()[:2])
+    fresh.save()
+    assert fresh._metadata_message_count is None
+    fresh.messages.append({"id": "u9", "role": "user", "content": "more", "timestamp": 9.0})
+    assert fresh.compact()["message_count"] == 3

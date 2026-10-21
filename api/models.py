@@ -2186,16 +2186,6 @@ class Session:
                 pass
             raise
 
-        # The sidecar now holds these counts. Keep this object's load-time
-        # metadata scalars aligned with what was just persisted: compact()
-        # prefers _metadata_message_count over the live array, so a session
-        # loaded with N rows, cleared or truncated, then saved would otherwise
-        # report N until the next load (the clear route returns s.compact()
-        # and the browser adopts it). Set only after the write succeeded; the
-        # early refusal above and a failed write keep the previous values.
-        self._metadata_message_count = meta['message_count']
-        self._metadata_visible_message_count = meta['visible_message_count']
-
         # #4985 belt-and-suspenders self-heal: a successful save with at
         # least one real message on the sidecar is unconditional proof the
         # row is alive (the #4985 "zero-message orphan" only ever exists
