@@ -780,8 +780,21 @@ def submit_gateway_pending_mirror(session_key: str, approval: dict) -> tuple[dic
                 mirror_entry[_GATEWAY_MIRROR_FLAG] = True
                 mirror_entry[_GATEWAY_MIRROR_TOKEN] = uuid.uuid4().hex
                 mirror_entry[_GATEWAY_MIRROR_RETAINED] = True
-                if not _gateway_pending_mirror_locked(session_key, approval_id=approval_id, run_id=run_id):
+                existing_mirror = _gateway_pending_mirror_locked(
+                    session_key, approval_id=approval_id, run_id=run_id
+                )
+                if existing_mirror is None:
                     _normalize_pending_queue_locked(session_key).append(mirror_entry)
+                elif existing_mirror.get(_GATEWAY_EXECUTION_GENERATION) != mirror_entry.get(
+                    _GATEWAY_EXECUTION_GENERATION
+                ):
+                    # The run re-published this prompt id at a new generation:
+                    # the old mirror's answer is a stale 409, so the live
+                    # payload replaces it (new payload, new mirror token)
+                    # instead of being deduped away by the id alone.
+                    queue = _normalize_pending_queue_locked(session_key)
+                    queue[:] = [entry for entry in queue if entry is not existing_mirror]
+                    queue.append(mirror_entry)
         elif not exact_local_entry:
             if not approval_id:
                 approval_id = uuid.uuid4().hex

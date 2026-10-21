@@ -668,8 +668,38 @@ def _gateway_runs_approval_event(payload: dict) -> dict | None:
 
 
 def _gateway_approval_key(payload) -> str:
-    """Stable id for one gateway approval, shared by the status probe and the event relay."""
-    return _gateway_prompt_identity(payload) or str(payload.get("timestamp") or "")
+    """Stable id for one gateway approval, shared by the status probe and the event relay.
+
+    The execution generation is part of the identity: a run that re-publishes the
+    same prompt id at a newer generation is a different prompt, and answering the
+    old generation is refused by the gateway. Keying on the id alone deduped that
+    replay away and left the mirror pointing at a dead generation.
+    """
+    identity = _gateway_prompt_identity(payload) or str(payload.get("timestamp") or "")
+    generation = payload.get("execution_generation")
+    if identity and type(generation) is int:
+        return f"{identity}#{generation}"
+    return identity
+
+
+def _gateway_status_approval(status: dict) -> dict | None:
+    """The pending approval a durable run status describes, in either projection shape.
+
+    The session bridge answers ``status["approval"]`` with the latest single
+    prompt; the canonical authority projection answers ``pending_controls``,
+    where the run's own queue order puts the prompt that must be answered first
+    at the head.
+    """
+    approval = status.get("approval")
+    if isinstance(approval, dict):
+        return approval
+    controls = status.get("pending_controls")
+    if not isinstance(controls, list):
+        return None
+    for control in controls:
+        if isinstance(control, dict) and control.get("kind") == "approval":
+            return control
+    return None
 
 
 def _relay_gateway_run_approval(session_id, run_id, payload, base_url, api_key, *, put_gateway_event) -> bool:
@@ -1297,7 +1327,7 @@ def _run_gateway_runs_api_streaming(
         gateway advertises ``approval_identity_v1``; without both, skip the
         status-card insert entirely so the replay alone orders the queue
         A -> B."""
-        approval = status.get("approval")
+        approval = _gateway_status_approval(status)
         if (
             str(status.get("status") or "").strip().lower() == "waiting_for_approval"
             and isinstance(approval, dict)
@@ -1748,7 +1778,7 @@ def _await_gateway_run_result(
             status = _get_gateway_run_status(base_url, api_key, run_id)
         except (urllib.error.URLError, OSError, ValueError):
             return True  # fail open: a stale card 409s, a missing one stalls the run
-        approval = status.get("approval")
+        approval = _gateway_status_approval(status)
         return (
             str(status.get("status") or "").strip().lower() == "waiting_for_approval"
             and isinstance(approval, dict)
@@ -1756,7 +1786,7 @@ def _await_gateway_run_result(
         )
 
     def surface_parked_approval(status):
-        approval = status.get("approval")
+        approval = _gateway_status_approval(status)
         if str(status.get("status") or "").strip().lower() == "waiting_for_approval" and isinstance(approval, dict):
             approval_key = _gateway_approval_key(approval)
             if approval_key not in surfaced_approval_ids:

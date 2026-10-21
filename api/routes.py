@@ -31399,26 +31399,43 @@ def _gateway_approval_failure(
     return payload, status
 
 
+_GATEWAY_PROMPT_REFRESH_TIMEOUT = 10.0
+
+
 def _gateway_run_prompt(
     base_url: str,
     api_key: str,
     run_id: str,
     approval_id: str,
-) -> tuple[str, int, list[str]] | None:
+) -> tuple[str, tuple[str, int, list[str]] | None]:
     """Read the prompt a run is currently waiting on, straight from the gateway.
 
-    A mirror the UI rebuilt for itself (a ``gwrun:`` head) carries no execution
-    generation, and any card synthesised from the live queue carries no
-    ``choices``. The run projection answers both for every card, whatever route
-    produced it, so one refresh covers them all.
+    Only used to verify an answer the gateway rejected. The read is bounded well
+    below the browser's own timeout because it happens on the request thread
+    while the relay owner claim is held.
+
+    Returns ``(outcome, prompt)`` where outcome is:
+
+    - ``"found"``: the run is parked on this exact prompt (``prompt`` is set);
+    - ``"superseded"``: the projection read fine and this prompt is gone — the
+      run parked nothing, or parked a different single prompt — so the card is
+      stale and must not answer that one;
+    - ``"ambiguous"``: several prompts are parked and none is this card's, so
+      the projection cannot say whether this one was answered;
+    - ``"failed"``: the projection could not be read at all.
+
+    Cross-prompt adoption is deliberately absent: a card may only answer its own
+    prompt id, or a stale card would approve a command the user never saw.
     """
     from api.runner_client import HttpRunnerClient
 
     try:
-        run = HttpRunnerClient(base_url=base_url, api_key=api_key).get_run(run_id)
+        run = HttpRunnerClient(base_url=base_url, api_key=api_key).get_run(
+            run_id, timeout=_GATEWAY_PROMPT_REFRESH_TIMEOUT
+        )
     except Exception:  # noqa: BLE001 - a failed refresh must never break the relay
         logger.debug("gateway run prompt refresh failed for %s", run_id, exc_info=True)
-        return None
+        return "failed", None
     controls = run.get("pending_controls") if isinstance(run, dict) else None
     prompts = [
         prompt
@@ -31431,14 +31448,10 @@ def _gateway_run_prompt(
         (prompt for prompt in prompts if str(prompt.get("prompt_id") or "") == approval_id),
         None,
     )
-    if match is None and len(prompts) == 1:
-        # A local id the gateway never issued, and exactly one prompt pending:
-        # the run can only be waiting on this one.
-        match = prompts[0]
     if match is None:
-        return None
+        return ("ambiguous" if len(prompts) > 1 else "superseded"), None
     choices = [c for c in (match.get("choices") or []) if isinstance(c, str)]
-    return str(match.get("prompt_id") or ""), int(match["execution_generation"]), choices
+    return "found", (str(match.get("prompt_id") or ""), int(match["execution_generation"]), choices)
 
 
 def _relay_gateway_run_approval(
@@ -31507,19 +31520,15 @@ def _relay_gateway_run_approval(
         execution_generation = current_mirror.get(_GATEWAY_EXECUTION_GENERATION)
         if type(execution_generation) is not int:
             execution_generation = None
-        # The card's own projection is the fast path; the run projection is the
-        # authority when the card was rebuilt locally (a ``gwrun:`` head, or a
-        # mirror reconstituted from the live queue) and carries neither a
-        # generation nor the choices the gateway will accept.
+        # A card carries its own identity: whatever published it stamped the
+        # prompt id, its generation and its choices — including a card rebuilt
+        # from durable run status, which is published with the run's pending
+        # controls. Nothing is resolved here, so a click on a legacy
+        # (no-generation) card posts immediately instead of blocking on a status
+        # read the browser gives up on first.
         prompt_id = approval_id
         choices = current_mirror.get("choices")
         choices = [c for c in choices if isinstance(c, str)] if isinstance(choices, list) else []
-        if execution_generation is None:
-            resolved = _gateway_run_prompt(base_url, api_key, run_id, approval_id)
-            if resolved is not None:
-                prompt_id, execution_generation, resolved_choices = resolved
-                identity_v1 = True
-                choices = resolved_choices or choices
         if identity_v1 and choices and choice not in choices:
             # The gateway offers fewer choices than the stale card shows;
             # forwarding this one is a guaranteed 400 that hides its cause.
@@ -31556,7 +31565,12 @@ def _relay_gateway_run_approval(
                     enable_yolo=enable_yolo,
                 )
 
-        def _respond(reply_prompt_id: str, reply_generation) -> str | None:
+        def _respond(reply_prompt_id: str, reply_generation) -> Exception | None:
+            """Send one answer; return the rejection itself, never its message.
+
+            The caller branches on the gateway's structured ``code``, so the
+            decision must not depend on how the message happens to be worded.
+            """
             try:
                 # Constructed per send: a misconfigured base must raise inside
                 # this try, or it escapes the relay and falls through to the
@@ -31573,32 +31587,34 @@ def _relay_gateway_run_approval(
                 )
                 return None
             except (RunnerClientError, ValueError) as exc:
-                return str(exc)
+                return exc
 
         yolo_transition = begin_session_yolo_transition(sid) if enable_yolo else None
         relay_succeeded = False
         already_resolved = False
         try:
             relay_error = _respond(prompt_id, execution_generation)
-            if relay_error is not None and "approval_not_pending" in relay_error:
+            if getattr(relay_error, "code", "") == "approval_not_pending":
                 # The mirror outlived the prompt it was built from: the run has
-                # since parked a newer one (fresh prompt id, newer generation).
-                # Re-project from the run's own pending_controls and answer that
-                # instead of replaying the dead prompt on every click.
-                resolved = _gateway_run_prompt(base_url, api_key, run_id, approval_id)
-                if resolved is not None:
+                # since answered it, or parked a newer one. Re-read the run's own
+                # pending_controls and act only on what they prove.
+                outcome, resolved = _gateway_run_prompt(base_url, api_key, run_id, approval_id)
+                if outcome == "found" and resolved is not None:
                     live_prompt_id, live_generation, live_choices = resolved
-                    if (live_prompt_id, live_generation) != (prompt_id, execution_generation):
+                    # The same prompt re-published at a newer generation: the
+                    # first POST was fenced to the dead one, so re-send against
+                    # the live generation. Never a different prompt id.
+                    if live_generation != execution_generation:
                         prompt_id, execution_generation = live_prompt_id, live_generation
                         identity_v1 = True
                         choices = live_choices or choices
                         relay_error = _respond(prompt_id, execution_generation)
-                else:
-                    # No pending control left for this run: the second click of a
-                    # double click, or a stale card in another tab. The answer the
-                    # user wanted is already in effect, so this is an idempotent
-                    # replay, not a failure — 502 here painted a red error on an
-                    # approval that had just succeeded.
+                elif outcome == "superseded":
+                    # The projection read fine and this card's prompt is gone.
+                    # The answer the user wanted is already in effect, so this is
+                    # an idempotent replay, not a failure — but only when the
+                    # refresh actually succeeded. An unreadable or ambiguous
+                    # projection keeps the mirror and reports the rejection.
                     already_resolved = True
             relay_succeeded = relay_error is None or already_resolved
         finally:
@@ -31625,7 +31641,7 @@ def _relay_gateway_run_approval(
                 sid,
                 choice,
                 code="gateway_approval_relay_failed",
-                error=relay_error,
+                error=str(relay_error),
                 status=502,
                 enable_yolo=enable_yolo,
                 relayed=True,

@@ -16,6 +16,8 @@ import io
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import api.route_approvals as approvals
 from api import routes
 from api.gateway_chat import (
@@ -59,21 +61,49 @@ def _relay(payload, *, put_event=None):
         )
 
 
-def _answer(body, captured, *, run_projection=None, run_status=None, respond_error=None):
-    def fake_request_json(_self, req):
+def _answer(
+    body,
+    captured,
+    *,
+    run_projection=None,
+    run_status=None,
+    respond_reject=None,
+):
+    """Drive the real answer handler with the gateway wire faked.
+
+    ``run_status`` non-None makes the run projection GET fail: an int is an HTTP
+    status, ``"timeout"`` is a transport failure (no status at all).
+    ``respond_reject`` is ``(http_status, code)`` for a rejected POST, and the
+    code travels structurally, exactly as ``_request_json`` parses it.
+    """
+
+    def fake_request_json(_self, req, **_kwargs):
         if req.method == "GET":
             captured.setdefault("gets", []).append(req.full_url)
+            if run_status == "timeout":
+                from api.runner_client import RunnerClientError
+
+                raise RunnerClientError("Runner request failed: timed out")
             if run_status:
                 from api.runner_client import RunnerClientError
 
-                raise RunnerClientError(f"Runner returned HTTP {run_status}: {{}}")
+                raise RunnerClientError(
+                    f"Runner returned HTTP {run_status}: {{}}", status=run_status
+                )
             return run_projection or {}
+        answer = json.loads(req.data)
+        captured.setdefault("posts", []).append(answer)
         captured["url"] = req.full_url
-        captured["body"] = json.loads(req.data)
-        if respond_error:
+        captured["body"] = answer
+        if respond_reject:
             from api.runner_client import RunnerClientError
 
-            raise RunnerClientError(respond_error)
+            status, code = respond_reject
+            raise RunnerClientError(
+                f'Runner returned HTTP {status}: {{"error": {{"code": "{code}"}}}}',
+                status=status,
+                code=code,
+            )
         return {"ok": True}
 
     handler = MagicMock()
@@ -216,8 +246,13 @@ def test_canonical_event_is_answered_with_generation_fenced_body():
     assert handler.send_response.call_args[0][0] == 200
 
 
-def test_legacy_event_is_still_answered_with_the_legacy_body():
-    """Backwards compatibility: a gateway that publishes no generation."""
+def test_legacy_click_posts_at_once_without_a_status_read():
+    """Backwards compatibility, and no click-time status read (review row 5).
+
+    A gateway that publishes no generation is answered with the legacy body
+    immediately. Resolving identity here instead would park the POST behind a
+    run-projection GET whose 60 s timeout outlives the browser's own 30 s.
+    """
     payload = {
         "event": "approval.request",
         "run_id": RUN_ID,
@@ -244,6 +279,8 @@ def test_legacy_event_is_still_answered_with_the_legacy_body():
         captured,
     )
 
+    assert "gets" not in captured, (
+        f"a legacy click must be answered without a run-projection read: {captured!r}")
     assert captured["body"] == {"choice": "once", "approval_id": ""}
     assert handler.send_response.call_args[0][0] == 200
 
@@ -252,7 +289,7 @@ def test_yolo_auto_approve_also_carries_the_generation():
     """The sibling path: session YOLO answers without a card, same contract."""
     captured = {}
 
-    def fake_request_json(_self, req):
+    def fake_request_json(_self, req, **_kwargs):
         captured["body"] = json.loads(req.data)
         return {"ok": True}
 
@@ -280,35 +317,28 @@ def test_yolo_auto_approve_also_carries_the_generation():
 
 
 # ---------------------------------------------------------------------------
-# Cards the UI rebuilt itself: the run projection is the authority
+# Answering a card the UI rebuilt itself, and the stale/ambiguous rejections
 # ---------------------------------------------------------------------------
 
-def test_synthetic_gwrun_card_is_answered_from_the_run_projection():
-    """A mirror rebuilt from the live queue carries no generation of its own.
+def test_stale_card_never_answers_the_prompt_that_replaced_it():
+    """Review row 2, the must-fix: a stale card must not answer prompt B.
 
-    Answering it from the mirror alone sent the legacy body and 400'd on every
-    click; the run projection names the live prompt and its generation.
+    Card A is on screen, and the run has since parked prompt B. A's click
+    reaches the gateway as A's own id and is rejected 409; the projection then
+    names B. Adopting that single pending prompt — the pre-fix behaviour —
+    approved B with a click the user made on A. Here A settles as stale and B is
+    never posted with the user's choice.
     """
-    payload = {
-        "event": "approval.request",
-        "run_id": RUN_ID,
-        "approval_id": "gwrun:run-local-1",
-        "command": "echo hi",
-        "description": "rebuilt card",
-    }
-    assert _relay(payload)
-    mirror = approvals.gateway_pending_mirror(
-        SID, approval_id="gwrun:run-local-1", run_id=RUN_ID
-    )
+    assert _relay(_canonical_payload(prompt_id="prompt-A", execution_generation=7))
+    mirror = approvals.gateway_pending_mirror(SID, approval_id="prompt-A", run_id=RUN_ID)
     assert mirror is not None
-    assert mirror[approvals._GATEWAY_EXECUTION_GENERATION] is None
 
     captured = {}
     handler = _answer(
         {
             "session_id": SID,
             "choice": "once",
-            "approval_id": "gwrun:run-local-1",
+            "approval_id": "prompt-A",
             "run_id": RUN_ID,
             "mirror_token": mirror[approvals._GATEWAY_MIRROR_TOKEN],
         },
@@ -318,21 +348,129 @@ def test_synthetic_gwrun_card_is_answered_from_the_run_projection():
             "pending_controls": [
                 {
                     "kind": "approval",
-                    "prompt_id": PROMPT_ID,
-                    "execution_generation": 7,
+                    "prompt_id": "prompt-B",
+                    "execution_generation": 8,
                     "choices": ["once", "deny"],
                 }
             ],
         },
+        respond_reject=(409, "approval_not_pending"),
     )
 
-    assert captured["gets"] and captured["gets"][0].endswith(f"/v1/runs/{RUN_ID}")
-    assert captured["body"] == {
-        "request_id": PROMPT_ID,
-        "execution_generation": 7,
-        "choice": "once",
-    }
+    answered = [answer.get("request_id") for answer in captured.get("posts", [])]
+    assert answered == ["prompt-A"], (
+        f"only the card's own prompt may be answered, got {captured.get('posts')!r}")
     assert handler.send_response.call_args[0][0] == 200
+    assert b'"already_resolved": true' in handler.wfile.getvalue()
+
+
+@pytest.mark.parametrize("run_status", ["timeout", 404, 409])
+def test_unverifiable_projection_keeps_the_card_and_reports_the_error(run_status):
+    """Review row 3: a failed refresh is a failure, never ``already_resolved``.
+
+    The projection read used to answer ``None`` for both "read failed" and "this
+    prompt is gone", so a timeout, a 404 or an unrelated 409 became
+    ``200 already_resolved`` and the mirror was retired without an accepted
+    answer.
+    """
+    assert _relay(_canonical_payload())
+    mirror = approvals.gateway_pending_mirror(SID, approval_id=PROMPT_ID, run_id=RUN_ID)
+    assert mirror is not None
+
+    captured = {}
+    handler = _answer(
+        {
+            "session_id": SID,
+            "choice": "once",
+            "approval_id": PROMPT_ID,
+            "run_id": RUN_ID,
+            "mirror_token": mirror[approvals._GATEWAY_MIRROR_TOKEN],
+        },
+        captured,
+        run_status=run_status,
+        respond_reject=(409, "approval_not_pending"),
+    )
+
+    assert handler.send_response.call_args[0][0] == 502, handler.wfile.getvalue()
+    assert b"gateway_approval_relay_failed" in handler.wfile.getvalue()
+    assert approvals.gateway_pending_mirror(
+        SID, approval_id=PROMPT_ID, run_id=RUN_ID
+    ) is not None, "the card must survive an unverified rejection"
+    assert len(captured.get("posts", [])) == 1, captured
+
+
+def test_ambiguous_projection_is_not_reported_as_success():
+    """Review must-fix 2, ambiguity arm: several prompts parked, none is this card's.
+
+    The projection cannot say whether this card was answered, so the mirror
+    stays and the rejection is reported instead of settling the card.
+    """
+    assert _relay(_canonical_payload())
+    mirror = approvals.gateway_pending_mirror(SID, approval_id=PROMPT_ID, run_id=RUN_ID)
+    assert mirror is not None
+    pending = [
+        {
+            "kind": "approval",
+            "prompt_id": f"prompt-other-{generation}",
+            "execution_generation": generation,
+            "choices": ["once", "deny"],
+        }
+        for generation in (8, 9)
+    ]
+
+    captured = {}
+    handler = _answer(
+        {
+            "session_id": SID,
+            "choice": "once",
+            "approval_id": PROMPT_ID,
+            "run_id": RUN_ID,
+            "mirror_token": mirror[approvals._GATEWAY_MIRROR_TOKEN],
+        },
+        captured,
+        run_projection={"status": "waiting_for_approval", "pending_controls": pending},
+        respond_reject=(409, "approval_not_pending"),
+    )
+
+    assert handler.send_response.call_args[0][0] == 502, handler.wfile.getvalue()
+    assert approvals.gateway_pending_mirror(SID, approval_id=PROMPT_ID, run_id=RUN_ID) is not None
+
+
+def test_republished_prompt_at_a_new_generation_replaces_its_card():
+    """Review row 4: the same prompt id at a new generation is a new prompt.
+
+    The dedupe key carries the generation, so the replay is relayed instead of
+    suppressed, and the mirror is replaced (new payload, new token) rather than
+    left pointing at the dead generation.
+    """
+    from api.gateway_chat import _gateway_approval_key
+
+    assert _gateway_approval_key(
+        _canonical_payload(execution_generation=7)
+    ) != _gateway_approval_key(
+        _canonical_payload(execution_generation=8)
+    ), "a re-published generation must not dedupe against the old one"
+
+    assert _relay(_canonical_payload(execution_generation=7))
+    first = approvals.gateway_pending_mirror(SID, approval_id=PROMPT_ID, run_id=RUN_ID)
+    assert first is not None
+    assert first[approvals._GATEWAY_EXECUTION_GENERATION] == 7
+
+    cards = []
+    assert _relay(
+        _canonical_payload(execution_generation=8, command="echo second"),
+        put_event=lambda name, payload: cards.append((name, payload)),
+    )
+
+    mirrors = [
+        entry
+        for entry in approvals._pending.get(SID, [])
+        if entry.get(approvals._GATEWAY_MIRROR_FLAG)
+    ]
+    assert len(mirrors) == 1, f"the obsolete mirror must be replaced, got {mirrors!r}"
+    assert mirrors[0][approvals._GATEWAY_EXECUTION_GENERATION] == 8
+    assert mirrors[0][approvals._GATEWAY_MIRROR_TOKEN] != first[approvals._GATEWAY_MIRROR_TOKEN]
+    assert cards and cards[0][1]["approval_id"] == PROMPT_ID
 
 
 def test_choice_the_gateway_does_not_offer_is_refused_before_it_is_sent():
@@ -407,10 +545,7 @@ def test_replay_of_an_already_answered_prompt_is_idempotent():
         },
         captured,
         run_projection={"status": "running", "pending_controls": []},
-        respond_error=(
-            'Runner returned HTTP 409: {"error": {"message": '
-            '"approval_not_pending", "code": "approval_not_pending"}}'
-        ),
+        respond_reject=(409, "approval_not_pending"),
     )
 
     assert handler.send_response.call_args[0][0] == 200
