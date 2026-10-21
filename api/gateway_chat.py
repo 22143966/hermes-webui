@@ -1853,6 +1853,46 @@ def _process_profile_is_root() -> bool:
         return False  # fail closed: treat the mirrored alias as per-profile
 
 
+def _shared_url_may_belong_to_process_profile(session_home) -> bool:
+    """True unless the shared Gateway URL is provably the launcher's, under a NAMED process profile (#8432).
+
+    With the root profile as the process profile, os.environ and the ambient config are the shared settings: False.
+    With a named (or undeterminable, fail closed) process profile, the URL is provably shared only when it comes from
+    a launcher export: present in os.environ, not mirrored by the profile loader, and not preloaded by a shell
+    launcher from a named profile home (ctl.sh sources ``$HERMES_HOME/.env`` before Python starts). A URL from the
+    ambient config, a mirrored value, or a named launch home may be the process profile's own. The default URL
+    (nothing configured anywhere) belongs to no profile. The process profile's own sessions are never affected.
+    """
+    from api import profiles as _profiles
+
+    if _process_profile_is_root():
+        return False
+    try:
+        if _same_profile_home(session_home, _profiles.get_process_profile_home()):
+            return False
+    except Exception:
+        pass
+    raw_env_url = str(os.environ.get(_WEBUI_GATEWAY_BASE_URL_ENV) or "").strip()
+    if raw_env_url:
+        mirrored = _WEBUI_GATEWAY_BASE_URL_ENV in (getattr(_profiles, "_loaded_profile_env_keys", ()) or ())
+        launch_home = str(getattr(_profiles, "_INITIAL_HERMES_HOME", "") or "").strip()
+        named_launch_home = bool(launch_home) and Path(launch_home).expanduser().parent.name == "profiles"
+        return mirrored or named_launch_home
+    try:
+        from api.config import get_config
+
+        cfg = get_config()
+        return bool(isinstance(cfg, dict) and str(cfg.get("webui_gateway_base_url") or "").strip())
+    except Exception:
+        return True
+
+
+def _same_profile_home(a, b) -> bool:
+    from api.workspace import _safe_resolve
+
+    return _safe_resolve(Path(a).expanduser()) == _safe_resolve(Path(b).expanduser())
+
+
 def _gateway_endpoint_for_profile(profile_name) -> tuple[str, str]:
     """URL and key for a session's profile, never those of the process-active profile.
 
@@ -1867,6 +1907,9 @@ def _gateway_endpoint_for_profile(profile_name) -> tuple[str, str]:
     - Key, on the shared URL: the profile's own HERMES_WEBUI_GATEWAY_API_KEY, then the shared alias (the
       launcher's export, or the root profile's .env), then the profile's API_SERVER_KEY (the key of its own
       Gateway), then the shared key.
+    - Exception (#8432): under a NAMED process profile, a profile with a key but no URL gets the process pair
+      (URL and key from one source, as v0.52.492 sends) unless the shared URL is provably a launcher export,
+      because that URL may be the process profile's own and must never receive another profile's key.
     """
     from api import profiles as _profiles
     from api.config import _expand_env_vars, _load_yaml_config_file_raw, _thread_ctx, get_config
@@ -1916,6 +1959,11 @@ def _gateway_endpoint_for_profile(profile_name) -> tuple[str, str]:
             )
     if url != shared_url:
         return url, own_key  # the profile's own Gateway: its own key or none, never the shared one
+    if not own_url_env and not own_url_cfg and own_key and _shared_url_may_belong_to_process_profile(home):
+        # #8432: this profile set a key but no URL, and the "shared" URL may be the NAMED process profile's own
+        # (mirrored from its .env or read from its config). Never send this profile's key there; use the process
+        # pair, URL and key from one source, exactly what v0.52.492 sends for every fresh turn.
+        return shared_url, shared_key
     return url, (own_alias or shared_alias or own_key or shared_key)
 
 
