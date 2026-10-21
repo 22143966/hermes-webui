@@ -18,9 +18,11 @@ the very breakage #8113 reports.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -205,6 +207,11 @@ def test_docker_init_readiness_runs_after_the_dependency_install():
 
 # ── read-only staged-source handling ─────────────────────────────────────────
 
+# Written by `write_agent_stage_manifest` in docker_init.bash next to the
+# staged copy; `_agent_install_dir()` reads it to bind the stage to the Agent.
+STAGE_MANIFEST = ".hermes-webui-stage-source"
+STAGE_ENV = "HERMES_WEBUI_AGENT_STAGE_DIR"
+
 
 @pytest.fixture(params=[0o022, 0o002], ids=["umask022", "umask002"])
 def ambient_umask(request):
@@ -233,20 +240,35 @@ def _agent(tmp_path: Path, name: str, *, reqs: bool = True, mode: int = 0o755) -
     return d
 
 
-def _install_dir_prefers_staged_copy(tmp_path):
-    """Export the chokepoint this test drives."""
-    from api.startup import _agent_install_dir
+def _publish_stage(source: Path, stage: Path) -> None:
+    """The manifest docker_init.bash publishes for a stage copied from ``source``."""
+    lines = [f"source={source.resolve()}"]
+    for name in ("pyproject.toml", "requirements.txt"):
+        path = source / name
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "-"
+        lines.append(f"{name}={digest}")
+    manifest = stage / STAGE_MANIFEST
+    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    manifest.chmod(0o644)
 
-    mount = _agent(tmp_path, "hermes-agent")
-    staged = _agent(tmp_path, "hermes-agent-src")
-    env = {"HERMES_WEBUI_AGENT_STAGE_DIR": str(staged)}
-    with patch.dict("os.environ", env, clear=False):
-        return _agent_install_dir(mount)
+
+def _staged_copy(tmp_path: Path, source: Path, *, name: str = "hermes-agent-src", mode: int = 0o755) -> Path:
+    """A staged copy of ``source`` with its manifest, as docker_init.bash leaves it."""
+    stage = tmp_path / name
+    shutil.copytree(source, stage)
+    stage.chmod(mode)
+    _publish_stage(source, stage)
+    return stage
 
 
 def test_auto_install_targets_the_writable_staged_copy(tmp_path, ambient_umask):
     """The `:ro` mount can never satisfy the install that would fix #8113."""
-    assert _install_dir_prefers_staged_copy(tmp_path).name == "hermes-agent-src"
+    from api.startup import _agent_install_dir
+
+    mount = _agent(tmp_path, "hermes-agent")
+    staged = _staged_copy(tmp_path, mount)
+    with patch.dict("os.environ", {STAGE_ENV: str(staged)}, clear=False):
+        assert _agent_install_dir(mount.resolve()) == staged.resolve()
 
 
 def test_auto_install_still_rejects_a_group_writable_stage(tmp_path):
@@ -254,10 +276,53 @@ def test_auto_install_still_rejects_a_group_writable_stage(tmp_path):
     from api.startup import _agent_install_dir
 
     mount = _agent(tmp_path, "hermes-agent")
-    staged = _agent(tmp_path, "hermes-agent-src", mode=0o775)
-    env = {"HERMES_WEBUI_AGENT_STAGE_DIR": str(staged)}
-    with patch.dict("os.environ", env, clear=False):
-        assert _agent_install_dir(mount) == mount
+    staged = _staged_copy(tmp_path, mount, mode=0o775)
+    with patch.dict("os.environ", {STAGE_ENV: str(staged)}, clear=False):
+        assert _agent_install_dir(mount.resolve()) == mount.resolve()
+
+
+def test_auto_install_rejects_an_unrelated_trusted_stage(tmp_path):
+    """Owner and mode prove the stage is ours, not that it is a copy of *this* Agent."""
+    from api.startup import _agent_install_dir
+
+    mount = _agent(tmp_path, "hermes-agent")
+    unrelated = _agent(tmp_path, "unrelated-src")
+    (unrelated / "requirements.txt").write_text("unrelated-pkg==6.6.6\n", encoding="utf-8")
+    with patch.dict("os.environ", {STAGE_ENV: str(unrelated)}, clear=False):
+        assert _agent_install_dir(mount.resolve()) == mount.resolve()
+
+
+def test_auto_install_rejects_a_stage_published_for_a_different_agent(tmp_path):
+    """Identical install inputs are not identity: the stage must name this Agent."""
+    from api.startup import _agent_install_dir
+
+    mount = _agent(tmp_path, "hermes-agent")
+    other = _agent(tmp_path, "other-agent")
+    staged = _staged_copy(tmp_path, other)
+    with patch.dict("os.environ", {STAGE_ENV: str(staged)}, clear=False):
+        assert _agent_install_dir(mount.resolve()) == mount.resolve()
+
+
+def test_auto_install_rejects_a_stale_stage(tmp_path):
+    """The Agent moved on after staging (upgrade / host checkout pull)."""
+    from api.startup import _agent_install_dir
+
+    mount = _agent(tmp_path, "hermes-agent")
+    staged = _staged_copy(tmp_path, mount)
+    (mount / "requirements.txt").write_text("python-dotenv==1.3.0\n", encoding="utf-8")
+    with patch.dict("os.environ", {STAGE_ENV: str(staged)}, clear=False):
+        assert _agent_install_dir(mount.resolve()) == mount.resolve()
+
+
+def test_auto_install_rejects_a_stage_changed_after_publication(tmp_path):
+    """The manifest vouches for what was copied, not for whatever is there now."""
+    from api.startup import _agent_install_dir
+
+    mount = _agent(tmp_path, "hermes-agent")
+    staged = _staged_copy(tmp_path, mount)
+    (staged / "requirements.txt").write_text("unrelated-pkg==6.6.6\n", encoding="utf-8")
+    with patch.dict("os.environ", {STAGE_ENV: str(staged)}, clear=False):
+        assert _agent_install_dir(mount.resolve()) == mount.resolve()
 
 
 def test_auto_install_falls_back_to_the_mount_without_a_stage_dir(tmp_path):
@@ -295,7 +360,7 @@ def test_auto_install_runs_pip_against_the_staged_copy(tmp_path):
     from api.startup import auto_install_agent_deps
 
     mount = _agent(tmp_path, "hermes-agent")
-    staged = _agent(tmp_path, "hermes-agent-src")
+    staged = _staged_copy(tmp_path, mount)
     env = {
         "HERMES_WEBUI_AGENT_DIR": str(mount),
         "HERMES_WEBUI_AGENT_STAGE_DIR": str(staged),
@@ -308,6 +373,82 @@ def test_auto_install_runs_pip_against_the_staged_copy(tmp_path):
                 assert auto_install_agent_deps(expected_agent_dir=mount) is True
     args = mock_run.call_args[0][0]
     assert any(str(staged) in str(a) for a in args), f"install did not target the staged copy: {args}"
+
+
+def test_auto_install_installs_the_authorized_agent_not_an_unrelated_stage(tmp_path):
+    """Two owned 0755 sources, each with its own requirements: install the authorized one.
+
+    Uses the real trust check (no patch): the unrelated directory passes it, so
+    only the stage binding can keep its requirements away from pip.
+    """
+    from api.startup import auto_install_agent_deps
+
+    mount = _agent(tmp_path, "hermes-agent")
+    unrelated = _agent(tmp_path, "unrelated-src")
+    (unrelated / "requirements.txt").write_text("unrelated-pkg==6.6.6\n", encoding="utf-8")
+    env = {
+        "HERMES_WEBUI_AGENT_DIR": str(mount),
+        "HERMES_WEBUI_AGENT_STAGE_DIR": str(unrelated),
+        "HERMES_WEBUI_AUTO_INSTALL": "1",
+    }
+    with patch.dict("os.environ", env, clear=False):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            assert auto_install_agent_deps(expected_agent_dir=mount) is True
+    args = [str(a) for a in mock_run.call_args[0][0]]
+    assert str(mount.resolve() / "requirements.txt") in args, args
+    assert not any(str(unrelated) in a for a in args), f"install used the unrelated stage: {args}"
+
+
+def _bash_function(src: str, name: str) -> str:
+    start = src.index(f"{name}() {{")
+    end = src.index("\n}\n", start) + len("\n}\n")
+    return src[start:end]
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("sha256sum") is None,
+    reason="bash and sha256sum are needed to run the docker_init.bash publisher",
+)
+def test_docker_init_stage_manifest_is_accepted_by_the_recovery_path(tmp_path):
+    """The real bash publisher and the Python reader must agree on the binding.
+
+    Runs `write_agent_stage_manifest` from docker_init.bash on a staged copy,
+    then checks that `_agent_install_dir()` accepts it — and stops accepting it
+    once the Agent's install inputs change underneath the stage.
+    """
+    from api.startup import _agent_install_dir
+
+    publisher = _bash_function(INIT_SH, "write_agent_stage_manifest")
+    mount = _agent(tmp_path, "hermes-agent", reqs=False)
+    staged = tmp_path / "hermes-agent-src"
+    shutil.copytree(mount, staged)
+    staged.chmod(0o755)
+    subprocess.run(
+        ["bash", "-c", publisher + '\nwrite_agent_stage_manifest "$1" "$2"', "bash", str(mount), str(staged)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    with patch.dict("os.environ", {STAGE_ENV: str(staged)}, clear=False):
+        assert _agent_install_dir(mount.resolve()) == staged.resolve()
+        (mount / "pyproject.toml").write_text(
+            '[project]\nname="hermes-agent"\nversion="0.22.0"\n', encoding="utf-8"
+        )
+        assert _agent_install_dir(mount.resolve()) == mount.resolve()
+
+
+def test_docker_init_publishes_the_stage_manifest_between_copy_and_install():
+    """The binding must describe the finished copy, before anything installs from it."""
+    call = 'write_agent_stage_manifest "$_agent_src" "$_stage_src"'
+    copy_pos = INIT_SH.find('chmod -R u+w "$_stage_src"')
+    call_pos = INIT_SH.find(call)
+    install_pos = INIT_SH.find('uv pip install -e "$_stage_src[all]"')
+    assert call_pos != -1, "docker_init.bash must publish the stage manifest"
+    assert copy_pos != -1 and install_pos != -1
+    assert copy_pos < call_pos < install_pos
 
 
 def test_docker_init_exports_the_staged_dir_for_the_recovery_path():

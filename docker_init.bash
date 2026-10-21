@@ -434,6 +434,32 @@ done
 # even when the staging block below is skipped and the copy already exists.
 export HERMES_WEBUI_AGENT_STAGE_DIR="/app/hermes-agent-src"
 
+# Bind a published stage to the Agent it was copied from (#8113). The recovery
+# path (`_agent_install_dir()` in api/startup.py) substitutes the staged copy
+# for the authorized Agent only when this manifest names that Agent's resolved
+# path and the install inputs of both trees still hash to what was recorded
+# here — an unrelated or stale directory that merely passes the ownership/mode
+# check is ignored. Format: `source=<path>` then `<file>=<sha256|->` lines.
+write_agent_stage_manifest() {
+  local _src="$1" _stage="$2" _real _name _sum
+  _real="$(cd "$_src" && pwd -P)" || return 1
+  # The stage is a verbatim copy of the source tree: never write through
+  # anything (e.g. a symlink of the same name) the copy brought along.
+  rm -f "$_stage/.hermes-webui-stage-source" || return 1
+  {
+    printf 'source=%s\n' "$_real"
+    for _name in pyproject.toml requirements.txt; do
+      if [ -f "$_src/$_name" ]; then
+        _sum="$(sha256sum < "$_src/$_name")" || return 1
+        printf '%s=%s\n' "$_name" "${_sum%% *}"
+      else
+        printf '%s=-\n' "$_name"
+      fi
+    done
+  } > "$_stage/.hermes-webui-stage-source" || return 1
+  chmod 0644 "$_stage/.hermes-webui-stage-source"
+}
+
 # Ask the staged agent which interpreter it actually requires instead of
 # inheriting the base image's. A bare `uv venv` pins whatever /app/venv ends up
 # with, and every dependency gated on a newer `python_version` is then silently
@@ -572,6 +598,10 @@ else
     fi
     chmod -R u+w "$_stage_src" \
       || error_exit "Failed to make staged hermes-agent source writable (rsync/cp preserved :ro mount perms)"
+    # Never fatal: without the manifest the recovery path simply ignores the
+    # stage and falls back to the authorized Agent directory.
+    write_agent_stage_manifest "$_agent_src" "$_stage_src" \
+      || echo "!! WARNING: could not record which hermes-agent source was staged; the startup recovery installer will not use the staged copy"
     uv pip install -e "$_stage_src[all]" --trusted-host pypi.org --trusted-host files.pythonhosted.org \
       || error_exit "Failed to install hermes-agent's requirements"
   else
