@@ -96,3 +96,12 @@ def test_explicit_state_dir_outside_the_checkout_is_honoured(tmp_path):
     out = _run_probe(tmp_path, str(target))
     assert out.returncode == 0, out.stderr
     assert Path(out.stdout.strip()).resolve() == target.resolve()
+
+
+def test_state_dir_ending_in_a_space_named_directory_is_kept_exactly(tmp_path):
+    # A non-blank value must not be stripped: "<dir>/ " would otherwise select
+    # <dir> itself, and the session cleanup would delete its other contents.
+    target = tmp_path / "parent" / " "
+    out = _run_probe(tmp_path, str(target))
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.rstrip("\n") == str(target.resolve())

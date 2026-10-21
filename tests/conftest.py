@@ -131,10 +131,13 @@ _TEST_STATE_ROOT = pathlib.Path(
 # ``os.getenv(name, default)`` returns "" (not the default) when the variable is
 # exported but empty, and ``Path("").resolve()`` is the CURRENT DIRECTORY — so a
 # bare ``HERMES_WEBUI_TEST_STATE_DIR=`` pointed the test state dir at the checkout
-# and teardown rmtree'd the repo. Treat an empty (or whitespace-only) value as unset.
+# and teardown rmtree'd the repo. Treat an empty (or whitespace-only) value as
+# unset; a non-blank value is used exactly as given (a directory name may end in
+# a space, and stripping it would select, then clean, the parent directory).
+_TEST_STATE_DIR_RAW = os.getenv('HERMES_WEBUI_TEST_STATE_DIR') or ''
 TEST_STATE_DIR = pathlib.Path(
-    (os.getenv('HERMES_WEBUI_TEST_STATE_DIR') or '').strip()
-    or str(_TEST_STATE_ROOT / _auto_state_dir_name(REPO_ROOT, TEST_PORT))
+    _TEST_STATE_DIR_RAW if _TEST_STATE_DIR_RAW.strip()
+    else str(_TEST_STATE_ROOT / _auto_state_dir_name(REPO_ROOT, TEST_PORT))
 ).resolve()
 
 # Belt and braces for an explicit value: never let the session fixture (which
