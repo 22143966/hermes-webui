@@ -1906,8 +1906,8 @@ def _config_url_may_belong_to_a_profile(profiles_mod, process_home) -> bool:
             roots.append(_safe_resolve(Path(canonical())))
     except Exception:
         return True  # fail closed
-    if any(cfg_dir.is_relative_to(root) for root in roots):
-        return True  # a file inside a named profile home is that profile's configuration
+    if any(root in cfg_dir.parents for root in roots):
+        return True  # strictly below the profiles root: inside a named profile's directory
     raw = _load_yaml_config_file_raw(Path(override).expanduser(), _copy=False)
     raw_url = str(raw.get("webui_gateway_base_url") or "") if isinstance(raw, dict) else ""
     for ref in _re.findall(r"\$\{([^}]+)\}", raw_url):

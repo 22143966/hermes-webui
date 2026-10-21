@@ -2441,3 +2441,21 @@ def test_8432_a_config_in_a_subdirectory_of_the_process_home_is_not_shared(tmp_p
 
     assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/alpha-sub", "alpha-alias")
 
+
+def test_8432_an_operator_config_directly_in_the_profiles_container_is_shared(tmp_path, monkeypatch):
+    """Senior r5: ~/.hermes/profiles/shared.yaml sits IN the profiles container, not inside any profile's directory,
+    so it is operator configuration (master 200; `is_relative_to` treated it as profile-owned and gave 401)."""
+    import api.config as config
+
+    envs = {"default": {}, "alpha": {"API_SERVER_KEY": "alpha-local-key"},
+            "beta": {"HERMES_WEBUI_GATEWAY_API_KEY": "beta-remote-key"}}
+    homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    _mirror_named_process_profile(monkeypatch, homes, envs)
+    shared = homes["default"] / "profiles" / "shared.yaml"
+    shared.parent.mkdir(parents=True)
+    shared.write_text('webui_gateway_base_url: "https://gw.example/shared"\n', encoding="utf-8")
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(shared))
+    monkeypatch.setattr(config, "get_config", lambda: {"webui_gateway_base_url": "https://gw.example/shared"})
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("https://gw.example/shared", "beta-remote-key")
+
