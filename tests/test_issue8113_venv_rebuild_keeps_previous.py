@@ -7,8 +7,10 @@ before the new one is fully installed turns an offline restart (or one with
 unimportable" into a failed start. ``rebuild_agent_venv`` is therefore a
 transaction: the old venv and staged Agent source are moved aside, and deleted
 only once the replacement exists, runs an admissible interpreter and has every
-dependency installed. Any failure puts them back. A container stopped mid-way
-is rolled back, or its commit finished, on the next boot.
+dependency installed. Any failure puts them back. A journal written before
+anything moves records the transaction, so a container stopped mid-way is
+rolled back, or its commit finished, on the next boot, while a ``.previous``
+directory this script did not create is never trusted or deleted.
 
 These tests run the real bash functions from ``docker_init.bash`` with a fake
 ``uv`` on ``PATH``, the real ``scripts/docker_venv_python.py --admits`` check,
@@ -73,6 +75,7 @@ error_exit() { echo "ERROR_EXIT: $*"; exit 1; }
 """
 
 FUNCTIONS = (
+    "write_agent_venv_journal",
     "restore_previous_agent_venv",
     "commit_agent_venv_rebuild",
     "recover_interrupted_agent_venv_rebuild",
@@ -106,6 +109,7 @@ def _layout(root: Path) -> dict[str, Path]:
         "venv_prev": app / "venv.previous",
         "stage": stage,
         "stage_prev": app / "hermes-agent-src.previous",
+        "journal": app / ".agent-venv-rebuild",
         "pyproject": pyproject,
     }
 
@@ -124,6 +128,7 @@ def _run(tmp_path: Path, paths: dict[str, Path], call: str, **fake: str) -> tupl
             f'_agent_venv_prev="{paths["venv_prev"]}"',
             f'_agent_stage="{paths["stage"]}"',
             f'_agent_stage_prev="{paths["stage_prev"]}"',
+            f'_agent_venv_journal="{paths["journal"]}"',
             f'_venv_helper="{HELPER}"',
             STUBS,
             *(_bash_function(INIT_SH, name) for name in FUNCTIONS),
@@ -155,6 +160,7 @@ def _assert_old_venv_intact(paths):
     assert not (venv / "partial").exists(), "nothing from the failed attempt may remain"
     assert (paths["stage"] / "marker").read_text(encoding="utf-8") == "old\n", "the old staged source came back"
     assert not paths["venv_prev"].exists() and not paths["stage_prev"].exists()
+    assert not paths["journal"].exists()
 
 
 def test_a_completed_rebuild_replaces_the_venv_and_removes_the_old_copies(tmp_path):
@@ -165,7 +171,7 @@ def test_a_completed_rebuild_replaces_the_venv_and_removes_the_old_copies(tmp_pa
     assert (paths["venv"] / ".deps_installed").exists()
     assert (paths["stage"] / "marker").read_text(encoding="utf-8") == "new\n"
     assert not paths["venv_prev"].exists() and not paths["stage_prev"].exists()
-    assert not (paths["venv"] / ".rebuild-committed").exists()
+    assert not paths["journal"].exists()
     assert log.splitlines() == ["3.14"], "the rebuild must name the selected interpreter"
 
 
@@ -226,6 +232,7 @@ def test_an_interrupted_rebuild_is_rolled_back_on_the_next_boot(tmp_path):
     (paths["venv"] / "bin").mkdir(parents=True)
     (paths["venv"] / ".deps_installed").write_text("", encoding="utf-8")  # installed but never committed
     paths["stage"].mkdir()
+    paths["journal"].write_text("pending\n", encoding="utf-8")
     out, _ = _run(tmp_path, paths, "recover_interrupted_agent_venv_rebuild")
     assert "Restoring" in out
     _assert_old_venv_intact(paths)
@@ -237,13 +244,58 @@ def test_a_committed_rebuild_is_finished_on_the_next_boot(tmp_path):
     paths["stage"].rename(paths["stage_prev"])
     (paths["venv"] / "bin").mkdir(parents=True)
     (paths["venv"] / "marker").write_text("new\n", encoding="utf-8")
-    (paths["venv"] / ".rebuild-committed").write_text("", encoding="utf-8")
     paths["stage"].mkdir()
+    paths["journal"].write_text("committed\n", encoding="utf-8")
     out, _ = _run(tmp_path, paths, "recover_interrupted_agent_venv_rebuild")
     assert "Finishing" in out
     assert (paths["venv"] / "marker").read_text(encoding="utf-8") == "new\n"
     assert not paths["venv_prev"].exists() and not paths["stage_prev"].exists()
-    assert not (paths["venv"] / ".rebuild-committed").exists()
+    assert not paths["journal"].exists()
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores directory permissions")
+def test_a_leftover_this_script_did_not_create_is_never_trusted(tmp_path):
+    """The #8360 fold-check BRICK: a permission-blocked stale backup with no journal.
+
+    Recovery used to treat any .previous directory as an interrupted rebuild,
+    delete the working venv and move the unusable copy into its place.
+    """
+    paths = _layout(tmp_path)
+    stale = paths["venv_prev"] / "locked"
+    stale.mkdir(parents=True)
+    (stale / "file").write_text("x\n", encoding="utf-8")
+    stale.chmod(0o500)
+    try:
+        out, _ = _run(tmp_path, paths, "recover_interrupted_agent_venv_rebuild")
+        assert "no rebuild of this script left it" in out
+        rc, out2, log = _rebuild(tmp_path, paths)
+    finally:
+        stale.chmod(0o700)
+    assert rc == 1, out2
+    assert log == "", "no rebuild may start next to an unrecognised leftover"
+    assert (paths["venv"] / "marker").read_text(encoding="utf-8") == "old\n"
+    assert (paths["venv"] / ".deps_installed").exists()
+    assert (stale / "file").exists(), "a leftover this script did not create is never deleted"
+
+
+def test_a_pending_journal_without_a_moved_venv_leaves_the_venv_alone(tmp_path):
+    """Stopped after the journal was written but before anything moved."""
+    paths = _layout(tmp_path)
+    paths["journal"].write_text("pending\n", encoding="utf-8")
+    _run(tmp_path, paths, "recover_interrupted_agent_venv_rebuild")
+    assert (paths["venv"] / "marker").read_text(encoding="utf-8") == "old\n"
+    assert (paths["stage"] / "marker").read_text(encoding="utf-8") == "old\n"
+    assert not paths["journal"].exists()
+
+
+def test_a_pending_rebuild_never_restores_an_unusable_copy(tmp_path):
+    paths = _layout(tmp_path)
+    paths["venv_prev"].mkdir()
+    (paths["venv_prev"] / "junk").write_text("x\n", encoding="utf-8")
+    paths["journal"].write_text("pending\n", encoding="utf-8")
+    out, _ = _run(tmp_path, paths, "recover_interrupted_agent_venv_rebuild")
+    assert "not usable" in out
+    assert (paths["venv"] / "marker").read_text(encoding="utf-8") == "old\n"
 
 
 def test_recovery_is_a_no_op_without_leftovers(tmp_path):
@@ -271,3 +323,6 @@ def test_docker_init_wires_the_transaction():
     rebuild = _bash_function(INIT_SH, "rebuild_agent_venv")
     assert "ensure_hindsight_client_docker_dependency soft" in rebuild
     assert "--admits" in rebuild
+    assert rebuild.index("write_agent_venv_journal pending") < rebuild.index('mv -T "$_agent_venv" "$_agent_venv_prev"'), (
+        "the journal must exist before anything is moved"
+    )

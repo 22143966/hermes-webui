@@ -470,6 +470,7 @@ _agent_venv=/app/venv
 _agent_venv_prev=/app/venv.previous
 _agent_stage=/app/hermes-agent-src
 _agent_stage_prev=/app/hermes-agent-src.previous
+_agent_venv_journal=/app/.agent-venv-rebuild
 _venv_helper=/app/scripts/docker_venv_python.py
 
 # Install WebUI's requirements and the staged agent into $VIRTUAL_ENV. Returns
@@ -587,10 +588,20 @@ ensure_hindsight_client_docker_dependency() {
   fi
 }
 
+# The journal is the transaction's provenance: it is written before anything is
+# moved ("pending") and flipped to "committed" before the old copies are
+# deleted. Recovery acts only on what a journal says this script did; a
+# .previous directory it did not create is never trusted or deleted.
+write_agent_venv_journal() {
+  printf '%s\n' "$1" > "$_agent_venv_journal.tmp" && mv -f "$_agent_venv_journal.tmp" "$_agent_venv_journal"
+}
+
 # Put the moved-aside venv and staged source back. Non-zero only when the
-# previous venv could not be restored.
+# previous venv could not be restored; the current venv is never swapped for a
+# copy that is not a usable venv.
 restore_previous_agent_venv() {
   if [ -e "$_agent_venv_prev" ]; then
+    [ -e "$_agent_venv_prev/bin/python3" ] || return 1
     rm -rf "$_agent_venv" || return 1
     mv -T "$_agent_venv_prev" "$_agent_venv" || return 1
   fi
@@ -599,31 +610,51 @@ restore_previous_agent_venv() {
       echo "!! WARNING: could not restore the previous staged hermes-agent source at $_agent_stage"
     fi
   fi
+  rm -f "$_agent_venv_journal"
   return 0
 }
 
-# Delete the old copies. The marker makes this restartable: a container stopped
-# after it is written finishes the commit on the next boot instead of rolling
-# back onto the old venv.
+# Delete the old copies. Flipping the journal first makes this restartable: a
+# container stopped after it finishes the commit on the next boot instead of
+# rolling back onto the old venv.
 commit_agent_venv_rebuild() {
-  touch "$_agent_venv/.rebuild-committed" || return 1
+  write_agent_venv_journal committed || return 1
   rm -rf "$_agent_stage_prev" "$_agent_venv_prev" || return 0
-  rm -f "$_agent_venv/.rebuild-committed"
+  rm -f "$_agent_venv_journal"
   return 0
 }
 
-# A container stopped mid-rebuild leaves the old venv aside: roll back unless
-# the replacement had already been committed.
+# A container stopped mid-rebuild leaves its journal behind: roll back a pending
+# rebuild, finish a committed one. Leftovers without a journal are not ours.
 recover_interrupted_agent_venv_rebuild() {
-  [ -e "$_agent_venv_prev" ] || [ -e "$_agent_stage_prev" ] || return 0
-  if [ -f "$_agent_venv/.rebuild-committed" ]; then
-    echo ""; echo "== Finishing an interrupted virtual environment rebuild"
-    { rm -rf "$_agent_stage_prev" "$_agent_venv_prev" && rm -f "$_agent_venv/.rebuild-committed"; } \
-      || echo "!! WARNING: could not remove the previous virtual environment at $_agent_venv_prev"
-  else
-    echo ""; echo "== Restoring the virtual environment an interrupted rebuild moved aside"
-    restore_previous_agent_venv || error_exit "Failed to restore the virtual environment at $_agent_venv_prev"
+  _rj_state=""
+  if [ -f "$_agent_venv_journal" ]; then
+    _rj_state="$(cat "$_agent_venv_journal" 2>/dev/null || true)"
   fi
+  case "$_rj_state" in
+    committed)
+      echo ""; echo "== Finishing an interrupted virtual environment rebuild"
+      { rm -rf "$_agent_stage_prev" "$_agent_venv_prev" && rm -f "$_agent_venv_journal"; } \
+        || echo "!! WARNING: could not remove the previous virtual environment at $_agent_venv_prev"
+      ;;
+    pending)
+      if [ -e "$_agent_venv_prev" ] && [ ! -e "$_agent_venv_prev/bin/python3" ]; then
+        echo ""; echo "!! WARNING: the virtual environment an interrupted rebuild moved aside is not usable; keeping the current one"
+        rm -f "$_agent_venv_journal"
+      else
+        echo ""; echo "== Restoring the virtual environment an interrupted rebuild moved aside"
+        restore_previous_agent_venv || error_exit "Failed to restore the virtual environment at $_agent_venv_prev"
+      fi
+      ;;
+    *)
+      if [ -e "$_agent_venv_prev" ] || [ -e "$_agent_stage_prev" ]; then
+        echo ""
+        echo "!! WARNING: $_agent_venv_prev or $_agent_stage_prev exists but no rebuild of this script left it;"
+        echo "!! the current virtual environment is kept as is and will not be rebuilt until it is removed."
+      fi
+      [ -z "$_rj_state" ] || rm -f "$_agent_venv_journal"
+      ;;
+  esac
 }
 
 # Rebuild the venv on <python> ("-" = uv's default) for the staged agent whose
@@ -633,11 +664,21 @@ recover_interrupted_agent_venv_rebuild() {
 rebuild_agent_venv() {
   _rv_py="$1"
   _rv_pyproject="$2"
-  if [ -e "$_agent_venv_prev" ] || ! mv -T "$_agent_venv" "$_agent_venv_prev" 2>/dev/null; then
-    echo "!! Could not move $_agent_venv aside (a mount point, or a leftover $_agent_venv_prev); keeping it unchanged."
+  if [ -e "$_agent_venv_prev" ] || [ -e "$_agent_stage_prev" ] || [ -e "$_agent_venv_journal" ]; then
+    echo "!! A leftover $_agent_venv_prev, $_agent_stage_prev or rebuild journal exists; keeping $_agent_venv unchanged."
     return 1
   fi
-  if [ -e "$_agent_stage" ] && { [ -e "$_agent_stage_prev" ] || ! mv -T "$_agent_stage" "$_agent_stage_prev" 2>/dev/null; }; then
+  if ! write_agent_venv_journal pending; then
+    rm -f "$_agent_venv_journal" "$_agent_venv_journal.tmp"
+    echo "!! Could not record the rebuild in $_agent_venv_journal; keeping $_agent_venv unchanged."
+    return 1
+  fi
+  if ! mv -T "$_agent_venv" "$_agent_venv_prev" 2>/dev/null; then
+    rm -f "$_agent_venv_journal"
+    echo "!! Could not move $_agent_venv aside (a mount point?); keeping it unchanged."
+    return 1
+  fi
+  if [ -e "$_agent_stage" ] && ! mv -T "$_agent_stage" "$_agent_stage_prev" 2>/dev/null; then
     echo "!! Could not move the staged hermes-agent source aside; keeping the existing virtual environment."
     restore_previous_agent_venv || return 2
     return 1
