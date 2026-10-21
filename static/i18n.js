@@ -11191,6 +11191,7 @@ const LOCALES = {
     settings_extensions_installed_loading: '正在加载已安装的扩展…',
     settings_extensions_copy_diagnostics: '复制诊断',
     settings_extensions_trust_model_label: '信任模型',
+    status_messages: '消息',
     status_messages_total: '消息总数',
     settings_extensions_trust_model_text: '扩展运行在 WebUI 浏览器源中，并可以访问与本会话相同的已认证 API。设置与扩展自有的存储仅存在于浏览器内，不应存放机密。只加载可信的本地扩展目录；禁用扩展会在重新加载后对已注入的资源生效。',
     settings_extensions_runtime_title: '扩展运行时',
