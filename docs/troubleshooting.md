@@ -303,7 +303,7 @@ Archived runs live at `_run_journal_archive/<session_id>/<run_id>.jsonl.gz` and 
 | `run_journal_retention_ttl_days` | `14` | Archive runs older than N days |
 | `run_journal_retention_max_runs_per_session` | `40` | Keep at most N newest runs live per session |
 | `run_journal_retention_max_bytes_per_session` | `256 MiB` | Per-session budget for live run-journal bytes |
-| `run_journal_archive_ttl_days` | `0` (never) | **Only destructive knob** — delete archives older than N days |
+| `run_journal_archive_ttl_days` | `0` (never) | **Only destructive knob** — delete archives older than N days (an archive a session still needs to recover an interrupted answer is kept until the session no longer references it or is deleted) |
 
 An explicitly supplied but invalid or out-of-range value **disables** that cap
 instead of falling back to `settings.json` or the default, so a typo can never

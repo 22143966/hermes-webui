@@ -463,7 +463,7 @@ Full list of environment variables:
 | `HERMES_WEBUI_RUN_JOURNAL_RETENTION_TTL_DAYS` | `14` | Runs whose journal file is older than N days are **archived** (compressed into `_run_journal_archive/`, not deleted). `0` disables the age cap. Also settable via `run_journal_retention_ttl_days` in `settings.json` (the env var wins) |
 | `HERMES_WEBUI_RUN_JOURNAL_RETENTION_MAX_RUNS_PER_SESSION` | `40` | Keep at most N newest runs live per session; older runs are archived. `0` disables the count cap (`run_journal_retention_max_runs_per_session` in `settings.json`) |
 | `HERMES_WEBUI_RUN_JOURNAL_RETENTION_MAX_BYTES_PER_SESSION` | `268435456` (256 MiB) | Per-session budget for LIVE run-journal bytes; sessions over budget archive their oldest runs. `0` disables the size cap (`run_journal_retention_max_bytes_per_session` in `settings.json`) |
-| `HERMES_WEBUI_RUN_JOURNAL_ARCHIVE_TTL_DAYS` | `0` (keep forever) | **The only destructive knob**: archives older than N days are deleted. `0` (default) never deletes archives — a stock install keeps every archived run forever (`run_journal_archive_ttl_days` in `settings.json`) |
+| `HERMES_WEBUI_RUN_JOURNAL_ARCHIVE_TTL_DAYS` | `0` (keep forever) | **The only destructive knob**: archives older than N days are deleted, except an archive a session still needs to recover an interrupted answer, which is kept until the session no longer references it or is deleted. `0` (default) never deletes archives — a stock install keeps every archived run forever (`run_journal_archive_ttl_days` in `settings.json`) |
 
 #### Run-journal retention (#7613)
 
