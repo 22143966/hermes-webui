@@ -2524,3 +2524,29 @@ def test_shared_url_key_without_any_shared_key_a_profile_sends_its_own(tmp_path,
 
     assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://127.0.0.1:8642", "beta-key")
 
+
+def test_shared_url_key_a_legacy_session_under_a_named_process_sends_the_process_key(tmp_path, monkeypatch):
+    """A legacy session (no profile recorded) resolves to the root home. Under a sticky named process profile whose
+    .env supplies API_SERVER_KEY, it sends the process key to the default Gateway, as v0.52.492 does, never the root
+    profile's own route key (senior review of the shared-URL key fix)."""
+    envs = {"default": {"API_SERVER_KEY": "root-key"}, "alpha": {"API_SERVER_KEY": "alpha-key"}}
+    homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    _mirror_named_process_profile(monkeypatch, homes, envs)
+
+    for legacy in (None, ""):
+        assert gateway_chat._gateway_endpoint_for_profile(legacy) == ("http://127.0.0.1:8642", "alpha-key")
+
+
+def test_shared_url_key_a_profile_config_naming_the_shared_url_still_sends_the_shared_key(tmp_path, monkeypatch):
+    """A profile whose config.yaml names the shared URL itself (trailing slash and all) is still on the shared URL:
+    it sends the shared key, as v0.52.492 does, not its own route key."""
+    import api.profiles as profiles
+
+    homes = _profile_homes(tmp_path, monkeypatch, {"beta": {"API_SERVER_KEY": "beta-key"}}, config_url=None)
+    (homes["beta"] / "config.yaml").write_text('webui_gateway_base_url: "http://gw.local:8642/"\n', encoding="utf-8")
+    _shared_gateway(monkeypatch)
+    monkeypatch.setattr(profiles, "_loaded_profile_env_keys", {"API_SERVER_KEY", "GW_ROUTE", "HERMES_WEBUI_GATEWAY_BASE_URL"})
+
+    url, key = gateway_chat._gateway_endpoint_for_profile("beta")
+    assert url.rstrip("/") == "http://gw.local:8642" and key == "shared-root-key", (url, key)
+

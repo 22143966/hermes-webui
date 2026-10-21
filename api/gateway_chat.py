@@ -1973,9 +1973,13 @@ def _gateway_endpoint_for_profile(profile_name) -> tuple[str, str]:
       the cached ambient config); without one it keeps the shared URL.
     - Key, on a URL that is not the shared one: the profile's own HERMES_WEBUI_GATEWAY_API_KEY or API_SERVER_KEY,
       or none; the launcher's and the shared key are never sent to another Gateway.
-    - Key, on the shared URL: the profile's own HERMES_WEBUI_GATEWAY_API_KEY, then the shared alias (the
-      launcher's export, or the root profile's .env), then the profile's API_SERVER_KEY (the key of its own
-      Gateway), then the shared key.
+    - Key, on the shared URL, for another profile: its own HERMES_WEBUI_GATEWAY_API_KEY, then the shared key
+      (what v0.52.492 sends), then its API_SERVER_KEY only when there is no shared key at all. A profile's
+      API_SERVER_KEY is the key of its OWN Gateway route: the Agent's API server picks the profile from the URL
+      and accepts only that profile's key, so on the shared URL it would be a 401.
+    - Key, on the shared URL, for the process profile's own sessions: its own HERMES_WEBUI_GATEWAY_API_KEY, then
+      the shared alias (the launcher's export, or the root profile's .env), then its API_SERVER_KEY (read fresh
+      from its .env), then the shared key.
     - Exception (#8432): under a NAMED process profile, a profile with a key but no URL gets the process pair
       (URL and key from one source, as v0.52.492 sends) unless the shared URL is provably the launcher's (an
       export that no profile .env supplied, or an operator config file outside every profile home), because that
