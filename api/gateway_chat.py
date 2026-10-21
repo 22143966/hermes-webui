@@ -1893,8 +1893,12 @@ def _config_url_may_belong_to_a_profile(profiles_mod, process_home) -> bool:
     if not override or _env_value_is_profile_sourced(profiles_mod, "HERMES_CONFIG_PATH", override):
         return True
     cfg_dir = _safe_resolve(Path(override).expanduser()).parent
-    if _same_profile_home(cfg_dir, process_home):
-        return True  # the process profile's own home
+    try:
+        own_home = _safe_resolve(Path(process_home).expanduser())
+        if cfg_dir == own_home or own_home in cfg_dir.parents:
+            return True  # inside the process profile's own home (any layout, isolated included)
+    except Exception:
+        return True  # fail closed
     try:
         roots = [_safe_resolve(Path(profiles_mod.get_hermes_home_for_profile("")).expanduser() / "profiles")]
         canonical = getattr(profiles_mod, "_profiles_root", None)

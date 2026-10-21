@@ -2424,3 +2424,20 @@ def test_8432_a_config_inside_another_named_profile_home_is_not_shared(tmp_path,
 
     assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/gamma-cfg", "alpha-alias")
 
+
+def test_8432_a_config_in_a_subdirectory_of_the_process_home_is_not_shared(tmp_path, monkeypatch):
+    """Senior r4 S26: a HERMES_CONFIG_PATH in a subdirectory of the named process profile's own home is that profile's
+    configuration, whatever the layout (here the home lies outside <root>/profiles, as in isolated/custom homes)."""
+    import api.config as config
+
+    envs = {"default": {}, "alpha": {"HERMES_WEBUI_GATEWAY_API_KEY": "alpha-alias"}, "beta": {"API_SERVER_KEY": "beta-key"}}
+    homes = _profile_homes(tmp_path, monkeypatch, envs, config_url=None)
+    _mirror_named_process_profile(monkeypatch, homes, envs)
+    sub_cfg = homes["alpha"] / "conf" / "webui.yaml"
+    sub_cfg.parent.mkdir()
+    sub_cfg.write_text('webui_gateway_base_url: "http://gw.local/alpha-sub"\n', encoding="utf-8")
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(sub_cfg))
+    monkeypatch.setattr(config, "get_config", lambda: {"webui_gateway_base_url": "http://gw.local/alpha-sub"})
+
+    assert gateway_chat._gateway_endpoint_for_profile("beta") == ("http://gw.local/alpha-sub", "alpha-alias")
+
