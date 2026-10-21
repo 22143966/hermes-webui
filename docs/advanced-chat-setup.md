@@ -72,6 +72,19 @@ manually titled. Image-only or metadata-only content does not provide title
 text. Existing manual-title protection and the title-generation setting still
 apply; this cleanup does not rewrite the transcript or native image parts.
 
+The Agent's separate `state.db` auto-title receives the exact submitted prompt
+through its `title_user_message` argument, when the installed Agent supports it.
+Workspace prefixes, injected process notifications, and native image parts
+remain in the model-facing input but do not become the Agent's title source.
+Text the browser itself puts into the prompt (an `[Attached files: ...]` suffix,
+or "I've uploaded N file(s): ..." for a file-only send) is part of the submitted
+prompt, so it can still reach the title. The shared invocation builder applies
+this to the initial call and self-heal retries, and the synchronous
+`POST /api/chat` route passes the same argument.
+An empty submitted prompt explicitly supplies an empty title input rather than
+falling back to workspace metadata. Older Agents without the argument remain
+callable, but need an Agent upgrade to use this title-source separation.
+
 Automatic title-generation LLM calls honor the active Hermes profile's
 `auxiliary.title_generation.enabled` setting (default: `true`):
 
@@ -291,7 +304,9 @@ On the runs API path WebUI sends the session's earlier user and assistant turns 
 
 Live runs-API turns are also guarded while they stream. Each events connection carries a ~120s watchdog budget: a stream that delivers nothing but keepalives for that long is treated as stalled (keepalives are liveness, not progress), and the same budget bounds the per-read wait so a byte-silent connection surfaces within roughly one interval instead of pinning the configured 600s read timeout. When the watchdog trips, or the stream drops, the durable run status (`GET /v1/runs/{run_id}`) is the success arbiter: terminal status finalizes the turn (a non-empty durable output wins over the streamed text; with an empty output the already-streamed partial is kept), a still-running status reconnects the events stream from the last seen event, and `waiting_for_approval` surfaces the pending approval card from the status payload. A durable-status 404 gets a small immediate re-probe grace and then fails the turn closed rather than spinning. When the durable status resolves cancelled or interrupted, the streamed partial answer is persisted into the session before the browser-facing cancel event is emitted.
 
-WebUI answers a Runs API approval with the Gateway's fenced body: `request_id`, `execution_generation`, and `choice`. The prompt identity and the integer generation come from the Gateway's own `approval.request` payload; a card rebuilt from durable run status takes them from that run's pending controls (`GET /v1/runs/{run_id}`). An answer naming a prompt that is no longer parked there, or a choice that prompt does not offer, is settled locally instead of posted as a request the Gateway would reject.
+Async `delegate_task` results on the Gateway backend are persisted by the Gateway as delivery rows in the profile's `state.db`; it starts no turn itself. WebUI runs a background poller (thread `hermes-webui-gateway-deleg-wakeup`, every 5 s) that wakes the idle WebUI session owning each new row, for every profile whose chat backend is the Gateway. It needs a Hermes Agent with the delivery reserve/commit/release API ([NousResearch/hermes-agent#125451](https://github.com/NousResearch/hermes-agent/pull/125451)); on older Agents it logs one line at startup and stays off, and results reach the agent on the user's next turn instead. Profiles on the in-process backend are not scanned; the backend is read from each profile's own `config.yaml` and `.env`. With `HERMES_WEBUI_RUNTIME_ADAPTER=runner-local` the poller wakes nothing (runner turns carry no lease back), and results reach the agent on the next turn. The poller leases the rows and starts a turn with a fixed prompt on the session profile's own Gateway; each result is copied once into the session's model context (shown as a wakeup notice, not a user message) in the same save that admits that turn, so a turn that loses the session to a user's message publishes nothing. The lease is committed only by that turn, once its Gateway accepts the run, and released if the turn ends before then; a commit that fails is retried by the next poll, and a WebUI restart in between either reattaches the run and commits, or lets the lease expire (120 s) so the next poll retries. A wake that is refused (for example a busy session or paused credentials) or never accepted by the Gateway is retried with exponential back-off up to 5 minutes. Rows older than 6 hours at startup are left for the next user turn. Results are never woken back in after the user clears or truncates the conversation (rows written before the clear are retired, including a clear that lands while the wake is being admitted), nor after an Agent rewind removed them from history (`active = 0`).
+
+WebUI answers a Runs API approval with the Gateway's fenced body: `request_id`, `execution_generation`, and `choice`. The prompt identity and the integer generation come from the Gateway's own `approval.request` payload, or — for a card rebuilt from durable run status — from that run's pending controls (`GET /v1/runs/{run_id}`) when the card is published, never at click time: a card that carries no generation still answers immediately with the legacy body. A choice the prompt does not offer is refused locally. An answer the Gateway reports as `approval_not_pending` is verified against the run's pending controls: an unreadable or ambiguous projection keeps the card and reports the error, and only a projection that shows this card's own prompt gone settles the card as already answered. A prompt re-published at a new generation replaces its card instead of being deduped away.
 
 When YOLO is enabled for a gateway-backed browser session, WebUI approves every
 approval already parked for that session: Runs API prompts are relayed by their
