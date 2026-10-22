@@ -90,7 +90,13 @@ jobs:
     # so this required context can never wedge; step guards degrade to full smoke.
     if: ${{ always() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Sized for the slow-mirror case, not the median. `playwright install --with-deps`
+    # runs apt-get on every job (setup-python's pip cache does not cover it), and on
+    # some runners the Ubuntu mirror serves its ~26 MB at ~50 kB/s: install alone then
+    # takes 7-9 minutes against ~20 s normally. With the gates (~3.5 min) that is
+    # ~12.5 min, so a 10-minute limit cancelled this required check on 6 of 40 runs
+    # on 2026-10-22. 20 minutes fits a mirror down to about 27 kB/s.
+    timeout-minutes: 20
     steps:
       - name: Docs-only short-circuit
         if: needs.changes.outputs.docs_only == 'true'

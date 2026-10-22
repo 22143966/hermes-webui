@@ -37,7 +37,12 @@ on:
 jobs:
   live-to-final:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Same slow-mirror budget as browser-smoke.yml: `playwright install --with-deps`
+    # runs apt-get on every job, and a ~50 kB/s Ubuntu mirror makes the install step
+    # alone take 7-10 minutes (normally ~25 s). The 10-minute limit cancelled 60 of
+    # 290 jobs across the last 60 runs of this workflow (2026-10-22), every sampled one
+    # inside the install step, including the two blocking matrix rows below.
+    timeout-minutes: 20
     # Keep existing proof rows informational; reconnect + #7676 settle
     # regressions fail CI.
     continue-on-error: ${{ matrix.name != 'reconnect-scene-redraw' && matrix.name != 'settle-visibility-7676' }}
