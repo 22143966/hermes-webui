@@ -31420,8 +31420,9 @@ def _gateway_run_prompt(
     - ``"superseded"``: the projection read fine and this prompt is gone — the
       run parked nothing, or parked a different single prompt — so the card is
       stale and must not answer that one;
-    - ``"ambiguous"``: several prompts are parked and none is this card's, so
-      the projection cannot say whether this one was answered;
+    - ``"ambiguous"``: several prompts are parked and none is this card's, or a
+      parked prompt's generation cannot be read — the projection cannot say
+      whether this one was answered;
     - ``"failed"``: the projection could not be read at all.
 
     Cross-prompt adoption is deliberately absent: a card may only answer its own
@@ -31437,19 +31438,22 @@ def _gateway_run_prompt(
         logger.debug("gateway run prompt refresh failed for %s", run_id, exc_info=True)
         return "failed", None
     controls = run.get("pending_controls") if isinstance(run, dict) else None
-    prompts = [
+    approvals = [
         prompt
         for prompt in (controls or [])
-        if isinstance(prompt, dict)
-        and prompt.get("kind") == "approval"
-        and type(prompt.get("execution_generation")) is int
+        if isinstance(prompt, dict) and prompt.get("kind") == "approval"
     ]
+    prompts = [prompt for prompt in approvals if type(prompt.get("execution_generation")) is int]
     match = next(
         (prompt for prompt in prompts if str(prompt.get("prompt_id") or "") == approval_id),
         None,
     )
     if match is None:
-        return ("ambiguous" if len(prompts) > 1 else "superseded"), None
+        # A parked prompt whose generation cannot be read is not a prompt that
+        # is gone: only a readable projection that does not list it proves it
+        # was answered, so an older or mixed shape is ambiguous, not superseded.
+        unreadable = len(approvals) != len(prompts)
+        return ("ambiguous" if unreadable or len(prompts) > 1 else "superseded"), None
     choices = [c for c in (match.get("choices") or []) if isinstance(c, str)]
     return "found", (str(match.get("prompt_id") or ""), int(match["execution_generation"]), choices)
 

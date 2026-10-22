@@ -436,6 +436,43 @@ def test_ambiguous_projection_is_not_reported_as_success():
     assert approvals.gateway_pending_mirror(SID, approval_id=PROMPT_ID, run_id=RUN_ID) is not None
 
 
+def test_unreadable_pending_prompt_is_not_reported_as_success():
+    """A parked prompt with no readable generation must not settle the card.
+
+    A mixed projection lists an approval but omits ``execution_generation``.
+    Filtering that entry out before the "is it gone?" decision left an empty
+    remainder, so the read succeeded into ``superseded`` and the click returned
+    ``200 already_resolved`` for a prompt the run was still holding.
+    """
+    assert _relay(_canonical_payload())
+    mirror = approvals.gateway_pending_mirror(SID, approval_id=PROMPT_ID, run_id=RUN_ID)
+    assert mirror is not None
+
+    captured = {}
+    handler = _answer(
+        {
+            "session_id": SID,
+            "choice": "once",
+            "approval_id": PROMPT_ID,
+            "run_id": RUN_ID,
+            "mirror_token": mirror[approvals._GATEWAY_MIRROR_TOKEN],
+        },
+        captured,
+        run_projection={
+            "status": "waiting_for_approval",
+            "pending_controls": [
+                {"kind": "approval", "prompt_id": PROMPT_ID, "choices": ["once", "deny"]}
+            ],
+        },
+        respond_reject=(409, "approval_not_pending"),
+    )
+
+    assert handler.send_response.call_args[0][0] == 502, handler.wfile.getvalue()
+    assert approvals.gateway_pending_mirror(
+        SID, approval_id=PROMPT_ID, run_id=RUN_ID
+    ) is not None, "an unreadable projection must keep the card"
+
+
 def test_republished_prompt_at_a_new_generation_replaces_its_card():
     """Review row 4: the same prompt id at a new generation is a new prompt.
 
