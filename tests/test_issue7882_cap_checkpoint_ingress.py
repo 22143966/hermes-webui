@@ -873,8 +873,10 @@ def test_stale_index_fact_does_not_vouch_for_a_newer_deferred_turn(monkeypatch, 
 
     # The overlay must take turn identity and fact from the CURRENT sidecar, not
     # from the stale index row: a stale fact travelling with the stale pending
-    # timestamp would agree with itself and vouch for the wrong turn.
-    assert _seen.get('pending_started_at') == pytest.approx(now, rel=0, abs=1e-6), (
+    # timestamp would agree with itself and vouch for the wrong turn. The
+    # sidecar's deferred turn started at ``now + 5``; that is the identity the
+    # overlay has to see.
+    assert _seen.get('pending_started_at') == pytest.approx(now + 5, rel=0, abs=1e-6), (
         "the overlay kept the stale index pending_started_at instead of the "
         "current sidecar's"
     )
