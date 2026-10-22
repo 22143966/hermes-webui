@@ -494,6 +494,9 @@ def test_img_tag_with_lt_inside_is_replaced_whole(tmp_path: Path, tag, wrap):
     ids=["lt_runs", "openers_then_data", "entity_openers", "unclosed"],
 )
 def test_img_tag_pass_stays_linear_on_unclosed_openers(text):
+    # A leading data: URI keeps the pass off its no-"data:" fast path, so
+    # every input really exercises the tag regex.
+    text = f"![x]({_uri()}) " + text
     shares._placeholder_inline_data_uris(text[:2_000])  # warm up
     small_text = text[: len(text) // 4]
     start = time.perf_counter()
