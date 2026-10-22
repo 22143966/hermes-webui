@@ -1634,10 +1634,6 @@ _SIDEBAR_HEAVY_METADATA_FIELDS = (
     'composer_draft',
     'process_wakeup_pause',
     'share_token',
-    # The overlay reads this one to decide whether a pending hidden wakeup is
-    # already materialised in the sidecar (#7882 cap follow-up), so the sidebar
-    # payload cannot drop the transcript before that check runs.
-    'messages',
 )
 
 
@@ -1646,6 +1642,23 @@ def _strip_sidebar_heavy_metadata(row: dict) -> dict:
     for key in _SIDEBAR_HEAVY_METADATA_FIELDS:
         row.pop(key, None)
     return row
+
+
+def _has_persisted_truncation(value) -> bool:
+    """True when ``value`` is a real persisted truncation boundary.
+
+    ``truncation_boundary`` rides the sidecar metadata prefix and marks a
+    transcript the writer rewrote: the rows below it are gone from the sidecar
+    while the append-only state.db still carries them. Absent/zero/unparseable
+    answers False.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(parsed) and parsed > 0
 
 
 def _validated_pending_hidden_wakeup_at(session, *, require_row: bool = True):
@@ -1673,6 +1686,12 @@ def _validated_pending_hidden_wakeup_at(session, *, require_row: bool = True):
         return None
     if not require_row:
         return float(value)
+    if _has_persisted_truncation(getattr(session, 'truncation_boundary', None)):
+        # A persisted truncation boundary means the writer rewrote the
+        # transcript: the checkpointed row may already be gone, so the fact
+        # cannot vouch for a row the walk would not count (#7882 re-gate
+        # round-4 must-fix 3).
+        return None
     for message in getattr(session, 'messages', None) or []:
         if not isinstance(message, dict):
             continue
@@ -8410,8 +8429,9 @@ def _apply_sidebar_state_db_override_rows(
                     )
                     # The sidebar payload strips the compact transcript right
                     # after the overlay (#7882 cap follow-up: only the hidden
-                    # materialisation check above needs it).
-                    session.pop('messages', None)
+                    # materialisation check above ever read it, and that check
+                    # has been metadata-only since the fact commit — the pop
+                    # here is a leftover and no longer needed).
                     # Shrink authority for the capped-out branch: the sidecar
                     # metadata prefix carries the truncation boundary (state.db
                     # is append-only and cannot refute it).
