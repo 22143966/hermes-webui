@@ -1667,20 +1667,38 @@ def _validated_pending_hidden_wakeup_at(session, *, require_row: bool = True):
     The fact is stamped by the eager checkpoint, and it must survive only as long
     as the pending turn it belongs to. With ``require_row`` (the writer's check)
     it must also still name a row in this transcript: a truncation or a reload
-    that dropped the row invalidates it. Every unknown answers ``None`` -- the
-    sidebar then treats the pending hidden row as still owed a discount, which is
-    the conservative branch (#7882 cap follow-up, GUIDELINES rule 3).
+    that dropped the row invalidates it.
+
+    ``require_row`` also lets the transcript stand in for the stamp when the
+    object never held one: the sidecar row that the pending turn materialised
+    into IS the fact, so a save of a session built without the eager stamp (a
+    sidecar written before the fact existed, a reload that dropped it) proves it
+    from the rows it is about to persist instead of falling back to the
+    conservative branch and discounting a row the sidecar already excludes.
+
+    Every unknown answers ``None`` -- the sidebar then treats the pending hidden
+    row as still owed a discount, which is the conservative branch (#7882 cap
+    follow-up, GUIDELINES rule 3).
     """
     source = str(getattr(session, 'pending_user_source', '') or '').strip().lower()
     if source != 'delegation_wakeup':
         return None
     value = getattr(session, '_pending_hidden_wakeup_at', None)
     started = getattr(session, 'pending_started_at', None)
-    for candidate in (value, started):
-        if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+    if isinstance(started, bool) or not isinstance(started, (int, float)):
+        return None
+    if float(started) <= 0:
+        return None
+    if value is None:
+        if not require_row:
+            # No stamp and no transcript to prove one from: nothing vouches for
+            # the row, so the discount stays owed.
             return None
-        if float(candidate) <= 0:
-            return None
+        value = started
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if float(value) <= 0:
+        return None
     if float(value) != float(started):
         # The fact belongs to a different pending turn.
         return None
