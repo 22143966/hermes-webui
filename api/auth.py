@@ -517,10 +517,13 @@ def get_forwarded_for_startup_warning() -> str | None:
     is allowlisted (#7864 round 2).
 
     TRUST_FORWARDED_FOR only has an effect once the raw socket peer is a
-    trusted proxy; the implicit loopback allowlist covers same-host proxies,
-    so an opt-in with no HERMES_WEBUI_TRUSTED_PROXY_CIDRS entry means a
-    LAN/Docker-bridge proxy's forwarded headers — and the request log's
-    forwarded_for field — are silently ignored.
+    trusted proxy. The request log trusts loopback implicitly, but the login
+    rate limiter (#7850) only uses the forwarded client from a proxy listed in
+    HERMES_WEBUI_TRUSTED_PROXY_CIDRS, so a same-host proxy must be listed
+    explicitly (127.0.0.1/32). An opt-in with no non-loopback entry means a
+    LAN/Docker-bridge proxy's forwarded headers, and the request log's
+    forwarded_for field for its requests, are silently ignored. The text must
+    stay true for the same-host case too, which is why it names both settings.
     """
     from api.routes import _trusted_proxy_networks, _truthy_env
 
@@ -554,12 +557,14 @@ def get_forwarded_for_startup_warning() -> str | None:
         return None
     return (
         "HERMES_WEBUI_TRUST_FORWARDED_FOR=1 is set but "
-        "HERMES_WEBUI_TRUSTED_PROXY_CIDRS contains no non-loopback entry. "
-        "Loopback is trusted implicitly, so this is expected for a same-host "
-        "proxy; if your proxy is on another host or a Docker bridge, add its "
-        "address there (e.g. HERMES_WEBUI_TRUSTED_PROXY_CIDRS=172.17.0.1) — "
-        "otherwise forwarded headers are ignored and the request log records "
-        "no forwarded_for field."
+        "HERMES_WEBUI_TRUSTED_PROXY_CIDRS lists no proxy outside this host. "
+        "That is fine for a proxy on this host as long as it is listed "
+        "(HERMES_WEBUI_TRUSTED_PROXY_CIDRS=127.0.0.1/32): login rate limiting "
+        "only uses the forwarded client address from a listed proxy. If your "
+        "proxy is on another host or a Docker bridge, add its address instead "
+        "(e.g. HERMES_WEBUI_TRUSTED_PROXY_CIDRS=172.17.0.1); until then its "
+        "forwarded headers are ignored and the request log records no "
+        "forwarded_for field for its requests."
     )
 
 

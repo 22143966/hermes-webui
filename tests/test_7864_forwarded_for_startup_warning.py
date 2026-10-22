@@ -43,10 +43,29 @@ class TestForwardedForStartupWarning:
         assert "172.17.0.1" in warning
 
     def test_opt_in_with_loopback_only_entry_still_warns(self, monkeypatch):
-        # A loopback CIDR entry adds nothing to the implicit default trust.
+        # A loopback-only list names no proxy outside this host, so a
+        # Docker-bridge/LAN proxy would still be ignored: keep warning. (Since
+        # #7850 the entry is not a no-op: it is what lets the login limiter use
+        # a same-host proxy's forwarded client, so the text must not call it
+        # pointless; see test_warning_text_is_true_for_a_listed_same_host_proxy.)
         monkeypatch.setenv("HERMES_WEBUI_TRUST_FORWARDED_FOR", "1")
         monkeypatch.setenv("HERMES_WEBUI_TRUSTED_PROXY_CIDRS", "127.0.0.0/8")
         assert auth_mod.get_forwarded_for_startup_warning() is not None
+
+    def test_warning_text_is_true_for_a_listed_same_host_proxy(self, monkeypatch):
+        # .env.example (#7850) tells same-host deployments to list
+        # 127.0.0.1/32. The warning still fires for that config, so it must not
+        # claim the request log records no forwarded_for (loopback is trusted
+        # for the log), and it must tell an unlisted same-host proxy to list
+        # itself for login rate limiting.
+        monkeypatch.setenv("HERMES_WEBUI_TRUST_FORWARDED_FOR", "1")
+        monkeypatch.setenv("HERMES_WEBUI_TRUSTED_PROXY_CIDRS", "127.0.0.1/32")
+        warning = auth_mod.get_forwarded_for_startup_warning()
+        assert warning is not None
+        assert "127.0.0.1/32" in warning
+        assert "login rate limiting" in warning
+        assert "records no forwarded_for field for its requests" in warning
+        assert "records no forwarded_for field." not in warning
 
     def test_opt_in_with_non_loopback_cidr_is_silent(self, monkeypatch):
         monkeypatch.setenv("HERMES_WEBUI_TRUST_FORWARDED_FOR", "1")
