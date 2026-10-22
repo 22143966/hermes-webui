@@ -8227,11 +8227,14 @@ def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
       documented and previously shipped value). It decides which rows are
       recent at all, so shrinking it to a smaller paint window silently froze
       the sort order of settled conversations.
-    * ``reconcile`` — the transcript walk, the measured 1.5 s-per-board cost,
-      runs for the top ``HERMES_WEBUI_STATE_DB_OVERRIDE_RECONCILE_TOP_N`` rows
-      (default ``60``), plus any row carrying a truncation boundary (its
-      visible count is only authoritative when re-walked). A row outside it
-      falls back to the cheap raw-delta arithmetic, never to a fabricated total.
+    * ``reconcile`` — the transcript walk runs for every row whose state.db
+      count grew past the sidecar's, whatever the paint window: only the walk
+      can tell a display row from a tool row, so it is the only honest source
+      for ``visible_message_count`` once state.db advanced (a raw delta counts
+      every appended row of any role and overstates any settled tool-using
+      session). Rows whose count did NOT grow never walk: the growth guard
+      above is what bounds the cost, and the per-build memo makes a repeat
+      poll on an unchanged row a metadata-only load.
     * everything else (source/title, the cheap count/timestamp repair, the
       hidden-row discount) runs for every row.
     """
@@ -8240,12 +8243,6 @@ def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
         _cap = int(_os.environ.get("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "300"))
     except (TypeError, ValueError):
         _cap = 300
-    try:
-        _reconcile_cap = int(
-            _os.environ.get("HERMES_WEBUI_STATE_DB_OVERRIDE_RECONCILE_TOP_N", "60")
-        )
-    except (TypeError, ValueError):
-        _reconcile_cap = 60
     all_ids = {str(s.get('session_id')) for s in sessions if s.get('session_id')}
     if _cap > 0 and len(sessions) > _cap:
         count_ids = {str(s.get('session_id')) for s in sessions[:_cap] if s.get('session_id')}
@@ -8259,32 +8256,23 @@ def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
         )
     except Exception:
         return
-    _apply_sidebar_state_db_override_metadata(
-        sessions, metadata, count_ids, reconcile_cap=_reconcile_cap
-    )
+    _apply_sidebar_state_db_override_metadata(sessions, metadata, count_ids)
 
 
 def _apply_sidebar_state_db_override_metadata(
     sessions: list[dict],
     metadata: dict[str, dict],
     count_session_ids: set[str] | None = None,
-    reconcile_cap: int | None = None,
 ) -> None:
     # ``count_session_ids`` bounds the SQL count/timestamp tier to the top-N
-    # rows (None = no cap). ``reconcile_cap`` bounds the transcript walk to a
-    # smaller top-N window (None/0 = no extra bound, every counted row walks):
-    # the walk is the expensive part, the SQL tier is not. Metadata-only
+    # rows (None = no cap). It does NOT bound the transcript walk: the walk is
+    # the only authority that can distinguish a display row from a tool row,
+    # so it must run for every row whose state.db count grew. Metadata-only
     # overrides still apply to every row: they are free and the sidebar source
     # filter depends on them.
-    reconcile_ids = count_session_ids
-    if reconcile_cap is not None and reconcile_cap > 0:
-        selected = {str(s.get('session_id')) for s in sessions[:reconcile_cap] if s.get('session_id')}
-        reconcile_ids = selected if count_session_ids is None else (selected & count_session_ids)
     memo_token = _SIDEBAR_RECONCILE_MEMO.set({})
     try:
-        _apply_sidebar_state_db_override_rows(
-            sessions, metadata, count_session_ids, reconcile_ids
-        )
+        _apply_sidebar_state_db_override_rows(sessions, metadata, count_session_ids)
     finally:
         _SIDEBAR_RECONCILE_MEMO.reset(memo_token)
 
@@ -8293,7 +8281,6 @@ def _apply_sidebar_state_db_override_rows(
     sessions: list[dict],
     metadata: dict[str, dict],
     count_session_ids: set[str] | None,
-    reconcile_ids: set[str] | None,
 ) -> None:
     for session in sessions:
         sid = session.get('session_id')
@@ -8448,39 +8435,47 @@ def _apply_sidebar_state_db_override_rows(
                     # the same authority the full save uses; the raw delta
                     # remains the fallback when rows can't be read.
                     #
-                    # This walk is the ONLY expensive part of the overlay, so
-                    # it is bounded by ``reconcile_ids`` (the top-N paint window
-                    # plus every truncation-bearing row, whose authoritative
-                    # count only exists inside the walk). Outside it the
-                    # raw-delta fallback runs instead: it still credits the
-                    # cheap raw growth (so a first-append cross-surface row
-                    # becomes visible rather than staying at zero) and it keeps
-                    # the delegation-wakeup hidden-row discount, so no hidden
-                    # row is resurrected. The bounded oracle therefore stays at
-                    # N merges per build, and the memo makes the second poll on
-                    # a settled board free for every row it did walk.
-                    in_reconcile_window = (
-                        reconcile_ids is None
-                        or str(sid) in reconcile_ids
-                        or bool(truncation_boundary)
-                    )
-                    reconciled_visible = (
-                        _reconciled_visible_count_for_sidebar(
-                            session.get('session_id'),
-                            expected_state_count=state_count,
-                            expected_last_message_at=state_last or None,
-                            fresh_if_unchanged_state_count=(
-                                current_count,
-                                current_visible,
-                            ),
-                        )
-                        if in_reconcile_window
-                        else None
+                    # This walk is the only expensive part of the overlay, and
+                    # it is also the only honest authority for the visible
+                    # total: state.db's count includes every appended row of
+                    # any role (tool rows included) while the sidecar holds
+                    # display rows only, so crediting the raw delta overstates
+                    # any settled tool-using session for as long as the row
+                    # sits outside a paint window. The walk therefore runs for
+                    # EVERY row whose raw count grew, whatever the paint
+                    # window bounds elsewhere. The growth guard above is what
+                    # bounds the cost (only rows state.db advanced past the
+                    # sidecar reach this line), and the memo returns the
+                    # reconciled count at the price of a metadata-only load
+                    # while state.db has not advanced again. The raw delta
+                    # survives only as the fallback when the sources cannot be
+                    # read at all (``None``), never as a proven total.
+                    reconciled_visible = _reconciled_visible_count_for_sidebar(
+                        session.get('session_id'),
+                        expected_state_count=state_count,
+                        expected_last_message_at=state_last or None,
+                        fresh_if_unchanged_state_count=(
+                            current_count,
+                            current_visible,
+                        ),
                     )
                     if reconciled_visible is not None:
-                        session['visible_message_count'] = min(
+                        visible_total = min(
                             state_count, max(current_visible, reconciled_visible)
                         )
+                        if (
+                            pending_source == 'delegation_wakeup'
+                            and not pending_hidden_materialized
+                        ):
+                            # The walk excludes a hidden row only when it can
+                            # match it by exact timestamp; a deferred wakeup
+                            # whose user row has not been stamped yet is still
+                            # owed its discount, and it is owed it on the walk
+                            # path exactly as on the fallback path — otherwise
+                            # a row's visible total would depend on whether it
+                            # sat inside the paint window.
+                            visible_total = max(current_visible, visible_total - 1)
+                        session['visible_message_count'] = visible_total
                     else:
                         # The outer guard already ensures state_count > current_count.
                         #

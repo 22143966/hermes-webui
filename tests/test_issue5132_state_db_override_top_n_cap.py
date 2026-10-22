@@ -104,23 +104,28 @@ def test_unparseable_cap_falls_back_to_default(monkeypatch):
     )
 
 
-def test_reconcile_tier_default_is_sixty(monkeypatch):
-    """The transcript walk keeps its own, smaller window: it is the real cost."""
+def test_grown_rows_beyond_the_paint_window_still_walk(monkeypatch):
+    """No second window: the walk runs for every grown row, the SQL tier keeps its cap.
+
+    A raw delta cannot tell a display row from a tool row, so the visible count
+    of a capped-out row has no honest cheap source. The growth guard bounds the
+    work instead: only rows state.db advanced past the sidecar reach the walk.
+    """
     monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", raising=False)
-    monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_RECONCILE_TOP_N", raising=False)
     reconciled = _capture_reconciled_ids(monkeypatch, 1000)
     models._apply_sidebar_state_db_overrides(_grown_sessions(1000))
-    assert sorted(reconciled) == sorted(f"s{i}" for i in range(60)), (
-        "only the top-60 grown rows may pay the transcript merge"
+    assert sorted(reconciled) == sorted(f"s{i}" for i in range(1000)), (
+        f"every grown row must walk; got {len(reconciled)}"
     )
 
 
-def test_reconcile_tier_is_env_configurable(monkeypatch):
+def test_removed_reconcile_window_env_does_not_narrow_the_walk(monkeypatch):
+    """The old RECONCILE_TOP_N knob is gone: setting it must not skip any row."""
     monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", raising=False)
     monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_RECONCILE_TOP_N", "5")
     reconciled = _capture_reconciled_ids(monkeypatch, 20)
     models._apply_sidebar_state_db_overrides(_grown_sessions(20))
-    assert sorted(reconciled) == sorted(f"s{i}" for i in range(5))
+    assert sorted(reconciled) == sorted(f"s{i}" for i in range(20))
 
 
 def test_list_under_cap_counts_everything(monkeypatch):
@@ -266,31 +271,81 @@ def _capture_reconciled_ids(monkeypatch, n):
     return reconciled
 
 
-def test_transcript_reconciliation_capped_to_top_n(monkeypatch):
-    """Oracle: with cap N, only the top-N grown rows pay the transcript merge."""
+def test_grown_rows_outside_the_count_window_walk_too(monkeypatch):
+    """With cap N the SQL tier still bounds to top-N, but the walk is not windowed.
+
+    Cheap repairs reach every row; the visible count is walked for every grown
+    row because the raw delta overstates a settled tool-using session.
+    """
     monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "3")
     reconciled = _capture_reconciled_ids(monkeypatch, 10)
     sessions = _grown_sessions(10)
 
     models._apply_sidebar_state_db_overrides(sessions)
 
-    assert sorted(reconciled) == ["s0", "s1", "s2"], (
-        "only the top-N rows may run the expensive transcript reconciliation; "
-        f"got {sorted(reconciled)}"
+    assert sorted(reconciled) == [f"s{i}" for i in range(10)], (
+        f"every grown row walks, window or not; got {sorted(reconciled)}"
     )
-    assert len(reconciled) <= 3, "the transcript-merge budget must stay bounded by the cap"
     # Rows inside the window still get the real state.db count.
     assert sessions[0]["message_count"] == 5
-    # Capped-out rows still get the CHEAP authoritative count + timestamps:
+    # Rows outside it still get the CHEAP authoritative count + timestamps:
     # state.db is the cross-surface writer and a stale zero here would hide a
-    # real conversation. What they do NOT get is the authoritative visible
-    # count — that keeps the raw-delta fallback, clamped by the raw count.
+    # real conversation.
     assert [s["message_count"] for s in sessions[3:]] == [5] * 7, (
         "capped rows must still receive the cheap raw/actual count repair"
     )
     assert [s["last_message_at"] for s in sessions[3:]] == [2000.0] * 7, (
         "capped rows must still receive the cheap last-message bump"
     )
+
+
+def test_capped_out_grown_row_takes_the_walk_not_the_raw_delta(monkeypatch):
+    """Review 5593765140 item 1: a settled tool-using row past the old 60-row window.
+
+    state.db's count includes rows the sidebar never renders (tool rows), so the
+    raw delta (4 -> 8) must never become the visible total. The walk answers 4
+    and is now the only source, window or not.
+    """
+    monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", raising=False)
+    sessions = _grown_sessions(61)
+    sessions.append(
+        {
+            "session_id": "TOOLUSER",
+            "message_count": 4,
+            "visible_message_count": 4,
+            "actual_message_count": 4,
+            "last_message_at": 1003.5,
+            "updated_at": 1003.5,
+        }
+    )
+    metadata = _grown_metadata(61)
+    metadata["TOOLUSER"] = {
+        "_state_db_source": "webui",
+        "_state_db_message_count": 8,
+        "_state_db_last_message_at": 1003.5,
+    }
+    walked = []
+
+    def _fake_walk(session_id, **_bounds):
+        walked.append(str(session_id))
+        return 4
+
+    monkeypatch.setattr(models, "_reconciled_visible_count_for_sidebar", _fake_walk)
+    monkeypatch.setattr(
+        models,
+        "_read_state_db_sidebar_overrides",
+        lambda db_path, id_set, count_session_ids=None: dict(metadata),
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
+
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    row = sessions[-1]
+    assert "TOOLUSER" in walked, "the grown row must be walked, not delta-arithmetic'd"
+    assert row["visible_message_count"] == 4, (
+        "4 display rows in the sidecar; the 4 tool rows in state.db must not inflate"
+    )
+    assert row["message_count"] == 8, "the raw count stays authoritative for the row"
 
 
 def test_transcript_reconciliation_uncapped_when_count_ids_is_none(monkeypatch):
@@ -413,8 +468,8 @@ def test_first_append_row_is_publicly_visible_at_default_cap(
         "the visible fallback must credit the cheap raw growth"
     )
     assert row["last_message_at"] == 20_000.0
-    assert "CONTINUED" not in reconciled, (
-        "the continued row is outside the top-N window, so it must not pay the merge"
+    assert reconciled == ["CONTINUED"], (
+        "the continued row is the only grown row here, so only it walks"
     )
 
 
@@ -428,7 +483,7 @@ def test_first_append_row_is_publicly_visible_at_explicit_cap_60(monkeypatch):
     row = sessions[-1]
     assert _sidecar_row_is_public(row)
     assert row["visible_message_count"] == 1
-    assert "CONTINUED" not in reconciled
+    assert reconciled == ["CONTINUED"]
 
 
 def test_first_append_row_survives_repeated_polls(monkeypatch):
@@ -502,10 +557,15 @@ def test_quiet_delegation_wakeup_still_credits_no_visible_row(monkeypatch):
         },
     }
     reconciled: list[str] = []
+
+    def _fake_reconciled(session_id, **_bounds):
+        reconciled.append(str(session_id))
+        return None
+
     monkeypatch.setattr(
         models,
         "_reconciled_visible_count_for_sidebar",
-        lambda sid: reconciled.append(str(sid)),
+        _fake_reconciled,
     )
     monkeypatch.setattr(
         models,
@@ -517,10 +577,10 @@ def test_quiet_delegation_wakeup_still_credits_no_visible_row(monkeypatch):
     models._apply_sidebar_state_db_overrides(sessions)
 
     row = sessions[1]
-    assert "WAKEUP" not in reconciled, "the hidden wakeup must stay outside the merge window"
+    assert "WAKEUP" in reconciled, "every grown row walks, hidden or not"
     assert row["visible_message_count"] == 0, (
         "a pending delegation_wakeup user row is hidden provenance: it must not "
-        "raise the visible count even outside the reconcile window"
+        "raise the visible count, and the fallback keeps its discount"
     )
     assert row["message_count"] == 1, "the raw count is still authoritative"
 
@@ -742,7 +802,7 @@ def test_capped_out_hidden_wakeup_already_in_sidecar_is_not_double_discounted(mo
     reconciled = _apply_with_fallback(monkeypatch, sessions, metadata, cap=2)
 
     row = sessions[-1]
-    assert "WAKEUP" not in reconciled, "the target sits outside the cap window"
+    assert reconciled == ["WAKEUP"], "the grown row walks; the fallback's arithmetic still decides"
     assert row["visible_message_count"] == 3, (
         "2 visible in the sidecar + 1 visible reply; the materialised hidden row "
         "must not be discounted a second time"

@@ -278,22 +278,23 @@ def test_eager_checkpoint_reports_visible_three_on_the_public_poll(monkeypatch, 
     first = _public_poll(TARGET)
     second = _public_poll(TARGET)
 
-    # Cost oracle: the capped-out row must never pay the transcript merge, and
-    # at most the top-N rows may. The repair is a metadata decision, not a walk.
+    # Cost oracle: the walk now runs for the grown row itself (its visible
+    # total has no honest cheap source), and the memo keeps the second poll
+    # free once state.db stops moving.
     reconciled = []
     original_reconcile = models._reconciled_visible_count_for_sidebar
 
-    def _counting_reconcile(session_id):
+    def _counting_reconcile(session_id, **bounds):
         reconciled.append(str(session_id))
-        return original_reconcile(session_id)
+        return original_reconcile(session_id, **bounds)
 
     monkeypatch.setattr(models, "_reconciled_visible_count_for_sidebar", _counting_reconcile)
     _public_poll(TARGET)
-    assert TARGET not in reconciled, (
-        "a capped-out row must not pay the per-row transcript reconciliation"
+    assert TARGET in reconciled, (
+        "the grown row's visible total is walked, not delta-arithmetic'd"
     )
-    assert len(reconciled) <= CAP, (
-        f"the reconciliation-attempt cap must stay at {CAP}, saw {reconciled}"
+    assert reconciled == [TARGET], (
+        f"only the grown row needs a walk, saw {reconciled}"
     )
 
     for label, row in (("first", first), ("second", second)):
