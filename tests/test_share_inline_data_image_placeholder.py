@@ -407,3 +407,42 @@ def test_img_with_data_outside_text_attributes_never_publishes_payload(tmp_path:
     blob = json.dumps(_snapshot(tmp_path, f"see {tag} end"))
     _assert_no_payload(blob)
     assert "data:" not in blob.lower()
+
+
+# --- Gate W20 (2026-10-22): a URI-shaped data: inside alt/title -------------------
+
+_NL_URI = f"data:image/png;base64\n,{PAYLOAD_B64}"
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        f'<img alt="{_uri()}" src="https://example.com/a.png">',
+        f'<img alt="{_NL_URI}" src="https://example.com/a.png">',
+        f'<img title="{_NL_URI}" src="https://example.com/a.png">',
+        f"<img title='a\" src=\"{_NL_URI}'>",
+        f"<img title=\"src='{_uri()}'\">",
+        f"<img title=\"src='{_NL_URI}'\">",
+        f'<img alt="x&quot; src=&quot;{_uri()}">',
+        f'<img alt="x&quot; src=&quot;{_NL_URI}">',
+        f'<img alt="data: image/png;base64,{PAYLOAD_B64}" src="https://example.com/a.png">',
+    ],
+    ids=[
+        "alt_uri",
+        "alt_nl_split",
+        "title_nl_split",
+        "sq_title_fake_src_nl",
+        "title_fake_src",
+        "title_fake_src_nl",
+        "alt_entity_quote_src",
+        "alt_entity_quote_src_nl",
+        "alt_space_after_scheme",
+    ],
+)
+def test_uri_shaped_data_in_text_attribute_replaces_whole_tag(tmp_path: Path, tag):
+    """The text-attribute allowance is for prose only. Before this, the
+    catch-all removed only the URI head up to the newline and the payload
+    stayed hidden in the kept alt/title value."""
+    content = _snapshot(tmp_path, f"see {tag} end")["messages"][-1]["content"]
+    _assert_no_payload(content)
+    assert content == f"see {PLACEHOLDER} end"

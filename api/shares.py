@@ -170,14 +170,21 @@ _CONTENT_IMG_TAG_RE = re.compile(
     re.IGNORECASE,
 )
 # Quoted values of attributes that only ever hold text. An <img> is replaced
-# when "data:" appears anywhere else in the tag, so an https image whose alt
-# text says "metadata:" keeps rendering while any URL-bearing or unknown
-# attribute carrying data: still fails closed.
+# when it contains a URI-shaped data: anywhere, or any "data:" outside these
+# values, so an https image whose alt text says "metadata:" or "data: 5 rows"
+# keeps rendering while every other data: still fails closed.
 _IMG_TEXT_ATTR_RE = re.compile(
     r"(?<![\w:-])(?:alt|title|aria-label|aria-description)\s*=\s*(?:\"[^\"]*\"|'[^']*')",
     re.IGNORECASE,
 )
 _DATA_SCHEME_RE = re.compile(r"data:", re.IGNORECASE)
+# A "data:" that starts a URI even inside a text attribute. Whitespace after
+# the scheme is allowed because the browser's data: URL processor strips it.
+# Used to replace the whole tag, so a newline-split URI cannot leave its
+# payload behind in an alt or title value.
+_DATA_URI_START_RE = re.compile(
+    r"\bdata:\s*(?=[a-z0-9!#$&^_.+-]+/|[;,])", re.IGNORECASE
+)
 
 # Max size (in bytes) for files we'll embed as base64 in a share snapshot.
 _SHARE_EMBED_MAX_BYTES = 512 * 1024  # 512 KiB
@@ -309,6 +316,8 @@ def _placeholder_inline_data_uris(text: str) -> str:
 
     def _img_tag(m: re.Match) -> str:
         tag = m.group(0)
+        if _DATA_URI_START_RE.search(tag):
+            return _INLINE_DATA_PLACEHOLDER
         rest = _IMG_TEXT_ATTR_RE.sub("", tag)
         return _INLINE_DATA_PLACEHOLDER if _DATA_SCHEME_RE.search(rest) else tag
 
