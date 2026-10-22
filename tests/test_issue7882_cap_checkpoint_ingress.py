@@ -374,6 +374,84 @@ def test_deferred_hidden_turn_is_still_discounted(monkeypatch, tmp_path):
     )
 
 
+def _deferred_target(monkeypatch, tmp_path):
+    """Sidecar without the wakeup row + a state.db that already has it.
+
+    This is the shape the re-gate called out: the eager checkpoint did NOT
+    materialise the row in the sidecar (so ``pending_hidden_materialized`` is
+    False), yet the reconciled walk can still stamp the state.db row as hidden
+    and exclude it. The discount is paid once by the walk -- subtracting it
+    again counts 2 for a transcript that renders 3.
+    """
+    now = time.time()
+    _seed_store(monkeypatch, tmp_path, now=now)
+    target_messages = [
+        {"role": "user", "content": "hi", "timestamp": now - 60},
+        {"role": "assistant", "content": "hello", "timestamp": now - 59},
+    ]
+    session = _new_session(TARGET, messages=target_messages, created_at=now - 60, updated_at=now - 59)
+    session.save(touch_updated_at=False)
+    _state_db(tmp_path, {TARGET: list(target_messages)})
+
+    session.pending_user_message = "handoff"
+    session.pending_user_source = "delegation_wakeup"
+    session.pending_started_at = now
+    session.active_stream_id = f"stream-{TARGET}"
+    session.save(touch_updated_at=False)
+    _append_state_db_rows(tmp_path, TARGET, [
+        {"role": "user", "content": "handoff", "timestamp": now},
+        {"role": "assistant", "content": "done", "timestamp": now + 2},
+    ])
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", str(CAP))
+
+
+def _poll_with_walk(monkeypatch, walk_result):
+    monkeypatch.setattr(
+        models,
+        "_reconciled_visible_count_for_sidebar",
+        lambda sid, **_bounds: walk_result,
+    )
+    return _public_poll(TARGET)
+
+
+def test_successful_walk_does_not_discount_a_deferred_wakeup_twice(monkeypatch, tmp_path):
+    """Re-gate finding 1: the walk already excluded the row, so do not subtract again."""
+    _deferred_target(monkeypatch, tmp_path)
+    row = _poll_with_walk(
+        monkeypatch, models._ReconciledSidebarVisible(3, True)
+    )
+
+    assert row["visible_message_count"] == 3, (
+        "a successful walk that dropped the hidden row already paid the "
+        "discount; subtracting it here reported 2 for a 3-row transcript"
+    )
+
+
+def test_successful_walk_still_discounts_an_unstamped_deferred_row(monkeypatch, tmp_path):
+    """Control: when the walk could NOT identify the row as hidden, the discount is owed."""
+    _deferred_target(monkeypatch, tmp_path)
+    row = _poll_with_walk(
+        monkeypatch, models._ReconciledSidebarVisible(3, False)
+    )
+
+    assert row["visible_message_count"] == 2, (
+        "an unstamped deferred row is still owed its discount on the walk path"
+    )
+
+
+def test_walk_reports_whether_it_excluded_a_hidden_row(monkeypatch, tmp_path):
+    """The flag is what lets the caller stop guessing: it comes from the merge."""
+    _deferred_target(monkeypatch, tmp_path)
+    result = models._reconciled_visible_count_for_sidebar(TARGET)
+
+    assert result is not None
+    assert isinstance(result, models._ReconciledSidebarVisible)
+    assert result.hidden_excluded is True, (
+        "the walk merged a state.db row and identified it as hidden, so it must "
+        "report the exclusion instead of leaving the caller to subtract again"
+    )
+
+
 def test_fact_from_another_turn_does_not_vouch(monkeypatch, tmp_path):
     """A checkpoint fact recorded for a PREVIOUS pending turn must not excuse a new one."""
     now = time.time()

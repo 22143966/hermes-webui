@@ -17,7 +17,7 @@ import uuid
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast, overload
+from typing import Literal, NamedTuple, cast, overload
 
 try:  # pragma: no cover - platform-specific imports.
     import fcntl as _fcntl
@@ -8496,20 +8496,33 @@ def _apply_sidebar_state_db_override_rows(
                         ),
                     )
                     if reconciled_visible is not None:
+                        # The walk returns its count together with whether it
+                        # already excluded the pending hidden row. A bare int
+                        # is a test double that cannot express the flag; it
+                        # keeps the pre-existing behaviour (no proof, so the
+                        # caller takes the discount itself).
+                        reconciled_count = cast(
+                            int, getattr(reconciled_visible, 'visible', reconciled_visible)
+                        )
+                        reconciled_hidden_excluded = bool(
+                            getattr(reconciled_visible, 'hidden_excluded', False)
+                        )
                         visible_total = min(
-                            state_count, max(current_visible, reconciled_visible)
+                            state_count,
+                            max(current_visible, reconciled_count),
                         )
                         if (
                             pending_source == 'delegation_wakeup'
                             and not pending_hidden_materialized
+                            and not reconciled_hidden_excluded
                         ):
-                            # The walk excludes a hidden row only when it can
-                            # match it by exact timestamp; a deferred wakeup
-                            # whose user row has not been stamped yet is still
-                            # owed its discount, and it is owed it on the walk
-                            # path exactly as on the fallback path — otherwise
-                            # a row's visible total would depend on whether it
-                            # sat inside the paint window.
+                            # The walk already paid this discount whenever it
+                            # could identify the pending hidden row as hidden
+                            # (``hidden_excluded``); subtracting again here made
+                            # a deferred wakeup count 2 instead of 3 (#7882
+                            # re-gate). The subtraction is still owed for a row
+                            # the walk could NOT stamp, so that shape keeps the
+                            # explicit control and its own test.
                             visible_total = max(current_visible, visible_total - 1)
                         session['visible_message_count'] = visible_total
                     else:
@@ -12240,13 +12253,28 @@ _SIDEBAR_RECONCILE_MEMO: contextvars.ContextVar[dict | None] = contextvars.Conte
 )
 
 
+class _ReconciledSidebarVisible(NamedTuple):
+    """Result of the reconciled sidebar walk.
+
+    ``visible`` is the count the sidebar may report. ``hidden_excluded`` says
+    whether the walk already dropped a hidden transcript row from that count --
+    the caller must not subtract the pending hidden turn a second time (#7882
+    re-gate: "deferred wakeup discounted twice"). A row the walk could not
+    identify as hidden reports ``False``, so the caller keeps its explicit
+    unstamped-row fallback.
+    """
+
+    visible: int
+    hidden_excluded: bool
+
+
 def _reconciled_visible_count_for_sidebar(
     sid,
     *,
     expected_state_count: int | None = None,
     expected_last_message_at: float | None = None,
     fresh_if_unchanged_state_count: tuple[int, int] | None = None,
-) -> int | None:
+) -> _ReconciledSidebarVisible | None:
     """Count visible rows in the reconciled sidecar+state.db transcript.
 
     The sidebar growth overlay's authority for ``visible_message_count``
@@ -12315,12 +12343,18 @@ def _reconciled_visible_count_for_sidebar(
         else:
             memo = _SIDEBAR_RECONCILE_MEMO.get()
             memo_key = (str(sid), memo_state_count)
-            if (
-                isinstance(memo, dict)
-                and memo_visible_count >= 0
-                and memo.get(memo_key) == memo_visible_count
-            ):
-                return memo_visible_count
+            if isinstance(memo, dict) and memo_visible_count >= 0:
+                cached = memo.get(memo_key)
+                # The cached entry carries the count *and* whether that walk
+                # had already excluded a hidden row; a bare int is a cache
+                # written before this round and is treated as a miss, so the
+                # answer is never reported without its provenance.
+                if isinstance(cached, tuple) and len(cached) == 2:
+                    cached_visible, cached_hidden = cached
+                    if int(cached_visible) == memo_visible_count:
+                        return _ReconciledSidebarVisible(
+                            int(cached_visible), bool(cached_hidden)
+                        )
     try:
         state_messages = get_state_db_session_messages(
             str(sid),
@@ -12386,6 +12420,14 @@ def _reconciled_visible_count_for_sidebar(
         1 for m in merged
         if isinstance(m, dict) and not is_hidden_transcript_row(m)
     )
+    # Did the merge actually drop a hidden row? That is the one signal that
+    # proves this walk already paid the pending hidden turn's discount, so the
+    # caller does not take it twice (#7882 re-gate: "deferred wakeup discounted
+    # twice"). A row the stamping could not identify stays visible, the flag
+    # stays False, and the caller's explicit unstamped-row fallback still runs.
+    hidden_excluded = any(
+        isinstance(m, dict) and is_hidden_transcript_row(m) for m in merged
+    )
     boundary = getattr(session, 'truncation_boundary', None)
     if not sidecar_messages and _boundary_lies_above_every_state_row(boundary, state_messages):
         # Truncated session with an empty sidecar, and every state.db row sits
@@ -12405,10 +12447,12 @@ def _reconciled_visible_count_for_sidebar(
     if isinstance(memo, dict):
         # Remember the answer under the revision it was derived from, so the
         # next poll on this board can skip the walk while state.db is unchanged.
+        # The count travels with its provenance so a memo hit is never
+        # reported as "no hidden row excluded" by accident.
         built_count, _built_last = _state_db_shape_of_messages(state_messages)
         if built_count is not None:
-            memo[(str(sid), int(built_count))] = visible
-    return visible
+            memo[(str(sid), int(built_count))] = (visible, hidden_excluded)
+    return _ReconciledSidebarVisible(visible, hidden_excluded)
 
 
 def _boundary_lies_above_every_state_row(boundary, state_messages) -> bool:
@@ -12490,10 +12534,22 @@ def get_state_db_session_summary(sid, *, profile=None) -> dict:
             available = {str(row['name']) for row in cur.fetchall()}
             if 'session_id' not in available:
                 return {"message_count": 0, "last_message_at": 0.0}
+            # #7882: the summary aggregate feeds the sidebar growth guard, which
+            # compares it against the DETAILED reader's count. The detailed
+            # reader excludes inactive archive rows by default
+            # (`include_inactive=False`), so counting them here would compare
+            # two different row domains: a static store with two active rows
+            # and four `active=0` archives looked like a concurrent append on
+            # every poll, sending the overlay down the raw-growth fallback and
+            # reporting 6 instead of 2. Mirror the reader's clause exactly, and
+            # keep the unfiltered count only when the column is absent.
+            active_clause = ""
+            if 'active' in available:
+                active_clause = " AND (active IS NULL OR active != 0)"
             if 'timestamp' in available:
                 cur.execute(
                     "SELECT COUNT(*) AS message_count, MAX(timestamp) AS last_message_at "
-                    "FROM messages WHERE session_id = ?",
+                    "FROM messages WHERE session_id = ?" + active_clause,
                     (str(sid),),
                 )
                 row = cur.fetchone()
