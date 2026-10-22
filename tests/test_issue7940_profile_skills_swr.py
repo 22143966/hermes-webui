@@ -222,3 +222,72 @@ class TestWorkerEdgeCases:
         mock_compute.assert_called_once()
         mock_spawn.assert_not_called()
         assert result == (4, 6)
+
+
+class TestInvalidationGeneration:
+    """A compute overtaken by invalidate_profile_skills_stats() must not publish."""
+
+    def test_background_compute_finishing_after_invalidate_is_dropped(self, profiles_mod):
+        mod, profile_dir = profiles_mod
+        stale = time.time() - mod._SKILLS_STATS_REVALIDATE_AFTER - 1.0
+        resolved = _seed(mod, profile_dir, enabled=2, compat=2, mtime=111, validated_at=stale)
+        mod._SKILLS_STATS_REVALIDATE_INFLIGHT.add(resolved)
+
+        def compute_then_mutation_lands(_pd):
+            mod.invalidate_profile_skills_stats()  # skill save + invalidate mid-compute
+            return (2, 2)  # counts read before the mutation
+
+        with (
+            patch.object(mod, "_skill_tree_max_mtime_ns", return_value=222),
+            patch.object(mod, "_active_org_marker", return_value=None),
+            patch.object(mod, "_compute_profile_skills_stats", side_effect=compute_then_mutation_lands),
+        ):
+            mod._revalidate_skills_stats_worker(profile_dir)
+        assert resolved not in mod._SKILLS_STATS_CACHE
+
+        with (
+            patch.object(mod, "_skill_tree_max_mtime_ns", return_value=333),
+            patch.object(mod, "_active_org_marker", return_value=None),
+            patch.object(mod, "_compute_profile_skills_stats", return_value=(3, 3)),
+        ):
+            assert mod._get_profile_skills_stats(profile_dir) == (3, 3)
+
+    def test_sync_compute_overtaken_returns_own_result_without_caching(self, profiles_mod):
+        mod, profile_dir = profiles_mod
+        resolved = Path(profile_dir).resolve()
+
+        def compute_then_second_toggle(_pd):
+            mod.invalidate_profile_skills_stats()
+            return (1, 1)
+
+        with (
+            patch.object(mod, "_skill_tree_max_mtime_ns", return_value=111),
+            patch.object(mod, "_active_org_marker", return_value=None),
+            patch.object(mod, "_compute_profile_skills_stats", side_effect=compute_then_second_toggle),
+        ):
+            assert mod._get_profile_skills_stats(profile_dir) == (1, 1)
+        assert resolved not in mod._SKILLS_STATS_CACHE
+
+
+def test_thread_start_failure_serves_cached_and_releases_inflight(profiles_mod):
+    mod, profile_dir = profiles_mod
+    stale = time.time() - mod._SKILLS_STATS_REVALIDATE_AFTER - 1.0
+    resolved = _seed(mod, profile_dir, validated_at=stale)
+    with patch.object(
+        mod, "_start_skills_stats_revalidate_thread",
+        side_effect=RuntimeError("can't start new thread"),
+    ):
+        assert mod._get_profile_skills_stats(profile_dir) == (3, 5)
+    assert resolved not in mod._SKILLS_STATS_REVALIDATE_INFLIGHT
+
+
+def test_org_change_bypasses_fresh_window(profiles_mod):
+    mod, profile_dir = profiles_mod
+    _seed(mod, profile_dir, org="org-a")
+    with (
+        patch.object(mod, "_active_org_marker", return_value="org-b"),
+        patch.object(mod, "_skill_tree_max_mtime_ns", return_value=111),
+        patch.object(mod, "_compute_profile_skills_stats", return_value=(9, 9)) as mock_compute,
+    ):
+        assert mod._get_profile_skills_stats(profile_dir) == (9, 9)
+    mock_compute.assert_called_once()
