@@ -42,7 +42,20 @@ logger = logging.getLogger(__name__)
 # Mirrors tools/async_delegation.py:_LIVE_STATES (running/stalling/finalizing).
 _LIVE_STATES = ("running", "stalling", "finalizing")
 # Terminal states whose completion can still be waiting for delivery.
-_TERMINAL_STATES = ("completed", "error", "interrupted", "cancelled")
+# Full producer contract (tools/async_delegation.py): completed/error/
+# interrupted/cancelled are normal finalizations; ``stalled`` is written by
+# the stall watchdog's forced ``_finalize``; ``unknown`` by
+# ``recover_abandoned_delegations`` when the owning process disappeared. Both
+# persist with delivery_state='pending', so omitting them tells a pre-switch
+# client "nothing is waiting" exactly when a completion IS waiting.
+_TERMINAL_STATES = (
+    "completed",
+    "error",
+    "interrupted",
+    "cancelled",
+    "stalled",
+    "unknown",
+)
 
 # Durable ledger columns (tools/async_delegation.py:_persist_dispatch maps the
 # dispatch-time session_key INTO origin_session; the in-memory record keeps the
@@ -51,7 +64,11 @@ _SELECTOR_COLUMNS = ("origin_ui_session_id", "origin_session", "parent_session_i
 
 
 def _profile_state_db_path(profile: str | None = None) -> Path | None:
-    """Locate the state.db that owns *profile*'s delegation ledger."""
+    """Locate the state.db that owns *profile*'s delegation ledger.
+
+    Returns None when the profile home cannot be resolved — an unavailable
+    source the caller must report as unknown, never as a zero count.
+    """
     try:
         from api.models import _active_state_db_path, _get_profile_home
 
@@ -83,10 +100,15 @@ def _memory_live_probe(session_id: str) -> bool | None:
 def _durable_counts(db_path: Path | None, session_id: str) -> tuple[int, int] | None:
     """Return (running, awaiting_delivery) for *session_id* from *db_path*.
 
-    None means the durable source could not be read (corrupt/locked/missing
-    table) — the caller must surface that as unknown, not as zero.
+    None means the durable source could not be read (unresolvable profile
+    home, corrupt/locked/missing table) — the caller must surface that as
+    unknown, not as zero.
     """
-    if not db_path or not db_path.exists():
+    if db_path is None:
+        # Resolver failed: the source is unavailable, which is NOT the same
+        # as a ledger this profile never created. Unknown, never zero.
+        return None
+    if not db_path.exists():
         # No state.db at all is a truthful zero: this profile has never
         # persisted a delegation ledger.
         return 0, 0

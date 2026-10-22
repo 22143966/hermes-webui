@@ -179,6 +179,66 @@ class TestAwaitingDelivery:
         result = delegation_status.session_delegation_status("sess_a", profile="alpha")
         assert result["awaiting_delivery"] == 1
 
+    def test_stalled_pending_counts_as_awaiting_delivery(self, two_profile_world):
+        # Producer: the stall watchdog force-finalizes via _finalize(...,
+        # "stalled"), and _persist_completion writes state='stalled' with
+        # delivery_state='pending' (tools/async_delegation.py).
+        _write_delegation_db(
+            two_profile_world / "alpha" / "state.db",
+            [_row("deleg_1", origin_ui_session_id="sess_a",
+                  state="stalled", delivery_state="pending")],
+        )
+        result = delegation_status.session_delegation_status("sess_a", profile="alpha")
+        assert result["running"] == 0
+        assert result["awaiting_delivery"] == 1
+
+    def test_unknown_pending_counts_as_awaiting_delivery(self, two_profile_world):
+        # Producer: recover_abandoned_delegations() writes state='unknown',
+        # delivery_state='pending' when the owning process disappeared.
+        _write_delegation_db(
+            two_profile_world / "alpha" / "state.db",
+            [_row("deleg_1", origin_ui_session_id="sess_a",
+                  state="unknown", delivery_state="pending")],
+        )
+        result = delegation_status.session_delegation_status("sess_a", profile="alpha")
+        assert result["running"] == 0
+        assert result["awaiting_delivery"] == 1
+
+    def test_stalled_and_unknown_mix_with_running(self, two_profile_world):
+        _write_delegation_db(
+            two_profile_world / "alpha" / "state.db",
+            [
+                _row("deleg_1", origin_ui_session_id="sess_a", state="running"),
+                _row("deleg_2", origin_ui_session_id="sess_a",
+                     state="stalled", delivery_state="pending"),
+                _row("deleg_3", origin_ui_session_id="sess_a",
+                     state="unknown", delivery_state="pending"),
+            ],
+        )
+        result = delegation_status.session_delegation_status("sess_a", profile="alpha")
+        assert result["running"] == 1
+        assert result["awaiting_delivery"] == 2
+
+    def test_stalled_delivered_does_not_count(self, two_profile_world):
+        _write_delegation_db(
+            two_profile_world / "alpha" / "state.db",
+            [_row("deleg_1", origin_ui_session_id="sess_a",
+                  state="stalled", delivery_state="delivered")],
+        )
+        result = delegation_status.session_delegation_status("sess_a", profile="alpha")
+        assert result["awaiting_delivery"] == 0
+
+    def test_dropped_completion_does_not_count(self, two_profile_world):
+        # Retry-exhausted / replay-cap rows are terminally dropped: their
+        # pending delivery is gone, so nobody is awaiting them.
+        _write_delegation_db(
+            two_profile_world / "alpha" / "state.db",
+            [_row("deleg_1", origin_ui_session_id="sess_a",
+                  state="completed", delivery_state="dropped")],
+        )
+        result = delegation_status.session_delegation_status("sess_a", profile="alpha")
+        assert result["awaiting_delivery"] == 0
+
 
 class TestCrossProfileIsolation:
     def test_bravo_rows_never_appear_for_alpha(self, two_profile_world):
@@ -222,6 +282,69 @@ class TestUnknownNotZero:
         db = two_profile_world / "alpha" / "state.db"
         db.write_bytes(b"this is not a sqlite database at all")
         monkeypatch.setattr(delegation_status, "_memory_live_probe", lambda *a, **kw: None)
+        result = delegation_status.session_delegation_status("sess_a", profile="alpha")
+        assert result["status"] == "unknown"
+        assert result["running"] is None
+        assert result["awaiting_delivery"] is None
+
+    def test_resolver_failure_reports_unknown_not_zero(self, tmp_path, monkeypatch):
+        """A raising profile-home resolver is an unavailable source: unknown,
+        never the (0, 0) a never-created ledger would truthfully report.
+
+        Drives the REAL _profile_state_db_path (no fixture override) with the
+        api.models resolver patched to raise, mirroring the reviewer's
+        profile-home-dependency repro.
+        """
+        import api.models as models
+
+        def _boom(profile):
+            raise RuntimeError("profile home exploded")
+
+        monkeypatch.setattr(models, "_get_profile_home", _boom)
+        monkeypatch.setattr(delegation_status, "_memory_live_probe", lambda *a, **kw: None)
+        result = delegation_status.session_delegation_status("sess_a", profile="ghost")
+        assert result["status"] == "unknown"
+        assert result["running"] is None
+        assert result["awaiting_delivery"] is None
+
+    def test_resolver_failure_keeps_memory_result_independent(self, tmp_path, monkeypatch):
+        """Durable unknown must not mask an independent in-memory live hit."""
+        import api.models as models
+
+        def _boom(profile):
+            raise RuntimeError("profile home exploded")
+
+        monkeypatch.setattr(models, "_get_profile_home", _boom)
+        monkeypatch.setattr(delegation_status, "_memory_live_probe", lambda *a, **kw: True)
+        result = delegation_status.session_delegation_status("sess_a", profile="ghost")
+        assert result["status"] == "unknown"
+        assert result["running"] is None
+        assert result["awaiting_delivery"] is None
+        assert result["memory_live"] is True
+
+    def test_resolved_never_created_ledger_is_truthful_zero(self, tmp_path, monkeypatch):
+        """Resolver succeeds but the profile never persisted state.db: ok/0/0,
+        distinct from the unresolvable case above."""
+        import api.models as models
+
+        monkeypatch.setattr(
+            models, "_get_profile_home", lambda profile: tmp_path / "ghostprofile"
+        )
+        monkeypatch.setattr(delegation_status, "_memory_live_probe", lambda *a, **kw: None)
+        result = delegation_status.session_delegation_status("sess_a", profile="ghost")
+        assert result["status"] == "ok"
+        assert result["running"] == 0
+        assert result["awaiting_delivery"] == 0
+
+    def test_missing_table_reports_unknown(self, two_profile_world):
+        db = two_profile_world / "alpha" / "state.db"
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.execute("DROP TABLE IF EXISTS async_delegations")
+            conn.execute("CREATE TABLE IF NOT EXISTS unrelated (x INTEGER)")
+            conn.commit()
+        finally:
+            conn.close()
         result = delegation_status.session_delegation_status("sess_a", profile="alpha")
         assert result["status"] == "unknown"
         assert result["running"] is None
