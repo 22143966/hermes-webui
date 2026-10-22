@@ -1860,15 +1860,19 @@ def _custom_provider_entry_owns_model(entry: dict, model_id: str) -> bool:
     """True when a ``custom_providers[]`` entry declares ``model_id`` itself.
 
     Ownership is by declaration, not substring: an exact ``model:`` match or a
-    listed id in the ``models:`` allowlist (all shapes via
-    ``_configured_model_ids``). Used to disambiguate several entries sharing
-    one ``base_url`` (#7176) — the declaring owner outranks declaration order.
+    listed id in a pinned ``models:`` allowlist (all shapes via
+    ``_configured_model_ids``). A live discovered catalog is metadata, not a
+    declaration. Used to disambiguate several entries sharing one ``base_url``
+    (#7176): the declaring owner outranks declaration order, and among several
+    declaring owners the first-declared one wins.
     """
     model = str(model_id or "").strip()
     if not model or not isinstance(entry, dict):
         return False
     if str(entry.get("model") or "").strip() == model:
         return True
+    if _provider_models_are_discovered_catalog(entry):
+        return False
     return model in _configured_model_ids(entry.get("models"))
 
 
@@ -7584,7 +7588,6 @@ def _static_models_catalog_without_live_probes() -> dict:
         except Exception:
             logger.debug("Failed to load auth store for static models catalog", exc_info=True)
 
-        default_model = get_effective_default_model(cfg)
         detected_providers: set[str] = set()
         configured_model_ids: dict[str, list[str]] = {}
         named_custom_groups: dict[str, dict[str, object]] = {}
@@ -10174,7 +10177,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                         model_cfg.get("provider"),
                         cfg,
                         base_url=base_url,
-                        model_id=model_cfg.get("default"),
+                        model_id=default_model,
                     )
                     if provider_hint:
                         return str(provider_hint).strip().lower()
@@ -10192,30 +10195,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                         if provider_hint:
                             return str(provider_hint).strip().lower()
 
-            custom_providers_cfg = cfg.get("custom_providers", [])
-            if isinstance(custom_providers_cfg, list):
-                # Several entries may share one base_url (#7176): the entry
-                # that declares the configured default model outranks
-                # declaration order; otherwise the historical first-match.
-                want_model = ""
-                if isinstance(model_cfg, dict):
-                    want_model = str(model_cfg.get("default") or "").strip()
-                fallback = ""
-                for entry in custom_providers_cfg:
-                    if not isinstance(entry, dict):
-                        continue
-                    entry_base_url = _normalize_base_url_for_match(entry.get("base_url"))
-                    if entry_base_url != target:
-                        continue
-                    entry_name = str(entry.get("name") or "").strip()
-                    slug = _custom_provider_slug_from_name(entry_name) if entry_name else "custom"
-                    if not fallback:
-                        fallback = slug
-                    if want_model and _custom_provider_entry_owns_model(entry, want_model):
-                        return slug
-                return fallback
-
-            return ""
+            return _named_custom_provider_slug_for_base_url(
+                base_url, cfg, model_id=default_model
+            )
 
         def _models_endpoint_for_base_url(base_url: str) -> str:
             base = str(base_url or "").strip().rstrip("/")
@@ -10473,6 +10455,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         # 4. Fetch models from custom endpoint if base_url is configured
         auto_detected_models = []
         auto_detected_models_by_provider: dict[str, list[dict]] = {}
+        _active_probe_owner = None
         if cfg_base_url:
             base_url = cfg_base_url.strip()
             configured_provider = _configured_provider_for_base_url(base_url)
@@ -10551,6 +10534,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 provider_key = provider.lower()
                 auto_detected_models_by_provider.setdefault(provider_key, []).append(auto_model)
                 detected_providers.add(provider_key)
+            _active_probe_owner = (provider.lower(), api_key)
 
         _custom_providers_cfg = cfg.get("custom_providers", [])
         _named_custom_groups: dict = {}
@@ -10601,6 +10585,15 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                         isinstance(_cp_configured_models, (dict, list))
                         and len(_cp_configured_models) > 0
                     )
+                    if (
+                        _active_probe_owner
+                        and _active_probe_owner[0] == _slug
+                        and _cp_api_key
+                        and _cp_api_key != _active_probe_owner[1]
+                    ):
+                        # #7176: a shared-URL entry with its own credential must
+                        # not inherit the active probe run with model.api_key.
+                        auto_detected_models_by_provider.pop(_slug, None)
                     _live_models = auto_detected_models_by_provider.get(_slug)
                     _live_error = None
                     if _cp_has_configured_models:

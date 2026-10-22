@@ -12,6 +12,9 @@ declaration order; when no model is given (or no entry declares it) the
 historical first-match stands.
 """
 
+import json
+import urllib.request
+
 import pytest
 
 import api.config as cfg_mod
@@ -87,12 +90,34 @@ class TestSlugForBaseUrlModelOwnership:
 
 class TestResolveModelProviderRouting:
     def test_configured_default_routes_to_owning_entry(self, shared_gateway_cfg):
-        """The issue's exact repro: the configured default model must resolve
-        to custom:gateway-claude, not the first-declared entry."""
+        """The issue's exact repro end to end. resolve_model_provider already
+        scanned for ownership on master; the provider-id resolver the catalog
+        builders use did not, so assert on it too."""
         model, provider, base_url = resolve_model_provider("claude-sonnet-5@default")
         assert provider == "custom:gateway-claude"
         assert model == "claude-sonnet-5@default"
         assert base_url == SHARED_BASE_URL
+        assert cfg_mod._resolve_configured_provider_id(
+            "custom", shared_gateway_cfg, base_url=SHARED_BASE_URL,
+            resolve_alias=False, model_id="claude-sonnet-5@default",
+        ) == "custom:gateway-claude"
+
+    @pytest.mark.parametrize(("discover", "owner"), [
+        (True, "custom:gateway-claude"),   # discovered catalog is not ownership
+        (False, "custom:gateway-openai-chat"),  # re-pinned mapping still is
+    ])
+    def test_discovered_catalog_does_not_claim_ownership(
+        self, shared_gateway_cfg, discover, owner
+    ):
+        first = shared_gateway_cfg["custom_providers"][0]
+        first["models"]["claude-sonnet-5@default"] = {}
+        first["models_discovered"] = True
+        if not discover:
+            first["discover_models"] = False
+        assert _named_custom_provider_slug_for_base_url(
+            SHARED_BASE_URL, shared_gateway_cfg, model_id="claude-sonnet-5@default"
+        ) == owner
+        assert cfg_mod._minimal_static_models_catalog()["active_provider"] == owner
 
     def test_singular_model_field_owns_too(self):
         old_model = cfg_mod.cfg.get("model")
@@ -129,3 +154,52 @@ class TestMinimalCatalogActiveProvider:
 
         catalog = config_mod._minimal_static_models_catalog()
         assert catalog["active_provider"] == "custom:gateway-claude"
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_shared_url_entry_with_own_key_keeps_its_live_models(monkeypatch):
+    """model.api_key belongs to entry one while entry two owns the default:
+    the active probe (run with model.api_key) must not stand in for entry
+    two's own keyed probe."""
+    catalogs = {"Bearer e1-key": ["gpt-x"], "Bearer e2-key": ["claude-default", "claude-live"]}
+
+    def fake_urlopen(req, timeout=None):
+        ids = catalogs.get(req.get_header("Authorization") or "", [])
+        return _FakeResponse({"data": [{"id": i} for i in ids]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        cfg_mod.socket, "getaddrinfo",
+        lambda *a, **k: [(None, None, None, None, ("93.184.216.34", 0))],
+    )
+    monkeypatch.setitem(cfg_mod.cfg, "model", {
+        "default": "claude-default", "provider": "custom",
+        "base_url": SHARED_BASE_URL, "api_key": "e1-key",
+    })
+    monkeypatch.setitem(cfg_mod.cfg, "custom_providers", [
+        {"name": "Gateway OpenAI", "base_url": SHARED_BASE_URL,
+         "api_key": "e1-key", "models": {"gpt-x": {}}},
+        {"name": "Gateway Claude", "base_url": SHARED_BASE_URL,
+         "api_key": "e2-key", "model": "claude-default"},
+    ])
+    cfg_mod.invalidate_models_cache()
+    try:
+        groups = cfg_mod.get_available_models(force_refresh=True)["groups"]
+    finally:
+        cfg_mod.invalidate_models_cache()
+    claude = [m["id"] for g in groups if g.get("provider_id") == "custom:gateway-claude"
+              for m in g["models"]]
+    assert claude == ["claude-default", "claude-live"]
