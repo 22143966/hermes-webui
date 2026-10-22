@@ -136,14 +136,16 @@ The same allowlist governs the trusted identity-header SSO setup
 > log therefore never trusts `X-Real-IP` for its `forwarded_for` field (only
 > the right-to-left `X-Forwarded-For` walk is accepted, and only from an
 > allowlisted peer). The local-origin gate still honors `X-Real-IP` when the
-> peer is trusted, as it did before; configure your proxy to overwrite it
+> peer is trusted and `HERMES_WEBUI_TRUST_FORWARDED_FOR=1` is set, as it did
+> before; configure your proxy to overwrite it
 > (`proxy_set_header X-Real-IP $remote_addr;`) to keep that path honest, or just
 > for your own logging. Trusted-header SSO reads neither header: it only checks
 > that the socket peer is an allowlisted proxy.
 
 ### Client IP in the request log (fail2ban)
 
-Each structured request-log record carries at most one client-IP field:
+Each structured request-log record always carries `remote`, the socket peer,
+and at most one forwarded client-IP field:
 
 - `forwarded_for`: the client address, present only when the socket peer is a
   trusted proxy and the `X-Forwarded-For` chain resolves to a valid address
