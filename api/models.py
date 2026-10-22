@@ -8105,12 +8105,14 @@ def _read_state_db_sidebar_overrides(
             has_messages_table = cur.fetchone() is not None
             messages_has_session_id = False
             messages_has_timestamp = False
+            messages_has_active = False
             messages_has_title_fields = False
             if has_messages_table:
                 cur.execute("PRAGMA table_info(messages)")
                 message_cols = {str(row[1]) for row in cur.fetchall()}
                 messages_has_session_id = 'session_id' in message_cols
                 messages_has_timestamp = 'timestamp' in message_cols
+                messages_has_active = 'active' in message_cols
                 messages_has_title_fields = {'session_id', 'role', 'content', 'timestamp'}.issubset(message_cols)
 
             delegated_title_ids: set[str] = set()
@@ -8158,9 +8160,29 @@ def _read_state_db_sidebar_overrides(
                         continue
                     count_placeholders = ','.join('?' * len(count_chunk))
                     last_at_expr = "MAX(timestamp) AS last_message_at" if messages_has_timestamp else "NULL AS last_message_at"
+                    # #7882 re-gate: this aggregate is compared against the
+                    # DETAILED reader's count by the sidebar revision check, and
+                    # that reader excludes ``active = 0`` archive rows by default
+                    # (``include_inactive=False``). Counting every row here
+                    # compares two different row domains: a static store with
+                    # two active rows and four archives read as a concurrent
+                    # append on every poll, so the check refused a settled
+                    # transcript and the raw-growth fallback reported six. Both
+                    # numbers are kept — the raw one still feeds the growth
+                    # guard and the displayed message_count — while the
+                    # active-domain one is what the revision check gets, so
+                    # archived rows never become visible growth.
+                    if messages_has_active:
+                        active_count_expr = (
+                            "SUM(CASE WHEN active IS NULL OR active != 0 "
+                            "THEN 1 ELSE 0 END) AS active_message_count"
+                        )
+                    else:
+                        active_count_expr = "COUNT(*) AS active_message_count"
                     cur.execute(
                         f"""
-                        SELECT session_id, COUNT(*) AS actual_message_count, {last_at_expr}
+                        SELECT session_id, COUNT(*) AS actual_message_count,
+                               {active_count_expr}, {last_at_expr}
                         FROM messages
                         WHERE session_id IN ({count_placeholders})
                         GROUP BY session_id
@@ -8174,6 +8196,13 @@ def _read_state_db_sidebar_overrides(
                             entry['_state_db_message_count'] = max(
                                 int(entry.get('_state_db_message_count') or 0),
                                 int(row['actual_message_count'] or 0),
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                        try:
+                            entry['_state_db_active_message_count'] = max(
+                                int(entry.get('_state_db_active_message_count') or 0),
+                                int(row['active_message_count'] or 0),
                             )
                         except (TypeError, ValueError):
                             pass
@@ -8330,6 +8359,7 @@ def _apply_sidebar_state_db_override_rows(
         state_db_session_source = entry.pop('_state_db_session_source', None)
         state_db_source_label = entry.pop('_state_db_source_label', None)
         state_db_message_count = entry.pop('_state_db_message_count', None)
+        state_db_active_message_count = entry.pop('_state_db_active_message_count', None)
         state_db_last_message_at = entry.pop('_state_db_last_message_at', None)
         state_db_display_title = entry.pop('_state_db_display_title', None)
         if state_db_source in ('webui', 'subagent'):
@@ -8360,6 +8390,26 @@ def _apply_sidebar_state_db_override_rows(
             except (TypeError, ValueError):
                 current_count = 0
                 state_count = 0
+            # #7882 re-gate: the reconciled walk's revision check compares its
+            # own row count with the overlay's count, so both sides must count
+            # the SAME row domain. The walk reads through the detailed reader,
+            # which excludes `active = 0` archive rows; `state_count` above is
+            # the raw total and legitimately includes them for the growth guard
+            # and the displayed message_count. Handing the raw total to the
+            # revision check made a static store with two active rows and four
+            # archives look like a concurrent append on every poll, and the
+            # raw-growth fallback reported six instead of two. The SQL read
+            # supplies the active-domain count next to the raw one; when it is
+            # absent (a test double, or a schema without the column) the raw
+            # count remains the expectation, exactly as before.
+            expected_state_count = state_count
+            if state_db_active_message_count is not None:
+                try:
+                    expected_state_count = max(
+                        0, int(state_db_active_message_count)
+                    )
+                except (TypeError, ValueError):
+                    expected_state_count = state_count
             try:
                 current_last = max(
                     float(session.get('last_message_at') or 0),
@@ -8488,7 +8538,7 @@ def _apply_sidebar_state_db_override_rows(
                     # read at all (``None``), never as a proven total.
                     reconciled_visible = _reconciled_visible_count_for_sidebar(
                         session.get('session_id'),
-                        expected_state_count=state_count,
+                        expected_state_count=expected_state_count,
                         expected_last_message_at=state_last or None,
                         fresh_if_unchanged_state_count=(
                             current_count,

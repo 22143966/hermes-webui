@@ -1164,3 +1164,158 @@ def test_reconcile_cap_leaves_the_latest_timestamp_tier_alone(monkeypatch):
         "settled conversation still rises to the top"
     )
 
+
+
+# --- the revision check compares one row domain, not two ---------------------------
+#
+# #7882 re-gate: the SQL aggregate that feeds the overlay counted EVERY state.db row
+# while the detailed reader the walk uses excludes ``active = 0`` archive rows. A
+# static store with two active rows and four archives therefore answered 2 from the
+# reader and 6 from the aggregate, the overlay read that as a concurrent append,
+# refused the walk, and the raw-growth fallback reported six visible messages on
+# every poll. Archived rows are pre-compaction history: they must never become
+# visible growth.
+
+
+def _archived_state_db(tmp_path):
+    """Two active rows plus four ``active = 0`` archives, in one real state.db."""
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, session_source TEXT, "
+        "title TEXT, message_count INTEGER)"
+    )
+    conn.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, "
+        "content TEXT, timestamp REAL, active INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, session_source, title, message_count) "
+        "VALUES ('s0', 'webui', 'webui', 'Archived', 6)"
+    )
+    conn.executemany(
+        "INSERT INTO messages (session_id, role, content, timestamp, active) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            ("s0", "user", "q1", 1000.0, 1),
+            ("s0", "assistant", "a1", 1001.0, 1),
+            ("s0", "user", "old1", 900.0, 0),
+            ("s0", "assistant", "old2", 901.0, 0),
+            ("s0", "user", "old3", 902.0, 0),
+            ("s0", "assistant", "old4", 903.0, 0),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _active_sidecar_rows():
+    return [
+        {"role": "user", "content": "q1", "timestamp": 1000.0},
+        {"role": "assistant", "content": "a1", "timestamp": 1001.0},
+    ]
+
+
+def test_archive_rows_never_become_visible_growth(monkeypatch, tmp_path):
+    """Three public payload builds on an unchanged store all report two, not six."""
+    db = _archived_state_db(tmp_path)
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
+    monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_RECONCILE_TOP_N", raising=False)
+
+    def _sidecar(sid, **_kwargs):
+        class _Stub:
+            _loaded_metadata_only = False
+            messages = _active_sidecar_rows()
+            profile = None
+            truncation_watermark = None
+            truncation_boundary = None
+            pending_user_source = None
+            pending_started_at = None
+            pending_user_message = None
+
+        return _Stub()
+
+    monkeypatch.setattr(models.Session, "load_metadata_only", _sidecar)
+
+    # The overlay's own read keeps both counts: the raw one (6, for the growth
+    # guard and the displayed message_count) and the active-domain one (2, which
+    # is the domain the detailed reader answers in).
+    overrides = models._read_state_db_sidebar_overrides(db, {"s0"}, {"s0"})
+    assert overrides["s0"]["_state_db_message_count"] == 6
+    assert overrides["s0"]["_state_db_active_message_count"] == 2
+
+    for build in range(3):
+        sessions = [
+            {
+                "session_id": "s0",
+                "message_count": 2,
+                "visible_message_count": 2,
+                "actual_message_count": 2,
+                "last_message_at": 1000.0,
+                "updated_at": 1000.0,
+            }
+        ]
+        models._apply_sidebar_state_db_overrides(sessions)
+        assert sessions[0]["visible_message_count"] == 2, (
+            f"build {build}: archive rows must not be credited as visible growth"
+        )
+        assert sessions[0]["message_count"] == 6, (
+            "the raw count still feeds the growth guard and the displayed total"
+        )
+
+
+def test_genuine_concurrent_append_still_refuses_the_walk(monkeypatch, tmp_path):
+    """A row that landed between the SQL read and the walk still fails the check."""
+    db = _archived_state_db(tmp_path)
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
+    monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_STATE_DB_OVERRIDE_RECONCILE_TOP_N", raising=False)
+
+    def _sidecar(sid, **_kwargs):
+        class _Stub:
+            _loaded_metadata_only = False
+            messages = _active_sidecar_rows()
+            profile = None
+            truncation_watermark = None
+            truncation_boundary = None
+            pending_user_source = None
+            pending_started_at = None
+            pending_user_message = None
+
+        return _Stub()
+
+    monkeypatch.setattr(models.Session, "load_metadata_only", _sidecar)
+
+    # The aggregate saw two active rows; the detailed reader answers three, i.e.
+    # an active append landed in between. The walk must be refused.
+    real_messages = models.get_state_db_session_messages
+
+    def _grown_reader(sid, **kwargs):
+        return list(real_messages(sid, **kwargs)) + [
+            {"role": "user", "content": "late", "timestamp": 1002.0}
+        ]
+
+    monkeypatch.setattr(models, "get_state_db_session_messages", _grown_reader)
+
+    sessions = [
+        {
+            "session_id": "s0",
+            "message_count": 2,
+            "visible_message_count": 2,
+            "actual_message_count": 2,
+            "last_message_at": 1000.0,
+            "updated_at": 1000.0,
+        }
+    ]
+    models._apply_sidebar_state_db_overrides(sessions)
+
+    from api.models import _SIDEBAR_RECONCILE_MEMO
+
+    assert _SIDEBAR_RECONCILE_MEMO.get() in (None, {}), (
+        "a transcript that answers a different revision must not be cached as "
+        "the row's visible count"
+    )
