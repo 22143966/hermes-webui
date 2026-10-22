@@ -850,11 +850,11 @@ def test_stale_index_fact_does_not_vouch_for_a_newer_deferred_turn(monkeypatch, 
     _seen = {}
     _original_overlay = models._apply_sidebar_state_db_override_metadata
 
-    def _capturing_overlay(sessions, metadata, count_session_ids=None, reconcile_cap=None):
+    def _capturing_overlay(sessions, metadata, count_session_ids=None):
         for _s in sessions:
             if _s.get('session_id') == TARGET:
                 _seen.update(_s)
-        return _original_overlay(sessions, metadata, count_session_ids, reconcile_cap)
+        return _original_overlay(sessions, metadata, count_session_ids)
 
     monkeypatch.setattr(
         models, '_apply_sidebar_state_db_override_metadata', _capturing_overlay
