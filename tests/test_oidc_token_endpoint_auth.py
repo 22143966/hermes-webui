@@ -193,6 +193,31 @@ def test_unknown_configured_method_falls_back_to_auto(monkeypatch):
     assert auth_oidc._normalize_token_auth_method(None) == "auto"
 
 
+def test_unsupported_method_warns_once_per_value_not_per_auth_check(monkeypatch, caplog):
+    """The OIDC config is resolved on every auth check (is_auth_enabled), so an
+    unsupported token_auth_method must not log a warning per request."""
+    import logging
+
+    import api.auth_oidc as auth_oidc
+
+    monkeypatch.setattr(auth_oidc, "_UNSUPPORTED_TOKEN_AUTH_WARNED", set())
+    caplog.set_level(logging.WARNING, logger=auth_oidc.logger.name)
+
+    for _ in range(200):
+        assert auth_oidc._normalize_token_auth_method("private_key_jwt") == "auto"
+    assert auth_oidc._normalize_token_auth_method("Bogus") == "auto"
+    assert auth_oidc._normalize_token_auth_method("bogus ") == "auto"
+
+    messages = [
+        r.getMessage() for r in caplog.records
+        if "unsupported webui_oidc.token_auth_method" in r.getMessage()
+    ]
+    assert messages == [
+        "Ignoring unsupported webui_oidc.token_auth_method 'private_key_jwt'; using auto",
+        "Ignoring unsupported webui_oidc.token_auth_method 'bogus'; using auto",
+    ]
+
+
 def test_valid_configured_methods_normalize_case_and_whitespace():
     import api.auth_oidc as auth_oidc
 

@@ -227,10 +227,25 @@ def _normalize_token_auth_method(raw: Any) -> str:
         return "auto"
     if value in _TOKEN_AUTH_METHODS:
         return value
-    logger.warning(
-        "Ignoring unsupported webui_oidc.token_auth_method %r; using auto", value
-    )
+    # The config is resolved on every auth check, so warn once per distinct
+    # unsupported value rather than once per request. The set is bounded:
+    # values come from operator config, and past the cap we stay quiet.
+    with _UNSUPPORTED_TOKEN_AUTH_WARNED_LOCK:
+        first = (
+            value not in _UNSUPPORTED_TOKEN_AUTH_WARNED
+            and len(_UNSUPPORTED_TOKEN_AUTH_WARNED) < 32
+        )
+        if first:
+            _UNSUPPORTED_TOKEN_AUTH_WARNED.add(value)
+    if first:
+        logger.warning(
+            "Ignoring unsupported webui_oidc.token_auth_method %r; using auto", value
+        )
     return "auto"
+
+
+_UNSUPPORTED_TOKEN_AUTH_WARNED: set[str] = set()
+_UNSUPPORTED_TOKEN_AUTH_WARNED_LOCK = threading.Lock()
 
 
 def _resolve_token_endpoint_auth(cfg: dict[str, Any], discovery: dict[str, Any]) -> str:
