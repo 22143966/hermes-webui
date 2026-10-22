@@ -269,3 +269,96 @@ def test_stale_index_fact_does_not_vouch_for_a_deferred_turn(monkeypatch, tmp_pa
         "the stale fact from the previous turn must not vouch for the new "
         "deferred turn"
     )
+
+
+def _read_index_rows():
+    import json
+
+    if not models.SESSION_INDEX_FILE.exists():
+        return []
+    return json.loads(models.SESSION_INDEX_FILE.read_bytes())
+
+
+def _write_index_rows(rows):
+    import json
+
+    models.SESSION_INDEX_FILE.write_bytes(json.dumps(rows).encode())
+
+
+def test_older_hidden_checkpoint_does_not_discount_a_current_ordinary_turn(
+    monkeypatch, tmp_path
+):
+    """A stale ``delegation_wakeup`` source must not survive the refresh.
+
+    The gate's scene: an older eager hidden checkpoint, its index row retained,
+    the turn settled, then a current ORDINARY pending turn saved and its user
+    row plus a visible reply appended through state.db. ``compact()`` omits the
+    default ``webui`` source, so copying pending fields only when non-None left
+    the older ``delegation_wakeup`` source on the refreshed row; the capped
+    fallback then discounts an ordinary user row as a hidden wakeup (the walk
+    no longer pays that discount, the fallback does).
+    """
+    now = time.time()
+    _seed_fillers(monkeypatch, tmp_path, now=now)
+
+    base = [
+        {"role": "user", "content": "hi", "timestamp": now - 60},
+        {"role": "assistant", "content": "hello", "timestamp": now - 59},
+    ]
+    session = _new_session(TARGET, messages=base, created_at=now - 60, updated_at=now - 59)
+    session.save(touch_updated_at=False)
+    _append_state_db_rows(tmp_path, TARGET, base)
+
+    _eager_checkpoint(session, text="handoff", started_at=now - 30)
+    session.save()
+    stale_index_row = next(
+        row for row in _read_index_rows() if row.get("session_id") == TARGET
+    )
+    assert stale_index_row.get("pending_user_source") == "delegation_wakeup"
+    assert stale_index_row.get("_pending_hidden_wakeup_at") == pytest.approx(
+        now - 30, rel=0, abs=1e-6
+    )
+
+    # The hidden turn settles: the sidecar no longer names a pending turn.
+    session.pending_user_message = None
+    session.pending_user_source = ""
+    session.pending_started_at = None
+    session.active_stream_id = None
+    session.save()
+    _append_state_db_rows(
+        tmp_path, TARGET,
+        [{"role": "assistant", "content": "done", "timestamp": now - 29}],
+    )
+
+    # A current ORDINARY pending turn on the same session.
+    session.pending_user_message = "next"
+    session.pending_user_source = "webui"
+    session.pending_started_at = now + 100
+    session.active_stream_id = "stream-ordinary"
+    session.save()
+    _append_state_db_rows(
+        tmp_path, TARGET,
+        [
+            {"role": "user", "content": "next", "timestamp": now + 101},
+            {"role": "assistant", "content": "sure", "timestamp": now + 102},
+        ],
+    )
+
+    # The sidebar still serves the stale index row for this session.
+    _write_index_rows([
+        stale_index_row if row.get("session_id") == TARGET else row
+        for row in _read_index_rows()
+    ])
+
+    _cap_the_target_out(monkeypatch)
+    capped = _sidebar_row_for(TARGET)
+
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", "0")
+    uncapped = _sidebar_row_for(TARGET)
+    assert capped["visible_message_count"] == uncapped["visible_message_count"], (
+        "the capped poll must match the reconciled count "
+        f"(capped {capped['visible_message_count']}, uncapped {uncapped['visible_message_count']})"
+    )
+    assert str(capped.get("pending_user_source") or "").strip().lower() != "delegation_wakeup", (
+        "an ordinary current turn must not inherit the settled checkpoint's source"
+    )

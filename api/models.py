@@ -7610,13 +7610,31 @@ def _refresh_index_rows_from_sidecar_metadata(
             'model', 'model_provider', 'created_at', 'pinned', 'archived', 'project_id',
             'profile', 'pre_compression_snapshot', 'parent_session_id', 'source_tag',
             'raw_source', 'session_source', 'source_label', 'active_stream_id',
-            'has_pending_user_message', 'pending_user_message', 'pending_started_at',
+            'has_pending_user_message', 'pending_user_message',
             'visible_message_count',
-            'pending_user_source',
         ):
             value = compact.get(key)
             if value is not None:
                 refreshed[key] = value
+        # #7882 re-gate (round-5): the pending turn's provenance is ONE unit and
+        # the CURRENT sidecar owns it. ``compact()`` deliberately omits the
+        # default ``webui``/``fork`` source and emits ``pending_started_at``
+        # only together with the checkpoint fact, so a non-None field copy
+        # keeps the older index row's ``delegation_wakeup`` source after the
+        # fact it excused is gone: an older hidden checkpoint followed by a
+        # current ordinary turn then gets its user row discounted as a hidden
+        # pending row (gate scene: visible 4 where the reconciled count is 5).
+        # Read source and start from the sidecar itself and clear what it does
+        # not describe, so the overlay classifies the row against the turn that
+        # is pending NOW.
+        for key in ('pending_user_source', 'pending_started_at'):
+            refreshed.pop(key, None)
+        pending_source = str(getattr(sidecar, 'pending_user_source', '') or '').strip()
+        if pending_source:
+            refreshed['pending_user_source'] = pending_source
+        pending_started = getattr(sidecar, 'pending_started_at', None)
+        if isinstance(pending_started, (int, float)) and not isinstance(pending_started, bool):
+            refreshed['pending_started_at'] = pending_started
         compact_fact = compact.get('_pending_hidden_wakeup_at')
         if compact_fact is not None:
             refreshed['_pending_hidden_wakeup_at'] = compact_fact
