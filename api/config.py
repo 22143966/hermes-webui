@@ -10534,7 +10534,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 provider_key = provider.lower()
                 auto_detected_models_by_provider.setdefault(provider_key, []).append(auto_model)
                 detected_providers.add(provider_key)
-            _active_probe_owner = (provider.lower(), api_key)
+            _active_probe_owner = (provider.lower(), str(api_key or "").strip())
 
         _custom_providers_cfg = cfg.get("custom_providers", [])
         _named_custom_groups: dict = {}
@@ -10588,11 +10588,10 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     if (
                         _active_probe_owner
                         and _active_probe_owner[0] == _slug
-                        and _cp_api_key
-                        and _cp_api_key != _active_probe_owner[1]
+                        and str(_cp_api_key or "").strip() != _active_probe_owner[1]
                     ):
-                        # #7176: a shared-URL entry with its own credential must
-                        # not inherit the active probe run with model.api_key.
+                        # #7176: a shared-URL entry whose credential (even none)
+                        # differs must not inherit the active probe's catalog.
                         auto_detected_models_by_provider.pop(_slug, None)
                     _live_models = auto_detected_models_by_provider.get(_slug)
                     _live_error = None

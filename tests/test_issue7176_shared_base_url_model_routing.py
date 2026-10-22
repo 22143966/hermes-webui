@@ -170,11 +170,12 @@ class _FakeResponse:
         return False
 
 
-def test_shared_url_entry_with_own_key_keeps_its_live_models(monkeypatch):
+@pytest.mark.parametrize("own_key, own_auth", [("e2-key", "Bearer e2-key"), ("", "")])
+def test_shared_url_entry_with_own_key_keeps_its_live_models(monkeypatch, own_key, own_auth):
     """model.api_key belongs to entry one while entry two owns the default:
     the active probe (run with model.api_key) must not stand in for entry
-    two's own keyed probe."""
-    catalogs = {"Bearer e1-key": ["gpt-x"], "Bearer e2-key": ["claude-default", "claude-live"]}
+    two's own probe, including an anonymous one when entry two has no key."""
+    catalogs = {"Bearer e1-key": ["gpt-x"], own_auth: ["claude-default", "claude-live"]}
 
     def fake_urlopen(req, timeout=None):
         ids = catalogs.get(req.get_header("Authorization") or "", [])
@@ -193,7 +194,7 @@ def test_shared_url_entry_with_own_key_keeps_its_live_models(monkeypatch):
         {"name": "Gateway OpenAI", "base_url": SHARED_BASE_URL,
          "api_key": "e1-key", "models": {"gpt-x": {}}},
         {"name": "Gateway Claude", "base_url": SHARED_BASE_URL,
-         "api_key": "e2-key", "model": "claude-default"},
+         "api_key": own_key, "model": "claude-default"},
     ])
     cfg_mod.invalidate_models_cache()
     try:
