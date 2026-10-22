@@ -92,12 +92,13 @@ jobs:
     runs-on: ubuntu-latest
     # Sized for the slow-mirror case, not the median. `playwright install --with-deps`
     # runs apt-get on every job (setup-python's pip cache does not cover it). Usually
-    # that takes ~25 s, but some runners get an Ubuntu mirror serving ~30-60 kB/s
-    # (slowest seen: 16.8 MB in 9 min 25 s, 29.8 kB/s, job 119972540773), and the
-    # install step alone then runs past 10 minutes. On 2026-10-22 the old 10-minute
-    # limit cancelled 6 of 39 jobs of this required check, all inside the install
-    # step. 30 minutes leaves room for the ~3.5 min of gates after a ~26 MB fetch at
-    # rates down to about 17 kB/s.
+    # that takes ~25 s, but some runners get an Ubuntu mirror serving ~25-65 kB/s
+    # (slowest completed fetch: 16.8 MB in 9 min 25 s, 29.8 kB/s, job 119972540773),
+    # and the install step then takes 7-10 minutes. On 2026-10-22 (to 19:20 UTC) the
+    # old 10-minute limit cut 24 of ~350 jobs of this required check: 10 inside the
+    # install step and 14 in the gates that followed an install of 7 to 9.3 minutes.
+    # 30 minutes leaves room for the ~3.5 min of gates after a ~26 MB fetch at rates
+    # down to about 17 kB/s.
     timeout-minutes: 30
     steps:
       - name: Docs-only short-circuit
