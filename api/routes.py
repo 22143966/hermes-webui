@@ -7394,6 +7394,7 @@ def _login_client_ip(handler) -> str:
 
 
 _FORWARDED_HEADER_IGNORED_WARNED = False
+_FORWARDED_HEADER_IGNORED_LOCK = threading.Lock()
 
 
 def _has_forwarded_header(handler) -> bool:
@@ -7451,9 +7452,10 @@ def _warn_forwarded_header_ignored(handler) -> None:
     plus ``HERMES_WEBUI_TRUST_FORWARDED_FOR`` when unset) instead.
     """
     global _FORWARDED_HEADER_IGNORED_WARNED
-    if _FORWARDED_HEADER_IGNORED_WARNED:
-        return
-    _FORWARDED_HEADER_IGNORED_WARNED = True
+    with _FORWARDED_HEADER_IGNORED_LOCK:
+        if _FORWARDED_HEADER_IGNORED_WARNED:
+            return
+        _FORWARDED_HEADER_IGNORED_WARNED = True
     peer = _request_client_ip(handler) or "unknown"
     trust_forwarded = _truthy_env("HERMES_WEBUI_TRUST_FORWARDED_FOR")
     cure = "HERMES_WEBUI_TRUSTED_PROXY_CIDRS"
@@ -7519,7 +7521,10 @@ def request_log_forwarded_fields(handler) -> dict:
         _warn_forwarded_header_ignored(handler)
         return {"forwarded_for_ignored": True}
     resolved = _forwarded_client_ip_from_trusted_proxy(handler, consult_real_ip=False)
-    if resolved and resolved != remote:
+    # An IPv6 zone id ("fe80::1%eth0") is free-form text that ipaddress keeps
+    # verbatim and that means nothing off-host, so a scoped address would put
+    # header text in forwarded_for. Treat it as unresolved (flagged below).
+    if resolved and resolved != remote and "%" not in resolved:
         return {"forwarded_for": resolved}
     # #7864 round 6 (nesquena-hermes review, SILENT): the trusted branch used to
     # return a bare {} here, so a TRUSTED proxy that produced no address emitted

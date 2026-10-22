@@ -135,9 +135,31 @@ The same allowlist governs the trusted identity-header SSO setup
 > (`proxy_pass_request_headers on`), which includes `X-Real-IP`. The request
 > log therefore never trusts `X-Real-IP` for its `forwarded_for` field (only
 > the right-to-left `X-Forwarded-For` walk is accepted, and only from an
-> allowlisted peer). The local-origin gate and trusted-header SSO still honor
-> `X-Real-IP` when the peer is trusted, as they did before; configure your
-> proxy to overwrite it (`proxy_set_header X-Real-IP $remote_addr;`) to keep
-> those paths honest, or just for your own logging.
+> allowlisted peer). The local-origin gate still honors `X-Real-IP` when the
+> peer is trusted, as it did before; configure your proxy to overwrite it
+> (`proxy_set_header X-Real-IP $remote_addr;`) to keep that path honest, or just
+> for your own logging. Trusted-header SSO reads neither header: it only checks
+> that the socket peer is an allowlisted proxy.
+
+### Client IP in the request log (fail2ban)
+
+Each structured request-log record carries at most one client-IP field:
+
+- `forwarded_for`: the client address, present only when the socket peer is a
+  trusted proxy and the `X-Forwarded-For` chain resolves to a valid address
+  other than the peer itself. It is always a normalized address, never header
+  text. Key fail2ban jails on this field when WebUI runs behind a proxy.
+- `forwarded_for_ignored: true`: a forwarded header was present but WebUI did
+  not record it, because the peer is not a trusted proxy or because the chain
+  from a trusted proxy is empty or malformed, is an IPv6 address with a zone
+  id, or names no hop beyond the trusted proxies themselves.
+  The first such request from an untrusted peer also logs a one-time warning
+  naming the peer and the setting to change.
+
+Attribution relies on the proxy appending the address it received the request
+from to `X-Forwarded-For` (nginx: `proxy_set_header X-Forwarded-For
+$proxy_add_x_forwarded_for;`). A proxy that passes the client's own header
+through unchanged lets the client choose the right-most hop, and therefore the
+logged address.
 
 ---
