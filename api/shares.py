@@ -165,8 +165,12 @@ _CONTENT_MD_DATA_IMAGE_LOOSE_RE = re.compile(
     re.IGNORECASE,
 )
 # A raw or entity-escaped <img ...> tag (renderMd decodes &lt;/&gt; first).
+# The body stops only at ">" / "&gt;", exactly like renderMd's own tag
+# recognizers (<img\b[^>]*> and <\/?[a-z][^>]*>), so a "<" or "&lt;" inside an
+# attribute value cannot hide a tag from this pass that the renderer will
+# still consume (and drop, together with any payload left in its attributes).
 _CONTENT_IMG_TAG_RE = re.compile(
-    r"(?:<|&lt;)\s*img\b(?:[^<>&]|&(?!lt;|gt;))*(?:>|&gt;)",
+    r"(?:<|&lt;)\s*img\b(?:[^>&]|&(?!gt;))*(?:>|&gt;)",
     re.IGNORECASE,
 )
 # Quoted values of attributes that only ever hold text. An <img> is replaced
@@ -327,7 +331,13 @@ def _placeholder_inline_data_uris(text: str) -> str:
             return m.group(0)
         return _INLINE_DATA_PLACEHOLDER + parts[1]
 
-    text = _CONTENT_IMG_TAG_RE.sub(_img_tag, text)
+    # Applied only up to the last ">" or "&gt;" so every opener finds a
+    # closer, which keeps the scan linear on unclosed "<img" runs. "&gt;"
+    # contains no ">" character, so both are needed.
+    entity_end = text.rfind("&gt;")
+    cut = max(text.rfind(">") + 1, entity_end + 4 if entity_end >= 0 else 0)
+    if cut:
+        text = _CONTENT_IMG_TAG_RE.sub(_img_tag, text[:cut]) + text[cut:]
     text = _CONTENT_MD_DATA_IMAGE_RE.sub(_INLINE_DATA_PLACEHOLDER, text)
     cut = text.rfind(")") + 1
     if cut:

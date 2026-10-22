@@ -446,3 +446,60 @@ def test_uri_shaped_data_in_text_attribute_replaces_whole_tag(tmp_path: Path, ta
     content = _snapshot(tmp_path, f"see {tag} end")["messages"][-1]["content"]
     _assert_no_payload(content)
     assert content == f"see {PLACEHOLDER} end"
+
+
+# --- Gate W21 (2026-10-22): "<" or "&lt;" inside an <img> tag ----------------------
+
+
+@pytest.mark.parametrize("wrap", ["{}", "<pre>{}</pre>"], ids=["bare", "pre"])
+@pytest.mark.parametrize(
+    "tag",
+    [
+        f'<img alt="a<b" src="{_NL_URI}">',
+        f'<img alt="a&lt;b" src="{_NL_URI}">',
+        f'<img alt="x<y" title="{_NL_URI}" src="https://example.com/a.png">',
+        f'<img alt="a<b" src="data:image/png;base64 ,{PAYLOAD_B64}">',
+        f'<img alt="a<b" src="{_uri()}">',
+        f'&lt;img alt="a&lt;b" src="{_NL_URI}"&gt;',
+        f"&lt;img title=&#39;a&quot; src=&quot;{_NL_URI}&#39;&gt;",
+    ],
+    ids=[
+        "lt_alt_src_nl",
+        "entity_lt_alt_src_nl",
+        "lt_alt_title_nl_https",
+        "lt_alt_src_space",
+        "lt_alt_src_strict",
+        "entity_tag_entity_lt",
+        "all_entity_tag",
+    ],
+)
+def test_img_tag_with_lt_inside_is_replaced_whole(tmp_path: Path, tag, wrap):
+    """renderMd's tag recognizers stop only at ">", so a "<" inside an
+    attribute value must not end the tag early here: the catch-all would strip
+    only the URI head and leave the payload in an attribute the renderer drops
+    (hidden on the page inside <pre>)."""
+    content = _snapshot(tmp_path, wrap.format(tag))["messages"][-1]["content"]
+    _assert_no_payload(content)
+    assert content == wrap.format(PLACEHOLDER)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<img <" * 40_000,
+        "<img " * 40_000 + 'src="data:image/png;base64,AAAA">',
+        "&lt;img " * 25_000 + "&gt;",
+        "<img " * 40_000,
+    ],
+    ids=["lt_runs", "openers_then_data", "entity_openers", "unclosed"],
+)
+def test_img_tag_pass_stays_linear_on_unclosed_openers(text):
+    shares._placeholder_inline_data_uris(text[:2_000])  # warm up
+    small_text = text[: len(text) // 4]
+    start = time.perf_counter()
+    shares._placeholder_inline_data_uris(small_text)
+    small = time.perf_counter() - start
+    start = time.perf_counter()
+    shares._placeholder_inline_data_uris(text)
+    large = time.perf_counter() - start
+    assert large < max(small * 10, 0.5), (small, large)
