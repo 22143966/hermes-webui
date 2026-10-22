@@ -389,7 +389,6 @@ def test_boot_js_mic_force_mediarecorder_ttl():
     Runs the real helpers: a fresh value expires, and a legacy ``'0'``/``'1'``
     saved before the expiry key existed gets a 24h window on first read.
     """
-    import json
     import subprocess
 
     js, _ = get_text("/static/boot.js")
