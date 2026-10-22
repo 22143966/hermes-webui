@@ -136,27 +136,45 @@ _SHARE_MEDIA_RE = re.compile(
 # embed of verified local files (_embed_share_media) may add data: URIs, and
 # it runs after the placeholder pass.
 _INLINE_DATA_PLACEHOLDER = "[*Inline attachment omitted from public share*]"
-# Any data: URI: data:[type/subtype][;param...],<payload>. The payload runs to
-# the first whitespace, quote, angle bracket, paren, square bracket or
-# backtick, which ends a URL in markdown, HTML attributes and prose alike.
-# Parameters exclude ':' and the type excludes ':' and '/', so overlapping
-# "data:" openers cannot make the scan quadratic.
+# Catch-all: a "data:" that starts a URI (followed by a type/subtype, ";" or
+# ",") is removed through the end of its token, the first whitespace, angle
+# bracket, paren, square bracket or backtick. Parameters are not parsed, so
+# colon-bearing and quoted parameter forms are covered too, and each match
+# consumes its whole token, which keeps the scan linear. Prose such as
+# "data: 5 rows", "metadata:" or "data:key,value" is left alone.
 _CONTENT_DATA_URI_RE = re.compile(
-    r"\bdata:(?:[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+)?"
-    r"(?:;[^\s,;:\"'<>()\[\]`]*)*,[^\s\"'<>()\[\]`]*",
+    r"\bdata:(?=[a-z0-9!#$&^_.+-]+/|[;,])[^\s<>()\[\]`]*",
     re.IGNORECASE,
 )
 # A whole markdown image whose destination is a data: URI, including the
 # <angle-bracket> form and an optional title. The alt text stops at the next
 # "![" and the destination at an unbalanced paren or newline, which keeps the
-# scan linear; anything this misses is still caught by _CONTENT_DATA_URI_RE.
+# scan linear; anything this misses is still caught by the passes below.
+# "(?:<\s*)?" rather than "<?\s*": two adjacent optional whitespace runs
+# backtrack quadratically on a long whitespace run.
 _CONTENT_MD_DATA_IMAGE_RE = re.compile(
-    r"!\[(?:[^\]!]|!(?!\[))*\]\(\s*<?\s*data:(?:[^()\n]|\([^()\n]*\))*\)",
+    r"!\[(?:[^\]!]|!(?!\[))*\]\(\s*(?:<\s*)?data:(?:[^()\n]|\([^()\n]*\))*\)",
+    re.IGNORECASE,
+)
+# The share renderer's own image rule (renderMd matches ![alt](data:image/...)
+# up to the first ")" across newlines, and shows a 64-character stub when the
+# URI fails its strict check). Applied only to the text up to the last ")" so
+# every opener finds a closer, which keeps it linear.
+_CONTENT_MD_DATA_IMAGE_LOOSE_RE = re.compile(
+    r"!\[(?:[^\]!]|!(?!\[))*\]\(data:image/[^)]*\)",
     re.IGNORECASE,
 )
 # A raw or entity-escaped <img ...> tag (renderMd decodes &lt;/&gt; first).
 _CONTENT_IMG_TAG_RE = re.compile(
     r"(?:<|&lt;)\s*img\b(?:[^<>&]|&(?!lt;|gt;))*(?:>|&gt;)",
+    re.IGNORECASE,
+)
+# Quoted values of attributes that only ever hold text. An <img> is replaced
+# when "data:" appears anywhere else in the tag, so an https image whose alt
+# text says "metadata:" keeps rendering while any URL-bearing or unknown
+# attribute carrying data: still fails closed.
+_IMG_TEXT_ATTR_RE = re.compile(
+    r"(?<![\w:-])(?:alt|title|aria-label|aria-description)\s*=\s*(?:\"[^\"]*\"|'[^']*')",
     re.IGNORECASE,
 )
 _DATA_SCHEME_RE = re.compile(r"data:", re.IGNORECASE)
@@ -291,7 +309,8 @@ def _placeholder_inline_data_uris(text: str) -> str:
 
     def _img_tag(m: re.Match) -> str:
         tag = m.group(0)
-        return _INLINE_DATA_PLACEHOLDER if _DATA_SCHEME_RE.search(tag) else tag
+        rest = _IMG_TEXT_ATTR_RE.sub("", tag)
+        return _INLINE_DATA_PLACEHOLDER if _DATA_SCHEME_RE.search(rest) else tag
 
     def _media_ref(m: re.Match) -> str:
         parts = split_media_token_ref(m.string, m)
@@ -301,6 +320,12 @@ def _placeholder_inline_data_uris(text: str) -> str:
 
     text = _CONTENT_IMG_TAG_RE.sub(_img_tag, text)
     text = _CONTENT_MD_DATA_IMAGE_RE.sub(_INLINE_DATA_PLACEHOLDER, text)
+    cut = text.rfind(")") + 1
+    if cut:
+        text = (
+            _CONTENT_MD_DATA_IMAGE_LOOSE_RE.sub(_INLINE_DATA_PLACEHOLDER, text[:cut])
+            + text[cut:]
+        )
     text = _SHARE_MEDIA_RE.sub(_media_ref, text)
     return _CONTENT_DATA_URI_RE.sub(_INLINE_DATA_PLACEHOLDER, text)
 
@@ -539,6 +564,7 @@ def build_share_snapshot(session) -> dict:
     _raw_title = safe_session.get("title")
     _raw_title = _raw_title if isinstance(_raw_title, str) else "Untitled"
     title = _force_redact_credentials(_raw_title or "Untitled")
+    title = _placeholder_inline_data_uris(title)
     title = _redact_share_paths(title, redact_paths) or "Untitled"
     return {
         "title": title,

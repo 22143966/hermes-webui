@@ -304,3 +304,106 @@ def test_adversarial_input_is_linear(unit):
     large = _elapsed(40_000)
     # 4x the input must stay far below the ~16x a quadratic scan would cost.
     assert large < max(small * 10, 0.5), (unit, small, large)
+
+
+# --- Gate W19 (2026-10-22) regressions ------------------------------------------
+
+
+@pytest.mark.parametrize("ws", [" ", "\n", "\t"], ids=["spaces", "newlines", "tabs"])
+def test_whitespace_run_after_md_image_opener_is_linear(ws):
+    """`\\(\\s*<?\\s*data:` backtracked quadratically: 32k spaces after "![](" held
+    the HTTP worker for seconds (master: 0.1 s)."""
+
+    def _elapsed(n: int) -> float:
+        text = f"![x]({_uri()}) " + "![x](" + ws * n + "x data:"
+        start = time.perf_counter()
+        shares._sanitize_message({"role": "assistant", "content": text})
+        return time.perf_counter() - start
+
+    _elapsed(2_000)
+    small = _elapsed(10_000)
+    large = _elapsed(40_000)
+    assert large < max(small * 10, 0.5), (small, large)
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        f"data:image/png;name=a:b;base64,{PAYLOAD_B64}",
+        f'data:image/png;name="chart.png";base64,{PAYLOAD_B64}',
+        f"data:image/png;x='a';base64,{PAYLOAD_B64}",
+        f"data:text/plain;charset=utf-8;x=1:2:3,{PCT_PAYLOAD}",
+    ],
+    ids=["colon_param", "dquoted_param", "squoted_param", "colons_pct"],
+)
+@pytest.mark.parametrize("wrap", ["prose", "md_image", "md_link", "html_img"])
+def test_colon_and_quoted_parameter_forms_never_reach_the_snapshot(tmp_path: Path, uri, wrap):
+    content = {
+        "prose": f"see {uri} end",
+        "md_image": f"![x]({uri})",
+        "md_link": f"[open]({uri})",
+        "html_img": f"<img src='{uri}'>" if '"' in uri else f'<img src="{uri}">',
+    }[wrap]
+    blob = json.dumps(_snapshot(tmp_path, content))
+    _assert_no_payload(blob)
+    assert "data:" not in blob.lower()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        f"![x](data:image/png;base64\n,{PAYLOAD_B64})",
+        f"![x](data:image/png\n;base64,{PAYLOAD_B64})",
+        f"![x](data:image/png(;base64,{PAYLOAD_B64})",
+        f"![x](data:image/png;x=(;base64,{PAYLOAD_B64})",
+    ],
+    ids=["nl_before_comma", "nl_before_semi", "paren_before_semi", "paren_in_param"],
+)
+def test_renderer_stub_shapes_never_reach_the_snapshot(tmp_path: Path, content):
+    """renderMd matches ![alt](data:image/...) up to the first ')' across
+    newlines and shows a 64-character stub when the URI fails its strict check:
+    the page would hide the payload while the snapshot JSON published it."""
+    snap = _snapshot(tmp_path, content)
+    _assert_no_payload(json.dumps(snap))
+    assert "data:" not in snap["messages"][-1]["content"].lower()
+    assert PLACEHOLDER in snap["messages"][-1]["content"]
+
+
+def test_title_data_uri_is_placeholdered(tmp_path: Path):
+    session = _session(tmp_path, "hello")
+    session.title = f"T {_uri()}"
+    snap = shares.build_share_snapshot(session)
+    _assert_no_payload(json.dumps(snap))
+    assert snap["title"] == f"T {PLACEHOLDER}"
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        '<img src="https://example.com/chart.png" alt="metadata: rows">',
+        '<img src="https://example.com/chart.png" alt="data: 5 rows">',
+        "<img alt='data: 5 rows' src='https://example.com/chart.png'>",
+        '<img src="https://example.com/chart.png" title="data:">',
+    ],
+    ids=["alt_metadata", "alt_data_prose", "alt_sq_first", "title_bare_scheme"],
+)
+def test_https_img_with_data_in_text_attributes_is_kept(tmp_path: Path, tag):
+    snap = _snapshot(tmp_path, f"see {tag} end")
+    assert tag in snap["messages"][-1]["content"]
+    assert PLACEHOLDER not in snap["messages"][-1]["content"]
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        f'<img alt="x" src="{_uri()}">',
+        f'<img data-alt="x" src="https://example.com/a.png" srcset="{_uri()} 2x">',
+        f'<img data-alt="{_uri()}" src="https://example.com/a.png">',
+        f"<img title='a\" src=\"{_uri()}'>",
+    ],
+    ids=["src_after_alt", "srcset", "unknown_attr", "title_swallowing_src"],
+)
+def test_img_with_data_outside_text_attributes_never_publishes_payload(tmp_path: Path, tag):
+    blob = json.dumps(_snapshot(tmp_path, f"see {tag} end"))
+    _assert_no_payload(blob)
+    assert "data:" not in blob.lower()
