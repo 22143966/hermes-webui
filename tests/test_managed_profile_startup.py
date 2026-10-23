@@ -66,12 +66,31 @@ def test_real_managed_bootstrap_preserves_named_profile_concurrency(tmp_path):
             import importlib, importlib.util, json, os, sys, sysconfig, threading, types
             from pathlib import Path
 
+            def _read_only_git(command):
+                # Read-only Agent/WebUI version metadata, never an installer.
+                # hermes_cli/version_info.py also asks for the branch, commit date,
+                # tags and distance, and runs `git --no-optional-locks status`.
+                rest = [str(part) for part in command[1:]]
+                while rest and rest[0].startswith("-"):  # global options
+                    if rest.pop(0) in {"-C", "-c"} and rest:
+                        rest.pop(0)
+                if not rest:
+                    return False
+                subcommand, options = rest[0], rest[1:]
+                if subcommand == "branch":
+                    return options == ["--show-current"]
+                if subcommand == "tag":
+                    return "--list" in options or "-l" in options
+                return subcommand in {
+                    "rev-parse", "describe", "status", "diff-index", "diff",
+                    "log", "show", "rev-list"}
+
             def deny_external_effects(event, args):
                 if event == "subprocess.Popen":
                     command = args[1]
                     if (isinstance(command, list) and Path(command[0]).name == "git"
-                            and command[1] in {"rev-parse", "describe", "status", "diff-index", "diff"}):
-                        return  # Agent/WebUI version metadata, never an installer.
+                            and _read_only_git(command)):
+                        return
                 if event in {"socket.connect", "socket.bind", "subprocess.Popen", "os.system", "os.exec"}:
                     raise RuntimeError("startup probe forbids external effects: " + event)
             sys.addaudithook(deny_external_effects)
