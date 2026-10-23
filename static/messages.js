@@ -8594,6 +8594,24 @@ function showApprovalCard(pending, pendingCount) {
   if (typeof syncTopbar === 'function') syncTopbar();
 }
 
+function _approvalDismissTarget(sid, owner) {
+  // A dismissal recorded without the run/mirror owner would suppress a different
+  // run's approval that shares the transport id space, which is the cross-owner
+  // leak #7493 guards. Prefer the captured owner, whose id the reconcile already
+  // adopted to the authoritative head on the same-logical path, then the pending
+  // entry, and only then the bare id.
+  if (owner) {
+    return {
+      approval_id: owner.approvalId,
+      run_id: owner.runId,
+      _gateway_mirror_token: owner.mirrorToken,
+    };
+  }
+  const pendingEntry = _approvalPendingBySession.get(sid);
+  if (pendingEntry && pendingEntry.pending) return pendingEntry.pending;
+  return _approvalCurrentId ? {approval_id: _approvalCurrentId} : null;
+}
+
 async function dismissApprovalCard() {
   const sid = _approvalSessionId;
   const owner = _captureApprovalResponseOwner();
@@ -8605,11 +8623,10 @@ async function dismissApprovalCard() {
   // (or card change) during it must not let this dismissal hide or mark a
   // newer session's card. Fail closed when the owner is no longer current.
   if (owner && !_approvalResponseOwnerIsCurrent(owner)) return;
-  // Dismiss exactly what the reconcile established as current — the adopted
-  // head id on the same-logical-approval path — so a successor that exists only
-  // in the mutable pending map is never marked dismissed on the user's behalf.
-  const dismissedId = _approvalCurrentId || (owner && owner.approvalId);
-  if (dismissedId) _markApprovalDismissed(sid, dismissedId);
+  // Dismiss exactly what the reconcile established as current. The bare
+  // approval id is NOT enough (see _approvalDismissTarget).
+  const dismissTarget = _approvalDismissTarget(sid, owner);
+  if (dismissTarget) _markApprovalDismissed(sid, dismissTarget);
   // Keep the unresolved owner for authoritative resolution/replacement.
   // Local dismissal hides attention, not the server-owned prompt.
   if (typeof syncTopbar === 'function') syncTopbar();
