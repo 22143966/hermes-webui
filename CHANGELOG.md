@@ -476,6 +476,8 @@
 
 ### Internal
 
+- **The local full test suite passes in the release sandbox (test-only).** Twenty-one tests failed only because of the host: no package index, the worktree's git dir hidden from git, `HOME=/tmp`, unmapped supplementary groups, no network route for Chromium, a process-wide truststore injection, and two newer-Agent shape changes. They now pass there, or skip with the missing condition named (package index, spare group, Agent org skill mirror). No product code changes, and CI still runs the packaging tests.
+
 - **Running the tests can no longer delete the checkout.** An exported-but-empty `HERMES_WEBUI_TEST_STATE_DIR=` used to resolve the test state directory to the current directory, and the session fixture's cleanup then deleted the whole repository, `.git` included. An empty or whitespace-only value now falls back to the temp-dir default, and the suite refuses to start when the state directory is the checkout, one of its parents, or a directory inside it (such as `tests` or `static`). Test-only; no runtime change. Thanks @Overview3833. (#8414, fixes #8413)
 
 - **Test suite keeps the Agent on `sys.path`.** The per-test `sys.path` guard restored a snapshot taken before
