@@ -222,6 +222,19 @@ def _click_dismiss(page) -> bool:
     )
 
 
+def _wait_boot_ready(page, timeout: float = 15.0) -> None:
+    """Wait until boot's async restore has settled.
+
+    Boot finishes after DOMContentLoaded and, treating a zero-message session as
+    an ephemeral scratch pad, clears S.session on the empty-chat restore path.
+    Creating or rendering into a session before that settles makes the gate
+    flaky under the current app, not under the code it is testing.
+    """
+    page.wait_for_function(
+        "() => typeof S !== 'undefined' && S._bootReady === true", timeout=timeout * 1000
+    )
+
+
 def _stop_approval_polling(page) -> None:
     """Freeze the 1.5s fallback poll so the stale-window stays deterministic."""
     _eval(page, "() => { stopApprovalPolling(); return true; }")
@@ -244,6 +257,7 @@ def _fresh_active_session(page) -> str:
     is a reusable empty chat, which would return the SAME sid (and its prior
     dismissal/approval state) instead of a genuinely fresh session.
     """
+    _wait_boot_ready(page)
     page.evaluate("async () => { await newSession(); return true; }")
     page.wait_for_function(
         "() => typeof S !== 'undefined' && !!S.session && !!S.session.session_id",
@@ -253,6 +267,22 @@ def _fresh_active_session(page) -> str:
     assert sid, "no session id after creating a fresh conversation"
     _stop_approval_polling(page)
     return sid
+
+
+def _settle_reconcile(page, timeout: float = 5.0) -> None:
+    """Wait (bounded) for a click's reconcile round-trip to complete.
+
+    The stale card is hidden once reconciliation re-renders the authoritative
+    head (in S4 the head is the dismissed successor B, so its render is
+    suppressed). Waiting here keeps the "no POST" assertion from passing
+    vacuously before a buggy implementation has had time to issue its request.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _card_visible(page):
+            page.wait_for_timeout(250)  # grace period for a late (buggy) request
+            return
+        page.wait_for_timeout(50)
 
 
 # ── scenarios ────────────────────────────────────────────────────────────────
@@ -429,10 +459,10 @@ def _scenario_4_dismissed_successor_in_map_never_resolves(
     # Click Allow once on the visible A: must NOT resolve B, and must NOT POST
     # approval-b's id (either no respond POST fires, or it carries A's id).
     _click_allow_once(page)
-    assert all(
-        payload.get("approval_id") != approval_b_id for payload in respond_payloads
-    ), (
-        "A's click must never POST approval-b's id; got "
+    _settle_reconcile(page)
+    assert respond_payloads == [], (
+        "a click on visible A whose authoritative head is the never-rendered "
+        "successor B must issue no /api/approval/respond request at all; got "
         + repr(respond_payloads)
     )
     still = _pending_head(base_url, sid)
@@ -521,6 +551,11 @@ def main() -> int:
 
         page.goto("/", wait_until="domcontentloaded")
         page.wait_for_selector("#msg", state="visible", timeout=15000)
+        # Boot restores asynchronously and, on an empty chat, resets S.session to
+        # null ("ephemeral scratch pad", boot.js). A chat created before boot
+        # settles is therefore dropped under the test: wait for S._bootReady so
+        # the session the gate renders into is the one the app keeps.
+        _wait_boot_ready(page)
         page.locator("#btnNewChat").click()
         page.wait_for_function(
             "() => typeof S !== 'undefined' && !!S.session && !!S.session.session_id",
