@@ -70,13 +70,20 @@ def test_real_managed_bootstrap_preserves_named_profile_concurrency(tmp_path):
                 # Read-only Agent/WebUI version metadata, never an installer.
                 # hermes_cli/version_info.py also asks for the branch, commit date,
                 # tags and distance, and runs `git --no-optional-locks status`.
+                # Only the two global options those calls use: `-c key=value` can make a
+                # read run a command (core.fsmonitor), and `--output` makes one write a file.
                 rest = [str(part) for part in command[1:]]
                 while rest and rest[0].startswith("-"):  # global options
-                    if rest.pop(0) in {"-C", "-c"} and rest:
+                    option = rest.pop(0)
+                    if option == "-C" and rest:
                         rest.pop(0)
+                    elif option != "--no-optional-locks":
+                        return False
                 if not rest:
                     return False
                 subcommand, options = rest[0], rest[1:]
+                if any(o.startswith("--output") for o in options):
+                    return False
                 if subcommand == "branch":
                     return options == ["--show-current"]
                 if subcommand == "tag":

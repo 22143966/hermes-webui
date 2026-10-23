@@ -45,6 +45,30 @@ _NO_INDEX_MARKERS = (
 )
 
 
+def _index_reachable(timeout: float = 5.0) -> bool:
+    """Can a child process reach the package index at all (proxies honoured)?
+
+    The skip is for a run with NO index, never for a pin the index cannot
+    satisfy: pip ends both with "No matching distribution found for setuptools".
+    Probed in a subprocess, like pip itself, so in-process test guards on
+    sockets do not answer for it. Any HTTP status proves the index is reachable.
+    """
+    url = os.environ.get("PIP_INDEX_URL") or "https://pypi.org/simple/"
+    probe = (
+        "import sys, urllib.error, urllib.request\n"
+        "try:\n"
+        f"    urllib.request.urlopen({url!r}, timeout={timeout!r}).close()\n"
+        "except urllib.error.HTTPError:\n"
+        "    pass\n"
+        "except Exception:\n"
+        "    sys.exit(1)\n"
+    )
+    try:
+        return subprocess.run([sys.executable, "-c", probe], timeout=timeout + 5).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _build_backend_importable() -> bool:
     return all(importlib.util.find_spec(name) is not None for name in ("setuptools", "setuptools_scm"))
 
@@ -80,6 +104,7 @@ def _build_wheel(repo_copy: Path) -> Path:
         result.returncode != 0
         and _BUILD_DEPS_STEP_FAILED in output
         and any(marker in output for marker in _NO_INDEX_MARKERS)
+        and not _index_reachable()
     ):
         if not _build_backend_importable():
             pytest.skip(
