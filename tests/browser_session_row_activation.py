@@ -848,6 +848,35 @@ def _check_touch(page, ctx, seed, label, phone):
             fail(f"a tap on a tag opened {_opens(page)}")
         if page.evaluate("() => !!document.querySelector('.session-action-menu')"):
             fail("a tap on a tag opened the action menu")
+        # With an action menu open, a tag tap closes the menu first, as on master, and the sidebar never shows a
+        # tag search it has not applied (Codex round F, 2026-10-23: the menu stayed open, the search field read
+        # "#short" and every conversation was still listed).
+        page.evaluate(CLEAR_SEARCH_JS)
+        page.wait_for_timeout(300)
+        _native_long_press(page, cdp, tag.bounding_box())
+        # Wait out the double-click interval: Chromium turns a long press and a tap on the same spot into a
+        # dblclick, which reaches the row after the tag filter has replaced it and starts a rename that never
+        # ends (#8503, also on master). This case is about the tap while the menu is open, not that.
+        page.wait_for_timeout(700)
+        if not page.evaluate("() => !!document.querySelector('.session-action-menu')"):
+            fail("setup: a long press on the tag did not open the action menu before the menu-open tap")
+        else:
+            page.evaluate(COUNT_OPENS_JS)
+            tag.tap()
+            page.wait_for_timeout(SETTLE_MS)
+            if page.evaluate("() => !!document.querySelector('.session-action-menu')"):
+                fail("a tag tap with the action menu open left the menu open")
+            if _opens(page):
+                fail(f"a tag tap with the action menu open opened {_opens(page)}")
+            query = page.locator('#sessionSearch').input_value()
+            alpha_listed = page.evaluate("""(sid) => {
+              const row = document.querySelector('#sessionList .session-item[data-sid="' + sid + '"]');
+              return !!(row && row.offsetParent !== null);
+            }""", alpha)
+            if query == '#short' and alpha_listed:
+                fail("after a tag tap with the action menu open the search reads #short but the sidebar is unfiltered")
+            page.evaluate("() => typeof closeSessionActionMenu === 'function' && closeSessionActionMenu()")
+            page.wait_for_timeout(300)
         # A short swipe that starts on the tag is a drag: it opens nothing and leaves the row in place.
         page.evaluate(CLEAR_SEARCH_JS)
         page.wait_for_timeout(300)

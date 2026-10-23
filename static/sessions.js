@@ -11251,13 +11251,15 @@ function renderSessionListFromCache(){
       _pointerY=clientY;
       _commitSessionSwipe();
       if(_longPressMenuOpened){_gestureState='idle';return true;}
-      // A tag tap filters (the chip's own click handler) and never opens the conversation.
-      if(_gestureState==='pressing'&&target&&target.closest&&target.closest('.session-tag')){_gestureState='idle';return false;}
       if(_gestureState==='committed') return true;
+      // An open action menu takes the tap first, exactly as on master: the tap only closes it (Codex round F,
+      // 2026-10-23: a tag tap that skipped this left the menu open, and the open menu holds back the filtered repaint).
       if(_sessionActionMenu&&!_sessionActionMenu.contains(target)){
         closeSessionActionMenu();
         return true;
       }
+      // A tag tap filters (the chip's own click handler) and never opens the conversation.
+      if(_gestureState==='pressing'&&target&&target.closest&&target.closest('.session-tag')){_gestureState='idle';return false;}
       if(target&&target.closest&&target.closest('.session-child-count,.session-child-sessions,.session-child-session,.session-lineage-count,.session-lineage-segments,.session-lineage-segment')) return false;
       if(_sessionSelectMode){if(!readOnly)toggleSessionSelect(s.session_id);return true;}
       if(wasDragging){
