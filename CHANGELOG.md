@@ -458,6 +458,8 @@
 
 ### Changed
 
+- **Keyboard and screen reader users can reach conversations in the sidebar directly.** Conversation titles are now real buttons (the open one is marked as the current page), the Chat label is a heading, and a keyboard-focused row shows a clear focus ring, including in forced-colours mode and the Geist Contrast skin. Focus stays on the same conversation when the list refreshes, J/K navigation keeps working after a mouse click, and opening a conversation closes any open project or model menu. On touch screens, the first tap on a tag filters by it, a long press on a tag still opens the conversation's actions, and a swipe that starts on a tag still swipes. (#7049, thanks @sheldon-im)
+
 - **`/status` shows the true message total when it differs from the visible count.** The status card's "Messages" row counts what you can see; hidden internal rows (delegation wakeups) are part of the session too, so the card now adds a "Total messages" row whenever the two numbers differ, and shows nothing extra when they match. Spanish, German and Simplified Chinese also get a translated "Messages" label (they showed the English word before). A maintainer fold makes clearing or truncating a conversation drop its stale cached counts, so the card no longer shows the pre-clear total right after "Clear conversation". Thanks @fedebyes. (#8310)
 
 - **Test suite: the run-journal echo-scan scaling check no longer flakes on a busy runner,** while still failing on a genuinely quadratic rebuild. Thanks @MuhammadUsamaMX. (#8328)
