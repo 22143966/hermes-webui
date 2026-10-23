@@ -2462,12 +2462,16 @@ def _start_server_side_wakeup_turn(
     attempt keeps the prompt queued WITHOUT scheduling another retry
     (#7680 CORE).
 
-    ``consumed_claimed_by_dispatch`` is carried into every re-defer below: the
-    idle branch of ``_process_one`` claims the shared registry consumed key
-    before this dispatch (transport dedupe for the A/B contract). A rejected
-    start must stay retryable, so the re-deferred entry remembers that the key
-    was claimed by our own dispatch rather than by an agent read (#8363
-    review).
+    ``consumed_claimed_by_dispatch`` is carried into every re-defer below AND
+    into ``start_session_turn``: the idle branch of ``_process_one`` claims the
+    shared registry consumed key before this dispatch (transport dedupe for the
+    A/B contract). A rejected start must stay retryable, so the re-deferred
+    entry remembers that the key was claimed by our own dispatch rather than by
+    an agent read (#8363 review). The launch-abort re-arm inside
+    ``_start_chat_stream_for_session`` gets the same provenance; without it, a
+    retry timer that fires before this abort's exception reaches the handler
+    below drains an untagged entry, reads the dispatch's own claim as an agent
+    read, and drops the only retry (#8363 review, stalled-unwind ordering).
 
     This is the ONLY caller that opts into the deferred-wakeup re-arm
     (``rearm_deferred_wakeup=True``): an async-delegation completion starts its
@@ -2508,6 +2512,12 @@ def _start_server_side_wakeup_turn(
                 process_id=process_id,
                 retry_attempt=retry_attempt,
                 rearm_deferred_wakeup=True,
+                # Thread the transport-claim provenance into the launch-abort
+                # re-arm (#8363 review). The one-shot retry timer can fire
+                # before this abort's exception reaches our ``except`` below;
+                # the drain it triggers must already see an entry tagged as
+                # dispatch-claimed instead of reading it as an agent read.
+                consumed_claimed_by_dispatch=consumed_claimed_by_dispatch,
             )
             status = int((resp or {}).get("_status", 200) or 200)
             if status == 404 and (resp or {}).get("error") == "Session not found":
