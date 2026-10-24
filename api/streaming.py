@@ -9147,6 +9147,16 @@ def _deduplicate_context_messages(messages, protected_rows=None):
         # Keep the display identity unchanged so ordinary transcript dedup still
         # collapses the same visible row.
         key = _message_replay_key(msg)
+        # #6310 bookkeeping (PR #8519 round 1): the exact-key index may only
+        # ever name a row that was actually RETAINED, and it is published
+        # after retention is decided. The historical code published the
+        # prospective append slot (``len(deduped)``) before the stable-id
+        # branch could drop the row, so a discarded replay left the index
+        # pointing past the list and the next same-key lookup dereferenced a
+        # slot that was never filled. ``retained_exact_key`` carries the key
+        # to the publish site at the bottom of the loop; a dropped row simply
+        # never publishes, and the previously retained owner stays indexed.
+        retained_exact_key = None
         if isinstance(msg, dict) and msg.get('role') == 'user' and key is not None:
             user_exact_key = (
                 key,
@@ -9155,6 +9165,7 @@ def _deduplicate_context_messages(messages, protected_rows=None):
                 msg.get('_source') or 'webui',
                 json.dumps(msg.get('attachments') or [], sort_keys=True, ensure_ascii=False),
             )
+            retained_exact_key = user_exact_key
             prior_exact_idx = user_exact_index.get(user_exact_key)
             if msg.get('_active_turn_token'):
                 if prior_exact_idx is not None:
@@ -9175,10 +9186,11 @@ def _deduplicate_context_messages(messages, protected_rows=None):
                 # apart. When BOTH rows carry valid DISTINCT stable ids the id
                 # is the preferred ownership signal — defer to that path. An
                 # id-less, id-matching or invalid-id row keeps the legacy
-                # collapse exactly as before.
+                # collapse exactly as before. Every stored index names a
+                # retained row (see the publish site below), so this lookup is
+                # always in range.
                 if not _independently_owned_user_pair(deduped[prior_exact_idx], msg):
                     continue
-            user_exact_index[user_exact_key] = len(deduped)
         if key is not None and key in seen:
             # #7237 round 7 finding 2 (nesquena-hermes 2026-10-14): a content
             # collision is a replay of an already-kept row UNLESS this row and
@@ -9212,6 +9224,11 @@ def _deduplicate_context_messages(messages, protected_rows=None):
                 stable_id if (stable_valid and stable_id is not None) else None
             ]
         deduped.append(msg)
+        # #6310 bookkeeping: publish the exact-key index only now that the row
+        # is retained, and name the slot it actually occupies. A dropped row
+        # never reaches this site, so no index can outlive its row.
+        if retained_exact_key is not None:
+            user_exact_index[retained_exact_key] = len(deduped) - 1
     return deduped
 
 

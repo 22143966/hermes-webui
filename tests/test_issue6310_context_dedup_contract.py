@@ -236,6 +236,105 @@ def test_active_turn_admitted_row_registers_its_stable_id():
     )
 
 
+def test_shifted_timestamp_replay_does_not_poison_the_exact_index():
+    """A dropped replay must not publish an out-of-range exact-key index.
+
+    Reviewer regression (PR #8519 round 1): the exact-key index used to be
+    published with the PROSPECTIVE append slot before the stable-id branch
+    decided whether the row survives. A replay dropped by that branch left
+    the index pointing past the retained list, and the next same-key lookup
+    dereferenced it (IndexError). The index must only ever name a retained
+    row, and only after retention is decided.
+    """
+    from api.streaming import _deduplicate_context_messages
+
+    messages = [
+        _user("higher", id=1, timestamp=1),
+        _assistant("guess 50", id=2, timestamp=1),
+        _user("higher", id=1, timestamp=2),  # replay of record 1, shifted ts
+        _user("higher", id=3, timestamp=2),  # independently owned turn
+    ]
+    deduped = _deduplicate_context_messages(copy.deepcopy(messages))
+    contents = _contents(deduped)
+    assert contents == ["higher", "guess 50", "higher"], (
+        "the shifted-timestamp replay of record 1 must collapse while the "
+        f"independently owned id-3 turn survives; got {contents}"
+    )
+    assert [r.get("id") for r in deduped if r.get("role") == "user"] == [1, 3], (
+        "the surviving user rows are record 1 and the independent id-3 turn; "
+        f"got {[r.get('id') for r in deduped if r.get('role') == 'user']}"
+    )
+
+
+def test_same_timestamp_replay_after_independent_owners_keeps_index_valid():
+    """Same replay schedule inside one timestamp bucket (ids 1, 3, replay 1, 4).
+
+    The independently owned id-3 row is admitted beside record 1, the replay
+    of record 1 then collapses, and a further independent id-4 turn is
+    admitted — every same-key lookup in that sequence must resolve to a
+    retained row.
+    """
+    from api.streaming import _deduplicate_context_messages
+
+    messages = [
+        _user("higher", id=1, timestamp=1),
+        _user("higher", id=3, timestamp=1),
+        _user("higher", id=1, timestamp=1),  # replay of record 1
+        _user("higher", id=4, timestamp=1),
+    ]
+    deduped = _deduplicate_context_messages(copy.deepcopy(messages))
+    ids = [r.get("id") for r in deduped]
+    assert ids == [1, 3, 4], (
+        "records 1, 3 and 4 are independently owned and survive in order "
+        f"while the replay of record 1 collapses; got {ids}"
+    )
+
+
+def test_replay_schedule_survives_cold_reconcile_and_next_turn_build(
+    tmp_path, monkeypatch
+):
+    """The same schedule through the real cold path: save → load → reconcile
+    → next-turn build → dedupe.
+
+    A replay that the exact index must collapse can arrive through the
+    reconciled state.db projection rather than a direct list, so the
+    bookkeeping repair is pinned at the composition the production routes
+    actually run.
+    """
+    import api.models as models
+
+    settled = [
+        _user("higher", id=1, timestamp=1),
+        _assistant("guess 50", id=2, timestamp=1),
+        _user("higher", id=1, timestamp=2),  # replay of record 1, shifted ts
+        _user("higher", id=3, timestamp=2),  # independently owned turn
+    ]
+    reloaded = _save_and_reload(settled, "i6310_cold_replay", tmp_path, monkeypatch)
+    reconciled = models.reconciled_state_db_messages_for_session(
+        reloaded, prefer_context=True
+    )
+    reconciled_ids = [
+        r.get("id") for r in reconciled if isinstance(r, dict) and r.get("role") == "user"
+    ]
+    assert 1 in reconciled_ids, (
+        "precondition: the replayed record must reach the dedupe through the "
+        f"reconciled projection; got {reconciled_ids}"
+    )
+    context = _build_next_turn_context(reloaded, "lower")
+    user_ids = [r.get("id") for r in context if r.get("role") == "user"]
+    assert user_ids.count(1) == 1, (
+        "record 1 must appear exactly once after the cold reconcile and "
+        f"next-turn build; got {user_ids}"
+    )
+    assert 3 in user_ids, (
+        f"the independently owned id-3 turn must survive; got {user_ids}"
+    )
+    assert _contents(context) == ["higher", "guess 50", "higher"], (
+        "the next-turn context is the reconciled history: the replay "
+        f"collapsed and the independent turn survived; got {_contents(context)}"
+    )
+
+
 @pytest.mark.parametrize(
     "bad_id",
     [True, False, -1, -7, "abc", "  ", float("inf"), float("nan"), 3.5, [1], {"a": 1}],
