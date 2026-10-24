@@ -1221,6 +1221,7 @@ let _previewCurrentMode = '';  // 'code' | 'csv' | 'md' | 'image' | 'html' | 'pd
 let _previewDirty = false;     // true when edits are unsaved (DERIVED — see _syncPreviewDirty)
 let _previewSavedText = null;  // text the editor was populated with / last saved (null = no baseline)
 let _previewEditSessionId = '';  // session the baseline was taken in (#8514 review)
+let _previewEditWorkspace = '';  // workspace the baseline was taken in (#8514 review)
 let _previewServerEditable = null;  // backend editability metadata when available
 let _previewSaveRoute = '/api/file/save';  // current save adapter for the open preview
 let _previewOfficeFormat = '';  // current claimed Office format, if any
@@ -1259,14 +1260,41 @@ function _previewHasUnsavedEdits(){
 }
 // Hidden edits only travel safely across a navigation inside the session they
 // were typed in: keeping them across a session switch would let a later save
-// land in the new session's workspace.
+// land in the new session's workspace. The same holds for a *workspace* switch
+// in the same session (#8514 review): the save route resolves a relative path
+// against the session's CURRENT workspace, so an editor carried from A into B
+// would write A's text into B's same-named file.
 function _previewHiddenEditsOwnedHere(){
   const sid=(S.session&&S.session.session_id)||'';
-  return !_previewEditSessionId || String(_previewEditSessionId)===String(sid);
+  if(_previewEditSessionId && String(_previewEditSessionId)!==String(sid)) return false;
+  const ws=(S.session&&S.session.workspace)||'';
+  if(typeof _previewEditWorkspace!=='undefined'&&_previewEditWorkspace&&ws
+     &&String(_previewEditWorkspace)!==String(ws)) return false;
+  return true;
+}
+// #8514 (review): `_previewDirty` answers "is there something on screen to warn
+// about", so it is false for a closed panel. A workspace TRANSITION is a
+// different question: it moves the tree the editor's relative path resolves
+// against, so it must consult the unsaved text itself, independently of
+// visibility. Without this a closed-panel edit crossed workspaces silently and
+// the next Save wrote it into the other workspace's file of the same name.
+function _previewNeedsDiscardPrompt(){
+  if(typeof _previewHasUnsavedEdits==='function' && _previewHasUnsavedEdits()) return true;
+  return typeof _previewDirty!=='undefined' && !!_previewDirty;
+}
+// The open preview's path is relative to the workspace it was opened in, so it
+// can only be saved into that workspace. `false` means the editor belongs to a
+// different tree and must be dropped before the session's workspace moves.
+function _previewBelongsToWorkspace(ws){
+  if(_previewSavedText===null) return true;      // no editor carrying text
+  if(!_previewEditWorkspace) return true;        // unknown baseline → don't over-clear
+  if(!ws) return true;
+  return String(_previewEditWorkspace)===String(ws);
 }
 function _resetPreviewDirty(){
   _previewSavedText=null;
   _previewEditSessionId='';
+  _previewEditWorkspace='';
   _previewDirty=false;
   updateEditBtn();
 }
@@ -1347,6 +1375,7 @@ async function toggleEditMode(){
       }
       _previewSavedText=savedContent;
       _previewEditSessionId=(S.session&&S.session.session_id)||'';
+      _previewEditWorkspace=(S.session&&S.session.workspace)||'';
       _previewDirty=false;
       // Update read-only views AND the cached raw content so a later
       // "Render as markdown anyway" force-render reflects the just-saved text
@@ -1369,6 +1398,7 @@ async function toggleEditMode(){
     $('previewEditArea').value=currentText;
     _previewSavedText=currentText;
     _previewEditSessionId=(S.session&&S.session.session_id)||'';
+    _previewEditWorkspace=(S.session&&S.session.workspace)||'';
     $('previewEditArea').style.display='';
     if(_previewCurrentMode==='code') $('previewCode').style.display='none';
     else $('previewMd').style.display='none';
