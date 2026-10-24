@@ -526,6 +526,8 @@ function _isOpenPreviewPathMutated(){
 
 async function refreshOpenPreviewIfMutated(){
   if(typeof _previewDirty!=='undefined'&&_previewDirty) return;
+  // #8514 (review): a hidden editor's unsaved text must not be reloaded over.
+  if(typeof _previewHasUnsavedEdits==='function'&&_previewHasUnsavedEdits()) return;
   if(!_isOpenPreviewPathMutated()) return;
   if(!_previewCurrentPath||!S.session) return;
   await openFile(_previewCurrentPath, { bustCache: true });
@@ -1033,9 +1035,18 @@ async function loadDir(path, opts={}){
       if(expanded.size>0)renderFileTree();
     }
     if(!preservePreview&&typeof clearPreview==='function'){
-      if(typeof _previewDirty!=='undefined'&&_previewDirty){
+      const hiddenEdits=typeof _previewHasUnsavedEdits==='function'&&_previewHasUnsavedEdits();
+      // #8514 (review): a hidden editor can still hold real unsaved text. Inside
+      // the same session, keep the preview instead of prompting or clearing —
+      // nothing is on screen to discard, and the user finds the edits (and the
+      // Save* badge, re-derived by _syncPreviewDirty()) when the panel reopens.
+      // Across a session switch the preview cannot travel: a later save would
+      // land in the new workspace, so there the prompt is legitimate.
+      const keepHiddenEdits=hiddenEdits
+        && (typeof _previewHiddenEditsOwnedHere!=='function'||_previewHiddenEditsOwnedHere());
+      if((typeof _previewDirty!=='undefined'&&_previewDirty)||(hiddenEdits&&!keepHiddenEdits)){
         showConfirmDialog({title:t('unsaved_confirm'),message:'',confirmLabel:'Discard',danger:true,focusCancel:true}).then(ok=>{if(ok)clearPreview({keepPanelOpen:true});});
-      }else{
+      }else if(!keepHiddenEdits){
         clearPreview({keepPanelOpen:true});
       }
     }else if(preservePreview){
@@ -1208,7 +1219,8 @@ function forceRenderMarkdownPreview(){
 let _previewCurrentPath = '';  // relative path of currently previewed file
 let _previewCurrentMode = '';  // 'code' | 'csv' | 'md' | 'image' | 'html' | 'pdf' | 'audio' | 'video'
 let _previewDirty = false;     // true when edits are unsaved (DERIVED — see _syncPreviewDirty)
-let _previewSavedText = '';    // text the editor was populated with / last saved
+let _previewSavedText = null;  // text the editor was populated with / last saved (null = no baseline)
+let _previewEditSessionId = '';  // session the baseline was taken in (#8514 review)
 let _previewServerEditable = null;  // backend editability metadata when available
 let _previewSaveRoute = '/api/file/save';  // current save adapter for the open preview
 let _previewOfficeFormat = '';  // current claimed Office format, if any
@@ -1236,8 +1248,25 @@ function _syncPreviewDirty(){
     && String(ta.value||'')!==String(_previewSavedText||'');
   updateEditBtn();
 }
+// #8514 (review): `_previewDirty` gates the *prompt*, so it is deliberately
+// false for a hidden editor — but a hidden editor can still hold real unsaved
+// text. Derive that separately: loadDir() must preserve such a preview instead
+// of clearing it silently, which would turn the old nag into silent data loss.
+function _previewHasUnsavedEdits(){
+  if(_previewSavedText===null) return false;  // no baseline recorded → nothing to compare
+  const ta=$('previewEditArea');
+  return !!ta && String(ta.value||'')!==String(_previewSavedText||'');
+}
+// Hidden edits only travel safely across a navigation inside the session they
+// were typed in: keeping them across a session switch would let a later save
+// land in the new session's workspace.
+function _previewHiddenEditsOwnedHere(){
+  const sid=(S.session&&S.session.session_id)||'';
+  return !_previewEditSessionId || String(_previewEditSessionId)===String(sid);
+}
 function _resetPreviewDirty(){
-  _previewSavedText='';
+  _previewSavedText=null;
+  _previewEditSessionId='';
   _previewDirty=false;
   updateEditBtn();
 }
@@ -1317,6 +1346,7 @@ async function toggleEditMode(){
         _previewSaveRoute = '/api/file/office-save';
       }
       _previewSavedText=savedContent;
+      _previewEditSessionId=(S.session&&S.session.session_id)||'';
       _previewDirty=false;
       // Update read-only views AND the cached raw content so a later
       // "Render as markdown anyway" force-render reflects the just-saved text
@@ -1338,6 +1368,7 @@ async function toggleEditMode(){
       : _previewRawContent||'';
     $('previewEditArea').value=currentText;
     _previewSavedText=currentText;
+    _previewEditSessionId=(S.session&&S.session.session_id)||'';
     $('previewEditArea').style.display='';
     if(_previewCurrentMode==='code') $('previewCode').style.display='none';
     else $('previewMd').style.display='none';

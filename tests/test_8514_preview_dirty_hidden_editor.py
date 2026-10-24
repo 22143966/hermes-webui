@@ -186,3 +186,88 @@ def test_closed_panel_is_never_dirty(tmp_path):
 def test_dirty_state_is_recomputed_even_when_it_stays_false(tmp_path):
     """The badge must be refreshed on every sync, not only when the state flips."""
     assert _run_sync("edited", "original", "", "closed", tmp_path)["updates"] == 1
+
+
+# ── The other half of the review: hidden edits must not be dropped ───────────
+#
+# `_previewDirty` is false for a hidden editor (nothing to prompt about), but the
+# textarea can still hold real unsaved text. `_previewHasUnsavedEdits()` is the
+# derived fact loadDir() consults to *preserve* that preview instead of clearing
+# it — turning the old nag into silent loss was the regression the review caught.
+
+
+_HIDDEN_HARNESS = r"""
+const params = __PARAMS__;
+globalThis.document = {documentElement: {dataset: {}}};
+const els = {};
+const $ = (id) => els[id];
+let _previewSavedText = params.savedText;
+let _previewEditSessionId = params.editSession;
+const S = {session: {session_id: params.session}};
+
+__HAS__
+__OWNED__
+
+els.previewEditArea = {value: params.text, style: {display: params.display}};
+console.log(JSON.stringify({
+  unsaved: _previewHasUnsavedEdits(),
+  ownedHere: _previewHiddenEditsOwnedHere()
+}));
+"""
+
+
+def _run_hidden(text, saved, display, session="s1", edit_session="s1", tmp_path=None):
+    payload = {"text": text, "savedText": saved, "display": display,
+               "session": session, "editSession": edit_session}
+    js = (
+        _HIDDEN_HARNESS.replace("__PARAMS__", json.dumps(payload))
+        .replace("__HAS__", _function_block(WORKSPACE_JS, "_previewHasUnsavedEdits"))
+        .replace("__OWNED__", _function_block(WORKSPACE_JS, "_previewHiddenEditsOwnedHere"))
+    )
+    script = Path(tmp_path or "/tmp") / "harness_8514_hidden.js"
+    script.write_text(js, encoding="utf-8")
+    proc = subprocess.run([NODE, str(script)], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_hidden_editor_with_divergent_text_still_holds_edits(tmp_path):
+    """Panel closed, editor mounted, text differs → real unsaved work."""
+    assert _run_hidden("edited", "original", "none", tmp_path=tmp_path)["unsaved"] is True
+
+
+def test_no_baseline_never_reports_unsaved_edits(tmp_path):
+    """After clearPreview() the baseline is null: a stale textarea value from a
+    previously previewed file must not look like unsaved work, or no preview
+    could ever be cleared again."""
+    assert _run_hidden("leftover", None, "none", tmp_path=tmp_path)["unsaved"] is False
+
+
+def test_text_equal_to_the_baseline_holds_no_edits(tmp_path):
+    assert _run_hidden("original", "original", "none", tmp_path=tmp_path)["unsaved"] is False
+
+
+def test_hidden_edits_are_owned_by_the_session_they_were_typed_in(tmp_path):
+    assert _run_hidden("edited", "original", "none", session="s2", edit_session="s1",
+                       tmp_path=tmp_path)["ownedHere"] is False
+    assert _run_hidden("edited", "original", "none", session="s1", edit_session="s1",
+                       tmp_path=tmp_path)["ownedHere"] is True
+
+
+def test_load_dir_preserves_hidden_edits_instead_of_clearing():
+    """Source lock: inside the session, loadDir() must keep the preview carrying
+    hidden unsaved edits and clear only when there is nothing to lose."""
+    load_dir = _function_block(WORKSPACE_JS, "loadDir")
+    assert "_previewHasUnsavedEdits" in load_dir, (
+        "loadDir() must consult the hidden-edit fact — clearing on _previewDirty "
+        "alone silently drops edits in a closed panel (#8514 review)"
+    )
+    assert "keepHiddenEdits" in load_dir
+
+
+def test_mutated_refresh_does_not_reload_over_hidden_edits():
+    block = _function_block(WORKSPACE_JS, "refreshOpenPreviewIfMutated")
+    assert "_previewHasUnsavedEdits" in block, (
+        "a refresh must not reload the file over a hidden editor's unsaved text "
+        "(#8514 review)"
+    )
