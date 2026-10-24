@@ -494,6 +494,24 @@ These restrictions keep the existing Content Security Policy intact and avoid
 turning the extension hook into a third-party script loader. Invalid configured
 URLs are ignored rather than injected.
 
+### Injected tags are mount-relative
+
+Configured URLs are still written with a leading slash (`/extensions/app.js`),
+but the tag WebUI emits into the app shell drops it:
+
+```html
+<script src="extensions/app.js" defer></script>
+<link rel="stylesheet" href="extensions/app.css">
+```
+
+This matches how the shell emits its own assets and is what makes extensions
+work behind a reverse-proxy subpath mount (e.g. `https://host/hermes/`):
+`static/index.html` injects a `<base href>` for the current mount, so a
+relative tag resolves inside the mount, while a leading slash would resolve
+against the origin root and 404 outside it. Root deployments (`/`) are
+unaffected because `extensions/app.js` and `/extensions/app.js` resolve to the
+same URL there.
+
 ## Trusted local sidecars
 
 Manifest-bundled extensions may integrate with a trusted local sidecar process,
