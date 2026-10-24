@@ -5,6 +5,10 @@
 
 ### Added
 
+- **Pinch, pan and zoom in the image lightbox.** An enlarged chat image can now be pinched to zoom and panned with two fingers on touch screens, zoomed with the mouse wheel at the cursor and dragged on desktop, and zoomed or reset with `+`, `-` and `F` on the keyboard. A Fit button next to close returns it to fit, the zoom carries across previous/next images, and the image can no longer be dragged out of view. An edge swipe inside the open lightbox no longer opens the session drawer behind it, and keyboard focus now moves into the dialog. A maintainer fold makes both buttons 44×44 on touch screens with a gap between them, gives them a hover state you can see over the dark backdrop and over bright images (the close button in the diagram lightbox included), and keeps Tab order in visual order. Thanks @silent-reader-cn. (#6896)
+
+- **Native OIDC login works with identity providers that accept only HTTP Basic client authentication.** WebUI always sent the client secret in the token request body (`client_secret_post`), which providers that support only `client_secret_basic` reject. In the default `auto` mode it now switches to Basic only when the provider's discovery document says `client_secret_post` is not supported, so existing deployments send byte-for-byte the same request; `webui_oidc.token_auth_method` (or `HERMES_WEBUI_OIDC_TOKEN_AUTH_METHOD`) can force either method. Basic credentials are form-encoded first as RFC 6749 section 2.3.1 requires, and an unsupported configured value is logged once instead of on every auth check. Thanks @chesterXalan. (#6471)
+
 - **Insights: pick an exact date range.** The period menu has a Custom range… option with Start and End date pickers (labelled, translated in all 15 languages), so usage, cost and model numbers can cover any window, not just the presets. Today is always selectable, and typing a date no longer clears the field. Thanks @silent-reader-cn. (#6970)
 
 - **Kanban Scheduled column.** Scheduled tasks get their own board column, and the task editor, task detail and bulk
@@ -49,6 +53,8 @@
 
 ### Security
 
+- **The request log no longer records a client-chosen address as `forwarded_for`.** The structured request log, which fail2ban jails read, copied the left-most `X-Forwarded-For` hop from any peer, so any client could write an arbitrary address there and get someone else banned. It now records `forwarded_for` only when the socket peer is a trusted proxy (loopback, or listed in `HERMES_WEBUI_TRUSTED_PROXY_CIDRS`), resolving the chain right to left to a validated address, and it never reads `X-Real-IP` for this field. A request whose forwarded header was not recorded carries `forwarded_for_ignored: true` instead, and the first one from an untrusted peer logs a one-time warning naming the peer and the setting to change. If a fail2ban jail matches `forwarded_for` and your proxy is not on loopback, add the proxy's address to `HERMES_WEBUI_TRUSTED_PROXY_CIDRS`; `docs/remote-access.md` documents both fields. Thanks @happy5318. (#7864, fixes #7863)
+
 - **Behind a reverse proxy, login rate limiting is per client again, and a client cannot pick its own bucket.** The password and passkey login limiters keyed on the socket peer, which behind a proxy is the proxy itself, so one user's failed logins locked out everyone. They now key on the forwarded client address, but only when `HERMES_WEBUI_TRUST_FORWARDED_FOR=1` and the proxy's address is listed in `HERMES_WEBUI_TRUSTED_PROXY_CIDRS` (implicit loopback trust is not enough, so a direct or SSH-tunnel client cannot send a fresh `X-Forwarded-For` on every attempt). Every `X-Forwarded-For` and `X-Real-IP` field is checked: if they disagree, a field is empty or a value is not an address, failed logins count against the socket peer as before. `.env.example` explains the trade-off of listing a loopback address. Thanks @codechrl. (#7850)
 
 - **Gateway chat no longer sends one profile's Gateway key to another profile's Gateway.** When the WebUI runs on a named profile whose `.env` sets its own Gateway URL, a session on a different profile that sets only a Gateway key (no URL of its own) sent that key to the first profile's Gateway, so the request failed with 401 or exposed the key to the wrong server. Such a profile now uses the WebUI's own Gateway URL and key together, which is what v0.52.492 and earlier sent. Profiles that set their own `HERMES_WEBUI_GATEWAY_BASE_URL`, shared operator configuration and launcher-exported URLs behave as before. To give a profile its own Gateway, set its own `HERMES_WEBUI_GATEWAY_BASE_URL`. (#8435, fixes #8432)
@@ -68,6 +74,12 @@
   exactly as before. Thanks @ybai08. (#8138, fixes #8126)
 
 ### Fixed
+
+- **An OpenRouter model from the overflow list no longer appears twice in the model picker.** Restoring a model that lives past the shown rows (for example an ID ending in `:free`) in the composer or Settings picker used to add a second, ungrouped copy of it. It now shows once, in its provider group, stays selected, and the "(a of b)" count stays right, for new chats and for reopened ones. Thanks @starship-s.
+
+- **CI: browser-gate jobs no longer time out on a slow package mirror.** `playwright install --with-deps` downloads Chromium's system packages with apt on every job, and on some runners the Ubuntu mirror serves them at 25-65 kB/s, so the install alone ran past the 10-minute job limit. On 2026-10-22 that cancelled about 7% of `browser-smoke` jobs (a required check) and about 4% of `conversation-lifecycle` jobs, including its two blocking rows. Both limits are now 30 minutes; no job, step or required check changes. (#8494)
+
+- **Docker: an Agent that needs a newer Python major gets a matching venv.** When choosing the interpreter for the Agent's venv, Docker startup only searched the base image's Python major, so a `requires-python` range such as `>=4.0,<4.2` on a 3.12 image silently kept the 3.12 venv. It now searches the primary major first, then every other major the range names at or above the image's own. Every range a released Agent declares today selects exactly as before. Thanks @MuhammadUsamaMX. (#8459, follow-up to #8113)
 
 - **Docker first start survives files vanishing during the ownership walk.** A fresh container could fail its first
   start at random when files disappeared while the init script aligned ownership. The walk now tolerates only
@@ -448,6 +460,10 @@
 
 ### Changed
 
+- **Keyboard and screen reader users can reach conversations in the sidebar directly.** Conversation titles are now real buttons (the open one is marked as the current page), the Chat label is a heading, and a keyboard-focused row shows a clear focus ring, including in forced-colours mode and the Geist Contrast skin. Focus stays on the same conversation when the list refreshes, J/K navigation keeps working after a mouse click, and opening a conversation closes any open project or model menu. On touch screens, the first tap on a tag filters by it, a long press on a tag still opens the conversation's actions, and a swipe that starts on a tag still swipes. (#7049, thanks @sheldon-im)
+
+- **`/status` shows the true message total when it differs from the visible count.** The status card's "Messages" row counts what you can see; hidden internal rows (delegation wakeups) are part of the session too, so the card now adds a "Total messages" row whenever the two numbers differ, and shows nothing extra when they match. Spanish, German and Simplified Chinese also get a translated "Messages" label (they showed the English word before). A maintainer fold makes clearing or truncating a conversation drop its stale cached counts, so the card no longer shows the pre-clear total right after "Clear conversation". Thanks @fedebyes. (#8310)
+
 - **Test suite: the run-journal echo-scan scaling check no longer flakes on a busy runner,** while still failing on a genuinely quadratic rebuild. Thanks @MuhammadUsamaMX. (#8328)
 
 - **Russian: the last English strings translated.** The Profiles explainer and the Transparent Stream timestamp setting now read in Russian. Thanks @RajPabnani03. (#8001)
@@ -461,6 +477,8 @@
 - **The busy-time send behavior is now called "Default message mode," and new installs default to Steer.** The Settings → Preferences control formerly labeled "Busy input mode" is renamed to "Default message mode," and a fresh install now defaults to **Steer** (inject a mid-turn correction without interrupting) instead of Queue. Your existing choice is preserved — if you ever saved settings, your current mode (Queue/Interrupt/Steer) is migrated as-is and unchanged; only never-configured installs pick up the new Steer default. The saved preference still survives a reload or a brief server outage (the localStorage mirror from the previous release is intact). Thanks @rodboev. (#5162, #5145)
 
 ### Internal
+
+- **The local full test suite passes in the release sandbox (test-only).** Twenty-one tests failed only because of the host: no package index, the worktree's git dir hidden from git, `HOME=/tmp`, unmapped supplementary groups, no network route for Chromium, a process-wide truststore injection, and two newer-Agent shape changes. They now pass there, or skip with the missing condition named (package index, spare group, Agent org skill mirror). No product code changes, and CI still runs the packaging tests.
 
 - **Running the tests can no longer delete the checkout.** An exported-but-empty `HERMES_WEBUI_TEST_STATE_DIR=` used to resolve the test state directory to the current directory, and the session fixture's cleanup then deleted the whole repository, `.git` included. An empty or whitespace-only value now falls back to the temp-dir default, and the suite refuses to start when the state directory is the checkout, one of its parents, or a directory inside it (such as `tests` or `static`). Test-only; no runtime change. Thanks @Overview3833. (#8414, fixes #8413)
 
@@ -1318,6 +1336,7 @@
   accepts either library. A broken Agent bootstrap now logs a warning instead of stopping WebUI.
   The interim workaround `HERMES_DISABLE_LAZY_INSTALLS=1` is no longer needed. Thanks @snoyberg
   (#7876) and @carlotestor (#7875); closes #7831, #7848.
+- **The request log no longer records a spoofable client IP, and says so when it drops the field.** The structured request log took the left-most `X-Forwarded-For` hop at face value, so any client could write a header that a fail2ban jail keyed on the log would act on (ban an arbitrary address). A forwarded IP is now asserted only when the un-spoofable raw socket peer is a trusted proxy (loopback, or an address in `HERMES_WEBUI_TRUSTED_PROXY_CIDRS`), the chain is walked right-to-left to the first untrusted hop, and the value is validated with `ipaddress` before it is written; malformed/empty chains and direct clients fail closed. On the default deployment a proxy on a Docker bridge or LAN address is not allowlisted, so its `forwarded_for` silently disappears — the log path now emits a one-time (process-wide) operator warning naming the peer and the env fix instead of changing the output in silence. Other `X-Forwarded-For` consumers (the local-origin gate, trusted-header auth) are unchanged. (#7863, #7864)
 
 - **Gateway-backend turns survive a WebUI restart.** With the Gateway runs API enabled
   (`HERMES_WEBUI_CHAT_BACKEND=gateway` + `HERMES_WEBUI_GATEWAY_USE_RUNS_API=true`), the Gateway
