@@ -42,21 +42,12 @@ POLL_INTERVAL_S = 5.0
 BACKOFF_MAX_S = 300.0
 RESERVATION_OWNER = "hermes-webui"
 RESERVATION_TTL_S = 120.0
-WAKE_PROMPT = ("[IMPORTANT: A delegated subagent finished. Its result is already in your "
-               "conversation history above; review it and continue the task.]")
-# A unit whose owner died mid-run is delivered as outcome unknown/interrupted.
-RECOVERED_MARKERS = ("outcome unknown", "Unrecorded outcomes remain unknown", "status=interrupted")
-REDISPATCH_PROMPT = ("[IMPORTANT: A delegated fan-out was cut off before it finished (its owner process exited). "
-                     "Its recovered state is in your conversation history above. Keep the results that finished; "
-                     "re-dispatch ONLY the unfinished tasks, starting each from its transcript tail and its "
-                     "existing worktree, then continue the task.]")
-
-
-def wake_prompt(rows) -> str:
-    """The redispatch prompt when any delivered row is a recovered (cut-off) unit."""
-    if any(m in (r.get("content") or "") for r in rows for m in RECOVERED_MARKERS):
-        return REDISPATCH_PROMPT
-    return WAKE_PROMPT
+WAKE_PROMPT = ("[IMPORTANT: A delegated subagent is reporting back. Its result is already in your "
+               "conversation history above; review it and continue the task. If that result carries "
+               "recovery evidence (an owner exit, a \"Last persisted unit status\" line, a RE-DISPATCH "
+               "list), read it first: keep the results it recorded, resume only the work it lists as "
+               "unfinished, starting each from its transcript tail and existing worktree, and do not "
+               "retry a side effect whose outcome is unrecorded.]")
 _LEASE_API = ("reserve_caller_history_deliveries", "commit_caller_history_deliveries",
                  "release_caller_history_deliveries")
 # Rows older than this at first sight are left for the next user turn to fold.
@@ -208,12 +199,12 @@ def _stale_ids(db_path: Path, rows: list[dict], cutoff: float) -> list:
     return [r["id"] for r in rows if float(ts.get(r["id"]) or 0.0) <= cutoff]
 
 
-def _start_wakeup(webui_sid: str, on_admitted, prompt: str = WAKE_PROMPT) -> bool:
+def _start_wakeup(webui_sid: str, on_admitted) -> bool:
     """True once the wake turn is persisted as the session's pending turn."""
     from api.routes import start_session_turn
 
     try:
-        resp = start_session_turn(webui_sid, prompt, source="process_wakeup",
+        resp = start_session_turn(webui_sid, WAKE_PROMPT, source="process_wakeup",
                                   on_admitted=on_admitted) or {}
     except ClearedSinceReserve:
         return False
@@ -375,7 +366,7 @@ def _claim_and_wake(db_path: Path, state_sid: str, webui_sid: str) -> int:
                 raise ClearedSinceReserve(webui_sid)
             _publish_results(s, rows, {**lease, "stream_id": stream_id})
 
-        if _start_wakeup(webui_sid, on_admitted, wake_prompt(rows)):
+        if _start_wakeup(webui_sid, on_admitted):
             return 1  # the wake turn's worker settles the lease and the back-off
         # Not admitted: nothing was published (or the launch rollback removed it).
         now_cutoff = _cutoff(webui_sid)
