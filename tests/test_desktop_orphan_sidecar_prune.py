@@ -24,7 +24,10 @@ These tests pin three things:
 
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -406,6 +409,128 @@ def test_all_profiles_uses_row_owning_db_for_destructive_absence(
 
     assert [row["session_id"] for row in payload["sessions"]] == ["same-id"]
     assert pruned == []
+
+
+def test_named_profile_missing_db_does_not_borrow_empty_active_db_with_cli_shown(
+    tmp_path, monkeypatch
+):
+    """Discriminate the strict probe from the legacy active-DB fallback."""
+    from api import models
+
+    active_home = tmp_path / "active"
+    active_home.mkdir()
+    _make_state_db(active_home / "state.db", [])
+    named_home = tmp_path / "named"
+    named_home.mkdir()
+
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: active_home / "state.db")
+    monkeypatch.setattr(models, "_get_profile_home", lambda _profile: named_home)
+
+    payload, pruned = _run_actual_builder(
+        monkeypatch,
+        [_desktop_row("foreign-retained", profile="work")],
+        show_cli_sessions=True,
+        all_profiles=True,
+    )
+
+    assert [row["session_id"] for row in payload["sessions"]] == [
+        "foreign-retained"
+    ]
+    assert pruned == []
+
+
+def _run_isolated_retained_store_probe(tmp_path: Path, *, show_cli_sessions: bool):
+    """Create a real sidecar, then invoke the builder in a fresh isolated process."""
+    sid = f"isolated-retained-{int(show_cli_sessions)}"
+    base = tmp_path / "hermes"
+    work_home = base / "profiles" / "work"
+    personal_home = base / "profiles" / "personal"
+    state_dir = tmp_path / "webui-state"
+    work_home.mkdir(parents=True)
+    personal_home.mkdir(parents=True)
+    (state_dir / "sessions").mkdir(parents=True)
+
+    setup_env = os.environ.copy()
+    setup_env.update(
+        {
+            "HOME": str(tmp_path),
+            "HERMES_HOME": str(work_home),
+            "HERMES_BASE_HOME": str(base),
+            "HERMES_WEBUI_STATE_DIR": str(state_dir),
+            "HERMES_WEBUI_ISOLATED_PROFILE": "0",
+            "HERMES_DISABLE_LAZY_INSTALLS": "1",
+            "HERMES_WEBUI_TEST_NETWORK_BLOCK": "1",
+        }
+    )
+    setup = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from api.models import Session; "
+                f"s=Session({sid!r}, title='Retained Desktop', workspace={str(tmp_path)!r}, "
+                "profile='work', messages=[{'role':'user','content':'keep'}], "
+                "source_tag='desktop', raw_source='desktop', session_source='other', "
+                "source_label='Desktop', is_cli_session=False); s.save()"
+            ),
+        ],
+        cwd=REPO,
+        env=setup_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert setup.returncode == 0, setup.stderr
+
+    _make_state_db(work_home / "state.db", [sid])
+    _make_state_db(personal_home / "state.db", [])
+    index_path = state_dir / "sessions" / "_index.json"
+    initial_index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert sid in {row.get("session_id") for row in initial_index}
+
+    isolated_env = dict(setup_env)
+    isolated_env.update(
+        {
+            "HERMES_HOME": str(personal_home),
+            "HERMES_WEBUI_ISOLATED_PROFILE": "1",
+        }
+    )
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from api.routes import _build_session_list_cache_payload; "
+                "_build_session_list_cache_payload(active_profile='personal', "
+                "all_profiles=False, "
+                f"show_cli_sessions={show_cli_sessions!r}, "
+                "show_previous_messaging_sessions=False, show_cron_sessions=False)"
+            ),
+        ],
+        cwd=REPO,
+        env=isolated_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert probe.returncode == 0, probe.stderr
+    return sid, json.loads(index_path.read_text(encoding="utf-8"))
+
+
+def test_isolated_fresh_start_retains_foreign_index_row_with_cli_hidden(tmp_path):
+    sid, index = _run_isolated_retained_store_probe(
+        tmp_path,
+        show_cli_sessions=False,
+    )
+    assert sid in {row.get("session_id") for row in index}
+
+
+def test_isolated_fresh_start_retains_foreign_index_row_with_cli_shown(tmp_path):
+    sid, index = _run_isolated_retained_store_probe(
+        tmp_path,
+        show_cli_sessions=True,
+    )
+    assert sid in {row.get("session_id") for row in index}
 
 
 def test_all_profiles_prune_matrix_for_named_profile_db(tmp_path, monkeypatch):

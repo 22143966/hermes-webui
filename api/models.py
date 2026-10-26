@@ -7722,6 +7722,22 @@ def _strict_agent_state_db_path(*, profile=None) -> Path | None:
     """
     try:
         if isinstance(profile, str) and profile:
+            from api.profiles import (
+                _is_isolated_profile_mode,
+                _isolated_profile_name,
+                _profiles_match,
+            )
+
+            # The generic resolver intentionally clamps every lookup to the
+            # pinned home in isolated mode.  That is safe for reads, but a
+            # destructive absence check must not mistake the pinned profile's
+            # DB for a foreign logical owner's DB.  Root aliases remain valid
+            # through the canonical profile matcher.
+            if _is_isolated_profile_mode() and not _profiles_match(
+                profile,
+                _isolated_profile_name(),
+            ):
+                return None
             db_path = _get_profile_home(profile) / 'state.db'
         else:
             db_path = _strict_active_state_db_path()
