@@ -1192,6 +1192,88 @@ class RunJournalWriter:
         )
 
 
+# Blocking prompt-tool names whose journal rows are settled by a later
+# ``tool_complete`` row for the same tool. ``clarify`` is a blocking tool call:
+# the tool's completion row (user answered, timed out, or was cancelled)
+# terminates that prompt's lifecycle, so replaying the prompt row after the
+# settle point only resurrects a dead card. ``approval`` is deliberately NOT
+# listed: approvals are a queue (``pending_count`` > 1 is a real shape) and a
+# single name-level settle row cannot prove every queued prompt resolved.
+REPLAY_PROMPT_TOOL_NAMES = frozenset({"clarify"})
+
+
+def settled_prompt_events(events) -> set[tuple[str, int]]:
+    """Return ``(run_id, seq)`` keys for prompt-settling journal rows.
+
+    A row settles a prompt when it is a ``tool_complete`` whose payload names a
+    blocking prompt tool (see ``REPLAY_PROMPT_TOOL_NAMES``) — the tool call that
+    asked the question has finished, whether by answer, timeout, or cancel.
+    Malformed rows are skipped (they contribute no evidence), never raise.
+    """
+    settled: set[tuple[str, int]] = set()
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        name = str(event.get("event") or event.get("type") or "")
+        if name != "tool_complete":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("name") or "") not in REPLAY_PROMPT_TOOL_NAMES:
+            continue
+        try:
+            seq = int(event.get("seq") or 0)
+        except (TypeError, ValueError):
+            continue
+        if seq <= 0:
+            continue
+        run_id = str(event.get("run_id") or "") or _run_id_from_event_id(
+            event.get("event_id")
+        )
+        settled.add((run_id, seq))
+    return settled
+
+
+def journal_replay_prompt_visible(event, settled_prompts) -> bool:
+    """Return True when a prompt row (clarify) should still be replayed.
+
+    A prompt row is hidden when the SAME run already holds settle evidence at a
+    later or equal seq — journal seqs are causal and monotonic within a run, so
+    a completed prompt tool call proves the prompt no longer awaits an answer.
+    Rows from other runs never settle it (session replay aggregates several
+    runs and their seqs are not comparable). A prompt with no settle evidence
+    stays visible: a reconnecting tab must still be able to answer it.
+    Fails open on malformed input (visible).
+    """
+    if not isinstance(event, dict):
+        return True
+    name = str(event.get("event") or event.get("type") or "")
+    if name not in REPLAY_PROMPT_TOOL_NAMES:
+        return True
+    try:
+        seq = int(event.get("seq") or 0)
+    except (TypeError, ValueError):
+        return True
+    if seq <= 0:
+        return True
+    run_id = str(event.get("run_id") or "") or _run_id_from_event_id(
+        event.get("event_id")
+    )
+    for settle_run, settle_seq in settled_prompts or ():
+        if settle_run == run_id and settle_seq >= seq:
+            return False
+    return True
+
+
+def _run_id_from_event_id(event_id) -> str:
+    """Extract the run id from ``<run_id>:<seq>``; empty string when unusable."""
+    raw = str(event_id or "")
+    if not raw or ":" not in raw:
+        return ""
+    return raw.rsplit(":", 1)[0]
+
+
 def journal_replay_visible(event) -> bool:
     """Return True when a journal row should be streamed to a reconnecting tab.
 
