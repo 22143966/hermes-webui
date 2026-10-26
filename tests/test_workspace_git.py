@@ -342,7 +342,7 @@ def test_git_diff_skips_repo_local_clean_filter_without_destructive_mode(tmp_pat
     assert not marker.exists()
 
 
-def test_status_check_does_not_take_the_index_lock(tmp_path):
+def test_status_check_does_not_take_the_index_lock(tmp_path, monkeypatch):
     """A background status check must not rewrite the index (#8520).
 
     Rewriting needs .git/index.lock, and a status killed at its timeout
@@ -352,6 +352,9 @@ def test_status_check_does_not_take_the_index_lock(tmp_path):
 
     from api.workspace_git import _dirty_worktree, resolve_git_context
 
+    # Pin the parent setting on, so the test can't pass just because the
+    # runner already has optional locks turned off.
+    monkeypatch.setenv("GIT_OPTIONAL_LOCKS", "1")
     repo = _init_repo(tmp_path / "repo")
     (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
     _commit_all(repo)
