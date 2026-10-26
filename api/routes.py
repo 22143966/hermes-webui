@@ -2499,6 +2499,71 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _prune_orphaned_desktop_sidecar_sessions(
+    rows,
+    *,
+    known_agent_ids=None,
+    diag_stage=None,
+):
+    """Prune Desktop sidecars only when their owning profile proves absence.
+
+    This pass is independent of ``show_cli_sessions``: the preference controls
+    CLI visibility, not whether stale Desktop sidecars are reconciled.  A
+    missing or unreadable profile DB is unknown and therefore retains the row.
+    """
+    if not rows:
+        return list(rows) if rows is not None else []
+    _diag = diag_stage if callable(diag_stage) else (lambda *_a, **_k: None)
+    known_ids = {
+        str(sid).strip() for sid in (known_agent_ids or set()) if str(sid or "").strip()
+    }
+    probe_rows = [
+        row for row in rows
+        if isinstance(row, dict)
+        and str(row.get("session_id") or "").strip()
+        and str(row.get("session_id") or "").strip() not in known_ids
+        and _is_desktop_sidecar_row(row)
+        and not _session_source_is_webui(row)
+    ]
+    if not probe_rows:
+        return list(rows)
+
+    rows_by_profile: dict[object, list[dict]] = defaultdict(list)
+    for row in probe_rows:
+        rows_by_profile[row.get("profile")].append(row)
+    missing_rows: set[tuple[object, str]] = set()
+    for profile_key, profile_rows in rows_by_profile.items():
+        probe_ids = [
+            str(row.get("session_id") or "").strip()
+            for row in profile_rows
+        ]
+        existing = agent_session_rows_existing_strict(
+            probe_ids,
+            profile=profile_key if isinstance(profile_key, str) and profile_key else None,
+        )
+        missing_rows.update(
+            (profile_key, sid) for sid in probe_ids if sid not in existing
+        )
+
+    kept = []
+    for row in rows:
+        sid = str(row.get("session_id") or "").strip() if isinstance(row, dict) else ""
+        profile_key = row.get("profile") if isinstance(row, dict) else None
+        if (profile_key, sid) not in missing_rows:
+            kept.append(row)
+            continue
+        try:
+            prune_session_from_index(sid)
+        except Exception:
+            logger.debug(
+                "Failed to prune orphaned Desktop sidecar %s",
+                sid,
+                exc_info=True,
+            )
+        _diag("prune_orphaned_desktop_sidecar")
+    return kept
+
+
 def _prune_orphaned_webui_zero_message_sessions(rows, *, diag_stage=None):
     """#4985 second-pass orphan prune for native-WebUI rows whose ``state.db.messages`` is empty.
 
@@ -2799,6 +2864,11 @@ def _build_session_list_cache_payload(
             )
         diag_stage("merge_cli_sessions")
         cli_by_id = {s["session_id"]: s for s in cli}
+        webui_sessions = _prune_orphaned_desktop_sidecar_sessions(
+            webui_sessions,
+            known_agent_ids=cli_by_id,
+            diag_stage=diag_stage,
+        )
         # #3238/#4591: reconcile orphaned imported sidecars. When a CLI or
         # API-server session is clicked in WebUI it gets a WebUI-owned sidecar
         # that all_sessions() returns independently of state.db. If the user
@@ -2831,7 +2901,6 @@ def _build_session_list_cache_payload(
                 and (
                     is_cli_session_row(s)
                     or _is_api_server_sidecar_row(s)
-                    or _is_desktop_sidecar_row(s)
                 )
                 and not _session_source_is_webui(s)
                 and _sid not in cli_by_id
@@ -2935,6 +3004,10 @@ def _build_session_list_cache_payload(
             source_filter=source_filter,
         )
     else:
+        webui_sessions = _prune_orphaned_desktop_sidecar_sessions(
+            webui_sessions,
+            diag_stage=diag_stage,
+        )
         diag_stage("filter_webui_sessions")
         webui_sessions = [s for s in webui_sessions if not _is_cli_session_for_settings(s)]
         # #4985 second pass — see _prune_orphaned_webui_zero_message_sessions
@@ -12509,6 +12582,7 @@ from api.models import (
     _hide_from_default_sidebar,
     prune_session_from_index,
     agent_session_rows_existing,
+    agent_session_rows_existing_strict,
     agent_session_zero_message_sids,
     _load_webui_zero_message_orphan_tombstone,
     _record_webui_zero_message_orphan_tombstone,

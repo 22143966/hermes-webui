@@ -240,3 +240,211 @@ def test_desktop_prune_decision_uses_existence_probe_not_sidecar_messages(
         "message_count": 401,
     }
     assert _is_orphaned_desktop_sidecar(row, {}, exists_fn) is True
+
+
+# ── Real sidebar builder ────────────────────────────────────────────────────
+
+
+def _desktop_row(sid: str, *, profile: str = "default") -> dict:
+    return {
+        "session_id": sid,
+        "profile": profile,
+        "source_tag": "desktop",
+        "raw_source": "desktop",
+        "session_source": "other",
+        "source_label": "Desktop",
+        "is_cli_session": False,
+        "title": "Desktop conversation",
+        "message_count": 1,
+        "updated_at": 1,
+    }
+
+
+def _run_actual_builder(
+    monkeypatch,
+    rows: list[dict],
+    *,
+    show_cli_sessions: bool,
+    all_profiles: bool = False,
+    cli_rows: list[dict] | None = None,
+):
+    """Run the production builder with only unrelated I/O isolated."""
+    import api.routes as routes
+
+    pruned: list[str] = []
+    monkeypatch.setattr(routes, "all_sessions", lambda **_kwargs: [dict(row) for row in rows])
+    monkeypatch.setattr(
+        routes,
+        "get_cli_sessions",
+        lambda **_kwargs: [dict(row) for row in (cli_rows or [])],
+    )
+    monkeypatch.setattr(
+        routes, "_reconcile_stale_stream_state_for_session_rows", lambda _rows: False
+    )
+    monkeypatch.setattr(
+        routes,
+        "_prune_orphaned_webui_zero_message_sessions",
+        lambda current, **_kwargs: list(current),
+    )
+    monkeypatch.setattr(routes, "_enrich_sidebar_lineage_metadata", lambda _rows: None)
+    monkeypatch.setattr(routes, "prune_session_from_index", pruned.append)
+
+    payload = routes._build_session_list_cache_payload(
+        active_profile="default",
+        all_profiles=all_profiles,
+        show_cli_sessions=show_cli_sessions,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+    )
+    return payload, pruned
+
+
+def test_actual_builder_prunes_desktop_orphan_with_cli_sessions_hidden(monkeypatch):
+    """The established-install path must reconcile Desktop rows too."""
+    import api.routes as routes
+
+    monkeypatch.setattr(
+        routes,
+        "agent_session_rows_existing_strict",
+        lambda ids, profile=None: frozenset(),
+        raising=False,
+    )
+    payload, pruned = _run_actual_builder(
+        monkeypatch,
+        [_desktop_row("desktop-gone")],
+        show_cli_sessions=False,
+    )
+
+    assert payload["sessions"] == []
+    assert pruned == ["desktop-gone"]
+
+
+def test_actual_builder_prunes_desktop_orphan_with_cli_sessions_shown(monkeypatch):
+    """The new pass must also preserve the existing toggle-on behavior."""
+    import api.routes as routes
+
+    monkeypatch.setattr(
+        routes,
+        "agent_session_rows_existing_strict",
+        lambda ids, profile=None: frozenset(),
+        raising=False,
+    )
+    payload, pruned = _run_actual_builder(
+        monkeypatch,
+        [_desktop_row("desktop-gone")],
+        show_cli_sessions=True,
+    )
+
+    assert payload["sessions"] == []
+    assert pruned == ["desktop-gone"]
+
+
+def test_actual_builder_keeps_live_desktop_row(monkeypatch):
+    import api.routes as routes
+
+    monkeypatch.setattr(
+        routes,
+        "agent_session_rows_existing_strict",
+        lambda ids, profile=None: frozenset(ids),
+        raising=False,
+    )
+    payload, pruned = _run_actual_builder(
+        monkeypatch,
+        [_desktop_row("desktop-live")],
+        show_cli_sessions=False,
+    )
+
+    assert [row["session_id"] for row in payload["sessions"]] == ["desktop-live"]
+    assert pruned == []
+
+
+def test_actual_builder_keeps_desktop_row_listed_by_cli_visibility(monkeypatch):
+    """A currently enumerated agent row remains a stronger live signal."""
+    import api.routes as routes
+
+    monkeypatch.setattr(
+        routes,
+        "agent_session_rows_existing_strict",
+        lambda ids, profile=None: frozenset(),
+        raising=False,
+    )
+    row = _desktop_row("desktop-enumerated")
+    payload, pruned = _run_actual_builder(
+        monkeypatch,
+        [row],
+        show_cli_sessions=True,
+        cli_rows=[row],
+    )
+
+    assert [item["session_id"] for item in payload["sessions"]] == [
+        "desktop-enumerated"
+    ]
+    assert pruned == []
+
+
+def test_all_profiles_uses_row_owning_db_for_destructive_absence(
+    tmp_path, monkeypatch
+):
+    """A named-profile miss must never be answered by the active profile DB."""
+    from api import models
+
+    active_home = tmp_path / "active"
+    active_home.mkdir()
+    _make_state_db(active_home / "state.db", ["same-id"])
+    named_home = tmp_path / "named"
+    named_home.mkdir()
+
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: active_home / "state.db")
+    monkeypatch.setattr(models, "_get_profile_home", lambda _profile: named_home)
+
+    payload, pruned = _run_actual_builder(
+        monkeypatch,
+        [_desktop_row("same-id", profile="work")],
+        show_cli_sessions=False,
+        all_profiles=True,
+    )
+
+    assert [row["session_id"] for row in payload["sessions"]] == ["same-id"]
+    assert pruned == []
+
+
+def test_all_profiles_prune_matrix_for_named_profile_db(tmp_path, monkeypatch):
+    """Live/missing/corrupt rows retain; only a confirmed deletion prunes."""
+    from api import models
+
+    active_home = tmp_path / "active"
+    active_home.mkdir()
+    _make_state_db(
+        active_home / "state.db",
+        ["missing-db", "live-row", "corrupt-db", "deleted-row"],
+    )
+    homes: dict[str, Path] = {}
+    for profile in ("missing", "live", "corrupt", "deleted"):
+        homes[profile] = tmp_path / profile
+        homes[profile].mkdir()
+    _make_state_db(homes["live"] / "state.db", ["live-row"])
+    (homes["corrupt"] / "state.db").write_text("not sqlite", encoding="utf-8")
+    _make_state_db(homes["deleted"] / "state.db", [])
+
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: active_home / "state.db")
+    monkeypatch.setattr(models, "_get_profile_home", lambda profile: homes[profile])
+
+    rows = [
+        _desktop_row("missing-db", profile="missing"),
+        _desktop_row("live-row", profile="live"),
+        _desktop_row("corrupt-db", profile="corrupt"),
+        _desktop_row("deleted-row", profile="deleted"),
+    ]
+    payload, pruned = _run_actual_builder(
+        monkeypatch,
+        rows,
+        show_cli_sessions=False,
+        all_profiles=True,
+    )
+
+    assert {row["session_id"] for row in payload["sessions"]} == {
+        "missing-db",
+        "live-row",
+        "corrupt-db",
+    }
+    assert pruned == ["deleted-row"]
