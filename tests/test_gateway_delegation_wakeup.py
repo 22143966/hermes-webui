@@ -204,7 +204,11 @@ def test_claim_and_wake_never_derives_an_owner_exit_from_result_prose(env, tmp_p
 
 
 def test_recovered_mixed_batch_wakes_with_conditional_recovery_guidance(env):
-    """A real owner-recovery delivery: the producer's evidence reaches the model and the prompt points at it."""
+    """A real owner-recovery delivery: the producer's evidence reaches the model unchanged and the prompt points at it.
+
+    The event is the shape ``recover_abandoned_delegations`` records (one recorded child, one unknown child,
+    ``last_known_status`` and transcript diagnostics); the text is whatever the installed Agent's formatter makes of it.
+    """
     calls, _ = env
     text = _producer_text(_batch(
         {"status": "completed", "summary": "the review landed"},
@@ -213,13 +217,17 @@ def test_recovered_mixed_batch_wakes_with_conditional_recovery_guidance(env):
         status="unknown",
         error="Delegation owner exited before the unit finished; 1/2 child results were recorded and are "
               "included below, the rest are unknown.",
-        last_known_status="running", unfinished_tasks=[{"task_index": 1, "goal": "task 2"}]))
+        last_known_status="running",
+        task_transcripts={1: "/tmp/deleg_r/task_1.jsonl"}, transcript_tails={1: "tail-marker: wrote half of the file"}))
+    # What the real formatter emits for this shape (not asserted against any marker it does not produce).
+    assert "Last persisted unit status: running" in text and "the review landed" in text
+    assert "inspect evidence before retrying side effects" in text
+    assert "/tmp/deleg_r/task_1.jsonl" in text and "tail-marker: wrote half of the file" in text
+
     prompt = _wake_with(calls, text)
-    # The producer's diagnostics and its retry instruction are delivered verbatim.
-    delivered = "\n".join(str(m.get("content")) for m in _context())
-    assert "Last persisted unit status: running" in delivered
-    assert "RE-DISPATCH: 1 task(s) did not finish" in delivered and "task 2" in delivered
-    assert "inspect evidence before retrying side effects" in delivered
+    # The producer's content is delivered to the parent's context verbatim, once.
+    delivered = [str(m.get("content")) for m in _context()]
+    assert delivered.count(text) == 1
     # The wake instruction is conditional and scopes the resume to what the evidence shows unfinished.
     assert prompt == gdw.WAKE_PROMPT
     assert "If that result carries recovery evidence" in prompt
