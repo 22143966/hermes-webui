@@ -1200,6 +1200,13 @@ class RunJournalWriter:
 # listed: approvals are a queue (``pending_count`` > 1 is a real shape) and a
 # single name-level settle row cannot prove every queued prompt resolved.
 REPLAY_PROMPT_TOOL_NAMES = frozenset({"clarify"})
+# Prompt row names that participate in replay filtering at all. ``approval``
+# rows carry no tool name (they are notification-queue events, not tool
+# calls), so the prompt-row gate keys on the SSE event name directly.
+# ``approval`` is settled ONLY by the run's terminal row: approvals are a
+# queue (#527, pending_count > 1) and the respond path writes no journal row,
+# so no per-entry settle evidence exists.
+REPLAY_PROMPT_EVENT_NAMES = frozenset({"clarify", "approval"})
 
 
 def settled_prompt_events(events) -> set[tuple[str, int]]:
@@ -1235,21 +1242,71 @@ def settled_prompt_events(events) -> set[tuple[str, int]]:
     return settled
 
 
-def journal_replay_prompt_visible(event, settled_prompts) -> bool:
-    """Return True when a prompt row (clarify) should still be replayed.
+def terminal_settled_prompt_events(events) -> dict[tuple[str, int], int]:
+    """Return ``{(run_id, prompt_seq): terminal_seq}`` for prompt rows proven
+    dead by their run's terminal row.
 
-    A prompt row is hidden when the SAME run already holds settle evidence at a
-    later or equal seq — journal seqs are causal and monotonic within a run, so
-    a completed prompt tool call proves the prompt no longer awaits an answer.
-    Rows from other runs never settle it (session replay aggregates several
-    runs and their seqs are not comparable). A prompt with no settle evidence
-    stays visible: a reconnecting tab must still be able to answer it.
-    Fails open on malformed input (visible).
+    Approvals cannot be settled per-entry: the respond path runs on the HTTP
+    thread and writes no journal row (verified against a real resolved
+    approval: the next row after ``approval`` was the tool's own
+    ``tool_complete``), and parallel approvals (#527) make any
+    tool-complete-to-approval pairing unsound. What IS sound is the run's
+    terminal row: once the run is done/cancelled/errored, no tool can still be
+    blocking on a prompt, so every prompt row BEFORE the first terminal row
+    of the same run is dead. Prompt rows AFTER the terminal row (late
+    notifications) stay visible. Only rows carrying ``terminal: true`` count
+    as evidence; malformed rows contribute nothing (fail open).
+    """
+    settled: dict[tuple[str, int], int] = {}
+    pending: dict[str, list[tuple[int, str]]] = {}
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        name = str(event.get("event") or event.get("type") or "")
+        try:
+            seq = int(event.get("seq") or 0)
+        except (TypeError, ValueError):
+            continue
+        run_id = str(event.get("run_id") or "") or _run_id_from_event_id(
+            event.get("event_id")
+        )
+        if name in TERMINAL_SSE_EVENTS and event.get("terminal") is True and seq > 0:
+            # Every prompt row seen so far in this run (seq < terminal seq)
+            # is now settled at this terminal seq.
+            for prompt_seq, _n in pending.get(run_id) or []:
+                key = (run_id, prompt_seq)
+                if key not in settled:
+                    settled[key] = seq
+            pending[run_id] = []
+        elif name in REPLAY_PROMPT_EVENT_NAMES and seq > 0:
+            pending.setdefault(run_id, []).append((seq, name))
+    return settled
+
+
+def journal_replay_prompt_visible(
+    event, settled_prompts, terminal_settled=None
+) -> bool:
+    """Return True when a prompt row (clarify/approval) should still be replayed.
+
+    Two independent settle proofs, both scoped to the SAME run (journal seqs
+    are causal within a run; session replay aggregates several runs whose seqs
+    are not comparable):
+
+    * ``settled_prompts`` — ``tool_complete`` rows for blocking prompt TOOLS
+      (clarify). A completed clarify tool call proves that prompt dead.
+    * ``terminal_settled`` — the run's terminal row (done/cancel/apperror/
+      error/stream_end with ``terminal: true``). Nothing can still be
+      blocking once the run ended, so every prompt row before it is dead.
+      This is the ONLY sound proof for approval rows (queue semantics, no
+      per-entry journal evidence on resolve).
+
+    A prompt with no settle evidence stays visible: a reconnecting tab must
+    still be able to answer it. Fails open on malformed input (visible).
     """
     if not isinstance(event, dict):
         return True
     name = str(event.get("event") or event.get("type") or "")
-    if name not in REPLAY_PROMPT_TOOL_NAMES:
+    if name not in REPLAY_PROMPT_EVENT_NAMES:
         return True
     try:
         seq = int(event.get("seq") or 0)
@@ -1262,6 +1319,10 @@ def journal_replay_prompt_visible(event, settled_prompts) -> bool:
     )
     for settle_run, settle_seq in settled_prompts or ():
         if settle_run == run_id and settle_seq >= seq:
+            return False
+    if terminal_settled is not None:
+        terminal_seq = terminal_settled.get((run_id, seq))
+        if terminal_seq is not None:
             return False
     return True
 

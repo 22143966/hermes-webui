@@ -12827,6 +12827,7 @@ from api.run_journal import (
     session_journal_fingerprint,
     settled_prompt_events,
     stale_interrupted_event,
+    terminal_settled_prompt_events,
     SSE_RELAY_CLOSE_EVENTS,
 )
 from api.todo_state import attach_todo_state
@@ -22268,20 +22269,27 @@ def _replay_run_journal(
     )
     events = journal.get("events") or []
     # Settled prompts (clarify already answered / timed out / cancelled — see
-    # settled_prompt_events) must not replay: a reconnecting tab would re-show
-    # the dead card, then the terminal event in the same batch force-hides it
-    # (flash-of-stale-card). Prescan is bounded by the same event list the
-    # emit loop walks; any prescan failure fails OPEN (prompt still replays).
+    # settled_prompt_events; approvals + any prompt in an ended run — see
+    # terminal_settled_prompt_events) must not replay: a reconnecting tab
+    # would re-show the dead card, then the terminal event in the same batch
+    # force-hides it (flash-of-stale-card). Prescan is bounded by the same
+    # event list the emit loop walks; any prescan failure fails OPEN (prompt
+    # still replays).
     try:
         settled_prompts = settled_prompt_events(events)
+        terminal_settled = terminal_settled_prompt_events(events)
     except Exception:
         logger.debug("Prompt-settle prescan failed; replaying prompts unfiltered", exc_info=True)
         settled_prompts = None
+        terminal_settled = None
     for entry in events:
         if not journal_replay_visible(entry):
             continue
-        if settled_prompts is not None and not journal_replay_prompt_visible(
-            entry, settled_prompts
+        if (
+            settled_prompts is not None
+            and not journal_replay_prompt_visible(
+                entry, settled_prompts, terminal_settled=terminal_settled
+            )
         ):
             continue
         _sse_with_id(
@@ -22817,18 +22825,24 @@ def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
 
     def emit_replay(events, stream_id, cutoff_seq):
         # Same settled-prompt guard as _replay_run_journal: a clarify whose
-        # tool call already completed must not re-surface as a live card on
-        # this session stream. Fail open when the prescan misbehaves.
+        # tool call already completed — and any prompt (incl. approval) in an
+        # ended run — must not re-surface as a live card on this session
+        # stream. Fail open when the prescan misbehaves.
         try:
             settled_prompts = settled_prompt_events(events)
+            terminal_settled = terminal_settled_prompt_events(events)
         except Exception:
             logger.debug("Prompt-settle prescan failed; replaying prompts unfiltered", exc_info=True)
             settled_prompts = None
+            terminal_settled = None
         for entry in events:
             if not journal_replay_visible(entry):
                 continue
-            if settled_prompts is not None and not journal_replay_prompt_visible(
-                entry, settled_prompts
+            if (
+                settled_prompts is not None
+                and not journal_replay_prompt_visible(
+                    entry, settled_prompts, terminal_settled=terminal_settled
+                )
             ):
                 continue
             event_id = str(entry.get("event_id") or "")
