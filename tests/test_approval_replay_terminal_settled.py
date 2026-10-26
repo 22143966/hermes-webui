@@ -4,8 +4,6 @@ import io
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-import pytest
-
 
 def _handler():
     return SimpleNamespace(wfile=io.BytesIO())
@@ -417,3 +415,100 @@ def test_session_stream_replay_keeps_active_run_approval(monkeypatch):
         ],
     )
     assert "event: approval\n" in body
+
+
+# ---------------------------------------------------------------------------
+# Cross-kind: clarify tool-completion evidence must never settle an approval
+# ---------------------------------------------------------------------------
+
+
+def test_journal_replay_prompt_visible_clarify_settle_never_hides_approval():
+    from api.run_journal import journal_replay_prompt_visible
+
+    settled = {("run_1", 4)}
+    # Pending approval BEFORE the clarify completion in the same run:
+    # still visible — the completion is clarify-kind evidence only.
+    assert (
+        journal_replay_prompt_visible(_row(2, "approval", _approval_payload()), settled)
+        is True
+    )
+    # Approval AFTER the clarify completion in the same run: visible too.
+    assert (
+        journal_replay_prompt_visible(_row(6, "approval", _approval_payload()), settled)
+        is True
+    )
+    # Control: the completed clarify itself stays settled (hidden).
+    assert (
+        journal_replay_prompt_visible(_row(3, "clarify", _clarify_payload()), settled)
+        is False
+    )
+    # Control: the same-run terminal proof still hides the approval.
+    assert (
+        journal_replay_prompt_visible(
+            _row(2, "approval", _approval_payload()),
+            settled,
+            terminal_settled={("run_1", 2): 5},
+        )
+        is False
+    )
+
+
+def test_dead_stream_replay_cross_kind_clarify_settle_keeps_pending_approval(monkeypatch):
+    # Reviewer reproduction: a live (nonterminal) run whose journal mixes a
+    # still-pending approval with an already-completed clarify. The approval
+    # must survive the clarify's tool_complete settle evidence.
+    body = _drive_replay(
+        monkeypatch,
+        [
+            _row(1, "token", {"text": "hi"}),
+            _row(2, "approval", _approval_payload()),
+            _row(3, "clarify", _clarify_payload()),
+            _settle_row(4),
+            _row(5, "token", {"text": "still waiting"}),
+        ],
+    )
+    assert "event: approval\n" in body
+    assert "id: run_1:2\n" in body
+    assert "gwlocal:aaa" in body
+    # Controls: the completed clarify stays settled; other rows untouched.
+    assert "event: clarify\n" not in body
+    assert "event: token\n" in body
+    assert "event: tool_complete\n" in body
+
+
+def test_dead_stream_replay_approval_after_clarify_settle_still_visible(monkeypatch):
+    # Same-run ordering: even an approval emitted AFTER the clarify's
+    # tool_complete stays visible while the run is still live — the settle
+    # seq comparison is kind-scoped, not a blanket run cursor.
+    body = _drive_replay(
+        monkeypatch,
+        [
+            _row(2, "clarify", _clarify_payload()),
+            _settle_row(3),
+            _row(4, "approval", _approval_payload()),
+            _row(5, "token", {"text": "waiting"}),
+        ],
+    )
+    assert "event: approval\n" in body
+    assert "id: run_1:4\n" in body
+    assert "event: clarify\n" not in body
+
+
+def test_session_stream_replay_cross_kind_clarify_settle_keeps_pending_approval(monkeypatch):
+    # Same mixed journal through the session events stream's emit_replay.
+    body = _drive_session_stream(
+        monkeypatch,
+        [
+            _row(1, "token", {"text": "hi"}, run_id="run_1"),
+            _row(2, "approval", _approval_payload(), run_id="run_1"),
+            _row(3, "clarify", _clarify_payload(), run_id="run_1"),
+            _settle_row(4, run_id="run_1"),
+            _row(5, "token", {"text": "still waiting"}, run_id="run_1"),
+        ],
+    )
+    assert "event: approval\n" in body
+    assert "id: run_1:2\n" in body
+    # Controls: completed clarify still filtered, run rows untouched.
+    assert "event: clarify\n" not in body
+    assert "event: token\n" in body
+    assert "event: tool_complete\n" in body

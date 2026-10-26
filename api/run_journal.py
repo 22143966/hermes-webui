@@ -1294,6 +1294,8 @@ def journal_replay_prompt_visible(
 
     * ``settled_prompts`` — ``tool_complete`` rows for blocking prompt TOOLS
       (clarify). A completed clarify tool call proves that prompt dead.
+      Kind-scoped: this evidence is consulted ONLY for clarify-kind rows —
+      it never settles an approval (whose lifecycle it says nothing about).
     * ``terminal_settled`` — the run's terminal row (done/cancel/apperror/
       error/stream_end with ``terminal: true``). Nothing can still be
       blocking once the run ended, so every prompt row before it is dead.
@@ -1317,9 +1319,17 @@ def journal_replay_prompt_visible(
     run_id = str(event.get("run_id") or "") or _run_id_from_event_id(
         event.get("event_id")
     )
-    for settle_run, settle_seq in settled_prompts or ():
-        if settle_run == run_id and settle_seq >= seq:
-            return False
+    # Kind-scoped: ``settled_prompts`` holds ``tool_complete`` rows for
+    # blocking prompt TOOLS (clarify). That evidence proves only a clarify
+    # lifecycle ended — it says nothing about an approval entry, so an
+    # approval must never consult it. A mixed journal (pending approval +
+    # completed clarify in the same run) would otherwise drop the still
+    # answerable approval card; approvals settle ONLY via the same-run
+    # terminal proof below.
+    if name in REPLAY_PROMPT_TOOL_NAMES:
+        for settle_run, settle_seq in settled_prompts or ():
+            if settle_run == run_id and settle_seq >= seq:
+                return False
     if terminal_settled is not None:
         terminal_seq = terminal_settled.get((run_id, seq))
         if terminal_seq is not None:

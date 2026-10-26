@@ -4,8 +4,6 @@ import io
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-import pytest
-
 
 def _handler():
     return SimpleNamespace(wfile=io.BytesIO())
