@@ -2828,7 +2828,11 @@ def _build_session_list_cache_payload(
             _sid = s.get("session_id")
             if (
                 _sid
-                and (is_cli_session_row(s) or _is_api_server_sidecar_row(s))
+                and (
+                    is_cli_session_row(s)
+                    or _is_api_server_sidecar_row(s)
+                    or _is_desktop_sidecar_row(s)
+                )
                 and not _session_source_is_webui(s)
                 and _sid not in cli_by_id
             ):
@@ -12064,6 +12068,30 @@ def _is_api_server_sidecar_row(session: dict) -> bool:
         for key in ("source", "source_tag", "raw_source", "session_source", "source_label")
     }
     return bool(markers & {"api", "api_server"})
+
+
+def _is_desktop_sidecar_row(session: dict) -> bool:
+    """Return True for Desktop-origin sidecars that need orphan pruning.
+
+    A conversation created in Hermes Desktop gets a WebUI-owned sidecar the
+    first time it is opened in the WebUI. If the user later deletes it from the
+    Desktop app, the ``state.db`` row disappears but the sidecar stays, so the
+    row lingers in the sidebar forever.
+
+    Such a row matches neither ``is_cli_session_row()`` (Desktop is not CLI and
+    its source marker is not ``cli``/``tui``) nor ``_is_api_server_sidecar_row()``
+    (Desktop is not API-server), so the #3238 existence probe never inspected it
+    and no prune path could reach it. Existence is still decided by
+    ``agent_session_rows_existing()``, which fails closed to "all present", so a
+    transient ``state.db`` read error never prunes a live Desktop session.
+    """
+    if not isinstance(session, dict) or _session_source_is_webui(session):
+        return False
+    markers = {
+        _normalized_source_marker(session.get(key))
+        for key in ("source", "source_tag", "raw_source", "session_source", "source_label")
+    }
+    return "desktop" in markers
 
 
 def _session_lineage_ids(session: dict) -> set[str]:
