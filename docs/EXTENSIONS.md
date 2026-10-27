@@ -508,9 +508,12 @@ This matches how the shell emits its own assets and is what makes extensions
 work behind a reverse-proxy subpath mount (e.g. `https://host/hermes/`):
 `static/index.html` injects a `<base href>` for the current mount, so a
 relative tag resolves inside the mount, while a leading slash would resolve
-against the origin root and 404 outside it. Root deployments (`/`) are
-unaffected because `extensions/app.js` and `/extensions/app.js` resolve to the
-same URL there.
+against the origin root and 404 outside it. At the root mount the two forms
+resolve to the same URL. On a `/session/<id>` deep link, the browser's preload
+scanner can resolve the relative tag against the page URL before `<base href>`
+runs and request `/session/extensions/app.js`; WebUI serves the real asset there
+(behind the same auth as `/extensions/`), as it already does for
+`/session/static/`.
 
 ## Trusted local sidecars
 

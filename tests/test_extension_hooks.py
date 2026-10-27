@@ -744,3 +744,49 @@ def test_extension_static_serving_rejects_symlink_escape(tmp_path, monkeypatch):
     escaped = FakeHandler()
     assert serve_extension_static(escaped, SimpleNamespace(path="/extensions/outside-link.txt")) is True
     assert escaped.status == 404
+
+
+def test_session_prefixed_extension_assets_serve_the_asset_not_the_shell(tmp_path, monkeypatch):
+    """Mount-relative tags (#8521): on /session/<id> a speculative preload asks
+    for /session/extensions/<file>. It must get the asset with its real MIME
+    type, not the HTML shell from the /session/ catch-all."""
+    from urllib.parse import urlparse
+
+    root = tmp_path / "extensions"
+    root.mkdir()
+    (root / "app.css").write_text("body{color:red}", encoding="utf-8")
+    (root / "app.js").write_text("window.extensionLoaded = true;", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_DIR", str(root))
+
+    from api.routes import handle_get
+
+    css = FakeHandler()
+    assert handle_get(css, urlparse("http://example.com/session/extensions/app.css")) is True
+    assert css.status == 200
+    assert (css.header("Content-Type") or "").startswith("text/css")
+    assert bytes(css.body) == b"body{color:red}"
+
+    js = FakeHandler()
+    assert handle_get(js, urlparse("http://example.com/session/extensions/app.js")) is True
+    assert js.status == 200
+    assert (js.header("Content-Type") or "").startswith("application/javascript")
+
+    traversal = FakeHandler()
+    assert handle_get(traversal, urlparse("http://example.com/session/extensions/%2e%2e/outside.txt")) is True
+    assert traversal.status == 404
+
+
+def test_session_prefixed_extension_assets_stay_behind_webui_auth(monkeypatch):
+    monkeypatch.setenv("HERMES_WEBUI_PASSWORD", "test-password")
+
+    from api.auth import check_auth, _invalidate_password_hash_cache
+
+    _invalidate_password_hash_cache()
+    try:
+        handler = FakeHandler()
+        assert check_auth(handler, SimpleNamespace(path="/session/extensions/app.js", query="")) is False
+        assert handler.status == 302
+    finally:
+        _invalidate_password_hash_cache()
