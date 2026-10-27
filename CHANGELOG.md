@@ -51,6 +51,10 @@
 
 ### Fixed
 
+- **The agent is no longer woken again for a background completion it already read.** A completion consumed through a terminal poll is not treated as read (a result longer than the preview is still delivered once), while one the agent actually read is not re-delivered, including when a launch fails and the 2-second retry fires before the failure handler. Thanks @angel291592. (#8363)
+
+- **Deleted Desktop conversations no longer linger in the sidebar.** A Desktop-origin row whose session was deleted from its owning profile's `state.db` is pruned from the sidebar index, with either CLI-visibility setting. Pruning only happens when that profile's own database is readable and confirms the deletion; a missing, corrupt, unreadable or inaccessible database keeps the row. Thanks @pxxD1998.
+
 - **An OpenRouter model from the overflow list no longer appears twice in the model picker.** Restoring a model that lives past the shown rows (for example an ID ending in `:free`) in the composer or Settings picker used to add a second, ungrouped copy of it. It now shows once, in its provider group, stays selected, and the "(a of b)" count stays right, for new chats and for reopened ones. Thanks @starship-s.
 
 - **CI: browser-gate jobs no longer time out on a slow package mirror.** `playwright install --with-deps` downloads Chromium's system packages with apt on every job, and on some runners the Ubuntu mirror serves them at 25-65 kB/s, so the install alone ran past the 10-minute job limit. On 2026-10-22 that cancelled about 7% of `browser-smoke` jobs (a required check) and about 4% of `conversation-lifecycle` jobs, including its two blocking rows. Both limits are now 30 minutes; no job, step or required check changes. (#8494)
