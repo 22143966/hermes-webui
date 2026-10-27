@@ -31703,9 +31703,10 @@ def _gateway_run_prompt(
     - ``"superseded"``: the projection read fine and this prompt is gone — the
       run parked nothing, or parked a different single prompt — so the card is
       stale and must not answer that one;
-    - ``"ambiguous"``: several prompts are parked and none is this card's, or a
-      parked prompt's generation cannot be read — the projection cannot say
-      whether this one was answered;
+    - ``"ambiguous"``: several prompts are parked and none is this card's, a
+      parked prompt's generation cannot be read, or the projection carries no
+      ``pending_controls`` list at all — it cannot say whether this one was
+      answered;
     - ``"failed"``: the projection could not be read at all.
 
     Cross-prompt adoption is deliberately absent: a card may only answer its own
@@ -31721,6 +31722,11 @@ def _gateway_run_prompt(
         logger.debug("gateway run prompt refresh failed for %s", run_id, exc_info=True)
         return "failed", None
     controls = run.get("pending_controls") if isinstance(run, dict) else None
+    if not isinstance(controls, list):
+        # No pending_controls list (the Agent's legacy runs bridge projects
+        # ``approval`` instead, or a bare ``running`` status) cannot prove this
+        # prompt was answered, so keep the card rather than settle it.
+        return "ambiguous", None
     approvals = [
         prompt
         for prompt in (controls or [])

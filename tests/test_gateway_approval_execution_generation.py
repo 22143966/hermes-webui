@@ -588,3 +588,69 @@ def test_replay_of_an_already_answered_prompt_is_idempotent():
     assert handler.send_response.call_args[0][0] == 200
     assert b'"already_resolved": true' in handler.wfile.getvalue()
     assert approvals.gateway_pending_mirror(SID, approval_id=PROMPT_ID, run_id=RUN_ID) is None
+
+
+@pytest.mark.parametrize(
+    "run_projection",
+    [
+        # The installed Agent's legacy runs bridge: projects ``approval``, not
+        # ``pending_controls``, and does emit 409 approval_not_pending.
+        {"status": "waiting_for_approval", "approval": {"request_id": PROMPT_ID, "choices": ["once", "deny"]}},
+        {"status": "running"},
+        {"status": "waiting_for_approval", "pending_controls": None},
+        {"status": "waiting_for_approval", "pending_controls": {"kind": "approval", "prompt_id": PROMPT_ID}},
+    ],
+    ids=["legacy-approval-shape", "status-only", "controls-null", "controls-not-a-list"],
+)
+def test_projection_without_a_controls_list_keeps_the_card(run_projection):
+    """Release-gate fold: only a readable ``pending_controls`` list that omits
+    this prompt proves it was answered. A projection with no list must keep the
+    card and report the rejection instead of ``200 already_resolved``."""
+    assert _relay(_canonical_payload())
+    mirror = approvals.gateway_pending_mirror(SID, approval_id=PROMPT_ID, run_id=RUN_ID)
+    assert mirror is not None
+
+    captured = {}
+    handler = _answer(
+        {
+            "session_id": SID,
+            "choice": "once",
+            "approval_id": PROMPT_ID,
+            "run_id": RUN_ID,
+            "mirror_token": mirror[approvals._GATEWAY_MIRROR_TOKEN],
+        },
+        captured,
+        run_projection=run_projection,
+        respond_reject=(409, "approval_not_pending"),
+    )
+
+    assert handler.send_response.call_args[0][0] == 502, handler.wfile.getvalue()
+    assert b"already_resolved" not in handler.wfile.getvalue()
+    assert approvals.gateway_pending_mirror(
+        SID, approval_id=PROMPT_ID, run_id=RUN_ID
+    ) is not None, "a projection without a controls list must keep the card"
+
+
+def test_empty_controls_list_still_settles_as_already_resolved():
+    """Control for the fold above: an authority projection that reads fine and
+    lists no pending prompt still proves the answer is in effect."""
+    assert _relay(_canonical_payload())
+    mirror = approvals.gateway_pending_mirror(SID, approval_id=PROMPT_ID, run_id=RUN_ID)
+    assert mirror is not None
+
+    captured = {}
+    handler = _answer(
+        {
+            "session_id": SID,
+            "choice": "once",
+            "approval_id": PROMPT_ID,
+            "run_id": RUN_ID,
+            "mirror_token": mirror[approvals._GATEWAY_MIRROR_TOKEN],
+        },
+        captured,
+        run_projection={"status": "running", "pending_controls": []},
+        respond_reject=(409, "approval_not_pending"),
+    )
+
+    assert handler.send_response.call_args[0][0] == 200, handler.wfile.getvalue()
+    assert b'"already_resolved": true' in handler.wfile.getvalue()
