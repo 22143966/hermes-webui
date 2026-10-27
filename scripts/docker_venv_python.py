@@ -440,6 +440,60 @@ def _parse_version(text: str) -> tuple[int, ...] | None:
         return None
 
 
+def uv_override_dependencies(pyproject_text: str) -> list[str]:
+    """The staged agent's ``[tool.uv] override-dependencies`` (#8524).
+
+    The agent resolves its own dependency set with these overrides (Agent
+    v0.22.5 overrides browser-harness's ``pillow==12.3.0`` pin to take Pillow
+    13's security fixes), but ``uv pip install`` never reads a project's
+    ``[tool.uv]`` table. Without passing them as ``--overrides`` the agent's
+    requirements are unsatisfiable and the container exits during install.
+
+    Returns the entries verbatim, markers included. Anything unreadable, an
+    absent table or a malformed entry yields no override for that entry, so
+    the caller falls back to the plain install it ran before this existed.
+    """
+    if tomllib is None:
+        return []
+    try:
+        data = tomllib.loads(pyproject_text)
+    except (tomllib.TOMLDecodeError, ValueError):
+        return []
+    tool = data.get("tool")
+    uv = tool.get("uv") if isinstance(tool, dict) else None
+    entries = uv.get("override-dependencies") if isinstance(uv, dict) else None
+    if not isinstance(entries, list):
+        return []
+    # One requirement per line in the file uv reads: never let an entry span lines.
+    return [e.strip() for e in entries if isinstance(e, str) and e.strip() and "\n" not in e and "\r" not in e]
+
+
+def _run_uv_overrides(argv: list[str]) -> int:
+    """``docker_venv_python.py --uv-overrides <pyproject> <out_file>``.
+
+    Writes the staged agent's ``[tool.uv] override-dependencies`` to
+    ``out_file``, one per line, for ``uv pip install --overrides``. An empty file
+    means there is nothing to override. Exit status is non-zero only when the
+    file could not be written, so docker_init.bash falls back to the plain
+    install.
+    """
+    if len(argv) != 4:
+        print("usage: docker_venv_python.py --uv-overrides <pyproject> <out_file>", file=sys.stderr)
+        return 2
+    try:
+        text = Path(argv[2]).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"-- could not read {argv[2]} for [tool.uv] overrides: {exc}", file=sys.stderr)
+        text = ""
+    entries = uv_override_dependencies(text)
+    try:
+        Path(argv[3]).write_text("".join(entry + "\n" for entry in entries), encoding="utf-8")
+    except OSError as exc:
+        print(f"-- could not write the uv overrides file {argv[3]}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _run_admits(argv: list[str]) -> int:
     """``docker_venv_python.py --admits <pyproject> <venv_dir>``.
 
@@ -487,6 +541,8 @@ def main(argv: list[str]) -> int:
         return _run_verify(argv)
     if len(argv) >= 2 and argv[1] == "--admits":
         return _run_admits(argv)
+    if len(argv) >= 2 and argv[1] == "--uv-overrides":
+        return _run_uv_overrides(argv)
 
     if len(argv) != 4:
         print("usage: docker_venv_python.py <pyproject> <venv_dir> <major.minor[.micro]>", file=sys.stderr)
