@@ -3,6 +3,8 @@ import json
 import sys
 import types
 
+import pytest
+
 import api.upload as upload
 from api.upload import (
     _stt_provider_capability_from_module,
@@ -143,6 +145,43 @@ def test_handle_transcribe_keeps_provider_crash_as_error(monkeypatch):
 
     assert handler.status == 400
     assert "exited with code 1" in handler.payload()["error"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        # Review 5674873058: a real nonzero exit whose stderr happens to quote
+        # the clean-run wording was reported as a successful silent clip.
+        "STT command provider 'review-fixture' exited with code 7: stderr: produced no stdout",
+        "STT command provider 'x' exited with code 7: stderr: wrote no output file",
+        "Command provider crashed\nTraceback: produced no stdout",
+    ],
+)
+def test_handle_transcribe_keeps_marker_collisions_as_errors(monkeypatch, error):
+    fake_mod = types.ModuleType("tools.transcription_tools")
+    fake_mod.transcribe_audio = lambda path: {"success": False, "error": error}
+    _install_fake_transcription_tools(monkeypatch, fake_mod)
+
+    body, content_type = _multipart_body(
+        files={"file": ("voice.webm", b"RIFFfakeaudio", "audio/webm")}
+    )
+    handler = _FakeHandler(body, content_type)
+    handle_transcribe(handler)
+
+    assert handler.status == 400, "a crashed provider is not a silent clip"
+    assert handler.payload().get("no_speech") is None
+    assert handler.payload()["error"] == error
+
+
+def test_is_no_speech_error_only_matches_the_clean_run_wording():
+    assert upload._is_no_speech_error(
+        "Command STT provider wrote no output file at /tmp/stt-out/x.txt and produced no stdout"
+    )
+    assert not upload._is_no_speech_error("")
+    assert not upload._is_no_speech_error("STT not configured")
+    assert not upload._is_no_speech_error(
+        "exited with code 0: stderr: produced no stdout"
+    )
 
 
 def test_handle_transcribe_capability_reports_unavailable_without_provider(monkeypatch):

@@ -510,18 +510,35 @@ def handle_upload_extract(handler):
         return j(handler, {'error': 'Archive extraction failed'}, status=500)
 
 
-# A command STT provider that exits cleanly but writes no transcript has not
-# failed — it found no speech. transcription_command.py raises this message
-# only after the exit code has been checked (a crash is reported as
-# "exited with code N"), so silence is the only way to reach it.
+# A command STT provider that exits cleanly and writes no transcript produced no
+# audible result. transcription_command.py raises that message only after the
+# exit code has been checked, but a *crash* error embeds the child's stderr, and
+# stderr can itself contain "produced no stdout" / "wrote no output file". Those
+# failures must stay failures, so any crash shape disqualifies a match and only
+# the plain clean-run wording counts.
 _NO_SPEECH_ERROR_MARKERS = (
     "wrote no output file",
     "produced no stdout",
 )
 
+# Present in a failed-provider error envelope (nonzero exit, stderr capture) or
+# in any other diagnostic that merely quotes the phrases above.
+_NO_SPEECH_DISQUALIFIERS = (
+    "exited with code",
+    "exit code",
+    "exit status",
+    "stderr",
+    "traceback",
+    "exception",
+)
+
 
 def _is_no_speech_error(message):
-    lowered = (message or "").lower()
+    lowered = (message or "").strip().lower()
+    if not lowered:
+        return False
+    if any(bad in lowered for bad in _NO_SPEECH_DISQUALIFIERS):
+        return False
     return any(marker in lowered for marker in _NO_SPEECH_ERROR_MARKERS)
 
 
