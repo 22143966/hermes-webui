@@ -453,6 +453,61 @@ console.log(JSON.stringify(out));
     assert rows["legacy-expired"]["value"] is None
 
 
+def test_boot_js_mic_force_mediarecorder_ttl_hostile_storage():
+    """A full store keeps a legacy preference; a garbled expiry never pins the device.
+
+    Release-manager fold after the #8295 gate (Codex: a legacy ``'0'`` read on a full
+    store threw on the expiry write and the outer catch discarded the preference;
+    advisor: a non-numeric expiry never expired). Runs the real helpers.
+    """
+    import subprocess
+
+    js, _ = get_text("/static/boot.js")
+    start = js.index("  const _micForceMediaRecorderKey=")
+    end = js.index("  const _micForceMediaRecorderStored=")
+    snippet = js[start:end]
+    script = r"""
+const store = new Map();
+let full = false;
+const localStorage = {
+  getItem: (k) => (store.has(k) ? store.get(k) : null),
+  setItem: (k, v) => {
+    if (full) { const e = new Error('quota'); e.name = 'QuotaExceededError'; throw e; }
+    store.set(k, String(v));
+  },
+  removeItem: (k) => store.delete(k),
+};
+let now = 1000000;
+const Date = { now: () => now };
+""" + snippet + r"""
+const out = {};
+store.set('mic_force_mediarecorder', '0');
+full = true;
+out.full_legacy_0 = _getMicForceMediaRecorderStored();
+out.full_legacy_0_exp = localStorage.getItem('mic_force_mediarecorder_expires');
+full = false;
+store.set('mic_force_mediarecorder', '1');
+store.set('mic_force_mediarecorder_expires', 'abc');
+out.garbled = _getMicForceMediaRecorderStored();
+out.garbled_value = localStorage.getItem('mic_force_mediarecorder');
+out.garbled_exp = localStorage.getItem('mic_force_mediarecorder_expires');
+console.log(JSON.stringify(out));
+"""
+    proc = subprocess.run(
+        ["node", "-e", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["full_legacy_0"] == "0"
+    assert out["full_legacy_0_exp"] is None
+    assert out["garbled"] is None
+    assert out["garbled_value"] is None
+    assert out["garbled_exp"] is None
+
+
 def test_routes_define_transcribe_endpoint():
     """Server routes must expose /api/transcribe for MediaRecorder fallback uploads."""
     routes = pathlib.Path(__file__).parent.parent.joinpath("api/routes.py").read_text(encoding="utf-8")

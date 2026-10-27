@@ -1111,7 +1111,9 @@ function _micToastKeyForRecognitionError(error){
       const stored=localStorage.getItem(_micForceMediaRecorderKey);
       if(exp){
         const expMs=parseInt(exp,10);
-        if(Number.isFinite(expMs)&&Date.now()>expMs){
+        // A garbled expiry counts as expired too: a value that never parses
+        // would otherwise pin this device forever.
+        if(!Number.isFinite(expMs)||Date.now()>expMs){
           localStorage.removeItem(_micForceMediaRecorderKey);
           localStorage.removeItem(_micForceMediaRecorderExpiryKey);
           return null;
@@ -1119,7 +1121,10 @@ function _micToastKeyForRecognitionError(error){
       }else if(stored==='0'||stored==='1'){
         // Values saved before the expiry key existed would otherwise pin this
         // device forever. Start the 24h window on the first read after upgrade.
-        localStorage.setItem(_micForceMediaRecorderExpiryKey,String(Date.now()+_MIC_FORCE_MR_TTL_MS));
+        // A full or read-only store must not discard the readable preference.
+        try{
+          localStorage.setItem(_micForceMediaRecorderExpiryKey,String(Date.now()+_MIC_FORCE_MR_TTL_MS));
+        }catch(_){}
       }
       return stored;
     }catch(_){
