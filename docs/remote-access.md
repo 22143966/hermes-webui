@@ -120,8 +120,31 @@ IPs:
 HERMES_WEBUI_TRUSTED_PROXY_CIDRS=172.17.0.1,10.9.9.0/24 ./start.sh
 ```
 
-Loopback (`127.0.0.0/8`, `::1`) is always trusted implicitly, so a proxy on the
-same host needs no configuration. Without a matching allowlist entry the proxy
+Loopback (`127.0.0.0/8`, `::1`) is always trusted implicitly for the request
+log and the local-origin features, so for those a proxy on the same host needs
+no configuration.
+
+Login rate limiting is the exception. It keys on the forwarded client address
+only when `HERMES_WEBUI_TRUST_FORWARDED_FOR=1` is set **and** the proxy's
+address is listed explicitly in `HERMES_WEBUI_TRUSTED_PROXY_CIDRS`; implicit
+loopback trust does not count. Without both, every user behind a same-host
+proxy shares the proxy's single login bucket, so repeated failed logins from
+one client lock out the others. To give each client its own bucket:
+
+```bash
+HERMES_WEBUI_TRUST_FORWARDED_FOR=1 HERMES_WEBUI_TRUSTED_PROXY_CIDRS=127.0.0.1 ./start.sh
+```
+
+Listing a loopback address trusts every local client (an SSH tunnel, another
+process on the host) exactly like the proxy, because the address cannot tell
+them apart. Only do it when the proxy is the sole local client that reaches
+WebUI. Appending to `X-Forwarded-For` (nginx's `$proxy_add_x_forwarded_for`)
+is fine, because WebUI walks the chain from the right. Have the proxy overwrite
+`X-Real-IP` (`proxy_set_header X-Real-IP $remote_addr;`). If it relays a
+client-supplied value that disagrees with the chain, WebUI falls back to the
+shared bucket.
+
+Without a matching allowlist entry the proxy
 is treated as an ordinary client: forwarded headers are ignored, so the
 structured request log records no `forwarded_for` field for requests arriving
 through it and local-origin features (onboarding, passwordless terminal) do not
