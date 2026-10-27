@@ -124,6 +124,13 @@ def _toml_str(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def test_dropped_entries_are_named_on_stderr(capsys):
+    text = '[tool.uv]\noverride-dependencies = ["-r http://127.0.0.1:9/x.txt", "pillow==13.0.0"]\n'
+    assert dvp.uv_override_dependencies(text) == ["pillow==13.0.0"]
+    err = capsys.readouterr().err
+    assert "Ignoring a [tool.uv] override-dependencies entry" in err and "-r http://127.0.0.1:9/x.txt" in err
+
+
 # ── the CLI mode docker_init.bash calls ──────────────────────────────────────
 
 def _cli(*args):
@@ -194,9 +201,10 @@ def _bash_function(src: str, name: str) -> str:
 
 
 def _install(tmp_path: Path, pyproject_text: str | None, *, helper: Path = HELPER, tmpdir: Path | None = None,
-             uv_rc: int = 0) -> tuple[int, str, str]:
-    stage = tmp_path / "hermes-agent-src"
-    stage.mkdir()
+             uv_rc: int = 0, app_writable: bool = True) -> tuple[int, str, str]:
+    app = tmp_path / "app"  # the stage's parent, /app in the image
+    stage = app / "hermes-agent-src"
+    stage.mkdir(parents=True)
     if pyproject_text is not None:
         (stage / "pyproject.toml").write_text(pyproject_text, encoding="utf-8")
     bindir = tmp_path / "fakebin"
@@ -219,10 +227,19 @@ def _install(tmp_path: Path, pyproject_text: str | None, *, helper: Path = HELPE
         "TMPDIR": str(work_tmp),
         "HOME": str(tmp_path),
     }
-    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60, env=env, check=False)
+    if not app_writable:
+        app.chmod(0o555)
+    try:
+        out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60, env=env, check=False)
+    finally:
+        app.chmod(0o755)
     assert out.returncode == 0, out.stdout + out.stderr
     rc = int(out.stdout.strip().splitlines()[-1].split("=", 1)[1])
     return rc, out.stdout, log.read_text(encoding="utf-8") if log.exists() else ""
+
+
+def _stage(tmp_path: Path) -> str:
+    return f"{tmp_path}/app/hermes-agent-src"
 
 
 def _calls(log: str) -> list[str]:
@@ -235,7 +252,7 @@ def test_the_agents_overrides_are_passed_to_uv(tmp_path):
     assert rc == 0
     calls = _calls(log)
     assert len(calls) == 1
-    assert calls[0].startswith(f"pip install -e {tmp_path}/hermes-agent-src[all] --overrides ")
+    assert calls[0].startswith(f"pip install -e {_stage(tmp_path)}[all] --overrides ")
     assert "--trusted-host pypi.org --trusted-host files.pythonhosted.org" in calls[0]
     assert [line[len("OVERRIDE:"):] for line in log.splitlines() if line.startswith("OVERRIDE:")] == EXPECTED
     assert "override-dependencies (4 entries)" in stdout
@@ -259,10 +276,13 @@ def test_a_failed_install_is_reported_and_still_cleans_up(tmp_path):
 PLAIN = "pip install -e {stage}[all] --trusted-host pypi.org --trusted-host files.pythonhosted.org"
 
 
+FAILING_HELPER = "import sys\nsys.exit(1)\n"
+
+
 @pytestmark_bash
 @pytest.mark.parametrize(
     "case",
-    ["no-override-table", "no-pyproject", "no-helper", "unwritable-tmpdir"],
+    ["no-override-table", "no-pyproject", "no-helper", "helper-fails", "no-writable-temp-dir"],
 )
 def test_every_fallback_is_the_plain_install_it_replaced(tmp_path, case):
     kwargs = {}
@@ -273,11 +293,37 @@ def test_every_fallback_is_the_plain_install_it_replaced(tmp_path, case):
         text = None
     elif case == "no-helper":
         kwargs["helper"] = tmp_path / "missing-helper.py"
-    elif case == "unwritable-tmpdir":
+    elif case == "helper-fails":
+        failing = tmp_path / "failing-helper.py"
+        failing.write_text(FAILING_HELPER, encoding="utf-8")
+        kwargs["helper"] = failing
+    elif case == "no-writable-temp-dir":
         kwargs["tmpdir"] = tmp_path / "does-not-exist"
-    rc, _, log = _install(tmp_path, text, **kwargs)
+        kwargs["app_writable"] = False
+    rc, stdout, log = _install(tmp_path, text, **kwargs)
     assert rc == 0
-    assert _calls(log) == [PLAIN.format(stage=f"{tmp_path}/hermes-agent-src")]
+    assert _calls(log) == [PLAIN.format(stage=_stage(tmp_path))]
+    # A skipped overrides step is announced when the Agent declared any, so the
+    # operator isn't left with only uv's "unsatisfiable" to go on.
+    if case == "helper-fails":
+        assert "!! Could not read hermes-agent's [tool.uv] override-dependencies" in stdout
+    if case == "no-writable-temp-dir":
+        assert "!! Could not create a temporary file for hermes-agent's uv overrides" in stdout
+    if case in ("no-override-table", "no-pyproject", "no-helper"):
+        assert "!!" not in stdout
+    assert list((tmp_path / "app").iterdir()) == [Path(_stage(tmp_path))]
+
+
+@pytestmark_bash
+def test_an_unwritable_tmpdir_falls_back_to_the_stage_parent(tmp_path):
+    # read_only podman (#1470) / userns (#2010): /tmp is not writable but /app is.
+    rc, _, log = _install(tmp_path, AGENT_PYPROJECT, tmpdir=tmp_path / "does-not-exist")
+    assert rc == 0
+    used = [line[len("OVERRIDES_FILE:"):] for line in log.splitlines() if line.startswith("OVERRIDES_FILE:")]
+    assert len(used) == 1 and Path(used[0]).parent == tmp_path / "app"
+    assert [line[len("OVERRIDE:"):] for line in log.splitlines() if line.startswith("OVERRIDE:")] == EXPECTED
+    assert not Path(used[0]).exists()
+    assert list((tmp_path / "app").iterdir()) == [Path(_stage(tmp_path))]
 
 
 @pytestmark_bash

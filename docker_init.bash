@@ -551,9 +551,15 @@ install_staged_agent() {
   _isa_src="$1"
   _isa_overrides=""
   if [ -f "$_venv_helper" ] && [ -f "$_isa_src/pyproject.toml" ]; then
-    _isa_overrides="$(mktemp "${TMPDIR:-/tmp}/hermes-agent-uv-overrides.XXXXXX" 2>/dev/null)" || _isa_overrides=""
-    if [ -n "$_isa_overrides" ] \
-        && ! python3 "$_venv_helper" --uv-overrides "$_isa_src/pyproject.toml" "$_isa_overrides"; then
+    # TMPDIR first; then the stage's parent (/app, already written to here), for
+    # runtimes whose /tmp is not writable (#1470 read_only, #2010 userns).
+    _isa_overrides="$(mktemp "${TMPDIR:-/tmp}/hermes-agent-uv-overrides.XXXXXX" 2>/dev/null)" \
+      || _isa_overrides="$(mktemp "$(dirname "$_isa_src")/.hermes-agent-uv-overrides.XXXXXX" 2>/dev/null)" \
+      || _isa_overrides=""
+    if [ -z "$_isa_overrides" ]; then
+      echo "!! Could not create a temporary file for hermes-agent's uv overrides; installing without them"
+    elif ! python3 "$_venv_helper" --uv-overrides "$_isa_src/pyproject.toml" "$_isa_overrides"; then
+      echo "!! Could not read hermes-agent's [tool.uv] override-dependencies; installing without them"
       rm -f "$_isa_overrides"
       _isa_overrides=""
     fi

@@ -473,12 +473,22 @@ def uv_override_dependencies(pyproject_text: str) -> list[str]:
     kept = []
     for entry in entries:
         if not isinstance(entry, str) or "\n" in entry or "\r" in entry:
+            _report_dropped(entry)
             continue
         entry = entry.strip()
         if not entry or not (entry[0].isascii() and entry[0].isalnum()) or entry.endswith("\\"):
+            if entry:
+                _report_dropped(entry)
             continue
         kept.append(entry)
     return kept
+
+
+def _report_dropped(entry: object) -> None:
+    # The value comes from the authorized Agent tree, so naming it is safe; a
+    # silent drop would leave only uv's "unsatisfiable" to explain a failed install.
+    print(f"-- Ignoring a [tool.uv] override-dependencies entry that is not a plain requirement: {entry!r}",
+          file=sys.stderr)
 
 
 def _run_uv_overrides(argv: list[str]) -> int:
