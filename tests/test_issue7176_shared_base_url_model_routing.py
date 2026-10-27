@@ -197,6 +197,17 @@ def test_shared_url_entry_with_own_key_keeps_its_live_models(monkeypatch, own_ke
          "api_key": own_key, "model": "claude-default"},
     ])
     cfg_mod.invalidate_models_cache()
+    # Pin the loaded-config path and mtime: tests/test_issue4662_reload_config_mtime_cache.py
+    # leaves _cfg_path and _cfg_mtime pointing at its deleted tmp config, so without this
+    # get_available_models() sees a stale mtime and reloads config.yaml over this in-memory
+    # seed, an order-dependent failure of the same class as #8226. A missing config.yaml
+    # must pin 0.0, the value get_available_models() reads for it.
+    monkeypatch.setattr(cfg_mod, "_cfg_path", cfg_mod._get_config_path())
+    try:
+        current_mtime = cfg_mod.Path(cfg_mod._get_config_path()).stat().st_mtime
+    except OSError:
+        current_mtime = 0.0
+    monkeypatch.setattr(cfg_mod, "_cfg_mtime", current_mtime)
     try:
         groups = cfg_mod.get_available_models(force_refresh=True)["groups"]
     finally:
