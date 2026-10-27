@@ -2437,7 +2437,7 @@ async function forkFromMessage(msgIdx, btn){
     // display-only rows excluded), but the busy guard inspects the rendered
     // array, which still holds those rows. Map back to the real current array
     // position before checking _live/_pending and the last-display-row rule,
-    // otherwise the guard lands on the recovered prompt (blocking a fork of
+    // otherwise the guard lands on the recovered prompt, blocking a fork of
     // the committed row right after it) or misses a live row entirely.
     const sessionIdx=(msgIdx-1)+((typeof _messageSessionIndexBase==='function')?_messageSessionIndexBase():0);
     const realIdx=(typeof _messageRawIdxForSessionIndex==='function')
