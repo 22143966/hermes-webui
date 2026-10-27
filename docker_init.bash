@@ -646,14 +646,16 @@ install_venv_dependencies() {
         || { echo "!! Failed to copy hermes-agent source to writable build dir"; return 1; }
       rm -rf "$_stage_src"/*.egg-info "$_stage_src"/build "$_stage_src"/dist 2>/dev/null || true
       rm -rf "$_stage_src"/.playwright 2>/dev/null || true
-      # Like rsync's --exclude='.git': a stage with .git is not the no-.git copy
-      # select_staged_agent_for_git_checkout runs.
-      rm -rf "$_stage_src"/.git 2>/dev/null || true
       rm -rf "$_stage_src"/.install.lock "$_stage_src"/tools/.install.lock 2>/dev/null || true
       find "$_stage_src" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
     fi
     chmod -R u+w "$_stage_src" \
       || { echo "!! Failed to make staged hermes-agent source writable (rsync/cp preserved :ro mount perms)"; return 1; }
+    # rsync excluded .git; the cp -a fallback copied it, and only now (after the
+    # chmod: cp -a keeps a :ro mount's 0555 directories) can it be removed. A
+    # stage with .git is never run by select_staged_agent_for_git_checkout.
+    rm -rf "$_stage_src/.git" \
+      || echo "!! WARNING: could not drop .git from the staged hermes-agent copy; the mounted Agent will be run instead"
     # Never fatal: without the manifest the recovery path simply ignores the
     # stage and falls back to the authorized Agent directory.
     write_agent_stage_manifest "$_agent_src" "$_stage_src" \
