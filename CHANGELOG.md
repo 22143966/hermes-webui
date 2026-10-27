@@ -51,6 +51,8 @@
 
 ### Fixed
 
+- **Gateway delegation wake-up after a cut-off fan-out is neutral and conditional.** When a delegation batch that was cut off is delivered, the parent now gets one prompt to check the recovery evidence and re-dispatch only work it can verify is unfinished, instead of a prompt that assumed the owner had exited. Completed batches that merely quote the marker text are no longer treated as recovered. Thanks @carlotestor.
+
 - **Extensions load behind a reverse-proxy subpath mount.** Injected extension script and stylesheet tags are now mount-relative, so `<base href>` resolves them inside `https://host/hermes/` instead of the origin root. Requests the browser's preload scanner makes from a `/session/<id>` deep link (`/session/extensions/...`) now get the real asset instead of the page shell, behind the same auth as `/extensions/`. Thanks @rpodgorny.
 
 - **The workspace panel's background Git status no longer leaves a stale `index.lock` behind.** A `git status` killed at its timeout while refreshing the index could leave `.git/index.lock`, so the next commit from WebUI failed. Status now runs with `GIT_OPTIONAL_LOCKS=0`; writes keep normal locking. (#8520 partly: on a stale index the follow-up `git diff` can still take the lock.) Thanks @balabommablock-cpu.
