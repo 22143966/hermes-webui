@@ -21861,8 +21861,11 @@ function renderMessages(options){
     if(recoveryHtml) bodyHtml += recoveryHtml;
     const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
     const isDisplayOnlyRow=!!(m&&m._displayOnlyRow);
-    const isEditableUser=isUser&&rawIdx===lastUserRawIdx&&!isDisplayOnlyRow;
-    const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
+    const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
+    // Display-only rows have no canonical index, so a keep_count derived from
+    // them would truncate/fork the wrong point: keep the row's actions off
+    // until the transcript row it mirrors actually lands.
+    const editBtn  = isEditableUser ? (isDisplayOnlyRow ? '' : `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>`) : '';
     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
     const retryBtn = isLastAssistant ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
     const copyBtn  = `<button class="msg-copy-btn msg-action-btn" title="${t('copy')}" onclick="copyMsg(this)">${li('copy',13)}</button>`;
