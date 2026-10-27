@@ -97,13 +97,27 @@ def test_malformed_entries_are_dropped_and_never_span_lines():
         "--index-url http://127.0.0.1:9/simple",
         "--extra-index-url=http://127.0.0.1:9/simple",
         "pillow==13.0.0 \\",
+        "\ufeff-r http://127.0.0.1:9/injected.txt",
+        "  \ufeff-r http://127.0.0.1:9/injected.txt",
+        "\ufeffpillow==13.0.0",
+        "# pillow==13.0.0",
+        "\u00e9clair==1.0",
+        "",
     ],
 )
 def test_requirements_file_directives_are_never_passed_to_uv(entry):
     # uv parses the overrides file as requirements.txt: a "-" line is a directive it
-    # acts on (a -r URL is fetched) and a trailing backslash joins the next line.
+    # acts on (a -r URL is fetched; uv strips a leading BOM first) and a trailing
+    # backslash joins the next line. Only entries that start like a PEP 508 name pass.
     text = "[tool.uv]\noverride-dependencies = [%s, \"cryptography==50.0.1\"]\n" % _toml_str(entry)
     assert dvp.uv_override_dependencies(text) == ["cryptography==50.0.1"]
+
+
+@pytest.mark.parametrize("entry", ["Pillow==13.0.0", "9p==1", "zope.interface>=6; python_version >= '3.14'",
+                                   "pkg @ https://example.invalid/pkg-1.0.tar.gz"])
+def test_pep508_requirements_are_kept(entry):
+    text = "[tool.uv]\noverride-dependencies = [%s]\n" % _toml_str(entry)
+    assert dvp.uv_override_dependencies(text) == [entry]
 
 
 def _toml_str(value: str) -> str:

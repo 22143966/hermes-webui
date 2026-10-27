@@ -466,15 +466,16 @@ def uv_override_dependencies(pyproject_text: str) -> list[str]:
         return []
     # uv reads the overrides file as requirements.txt syntax, so a line starting with
     # "-" is a directive (-r/-c/-e/--index-url, which uv acts on, fetching -r URLs,
-    # before it judges the entry), and a trailing "\" joins the next line. Neither can
-    # be a PEP 508 requirement, which is all [tool.uv] override-dependencies accepts.
+    # before it judges the entry; uv also strips a leading BOM first), and a trailing
+    # "\" joins the next line. [tool.uv] override-dependencies only accepts PEP 508
+    # requirements, whose name starts with an ASCII letter or digit: keep exactly those.
     # Keep one requirement per line: never let an entry span lines.
     kept = []
     for entry in entries:
         if not isinstance(entry, str) or "\n" in entry or "\r" in entry:
             continue
         entry = entry.strip()
-        if not entry or entry.startswith("-") or entry.endswith("\\"):
+        if not entry or not (entry[0].isascii() and entry[0].isalnum()) or entry.endswith("\\"):
             continue
         kept.append(entry)
     return kept
