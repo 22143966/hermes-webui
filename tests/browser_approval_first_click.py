@@ -21,6 +21,9 @@ the volatile `approval_id`):
 - different logical approval (queued A -> B while A is still visible) -> the
   click is NEVER transferred; the card re-renders to the head and a fresh
   deliberate click is required;
+- different approval with IDENTICAL content (same command/description/patterns,
+  different `request_id`) -> also never transferred: content is not identity, so
+  the click posts nothing and B stays pending until a fresh click;
 - nothing pending -> orphan card clears (server `stale_cleared` path).
 
 This gate drives the REAL frontend functions (`showApprovalForSession`,
@@ -138,11 +141,21 @@ def _get_json(url: str) -> dict:
 # ── approval API helpers against the real server ─────────────────────────────
 
 
-def _inject_approval(base_url: str, sid: str, command: str, key: str) -> None:
-    query = urllib.parse.urlencode(
-        {"session_id": sid, "pattern_key": key, "command": command}
-    )
-    _get_json(f"{base_url}/api/approval/inject_test?{query}")
+def _inject_approval(
+    base_url: str,
+    sid: str,
+    command: str,
+    key: str,
+    *,
+    description: str | None = None,
+    request_id: str | None = None,
+) -> dict:
+    params = {"session_id": sid, "pattern_key": key, "command": command}
+    if description is not None:
+        params["description"] = description
+    if request_id is not None:
+        params["request_id"] = request_id
+    return _get_json(f"{base_url}/api/approval/inject_test?{urllib.parse.urlencode(params)}")
 
 
 def _pending_head(base_url: str, sid: str) -> dict | None:
@@ -472,6 +485,90 @@ def _scenario_4_dismissed_successor_in_map_never_resolves(
     page.screenshot(path=str(artifact_dir / "s4-after-click-keeps-b-pending.png"))
 
 
+def _scenario_5_identical_content_queued_b_never_approved(
+    page, base_url: str, artifact_dir: Path
+) -> None:
+    """Identical content, different request: a click on A must never answer B.
+
+    Two queued approvals can share the command, description and patterns (an
+    identical retried command). Only the core's per-approval `request_id`
+    distinguishes them, so adopting the head's transport id on a content match
+    would answer the approval the user never saw (#7144 r6).
+    """
+    print("S5: identical-content queued B -> A's click must not resolve B")
+    sid = _fresh_active_session(page)
+    same_cmd = "rm -rf /tmp/approval-same"
+    same_key = "dangerous_same"
+    same_desc = "identical retry"
+
+    # 1. Queue two approvals with the same command, description and patterns;
+    #    only their stable request_id differs, exactly as the core stamps it.
+    injected_a = _inject_approval(
+        base_url, sid, same_cmd, same_key, description=same_desc, request_id="req-a"
+    )
+    head_a = _pending_head(base_url, sid)
+    assert head_a and head_a.get("approval_id"), f"precondition: head A missing: {head_a}"
+    assert head_a.get("request_id") == "req-a", f"request_id must survive inject: {head_a}"
+    assert injected_a.get("request_id") == "req-a", injected_a
+    _inject_approval(
+        base_url, sid, same_cmd, same_key, description=same_desc, request_id="req-b"
+    )
+
+    # 2. Render A.
+    _render_card(page, sid, head_a)
+    assert _wait_card_visible(page), "card must be visible after render"
+    assert _card_command(page).strip() == same_cmd, _card_command(page)
+
+    # 3. Resolve A elsewhere (another tab / the CLI). B is now the head, with
+    #    identical content and a different request_id.
+    resolved = _respond(base_url, sid, head_a["approval_id"])
+    assert resolved.get("ok") is True, f"server-side resolve of A failed: {resolved}"
+    head_b = _pending_head(base_url, sid)
+    assert head_b and head_b.get("request_id") == "req-b", (
+        f"precondition: head must now be B with req-b: {head_b}"
+    )
+    approval_b_id = head_b["approval_id"]
+    assert approval_b_id != head_a["approval_id"]
+
+    # 4. Click A's still-visible card: no POST at all, and B stays pending.
+    respond_payloads: list[dict] = []
+
+    def _on_request(request) -> None:
+        if request.method == "POST" and request.url.endswith("/api/approval/respond"):
+            try:
+                respond_payloads.append(json.loads(request.post_data or "{}"))
+            except Exception:
+                respond_payloads.append({})
+
+    page.on("request", _on_request)
+
+    ok = _click_allow_once(page)
+    assert ok is False, "a click on stale A must not resolve the identical-content B"
+    assert respond_payloads == [], (
+        "identical content is not identity: a click on A whose head is the "
+        "identical-content successor B must issue no /api/approval/respond "
+        "request at all; got " + repr(respond_payloads)
+    )
+    assert NOT_ACCEPTED_TOAST not in _toast_text(page), _toast_text(page)
+    still = _pending_head(base_url, sid)
+    assert still and still.get("approval_id") == approval_b_id, (
+        f"B must stay pending after the click on A: {still}"
+    )
+    # The card re-rendered to B so it can still be answered deliberately.
+    assert _card_visible(page), "card must stay visible, re-rendered to B"
+    assert _eval(page, "() => _approvalCurrentId") == approval_b_id, (
+        "card must re-render to B's transport id"
+    )
+    page.screenshot(path=str(artifact_dir / "s5-after-click-keeps-identical-b-pending.png"))
+
+    # A fresh deliberate click on the re-rendered B card resolves B.
+    ok_second = _click_allow_once(page)
+    assert ok_second is True, "fresh click on B must resolve"
+    assert not _card_visible(page), "card must hide after resolving B"
+    assert _pending_head(base_url, sid) is None, "B must be resolved server-side"
+    page.screenshot(path=str(artifact_dir / "s5-after-b-resolved.png"))
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 
@@ -570,6 +667,7 @@ def main() -> int:
         _scenario_2_queued_a_to_b_never_transfers_click(page, base_url, sid, artifact_dir)
         _scenario_3_dismiss_syncs_to_authoritative_head(page, base_url, sid, artifact_dir)
         _scenario_4_dismissed_successor_in_map_never_resolves(page, base_url, artifact_dir)
+        _scenario_5_identical_content_queued_b_never_approved(page, base_url, artifact_dir)
 
         context.close()
         browser.close()

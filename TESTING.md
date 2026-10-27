@@ -376,6 +376,10 @@ state, and seeds approvals through the loopback-only
 - S3: dismiss with a stale id re-renders the head first and does not resurrect it.
 - S4: a successor that never rendered must produce no `/api/approval/respond`
   request at all.
+- S5: two queued approvals with identical content (same command, description and
+  patterns, different `request_id`) are still distinct identities: clicking A
+  posts nothing, B stays pending, and only a fresh click resolves B. Identical
+  content alone must never let a click answer the approval the user never saw.
 
 ```bash
 pip install -r requirements.txt playwright
@@ -387,6 +391,14 @@ Set `APPROVAL_ARTIFACT_DIR` to keep the screenshots and server log. The
 `approval-first-click` row in the conversation lifecycle workflow is blocking,
 so a regression in the response-id reconciliation fails CI instead of being
 swallowed.
+
+The same identity rules are pinned headlessly in
+`tests/test_gateway_yolo_webui_compat.py`: an entry with no `request_id` and no
+producer token fails closed when the head's transport id differs (no respond
+POST), still answers when the transport id matches (the server-minted id is its
+own proof, so the card cannot re-render forever), and the id-equality
+short-circuit still respects the post-await session fence for both respond and
+dismiss.
 
 ### Active-session reconnect redraw gate
 

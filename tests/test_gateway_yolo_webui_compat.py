@@ -1935,12 +1935,12 @@ def test_approval_reconciles_stale_transport_id_for_same_logical_approval():
         "let _loadSessionGeneration=1;",
         "let _approvalResponding=null;",
         "let _approvalClearedOwner=null;",
-        "let _approvalDisplayedOwner={sid:'browser-session',approvalId:'approval-1',runId:'run-1',mirrorToken:'mirror-1',displayedKey:'{\"sid\":\"browser-session\",\"desc\":\"\",\"cmd\":\"\",\"run_id\":\"run-1\",\"mirror_token\":\"mirror-1\"}'};",
+        "let _approvalDisplayedOwner={sid:'browser-session',approvalId:'approval-1',runId:'run-1',mirrorToken:'mirror-1'};",
         "let _yoloEnabled=false;",
-        "const _approvalPendingBySession=new Map([['browser-session',{pending:{approval_id:'approval-1',run_id:'run-1',_gateway_mirror_token:'mirror-1'}}]]);",
+        "const _approvalPendingBySession=new Map([['browser-session',{pending:{approval_id:'approval-1',request_id:'req-1',run_id:'run-1',_gateway_mirror_token:'mirror-1'}}]]);",
         "const api=async(path,opts={})=>{",
         " calls.push([path,opts.body?JSON.parse(opts.body):null]);",
-        " if(path.startsWith('/api/approval/pending'))return {pending:{approval_id:'approval-1-updated',run_id:'run-1',_gateway_mirror_token:'mirror-1'},pending_count:1};",
+        " if(path.startsWith('/api/approval/pending'))return {pending:{approval_id:'approval-1-updated',request_id:'req-1',run_id:'run-1',_gateway_mirror_token:'mirror-1'},pending_count:1};",
         " return {ok:true,yolo_enabled:true};",
         "};",
         "const showApprovalForSession=(sid,pending,count)=>{showApprovalCalls+=1;};",
@@ -1955,6 +1955,7 @@ def test_approval_reconciles_stale_transport_id_for_same_logical_approval():
         extract("respondApproval", "\nfunction startApprovalPolling"),
         extract("toggleYoloFromApproval", "\n// ── Approval polling"),
         "(async()=>{",
+        " _approvalDisplayedOwner.displayedKey=_approvalLogicalKey('browser-session',_approvalPendingBySession.get('browser-session').pending);",
         " const ok=await toggleYoloFromApproval();",
         " if(!ok) throw new Error('action failed');",
         " if(calls.length!==2) throw new Error('expected reconcile GET + one respond '+JSON.stringify(calls));",
@@ -2024,6 +2025,365 @@ def test_approval_never_auto_transfers_click_to_different_logical_approval():
         " if(hideApprovalCalls!==0) throw new Error('re-rendered head must stay visible for a fresh click');",
         " if(_approvalResponding!==null) throw new Error('response owner was not released');",
         " if(_yoloEnabled!==false) throw new Error('YOLO must not be projected for a different approval');",
+        "})().catch(e=>{console.error(e.stack||e);process.exit(1)});",
+    ])
+    result = subprocess.run([shutil.which("node"), "-e", script], text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not available")
+def test_identical_content_successor_with_distinct_request_id_is_not_answered():
+    """#7144 r6 (CORE): identical content is not identity.
+
+    Two queued approvals can share command, description and patterns (an
+    identical retried command); only the core's per-approval `request_id`
+    distinguishes them. A click on visible A whose authoritative head is the
+    identical-content successor B must issue NO respond POST: adopting B's
+    transport id would answer an approval the user never saw.
+    """
+    messages_js = (pathlib.Path(__file__).resolve().parents[1] / "static" / "messages.js").read_text()
+
+    def extract(name, end_marker):
+        start = messages_js.index(f"async function {name}(")
+        return messages_js[start:messages_js.index(end_marker, start)]
+
+    script = "\n".join([
+        "const calls=[]; let showApprovalCalls=[]; let hideApprovalCalls=0;",
+        "const S={session:{session_id:'browser-session'}};",
+        "let _approvalSessionId='browser-session';",
+        "let _approvalCurrentId='approval-1';",
+        "let _loadSessionGeneration=1;",
+        "let _approvalResponding=null;",
+        "let _approvalClearedOwner=null;",
+        "let _yoloEnabled=false;",
+        "const cardA={approval_id:'approval-1',command:'rm -rf /tmp/same',description:'identical retry',pattern_key:'p',pattern_keys:['p'],request_id:'req-a',run_id:'run-1',_gateway_mirror_token:'mirror-1'};",
+        "let _approvalDisplayedOwner={sid:'browser-session',approvalId:'approval-1',runId:'run-1',mirrorToken:'mirror-1'};",
+        "const _approvalPendingBySession=new Map([['browser-session',{pending:cardA}]]);",
+        "const api=async(path,opts={})=>{",
+        " calls.push([path,opts.body?JSON.parse(opts.body):null]);",
+        " if(path.startsWith('/api/approval/pending'))return {pending:{...cardA,approval_id:'approval-2',request_id:'req-b'},pending_count:1};",
+        " if(path==='/api/approval/respond')return {ok:true};",
+        " return {ok:true};",
+        "};",
+        "const showApprovalForSession=(sid,pending,count)=>{showApprovalCalls.push(pending);_approvalCurrentId=pending.approval_id||null;};",
+        "const hideApprovalCard=()=>{hideApprovalCalls+=1;};",
+        "const $=()=>({disabled:false,classList:{contains:v=>v==='visible',add(){},remove(){}}});",
+        "const t=k=>k; const showToast=()=>{}; const setStatus=()=>{};",
+        "const _unmarkApprovalDismissed=()=>{};",
+        "const _setApprovalControlsDisabled=()=>{}; const _clearApprovalPendingForSession=()=>{};",
+        "const _updateYoloPill=()=>{};",
+        _js_block(messages_js, "function _approvalMirrorOwnerFor(", "\nfunction _setApprovalControlsDisabled"),
+        _js_block(messages_js, "function _applyApprovalYoloProjection(", "\nfunction toggleApprovalCardCollapsed"),
+        extract("respondApproval", "\nfunction startApprovalPolling"),
+        extract("toggleYoloFromApproval", "\n// ── Approval polling"),
+        "(async()=>{",
+        # Model a card rendered by showApprovalCard: the captured owner carries
+        # the RENDER-time logical key, as the real capture does.
+        " _approvalDisplayedOwner.displayedKey=_approvalLogicalKey('browser-session',cardA);",
+        " if(!_approvalDisplayedOwner.displayedKey) throw new Error('fixture has no stable identity');",
+        " const ok=await toggleYoloFromApproval();",
+        " if(ok) throw new Error('identical-content click must not succeed');",
+        " if(calls.length!==1) throw new Error('identical content is not identity: the click answered the never-seen successor '+JSON.stringify(calls));",
+        " if(!calls[0][0].startsWith('/api/approval/pending')) throw new Error('expected reconcile GET');",
+        " if(showApprovalCalls.length!==1) throw new Error('card was not re-rendered to B '+JSON.stringify(showApprovalCalls));",
+        " if(showApprovalCalls[0].approval_id!=='approval-2') throw new Error('re-render must show the authoritative head B');",
+        " if(_approvalResponding!==null) throw new Error('response owner was not released');",
+        " if(_yoloEnabled!==false) throw new Error('YOLO must not be projected for a never-seen approval');",
+        "})().catch(e=>{console.error(e.stack||e);process.exit(1)});",
+    ])
+    result = subprocess.run([shutil.which("node"), "-e", script], text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not available")
+def test_stale_transport_id_with_matching_request_id_is_still_adopted():
+    """#7091 direction 1 must survive the #7144 r6 identity change.
+
+    The same approval, with the same stable `request_id`, whose transport id
+    advanced between render and click: the click adopts the head's id and
+    resolves once (no re-render, no second click).
+    """
+    messages_js = (pathlib.Path(__file__).resolve().parents[1] / "static" / "messages.js").read_text()
+
+    def extract(name, end_marker):
+        start = messages_js.index(f"async function {name}(")
+        return messages_js[start:messages_js.index(end_marker, start)]
+
+    script = "\n".join([
+        "const calls=[]; let showApprovalCalls=0; let hideApprovalCalls=0;",
+        "const S={session:{session_id:'browser-session'}};",
+        "let _approvalSessionId='browser-session';",
+        "let _approvalCurrentId='approval-1';",
+        "let _loadSessionGeneration=1;",
+        "let _approvalResponding=null;",
+        "let _approvalClearedOwner=null;",
+        "let _yoloEnabled=false;",
+        "const cardA={approval_id:'approval-1',command:'rm -rf /tmp/same',description:'identical retry',pattern_key:'p',pattern_keys:['p'],request_id:'req-a',run_id:'run-1',_gateway_mirror_token:'mirror-1'};",
+        "let _approvalDisplayedOwner={sid:'browser-session',approvalId:'approval-1',runId:'run-1',mirrorToken:'mirror-1'};",
+        "const _approvalPendingBySession=new Map([['browser-session',{pending:cardA}]]);",
+        "const api=async(path,opts={})=>{",
+        " calls.push([path,opts.body?JSON.parse(opts.body):null]);",
+        " if(path.startsWith('/api/approval/pending'))return {pending:{...cardA,approval_id:'approval-1-updated'},pending_count:1};",
+        " if(path==='/api/approval/respond')return {ok:true,yolo_enabled:true};",
+        " return {ok:true};",
+        "};",
+        "const showApprovalForSession=()=>{showApprovalCalls+=1;};",
+        "const hideApprovalCard=()=>{hideApprovalCalls+=1;};",
+        "const $=()=>({disabled:false,classList:{contains:v=>v==='visible',add(){},remove(){}}});",
+        "const t=k=>k; const showToast=()=>{}; const setStatus=()=>{};",
+        "const _unmarkApprovalDismissed=()=>{};",
+        "const _setApprovalControlsDisabled=()=>{}; const _clearApprovalPendingForSession=()=>{};",
+        "const _updateYoloPill=()=>{};",
+        _js_block(messages_js, "function _approvalMirrorOwnerFor(", "\nfunction _setApprovalControlsDisabled"),
+        _js_block(messages_js, "function _applyApprovalYoloProjection(", "\nfunction toggleApprovalCardCollapsed"),
+        extract("respondApproval", "\nfunction startApprovalPolling"),
+        extract("toggleYoloFromApproval", "\n// ── Approval polling"),
+        "(async()=>{",
+        " _approvalDisplayedOwner.displayedKey=_approvalLogicalKey('browser-session',cardA);",
+        " if(!_approvalDisplayedOwner.displayedKey) throw new Error('fixture has no stable identity');",
+        " const ok=await toggleYoloFromApproval();",
+        " if(!ok) throw new Error('same-request click must resolve on the first click');",
+        " if(calls.length!==2) throw new Error('expected reconcile GET + one respond '+JSON.stringify(calls));",
+        " const [path,body]=calls[1];",
+        " if(path!=='/api/approval/respond') throw new Error('wrong endpoint '+path);",
+        " if(body.approval_id!=='approval-1-updated') throw new Error('stale transport id was not reconciled '+JSON.stringify(body));",
+        " if(showApprovalCalls!==0) throw new Error('same-request approval must not re-render');",
+        " if(hideApprovalCalls!==1) throw new Error('card must hide after success');",
+        "})().catch(e=>{console.error(e.stack||e);process.exit(1)});",
+    ])
+    result = subprocess.run([shutil.which("node"), "-e", script], text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not available")
+def test_identity_less_card_with_drifted_head_fails_closed():
+    """No stable identity + a different transport id must fail closed.
+
+    The raw `_pending` shape has no `request_id` and no run/mirror producer
+    token, so matching content proves nothing. When the head's transport id has
+    drifted, the click must not adopt it: the card re-renders and no respond
+    POST is issued. This is the other half of the #7144 r6 rule (identity must
+    be non-empty), and it fails against the content-only key.
+    """
+    messages_js = (pathlib.Path(__file__).resolve().parents[1] / "static" / "messages.js").read_text()
+
+    def extract(name, end_marker):
+        start = messages_js.index(f"async function {name}(")
+        return messages_js[start:messages_js.index(end_marker, start)]
+
+    script = "\n".join([
+        "const calls=[]; let showApprovalCalls=[]; let hideApprovalCalls=0;",
+        "const S={session:{session_id:'browser-session'}};",
+        "let _approvalSessionId='browser-session';",
+        "let _approvalCurrentId='approval-1';",
+        "let _loadSessionGeneration=1;",
+        "let _approvalResponding=null;",
+        "let _approvalClearedOwner=null;",
+        "let _yoloEnabled=false;",
+        # The raw _pending shape: no request_id, no run_id, no mirror token.
+        "const cardA={approval_id:'approval-1',command:'rm -rf /tmp/same',description:'identical retry',pattern_key:'p',pattern_keys:['p']};",
+        "let _approvalDisplayedOwner={sid:'browser-session',approvalId:'approval-1',runId:'',mirrorToken:''};",
+        "const _approvalPendingBySession=new Map([['browser-session',{pending:cardA}]]);",
+        "const api=async(path,opts={})=>{",
+        " calls.push([path,opts.body?JSON.parse(opts.body):null]);",
+        " if(path.startsWith('/api/approval/pending'))return {pending:{...cardA,approval_id:'approval-2'},pending_count:1};",
+        " if(path==='/api/approval/respond')return {ok:true};",
+        " return {ok:true};",
+        "};",
+        "const showApprovalForSession=(sid,pending,count)=>{showApprovalCalls.push(pending);_approvalCurrentId=pending.approval_id||null;};",
+        "const hideApprovalCard=()=>{hideApprovalCalls+=1;};",
+        "const $=()=>({disabled:false,classList:{contains:v=>v==='visible',add(){},remove(){}}});",
+        "const t=k=>k; const showToast=()=>{}; const setStatus=()=>{};",
+        "const _unmarkApprovalDismissed=()=>{};",
+        "const _setApprovalControlsDisabled=()=>{}; const _clearApprovalPendingForSession=()=>{};",
+        "const _updateYoloPill=()=>{};",
+        _js_block(messages_js, "function _approvalMirrorOwnerFor(", "\nfunction _setApprovalControlsDisabled"),
+        _js_block(messages_js, "function _applyApprovalYoloProjection(", "\nfunction toggleApprovalCardCollapsed"),
+        extract("respondApproval", "\nfunction startApprovalPolling"),
+        extract("toggleYoloFromApproval", "\n// ── Approval polling"),
+        "(async()=>{",
+        " const key=_approvalLogicalKey('browser-session',cardA);",
+        " if(key!==null) throw new Error('identity-less entry must not have a logical key '+key);",
+        " _approvalDisplayedOwner.displayedKey=key;",
+        " const ok=await toggleYoloFromApproval();",
+        " if(ok) throw new Error('unprovable head must not be answered');",
+        " if(calls.length!==1) throw new Error('no respond POST may be issued without stable identity '+JSON.stringify(calls));",
+        " if(showApprovalCalls.length!==1) throw new Error('card must re-render to the head '+JSON.stringify(showApprovalCalls));",
+        " if(showApprovalCalls[0].approval_id!=='approval-2') throw new Error('re-render must show the head');",
+        " if(_approvalCurrentId!=='approval-2') throw new Error('head must become the displayed approval');",
+        " if(_yoloEnabled!==false) throw new Error('YOLO must not be projected');",
+        "})().catch(e=>{console.error(e.stack||e);process.exit(1)});",
+    ])
+    result = subprocess.run([shutil.which("node"), "-e", script], text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not available")
+def test_identity_less_card_with_equal_transport_id_stays_answerable():
+    """No stable identity but the SAME transport id must still answer once.
+
+    The server mints `gwlocal-mirrorless:<hex>` for the raw `_pending` shape and
+    persists it, so the card and the head are the same queue entry and the id is
+    its own proof. Without the id-equality short-circuit, failing closed on a
+    missing identity would re-render forever and the card could never be
+    answered (the incident #5269 regression this shape already fixed once).
+    """
+    messages_js = (pathlib.Path(__file__).resolve().parents[1] / "static" / "messages.js").read_text()
+
+    def extract(name, end_marker):
+        start = messages_js.index(f"async function {name}(")
+        return messages_js[start:messages_js.index(end_marker, start)]
+
+    script = "\n".join([
+        "const calls=[]; let showApprovalCalls=0; let hideApprovalCalls=0;",
+        "const S={session:{session_id:'browser-session'}};",
+        "let _approvalSessionId='browser-session';",
+        "let _approvalCurrentId='gwlocal-mirrorless:abc';",
+        "let _loadSessionGeneration=1;",
+        "let _approvalResponding=null;",
+        "let _approvalClearedOwner=null;",
+        "let _yoloEnabled=false;",
+        "const cardA={approval_id:'gwlocal-mirrorless:abc',command:'rm -rf /tmp/same',description:'identical retry',pattern_key:'p',pattern_keys:['p']};",
+        "let _approvalDisplayedOwner={sid:'browser-session',approvalId:'gwlocal-mirrorless:abc',runId:'',mirrorToken:''};",
+        "const _approvalPendingBySession=new Map([['browser-session',{pending:cardA}]]);",
+        "const api=async(path,opts={})=>{",
+        " calls.push([path,opts.body?JSON.parse(opts.body):null]);",
+        " if(path.startsWith('/api/approval/pending'))return {pending:cardA,pending_count:1};",
+        " return {ok:true,yolo_enabled:true};",
+        "};",
+        "const showApprovalForSession=()=>{showApprovalCalls+=1;};",
+        "const hideApprovalCard=()=>{hideApprovalCalls+=1;};",
+        "const $=()=>({disabled:false,classList:{contains:v=>v==='visible',add(){},remove(){}}});",
+        "const t=k=>k; const showToast=()=>{}; const setStatus=()=>{};",
+        "const _unmarkApprovalDismissed=()=>{};",
+        "const _setApprovalControlsDisabled=()=>{}; const _clearApprovalPendingForSession=()=>{};",
+        "const _updateYoloPill=()=>{};",
+        _js_block(messages_js, "function _approvalMirrorOwnerFor(", "\nfunction _setApprovalControlsDisabled"),
+        _js_block(messages_js, "function _applyApprovalYoloProjection(", "\nfunction toggleApprovalCardCollapsed"),
+        extract("respondApproval", "\nfunction startApprovalPolling"),
+        extract("toggleYoloFromApproval", "\n// ── Approval polling"),
+        "(async()=>{",
+        " const key=_approvalLogicalKey('browser-session',cardA);",
+        " if(key!==null) throw new Error('identity-less entry must not have a logical key '+key);",
+        " _approvalDisplayedOwner.displayedKey=key;",
+        " const ok=await toggleYoloFromApproval();",
+        " if(!ok) throw new Error('an equal transport id is its own proof and must answer');",
+        " if(calls.length!==2) throw new Error('expected reconcile GET + one respond '+JSON.stringify(calls));",
+        " const [path,body]=calls[1];",
+        " if(path!=='/api/approval/respond') throw new Error('wrong endpoint '+path);",
+        " if(body.approval_id!=='gwlocal-mirrorless:abc') throw new Error('wrong approval id '+JSON.stringify(body));",
+        " if(showApprovalCalls!==0) throw new Error('equal-id card must not re-render');",
+        " if(hideApprovalCalls!==1) throw new Error('card must hide after the answer');",
+        "})().catch(e=>{console.error(e.stack||e);process.exit(1)});",
+    ])
+    result = subprocess.run([shutil.which("node"), "-e", script], text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not available")
+def test_equal_transport_id_short_circuit_blocks_respond_after_session_switch():
+    """The id-equality short-circuit must not bypass the post-await fence.
+
+    When the session switches while the pending GET is in flight and the head
+    carries the id the card captured, the reconcile legally returns "same", so
+    the caller's ownership re-check is the only thing standing between the user
+    and a POST into a session they navigated away from.
+    """
+    messages_js = (pathlib.Path(__file__).resolve().parents[1] / "static" / "messages.js").read_text()
+
+    def extract(name, end_marker):
+        start = messages_js.index(f"async function {name}(")
+        return messages_js[start:messages_js.index(end_marker, start)]
+
+    script = "\n".join([
+        "const calls=[]; let controlReset=0; let rendered=0;",
+        "let S={session:{session_id:'session-a'}};",
+        "let _loadSessionGeneration=1; let _approvalSessionId='session-a'; let _approvalCurrentId='approval-a';",
+        "let _approvalResponding=null; let _approvalClearedOwner=null; let _yoloEnabled=false;",
+        "const _approvalPendingBySession=new Map([['session-a',{pending:{approval_id:'approval-a'}}]]);",
+        "let _approvalDisplayedOwner={sid:'session-a',approvalId:'approval-a',runId:'',mirrorToken:''};",
+        # The GET switches sessions mid-await but returns the same transport id.
+        "const api=async(path,opts={})=>{",
+        " calls.push([path,opts.body?JSON.parse(opts.body):null]);",
+        " if(path.startsWith('/api/approval/pending')){",
+        "  S.session={session_id:'session-b'};",
+        "  _approvalSessionId='session-b'; _approvalCurrentId='approval-b';",
+        "  _approvalDisplayedOwner={sid:'session-b',approvalId:'approval-b',runId:'',mirrorToken:''};",
+        "  return {pending:{approval_id:'approval-a'},pending_count:1};",
+        " }",
+        " throw new Error('respond POST must not fire after the session switched');",
+        "};",
+        "const $=()=>({disabled:false,classList:{contains:v=>v==='visible',add(){},remove(){}}});",
+        "const t=k=>k; const showToast=()=>{}; const setStatus=()=>{};",
+        "const _unmarkApprovalDismissed=()=>{};",
+        "const _setApprovalControlsDisabled=()=>{controlReset+=1;};",
+        "const hideApprovalCard=()=>{}; const showApprovalForSession=()=>{rendered+=1;};",
+        "const _clearApprovalPendingForSession=()=>{}; const _renderPendingApprovalForActiveSession=()=>{};",
+        "const _updateYoloPill=()=>{};",
+        _js_block(messages_js, "function _approvalMirrorOwnerFor(", "\nfunction _setApprovalControlsDisabled"),
+        _js_block(messages_js, "function _applyApprovalYoloProjection(", "\nfunction toggleApprovalCardCollapsed"),
+        extract("respondApproval", "\nfunction startApprovalPolling"),
+        "(async()=>{",
+        " const ok=await respondApproval('once');",
+        " if(ok!==false) throw new Error('respond reported success after the session switched');",
+        " if(calls.length!==1) throw new Error('only the reconcile GET may run '+JSON.stringify(calls));",
+        " if(rendered!==0) throw new Error('an equal transport id must short-circuit, not re-render');",
+        " if(_approvalResponding!==null) throw new Error('response owner was not released');",
+        " if(controlReset===0) throw new Error('controls were left disabled for the new session');",
+        " if(_approvalCurrentId!=='approval-b') throw new Error('the new session current id was mutated');",
+        "})().catch(e=>{console.error(e.stack||e);process.exit(1)});",
+    ])
+    result = subprocess.run([shutil.which("node"), "-e", script], text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not available")
+def test_equal_transport_id_short_circuit_blocks_dismiss_after_session_switch():
+    """Same fence for the X button: an equal-id "same" result must not let a
+    dismissal mark or hide the card of the session the user switched to."""
+    messages_js = (pathlib.Path(__file__).resolve().parents[1] / "static" / "messages.js").read_text()
+
+    def extract(name, end_marker):
+        start = messages_js.index(f"async function {name}(")
+        return messages_js[start:messages_js.index(end_marker, start)]
+
+    script = "\n".join([
+        "const calls=[]; const dismissed=[]; let hideCount=0; let pendingClears=0; let rendered=0;",
+        "let S={session:{session_id:'session-a'}};",
+        "let _loadSessionGeneration=1; let _approvalSessionId='session-a'; let _approvalCurrentId='approval-a';",
+        "let _approvalResponding=null; let _approvalClearedOwner=null;",
+        "const _approvalPendingBySession=new Map([['session-a',{pending:{approval_id:'approval-a'}}]]);",
+        "let _approvalDisplayedOwner={sid:'session-a',approvalId:'approval-a',runId:'',mirrorToken:''};",
+        "const api=async(path,opts={})=>{",
+        " calls.push(path);",
+        " if(path.startsWith('/api/approval/pending')){",
+        "  S.session={session_id:'session-b'};",
+        "  _approvalSessionId='session-b'; _approvalCurrentId='approval-b';",
+        "  _approvalDisplayedOwner={sid:'session-b',approvalId:'approval-b',runId:'',mirrorToken:''};",
+        "  return {pending:{approval_id:'approval-a'},pending_count:1};",
+        " }",
+        " return {ok:true};",
+        "};",
+        "const $=()=>({disabled:false,classList:{contains:v=>v==='visible',add(){},remove(){}}});",
+        "const t=k=>k; const showToast=()=>{}; const setStatus=()=>{};",
+        "const _unmarkApprovalDismissed=()=>{};",
+        "const _markApprovalDismissed=(sid,id)=>{dismissed.push([sid,id]);};",
+        "const hideApprovalCard=()=>{hideCount+=1;};",
+        "const showApprovalForSession=()=>{rendered+=1;};",
+        "const syncTopbar=()=>{};",
+        "const _clearApprovalPendingForSession=()=>{pendingClears+=1;};",
+        _js_block(messages_js, "function _approvalMirrorOwnerFor(", "\nfunction _setApprovalControlsDisabled"),
+        _js_block(messages_js, "function _approvalDismissTarget(", "\nasync function dismissApprovalCard("),
+        _js_block(messages_js, "async function dismissApprovalCard(", "\nfunction _syncApprovalCollapseButton"),
+        extract("respondApproval", "\nfunction startApprovalPolling"),
+        "(async()=>{",
+        " await dismissApprovalCard();",
+        " if(dismissed.length!==0) throw new Error('dismissal marked the wrong entry '+JSON.stringify(dismissed));",
+        " if(hideCount!==0) throw new Error('dismissal hid the new session card');",
+        " if(pendingClears!==0) throw new Error('dismissal cleared the new session pending state');",
+        " if(calls.length!==1) throw new Error('only the reconcile GET may run '+JSON.stringify(calls));",
+        " if(rendered!==0) throw new Error('an equal transport id must short-circuit, not re-render');",
+        " if(_approvalCurrentId!=='approval-b') throw new Error('the new session current id was mutated');",
         "})().catch(e=>{console.error(e.stack||e);process.exit(1)});",
     ])
     result = subprocess.run([shutil.which("node"), "-e", script], text=True, capture_output=True)

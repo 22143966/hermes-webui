@@ -8890,16 +8890,30 @@ async function respondApproval(choice, options = {}) {
 // plus the request/run/mirror ownership fields, minus the volatile
 // `approval_id` — and only adopt the head's id when it proves to be the same
 // approval the card is showing.
+//
+// Content is NOT identity: two queued approvals can share the command,
+// description and patterns (an identical retried command), and the core stamps
+// exactly one stable `request_id` per `_ApprovalEntry`. Without that stable
+// identity a content-only match would let a click on A adopt B's transport id
+// and answer the approval the user never saw (#7144 r6). So the key requires a
+// non-empty stable identity — the `request_id`, or the gateway producer token
+// (run id + mirror token) — and returns null when neither is available, which
+// makes `_reconcileApprovalToHead` fail closed (re-render, no POST).
 function _approvalLogicalKey(sid, pending) {
   if (!sid || !pending) return null;
   const keys = pending.pattern_keys || (pending.pattern_key ? [pending.pattern_key] : []);
   const desc = (pending.description || "") + (keys.length ? " [" + keys.join(", ") + "]" : "");
+  const requestId = String(pending.request_id || "").trim();
+  const runId = String(pending.run_id || "").trim();
+  const mirrorToken = String(pending._gateway_mirror_token || "").trim();
+  if (!requestId && !(runId && mirrorToken)) return null;
   return JSON.stringify({
     sid,
     desc,
     cmd: pending.command || "",
-    run_id: String(pending.run_id || "").trim(),
-    mirror_token: String(pending._gateway_mirror_token || "").trim(),
+    request_id: requestId,
+    run_id: runId,
+    mirror_token: mirrorToken,
   });
 }
 
@@ -8910,10 +8924,11 @@ function _approvalLogicalKey(sid, pending) {
 //                   caller may act. When the transport id advanced, the card
 //                   state and `owner.approvalId` are updated to the head's id
 //                   so the click completes once.
-//   'rerender'    — the head is a DIFFERENT logical approval: the card has been
-//                   re-rendered to the head (or hidden when the head was
-//                   already dismissed) and the caller MUST NOT act; a fresh
-//                   deliberate click is required.
+//   'rerender'    — the head is a DIFFERENT logical approval, or the card
+//                   cannot be proven to be the same one (no stable identity):
+//                   the card has been re-rendered to the head (or hidden when
+//                   the head was already dismissed) and the caller MUST NOT
+//                   act; a fresh deliberate click is required.
 //   'unavailable' — the best-effort /api/approval/pending fetch failed; the
 //                   caller falls back to the captured id (the #527 server
 //                   guard remains the backstop).
@@ -8940,6 +8955,13 @@ async function _reconcileApprovalToHead(owner) {
   // because the gateway is authoritative and the respond can still succeed
   // (the retired-run case is cleared in the respond failure path).
   if (!head) return "same";
+  // Same transport id: the visible card and the head are literally the same
+  // queue entry, so no stable identity is needed to prove it. This keeps
+  // id-less entries actionable — the server mints `gwlocal-mirrorless:<hex>`
+  // for the raw `_pending` shape, which carries no `request_id` and no
+  // producer token, and failing closed on it would make the card unanswerable.
+  const displayedId = owner ? owner.approvalId : _approvalCurrentId;
+  if (head.approval_id && displayedId && head.approval_id === displayedId) return "same";
   const headKey = _approvalLogicalKey(sid, head);
   const pendingEntry = _approvalPendingBySession.get(sid);
   // Compare the head against the captured RENDER-time key when an owner was
