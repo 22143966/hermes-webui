@@ -51,6 +51,8 @@
 
 ### Fixed
 
+- **New Chat no longer shows the previous session's transcript.** Clicking New Chat while another session was still loading could let that load's response land in the new pane. The transcript commit point now also checks that the session it loaded is still the current one, and New Chat invalidates the in-flight load. Thanks @happy5318. (#8356)
+
 - **The agent is no longer woken again for a background completion it already read.** A completion consumed through a terminal poll is not treated as read (a result longer than the preview is still delivered once), while one the agent actually read is not re-delivered, including when a launch fails and the 2-second retry fires before the failure handler. Thanks @angel291592. (#8363)
 
 - **Deleted Desktop conversations no longer linger in the sidebar.** A Desktop-origin row whose session was deleted from its owning profile's `state.db` is pruned from the sidebar index, with either CLI-visibility setting. Pruning only happens when that profile's own database is readable and confirms the deletion; a missing, corrupt, unreadable or inaccessible database keeps the row. Thanks @pxxD1998.
