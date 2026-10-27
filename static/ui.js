@@ -1260,8 +1260,11 @@ function _messageSessionIndexForRawIdx(rawIdx){
   // Display-only rows have no canonical position: any value here would be a
   // fabricated index that fork/edit/regenerate could act on.
   const hasDisplayOnlyHelpers=typeof _displayOnlyRowAt==='function'&&typeof _displayOnlyCountBefore==='function';
-  if(hasDisplayOnlyHelpers&&_displayOnlyRowAt(n)) return null;
-  return _messageSessionIndexBase()+n-(hasDisplayOnlyHelpers?_displayOnlyCountBefore(n):0);
+  if(!hasDisplayOnlyHelpers) return _messageSessionIndexBase()+n;
+  if(_displayOnlyRowAt(n)) return null;
+  const shiftedBy=_displayOnlyCountBefore(n);
+  if(!shiftedBy) return _messageSessionIndexBase()+n;
+  return _messageSessionIndexBase()+n-shiftedBy;
 }
 function _messageRawIdxForSessionIndex(sessionIdx){
   const n=Number(sessionIdx);
