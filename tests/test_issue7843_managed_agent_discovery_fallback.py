@@ -33,6 +33,10 @@ def _managed_agent(fixture, *, bootstrap=True):
         )
     (agent_dir / "run_agent.py").write_text("class AIAgent: pass\n", encoding="utf-8")
     (agent_dir / "hermes_cli").mkdir()
+    # A PM launcher (v0.21.6+): the only Agents activated without the env var.
+    (agent_dir / "hermes_cli" / "venv_sync.py").write_text("", encoding="utf-8")
+    (agent_dir / "pm").mkdir()
+    (agent_dir / "pm" / "environments.py").write_text("", encoding="utf-8")
     (agent_dir / "pyproject.toml").write_text(
         "[project]\nname='hermes-agent'\n", encoding="utf-8"
     )

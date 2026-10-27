@@ -18,6 +18,18 @@ import sys
 # auto-install authorization (#8529 gate).
 _RELAUNCH_AGENT_DIR_ENV = "_HERMES_WEBUI_RELAUNCH_AGENT_DIR"
 
+# What makes an Agent's bootstrap a PM launcher that may re-exec this process
+# (Agent v0.21.6+): ``hermes_bootstrap`` calls ``hermes_cli.venv_sync.prepare_launch``,
+# which resolves the store Python through ``pm.environments``. ``hermes_bootstrap.py``
+# alone is not enough: pre-PM Agents ship one too (the Windows UTF-8 shim, since
+# 2026-05). docker_init.bash's select_staged_agent_for_git_checkout checks the same
+# files.
+_PM_LAUNCH_MARKERS = ("hermes_bootstrap.py", "hermes_cli/venv_sync.py", "pm/environments.py")
+
+
+def _is_pm_launcher(agent_dir: Path) -> bool:
+    return all((agent_dir / marker).is_file() for marker in _PM_LAUNCH_MARKERS)
+
 
 def _resolve_agent_dir(webui_root: Path) -> str | None:
     """The Agent root to activate: the exported one, else the one api.config uses.
@@ -70,11 +82,21 @@ def activate_managed_agent() -> None:
     # Discovery imports api.startup: make sure it is THIS checkout's package.
     if webui_root not in sys.path:
         sys.path.insert(0, webui_root)
+    explicit = bool(os.environ.get("HERMES_WEBUI_AGENT_DIR", "").strip())
     agent_dir = _resolve_agent_dir(Path(webui_root))
     if not agent_dir:
         return
     # Browser-only setups may deliberately point at an empty Agent directory.
     if not (Path(agent_dir) / "run_agent.py").is_file():
+        return
+    # Without the operator's variable, activate early only the Agents whose
+    # bootstrap can re-exec this process: that late re-exec is the #8529 crash.
+    # Any other discovered Agent keeps master's direct-launch behaviour exactly:
+    # api.config appends it at the END of sys.path and its bootstrap runs lazily,
+    # after WebUI's own dependencies loaded from site-packages (a pre-PM Agent's
+    # bootstrap moves its checkout to the front, where copies vendored into it
+    # would shadow them; #8529 gate).
+    if not explicit and not _is_pm_launcher(Path(agent_dir)):
         return
     # Activate dependencies without importing the application: api.config must
     # select the active profile before Agent modules cache profile-sensitive paths.
@@ -87,7 +109,7 @@ def activate_managed_agent() -> None:
         # which cannot re-discover an Agent this interpreter found through its
         # own site-packages (`pip install -e`, a .pth). Hand the child the same
         # root privately; an explicit HERMES_WEBUI_AGENT_DIR reaches it anyway.
-        if not os.environ.get("HERMES_WEBUI_AGENT_DIR", "").strip():
+        if not explicit:
             os.environ[_RELAUNCH_AGENT_DIR_ENV] = agent_dir
         # Bootstrap's probe adds the checkout to its own PYTHONPATH, not ours.
         if agent_dir not in sys.path:
