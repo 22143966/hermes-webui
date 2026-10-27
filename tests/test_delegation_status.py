@@ -459,3 +459,59 @@ class TestRoute:
         assert payload["running"] == 0
         assert payload["awaiting_delivery"] == 0
 
+
+
+# ---------------------------------------------------------------------------
+# Ledger path encoding (release-manager fold on #8449)
+# ---------------------------------------------------------------------------
+
+class TestLedgerPathEncoding:
+    """The read-only URI must address exactly the resolved ledger file.
+
+    A raw ``f"file:{path}?mode=ro"`` lets SQLite decode ``%xx`` and treat ``#``
+    as a fragment, so a profile home named ``home%20demo`` read its sibling
+    ``home demo``, and a home containing ``#`` dropped ``?mode=ro`` and opened
+    (creating) a different file.
+    """
+
+    def _point_at(self, monkeypatch, db_path):
+        monkeypatch.setattr(delegation_status, "_profile_state_db_path", lambda profile=None: db_path)
+        monkeypatch.setattr(delegation_status, "_memory_live_probe", lambda *a, **kw: None)
+
+    def test_percent_escape_in_home_reads_its_own_ledger(self, tmp_path, monkeypatch):
+        sibling = tmp_path / "home demo" / "state.db"
+        own = tmp_path / "home%20demo" / "state.db"
+        _write_delegation_db(sibling, [_row("d-sibling", origin_ui_session_id="sess_a",
+                                            state="completed", delivery_state="pending")])
+        _write_delegation_db(own, [])
+        self._point_at(monkeypatch, own)
+        result = delegation_status.session_delegation_status("sess_a")
+        assert result["status"] == "ok"
+        assert result["awaiting_delivery"] == 0, "read the decoded sibling ledger, not its own"
+
+    def test_hash_in_home_stays_read_only_and_creates_nothing(self, tmp_path, monkeypatch):
+        own = tmp_path / "ho#me" / "state.db"
+        _write_delegation_db(own, [_row("d-own", origin_ui_session_id="sess_a",
+                                        state="completed", delivery_state="pending")])
+        self._point_at(monkeypatch, own)
+        result = delegation_status.session_delegation_status("sess_a")
+        assert result["status"] == "ok"
+        assert result["awaiting_delivery"] == 1
+        assert not (tmp_path / "ho").exists(), "the fragment-truncated path was opened and created"
+
+    def test_unstatable_ledger_path_reports_unknown(self, monkeypatch):
+        class _Unstatable:
+            def exists(self):
+                raise PermissionError(13, "Permission denied")
+
+            def resolve(self):
+                raise PermissionError(13, "Permission denied")
+
+            def __str__(self):
+                return "/unreadable/profile/state.db"
+
+        self._point_at(monkeypatch, _Unstatable())
+        result = delegation_status.session_delegation_status("sess_a")
+        assert result["status"] == "unknown"
+        assert result["running"] is None
+        assert result["awaiting_delivery"] is None

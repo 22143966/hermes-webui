@@ -37,6 +37,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from api.agent_sessions import state_db_readonly_uri
+
 logger = logging.getLogger(__name__)
 
 # Mirrors tools/async_delegation.py:_LIVE_STATES (running/stalling/finalizing).
@@ -108,11 +110,19 @@ def _durable_counts(db_path: Path | None, session_id: str) -> tuple[int, int] | 
         # Resolver failed: the source is unavailable, which is NOT the same
         # as a ledger this profile never created. Unknown, never zero.
         return None
-    if not db_path.exists():
-        # No state.db at all is a truthful zero: this profile has never
-        # persisted a delegation ledger.
-        return 0, 0
-    uri = f"file:{db_path}?mode=ro"
+    try:
+        if not db_path.exists():
+            # No state.db at all is a truthful zero: this profile has never
+            # persisted a delegation ledger.
+            return 0, 0
+        # Percent-encode the path like every other read-only state.db reader
+        # (api.agent_sessions): a raw f"file:{path}" lets '%xx', '?' or '#' in a
+        # profile home re-address the read to another file or drop ?mode=ro.
+        uri = state_db_readonly_uri(db_path.resolve())
+    except OSError:
+        # An unreadable profile directory is an unavailable source, not a 500.
+        logger.debug("delegation status: cannot stat %s", db_path, exc_info=True)
+        return None
     conn = None
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=2.0)
