@@ -14,11 +14,9 @@ discovery (api.startup.discover_runtime_agent_identity) instead of going blind
 when the variable is unset.
 """
 
-import os
-import subprocess
-import sys
+import pytest
 
-WEBUI_ROOT = os.path.dirname(os.path.dirname(__file__))
+from tests._hermetic_agent_launch import copy_webui, hermetic_env, run_guarded
 
 
 def _managed_agent(fixture, *, bootstrap=True):
@@ -41,6 +39,12 @@ def _managed_agent(fixture, *, bootstrap=True):
     return agent_dir
 
 
+@pytest.fixture(scope="module")
+def webui(tmp_path_factory):
+    """This WebUI, copied where neither `<repo>/..` nor `<repo>/../hermes-agent` is an Agent."""
+    return copy_webui(tmp_path_factory.mktemp("isolated-webui"))
+
+
 # Stop at the first WebUI module import: that is the seam where api/profiles.py
 # needs PyYAML, and it keeps the host's real Agent out of the run.
 _SEAM_SCRIPT = (
@@ -54,38 +58,28 @@ _SEAM_SCRIPT = (
     "builtins.__import__ = check\n"
     "import server\n"
     "raise SystemExit(9)\n"
-) % WEBUI_ROOT
+)
 
 
-def _launch(agent_dir, extra_env):
-    env = os.environ.copy()
-    env.pop("PYTHONPATH", None)
-    env.pop("HERMES_WEBUI_AGENT_DIR", None)
-    env.pop("PM_DEPS_ACTIVATED", None)
-    env["HERMES_HOME"] = str(agent_dir.parent)
-    # Hermetic: discovery also probes ~/.hermes, ~/hermes-agent, XDG data, a
-    # `hermes` launcher on PATH and the selected interpreter's site-packages
-    # (the test interpreter may be a real Agent's venv). Without this a real
-    # host Agent would be found and its bootstrap run against the temp home.
-    user_home = agent_dir.parent / "user-home"
-    user_home.mkdir(parents=True, exist_ok=True)
-    env["HERMES_WEBUI_PYTHON"] = str(user_home / "no-python")
-    env["HOME"] = str(user_home)
-    env["USERPROFILE"] = str(user_home)
-    env["XDG_DATA_HOME"] = str(user_home / ".local" / "share")
-    env["PATH"] = os.pathsep.join([os.path.dirname(sys.executable), "/usr/bin", "/bin"])
-    env.update(extra_env)
-    return subprocess.run(
-        [sys.executable, "-c", _SEAM_SCRIPT],
-        cwd=str(agent_dir), env=env, capture_output=True, text=True, timeout=60,
+def _launch(webui, fixture_root, agent_dir, extra_env):
+    # Hermetic (tests/_hermetic_agent_launch.py): discovery also probes the
+    # WebUI checkout's parent, ~/.hermes, ~/hermes-agent, XDG data, system
+    # paths, a `hermes` launcher on PATH and the selected interpreter's
+    # site-packages (the test interpreter may be a real Agent's venv). Without
+    # this a real host Agent would be found and its bootstrap run against the
+    # temp home; the pre-flight skips if one cannot be hidden.
+    env = hermetic_env(fixture_root, **{"HERMES_HOME": str(agent_dir.parent), **extra_env})
+    result, _resolved = run_guarded(
+        _SEAM_SCRIPT % str(webui), webui=webui, env=env, cwd=agent_dir, timeout=60,
     )
+    return result
 
 
-def test_documented_launch_activates_managed_deps_without_the_env_var(tmp_path):
+def test_documented_launch_activates_managed_deps_without_the_env_var(tmp_path, webui):
     """The README manual launch exports nothing; discovery must still find the Agent."""
     agent_dir = _managed_agent(tmp_path)
 
-    result = _launch(agent_dir, {})
+    result = _launch(webui, tmp_path, agent_dir, {})
 
     assert result.returncode == 0, (
         "activate_managed_agent() no-opped without HERMES_WEBUI_AGENT_DIR, so the "
@@ -95,14 +89,14 @@ def test_documented_launch_activates_managed_deps_without_the_env_var(tmp_path):
     )
 
 
-def test_explicit_env_var_still_wins_over_discovery(tmp_path):
+def test_explicit_env_var_still_wins_over_discovery(tmp_path, webui):
     """Precedence is unchanged: an exported Agent dir is used as-is."""
     discovered = _managed_agent(tmp_path / "home")
     explicit = _managed_agent(tmp_path / "explicit", bootstrap=False)
     explicit_marker = explicit / "explicit-marker"
 
     result = _launch(
-        explicit,
+        webui, tmp_path, explicit,
         {"HERMES_HOME": str(discovered.parent), "HERMES_WEBUI_AGENT_DIR": str(explicit)},
     )
 
@@ -115,7 +109,7 @@ def test_explicit_env_var_still_wins_over_discovery(tmp_path):
     assert not explicit_marker.exists()
 
 
-def test_browser_only_empty_agent_dir_still_no_ops(tmp_path):
+def test_browser_only_empty_agent_dir_still_no_ops(tmp_path, webui):
     """An exported empty Agent directory is a deliberate browser-only signal."""
     empty = tmp_path / "browser-only" / "hermes-agent"
     empty.mkdir(parents=True)
@@ -124,7 +118,7 @@ def test_browser_only_empty_agent_dir_still_no_ops(tmp_path):
     discoverable = _managed_agent(tmp_path / "home")
 
     result = _launch(
-        empty,
+        webui, tmp_path, empty,
         {"HERMES_WEBUI_AGENT_DIR": str(empty), "HERMES_HOME": str(discoverable.parent)},
     )
 
@@ -135,12 +129,12 @@ def test_browser_only_empty_agent_dir_still_no_ops(tmp_path):
     )
 
 
-def test_no_agent_anywhere_still_reaches_the_webui_import_seam(tmp_path):
+def test_no_agent_anywhere_still_reaches_the_webui_import_seam(tmp_path, webui):
     """Discovery finding nothing must not break startup."""
     hermes_home = tmp_path / "empty-home"
     hermes_home.mkdir()
 
-    result = _launch(hermes_home, {})
+    result = _launch(webui, tmp_path, hermes_home, {})
 
     # 3 = seam reached, deps absent (correct: there is no Agent to activate).
     # Anything else (9, or a bootstrap's SystemExit) means the hook did not
@@ -150,14 +144,14 @@ def test_no_agent_anywhere_still_reaches_the_webui_import_seam(tmp_path):
     )
 
 
-def test_broken_bootstrap_still_warns_and_continues(tmp_path):
+def test_broken_bootstrap_still_warns_and_continues(tmp_path, webui):
     """A broken Agent bootstrap must not stop WebUI startup."""
     agent_dir = _managed_agent(tmp_path)
     (agent_dir / "hermes_bootstrap.py").write_text(
         "import deliberately_missing_agent_dependency\n", encoding="utf-8"
     )
 
-    result = _launch(agent_dir, {})
+    result = _launch(webui, tmp_path, agent_dir, {})
 
     assert "Hermes Agent dependency activation failed" in result.stderr, result.stderr
     assert "deliberately_missing_agent_dependency" in result.stderr, result.stderr
