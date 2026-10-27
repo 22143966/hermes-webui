@@ -120,10 +120,41 @@ def test_index_html_injection_escapes_urls_and_preserves_disabled_default(tmp_pa
 
     injected = inject_extension_tags(html)
 
-    assert '<link rel="stylesheet" href="/extensions/app.css">' in injected
-    assert '<script src="/extensions/app.js?v=1&amp;mode=dev" defer></script>' in injected
-    assert injected.index("/extensions/app.css") < injected.index("</head>")
-    assert injected.index("/extensions/app.js") < injected.index("</body>")
+    assert '<link rel="stylesheet" href="extensions/app.css">' in injected
+    assert '<script src="extensions/app.js?v=1&amp;mode=dev" defer></script>' in injected
+    assert injected.index("extensions/app.css") < injected.index("</head>")
+    assert injected.index("extensions/app.js") < injected.index("</body>")
+
+
+def test_injected_extension_tags_stay_inside_a_subpath_mount(tmp_path, monkeypatch):
+    """Injected tags must be mount-relative, like the shell's own asset tags.
+
+    ``static/index.html`` injects ``<base href>`` from ``location.pathname`` so
+    the app can be served at a reverse-proxy subpath (``/hermes/``). A tag with
+    a leading slash resolves against the origin root and 404s there — the same
+    failure the ``sw.js`` regression test guards against for the service worker
+    (``tests/test_pwa_manifest_sw.py``).
+
+    Before the fix this test fails: the injected src/href carry the leading
+    slash, so a browser at ``https://host/hermes/`` requests
+    ``https://host/extensions/...`` instead of ``https://host/hermes/extensions/...``.
+    """
+    root = tmp_path / "extensions"
+    root.mkdir()
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_DIR", str(root))
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_SCRIPT_URLS", "/extensions/app.js")
+    monkeypatch.setenv("HERMES_WEBUI_EXTENSION_STYLESHEET_URLS", "/extensions/app.css")
+
+    from api.extensions import inject_extension_tags
+
+    injected = inject_extension_tags("<html><head></head><body></body></html>")
+
+    # Relative form resolves through <base href> on both root and subpath mounts.
+    assert '<script src="extensions/app.js" defer></script>' in injected
+    assert '<link rel="stylesheet" href="extensions/app.css">' in injected
+    # Must NOT carry the origin-root form.
+    assert 'src="/extensions/app.js"' not in injected
+    assert 'href="/extensions/app.css"' not in injected
 
 
 def test_extension_settings_runtime_config_injects_before_extension_scripts(tmp_path, monkeypatch):
@@ -157,7 +188,7 @@ def test_extension_settings_runtime_config_injects_before_extension_scripts(tmp_
     assert "window.HermesExtensionSettings.primeFromStatus(window.__HERMES_EXTENSION_CONFIG__)" in injected
     assert '"storage_owned":true' in injected
     assert '"settings_schema":[{"key":"flag","type":"boolean"' in injected
-    assert injected.index("window.__HERMES_EXTENSION_CONFIG__") < injected.index("/extensions/settings-ok.js")
+    assert injected.index("window.__HERMES_EXTENSION_CONFIG__") < injected.index("extensions/settings-ok.js")
 
 
 def test_extension_settings_only_manifest_still_injects_runtime_config(tmp_path, monkeypatch):
