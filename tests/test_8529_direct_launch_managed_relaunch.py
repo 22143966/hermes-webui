@@ -25,6 +25,7 @@ Agent before anything imports it, and a guard against any other bootstrap.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -516,8 +517,50 @@ def test_docker_init_selects_the_stage_before_launching_server():
     assert '_stage_src="/app/hermes-agent-src"' in source
     assert "--exclude='.git'" in source
     # The cp -a fallback (no rsync in the image) must drop .git as well, or its
-    # stage would never be selected.
-    assert 'rm -rf "$_stage_src"/.git' in source
+    # stage would never be selected (exercised in the test below).
+    assert 'rm -rf "$_stage_src/.git"' in source
     # The selection must not be skipped by the fast-restart path: it sits after
     # the dependency install / reuse decision, not inside install_venv_dependencies.
     assert call > source.index("ensure_hindsight_client_docker_dependency\n\n")
+
+
+def test_cp_fallback_stage_drops_git_from_a_read_only_mount(tmp_path, staged_agent):
+    """No rsync in the image: `cp -a` copies a :ro mount's .git with its 0555
+    directories, so .git can only go after the chmod. The stage must end up
+    without .git, i.e. selectable (#8529 gate r3)."""
+    src, _ = staged_agent
+    (src / ".git" / "objects").mkdir(parents=True)
+    (src / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    source = _docker_init_source()
+    start = source.index("    if command -v rsync >/dev/null 2>&1; then")
+    # Through the chmod and the .git removal, up to the stage manifest.
+    block = source[start:source.index("    # Never fatal: without the manifest", start)]
+    assert 'rm -rf "$_stage_src/.git"' in block
+    bindir = tmp_path / "bin-without-rsync"
+    bindir.mkdir()
+    for tool in ("cp", "rm", "chmod", "find", "mkdir"):
+        real = shutil.which(tool)
+        assert real, tool
+        (bindir / tool).symlink_to(real)
+    stage = tmp_path / "app2" / "hermes-agent-src"
+    stage.mkdir(parents=True)
+    for d in [src, *[p for p in src.rglob("*") if p.is_dir()]]:
+        d.chmod(0o555)
+    try:
+        script = (
+            "stage_it() {\n"
+            f'  local _agent_src="{src}" _stage_src="{stage}"\n'
+            + block
+            + "}\nstage_it; echo rc=$?\n"
+        )
+        result = subprocess.run(
+            [shutil.which("bash") or "/bin/bash", "-c", script], env={"PATH": str(bindir)},
+            capture_output=True, text=True, timeout=30,
+        )
+    finally:
+        for d in [src, *[p for p in src.rglob("*") if p.is_dir()]]:
+            d.chmod(0o755)
+    assert result.stdout.strip().endswith("rc=0"), result.stdout + result.stderr
+    assert (stage / "run_agent.py").is_file()
+    assert not (stage / ".git").exists(), result.stdout + result.stderr
+    assert _run_selection(tmp_path, str(src), str(stage), None) == str(stage)
