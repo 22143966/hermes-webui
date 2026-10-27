@@ -646,6 +646,9 @@ install_venv_dependencies() {
         || { echo "!! Failed to copy hermes-agent source to writable build dir"; return 1; }
       rm -rf "$_stage_src"/*.egg-info "$_stage_src"/build "$_stage_src"/dist 2>/dev/null || true
       rm -rf "$_stage_src"/.playwright 2>/dev/null || true
+      # Like rsync's --exclude='.git': a stage with .git is not the no-.git copy
+      # select_staged_agent_for_git_checkout runs.
+      rm -rf "$_stage_src"/.git 2>/dev/null || true
       rm -rf "$_stage_src"/.install.lock "$_stage_src"/tools/.install.lock 2>/dev/null || true
       find "$_stage_src" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
     fi
@@ -935,14 +938,18 @@ fi
 # instead: it is the tree /app/venv's dependencies were installed from, and it
 # has no .git, so the Agent's bootstrap leaves the process alone. Agent images
 # ship without .git, so the two- and three-container stacks keep the mounted
-# Agent; an Agent without hermes_bootstrap.py (pre-PM) never relaunches, so it
-# keeps the mounted checkout too; and an operator-set HERMES_WEBUI_AGENT_DIR
+# Agent; a pre-PM Agent (no hermes_cli/venv_sync.py + pm/environments.py beside
+# its hermes_bootstrap.py) never relaunches, so it keeps the mounted checkout too; and an operator-set HERMES_WEBUI_AGENT_DIR
 # always wins. A blank or whitespace-only value is unset, as server.py and
 # api/config.py treat it.
 select_staged_agent_for_git_checkout() {
   local _src="$1" _stage="$2" _override="${HERMES_WEBUI_AGENT_DIR:-}"
   [ -z "${_override//[[:space:]]/}" ] || return 0
-  [ -n "$_src" ] && [ -e "$_src/.git" ] && [ -f "$_src/hermes_bootstrap.py" ] || return 0
+  # Only a PM launcher (Agent v0.21.6+) re-execs WebUI: hermes_bootstrap.py alone
+  # is also in pre-PM Agents. managed_agent_startup._PM_LAUNCH_MARKERS lists the same files.
+  [ -n "$_src" ] && [ -e "$_src/.git" ] || return 0
+  [ -f "$_src/hermes_bootstrap.py" ] && [ -f "$_src/hermes_cli/venv_sync.py" ] \
+    && [ -f "$_src/pm/environments.py" ] || return 0
   [ -f "$_stage/run_agent.py" ] && [ ! -e "$_stage/.git" ] || return 0
   export HERMES_WEBUI_AGENT_DIR="$_stage"
   echo "-- $_src is a git checkout; running the staged copy at $_stage"
