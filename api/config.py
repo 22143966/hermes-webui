@@ -10854,12 +10854,17 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 # allowlist, or a discovered catalog whose live probe returned
                 # nothing (transient failure). On a successful probe the live
                 # catalog is authoritative, so stale configured IDs the provider
-                # has dropped do not reappear (#7404).
+                # Singular sticky default is metadata, not a discovered catalog
+                # entry, so a successful probe does not retire it (#8080).
                 _cp_model_ids: list[str] = []
+                _cp_sticky_default = str(_cp.get("model", "") or "").strip()
+                _live_id_set = {
+                    str(_lm.get("id") or "").strip() for _lm in _live_models
+                }
+                if _cp_sticky_default and _cp_sticky_default not in _live_id_set:
+                    if _cp_sticky_default not in _cp_model_ids:
+                        _cp_model_ids.append(_cp_sticky_default)
                 if not _cp_live_won:
-                    _cp_model = _cp.get("model", "")
-                    if _cp_model:
-                        _cp_model_ids.append(_cp_model)
                     for _cp_model_id in _configured_model_ids(_cp.get("models")):
                         if _cp_model_id not in _cp_model_ids:
                             _cp_model_ids.append(_cp_model_id)
