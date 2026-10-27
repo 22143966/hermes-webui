@@ -935,11 +935,14 @@ fi
 # instead: it is the tree /app/venv's dependencies were installed from, and it
 # has no .git, so the Agent's bootstrap leaves the process alone. Agent images
 # ship without .git, so the two- and three-container stacks keep the mounted
-# Agent, and an operator-set HERMES_WEBUI_AGENT_DIR always wins.
+# Agent; an Agent without hermes_bootstrap.py (pre-PM) never relaunches, so it
+# keeps the mounted checkout too; and an operator-set HERMES_WEBUI_AGENT_DIR
+# always wins. A blank or whitespace-only value is unset, as server.py and
+# api/config.py treat it.
 select_staged_agent_for_git_checkout() {
-  local _src="$1" _stage="$2"
-  [ -z "${HERMES_WEBUI_AGENT_DIR:-}" ] || return 0
-  [ -n "$_src" ] && [ -e "$_src/.git" ] || return 0
+  local _src="$1" _stage="$2" _override="${HERMES_WEBUI_AGENT_DIR:-}"
+  [ -z "${_override//[[:space:]]/}" ] || return 0
+  [ -n "$_src" ] && [ -e "$_src/.git" ] && [ -f "$_src/hermes_bootstrap.py" ] || return 0
   [ -f "$_stage/run_agent.py" ] && [ ! -e "$_stage/.git" ] || return 0
   export HERMES_WEBUI_AGENT_DIR="$_stage"
   echo "-- $_src is a git checkout; running the staged copy at $_stage"

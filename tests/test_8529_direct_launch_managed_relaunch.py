@@ -16,8 +16,13 @@ parent, so the relaunched child died on `import yaml`.
 The fake Agent below reproduces the mechanism: its bootstrap re-execs the caller
 with `-I -S` (no site-packages, like the store Python) and only "activates" the
 dependency path when it is imported again in the child.
+
+Every launch goes through tests/_hermetic_agent_launch.py: a copy of this WebUI
+with no Agent beside it, a sanitized environment, a pre-flight that resolves the
+Agent before anything imports it, and a guard against any other bootstrap.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -27,7 +32,10 @@ from pathlib import Path
 
 import pytest
 
+from tests._hermetic_agent_launch import copy_webui, hermetic_env, run_guarded
+
 WEBUI_ROOT = Path(__file__).resolve().parent.parent
+HANDOFF = "_HERMES_WEBUI_RELAUNCH_AGENT_DIR"
 
 _FAKE_BOOTSTRAP = textwrap.dedent(
     '''
@@ -55,10 +63,21 @@ _FAKE_BOOTSTRAP = textwrap.dedent(
     '''
 )
 
+# An Agent whose bootstrap activates in place (no relaunch: already the store
+# Python, an older PM, HERMES_DISABLE_LAZY_INSTALLS). It records what it saw.
+_FAKE_PLAIN_BOOTSTRAP = textwrap.dedent(
+    f'''
+    import os
+    os.environ["FAKE_PM_SEEN_HANDOFF"] = os.environ.get({HANDOFF!r}, "<unset>")
+    os.environ["FAKE_PM_SEEN_AGENT_DIR"] = os.environ.get("HERMES_WEBUI_AGENT_DIR", "<unset>")
+    os.environ["FAKE_PM_ACTIVATED"] = "1"
+    '''
+)
 
-def _fake_managed_agent(agent_dir: Path) -> Path:
+
+def _fake_managed_agent(agent_dir: Path, bootstrap: str = _FAKE_BOOTSTRAP) -> Path:
     agent_dir.mkdir(parents=True)
-    (agent_dir / "hermes_bootstrap.py").write_text(_FAKE_BOOTSTRAP, encoding="utf-8")
+    (agent_dir / "hermes_bootstrap.py").write_text(bootstrap, encoding="utf-8")
     (agent_dir / "run_agent.py").write_text(
         "import hermes_bootstrap\nclass AIAgent:\n    pass\n", encoding="utf-8"
     )
@@ -66,92 +85,185 @@ def _fake_managed_agent(agent_dir: Path) -> Path:
     return agent_dir
 
 
+@pytest.fixture(scope="module")
+def webui(tmp_path_factory):
+    """This WebUI, copied where neither `<repo>/..` nor `<repo>/../hermes-agent` is an Agent."""
+    return copy_webui(tmp_path_factory.mktemp("isolated-webui"))
+
+
 def _isolated_env(tmp_path: Path, **extra: str) -> dict:
-    env = {
-        k: v for k, v in os.environ.items()
-        if not k.startswith(("HERMES_", "PYTHON", "FAKE_PM_"))
-    }
-    env.update(
-        HOME=str(tmp_path / "home"),
-        HERMES_HOME=str(tmp_path / "hermes-home"),
-        HERMES_WEBUI_STATE_DIR=str(tmp_path / "state"),
-        HERMES_WEBUI_TEST_NETWORK_BLOCK="1",
-        XDG_DATA_HOME=str(tmp_path / "xdg"),
-        # No `hermes` launcher on PATH: discovery must not find a host Agent.
-        PATH=os.pathsep.join([os.path.dirname(sys.executable), "/usr/bin", "/bin"]),
-        # Discovery also asks the selected interpreter where `run_agent` lives.
-        # The test interpreter may BE a real Agent's venv: never let a (possibly
-        # regressed) hook find and run that Agent's bootstrap.
-        HERMES_WEBUI_PYTHON=str(tmp_path / "no-python"),
-        FAKE_PM_MISSING_PYTHON=str(tmp_path / "no-python"),
+    return hermetic_env(tmp_path, FAKE_PM_MISSING_PYTHON=str(tmp_path / "no-python"), **extra)
+
+
+def _import_server(webui: Path) -> str:
+    return (
+        "import os, sys\n"
+        f"sys.path.insert(0, {str(webui)!r})\n"
+        "import server\n"
+        "print('SERVER_IMPORTED relaunched=%s activated=%s' % (\n"
+        "    os.environ.get('FAKE_PM_RELAUNCHED'), os.environ.get('FAKE_PM_ACTIVATED')))\n"
+        f"print('AFTER handoff=%s agent_dir=%r' % (os.environ.get({HANDOFF!r}), os.environ.get('HERMES_WEBUI_AGENT_DIR')))\n"
     )
-    (tmp_path / "home").mkdir(exist_ok=True)
-    (tmp_path / "hermes-home").mkdir(exist_ok=True)
-    env.update(extra)
-    return env
-
-
-_IMPORT_SERVER = (
-    "import os, sys\n"
-    f"sys.path.insert(0, {str(WEBUI_ROOT)!r})\n"
-    "import server\n"
-    "print('SERVER_IMPORTED relaunched=%s activated=%s' % (\n"
-    "    os.environ.get('FAKE_PM_RELAUNCHED'), os.environ.get('FAKE_PM_ACTIVATED')))\n"
-)
 
 
 @pytest.mark.parametrize(
     "shape", ["discovered", "discovered-cwd-agent", "pythonpath-only", "blank-agent-dir-env"]
 )
-def test_direct_launch_survives_isolated_relaunch_without_agent_dir_env(tmp_path, shape):
+def test_direct_launch_survives_isolated_relaunch_without_agent_dir_env(tmp_path, webui, shape):
+    agent_dir_env = None
     if shape == "pythonpath-only":
         # systemd unit with Environment=PYTHONPATH=<agent> at a non-standard path (#8529 A)
         agent_dir = _fake_managed_agent(tmp_path / "opt" / "hermes-agent")
         # PYTHONPATH precedes site-packages, so the interpreter finds the fake.
         env = _isolated_env(tmp_path, PYTHONPATH=str(agent_dir), HERMES_WEBUI_PYTHON=sys.executable)
-        cwd = WEBUI_ROOT
+        cwd = webui
     else:
         # Agent at $HERMES_HOME/hermes-agent, nothing exported (README manual
         # launch from the Agent checkout, a bare systemd unit). A blank
         # HERMES_WEBUI_AGENT_DIR (`Environment=HERMES_WEBUI_AGENT_DIR=`) is unset
         # for api.config, so it must be unset for activation too.
         agent_dir = _fake_managed_agent(tmp_path / "hermes-home" / "hermes-agent")
-        extra = {"HERMES_WEBUI_AGENT_DIR": "  "} if shape == "blank-agent-dir-env" else {}
+        if shape == "blank-agent-dir-env":
+            agent_dir_env = "  "
+        extra = {"HERMES_WEBUI_AGENT_DIR": agent_dir_env} if agent_dir_env else {}
         env = _isolated_env(tmp_path, **extra)
-        cwd = agent_dir if shape == "discovered-cwd-agent" else WEBUI_ROOT
-    result = subprocess.run(
-        [sys.executable, "-c", _IMPORT_SERVER],
-        cwd=str(cwd), env=env, capture_output=True, text=True, timeout=180,
-    )
+        cwd = agent_dir if shape == "discovered-cwd-agent" else webui
+    result, resolved = run_guarded(_import_server(webui), webui=webui, env=env, cwd=cwd)
+    assert resolved["ACTIVATES"] == resolved["RUNTIME"] == agent_dir.resolve(), resolved
     assert result.returncode == 0, (
         "WebUI died in the Agent's isolated relaunch: activation ran after a "
         f"third-party import.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr[-3000:]}"
     )
     assert "SERVER_IMPORTED relaunched=1 activated=1" in result.stdout, result.stdout
+    # The relaunch handoff is private and one-shot, and the operator's variable
+    # is never written: not even in the relaunched child.
+    assert f"AFTER handoff=None agent_dir={agent_dir_env!r}" in result.stdout, result.stdout
 
 
-def test_relaunched_child_activates_the_agent_the_parent_discovered(tmp_path):
+def test_relaunched_child_activates_the_agent_the_parent_discovered(tmp_path, webui):
     """The launching interpreter found the Agent through its own import path; the
     Agent's store Python cannot. The child must get the parent's root handed over
-    (as start.sh/bootstrap.py export it), not re-discover and come up empty."""
+    privately, not re-discover and come up empty (sandbox method H2: an Agent
+    reachable only through the WebUI venv's .pth)."""
     agent_dir = _fake_managed_agent(tmp_path / "opt" / "hermes-agent")
     env = _isolated_env(
         tmp_path, PYTHONPATH=str(agent_dir), HERMES_WEBUI_PYTHON=sys.executable,
         FAKE_PM_CHILD_DROPS_PYTHONPATH="1",
     )
-    script = _IMPORT_SERVER + "print('CHILD_AGENT_DIR=%s' % os.environ.get('HERMES_WEBUI_AGENT_DIR'))\n"
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(WEBUI_ROOT), env=env, capture_output=True, text=True, timeout=180,
-    )
+    result, resolved = run_guarded(_import_server(webui), webui=webui, env=env, cwd=webui)
+    assert resolved["ACTIVATES"] == agent_dir.resolve(), resolved
     assert result.returncode == 0, (
         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr[-3000:]}"
     )
     assert "SERVER_IMPORTED relaunched=1 activated=1" in result.stdout, result.stdout
-    assert f"CHILD_AGENT_DIR={agent_dir.resolve()}" in result.stdout, result.stdout
+    assert "AFTER handoff=None agent_dir=None" in result.stdout, result.stdout
 
 
-def test_explicit_agent_dir_still_wins_over_discovery(tmp_path, monkeypatch):
+_ACTIVATE_AND_REPORT = """
+import json, os, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, {webui!r})
+from api import startup
+auth_before = startup._agent_dir()
+import managed_agent_startup
+managed_agent_startup.activate_managed_agent()
+report = dict(
+    activated=os.environ.get("FAKE_PM_ACTIVATED"),
+    seen_handoff=os.environ.get("FAKE_PM_SEEN_HANDOFF"),
+    seen_agent_dir=os.environ.get("FAKE_PM_SEEN_AGENT_DIR"),
+    handoff_after=os.environ.get({handoff!r}),
+    agent_dir_after=os.environ.get("HERMES_WEBUI_AGENT_DIR"),
+    auth_before=str(auth_before) if auth_before else None,
+    auth_after=str(startup._agent_dir()) if startup._agent_dir() else None,
+)
+def _no_pip(args, **kwargs):
+    print("PIP_REACHED %r" % (args,), flush=True)
+    raise SystemExit(87)
+_run, subprocess.run = subprocess.run, _no_pip
+os.environ["HERMES_WEBUI_AUTO_INSTALL"] = "1"
+report["auto_install"] = startup.auto_install_agent_deps(expected_agent_dir=Path({agent!r}))
+subprocess.run = _run
+del os.environ["HERMES_WEBUI_AUTO_INSTALL"]
+if {with_config!r}:
+    import api.config as config
+    report.update(
+        runtime_agent=str(config._AGENT_DIR),
+        proven_python=config._DISCOVERY.python_exe,
+        python_exe=config.PYTHON_EXE,
+    )
+print("REPORT=" + json.dumps(report))
+"""
+
+
+def _activate_and_report(tmp_path, webui, agent_dir, env, *, with_config=False) -> dict:
+    script = _ACTIVATE_AND_REPORT.format(
+        webui=str(webui), handoff=HANDOFF, agent=str(agent_dir), with_config=with_config,
+    )
+    result, resolved = run_guarded(script, webui=webui, env=env, cwd=webui)
+    assert resolved["ACTIVATES"] == agent_dir.resolve(), resolved
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr[-3000:]}"
+    assert "PIP_REACHED" not in result.stdout, result.stdout
+    line = next(x for x in result.stdout.splitlines() if x.startswith("REPORT="))
+    return json.loads(line.removeprefix("REPORT="))
+
+
+def test_discovered_agent_is_not_turned_into_the_operator_override(tmp_path, webui):
+    """No relaunch: the activation must leave the process exactly as master's
+    discovery would. A discovered-only Agent (here: XDG data dir) must not become
+    HERMES_WEBUI_AGENT_DIR, which api.startup reads as auto-install authorization
+    (#8529 gate: the public export let HERMES_WEBUI_AUTO_INSTALL reach pip)."""
+    env = _isolated_env(tmp_path)
+    agent_dir = _fake_managed_agent(
+        Path(env["XDG_DATA_HOME"]) / "hermes-agent", bootstrap=_FAKE_PLAIN_BOOTSTRAP,
+    )
+    report = _activate_and_report(tmp_path, webui, agent_dir, env)
+    assert report["activated"] == "1", report
+    # Offered to a would-be relaunched child while the bootstrap ran...
+    assert report["seen_handoff"] == str(agent_dir.resolve()), report
+    assert report["seen_agent_dir"] == "<unset>", report
+    # ...and gone once activation returned.
+    assert report["handoff_after"] is None, report
+    assert report["agent_dir_after"] is None, report
+    # Auto-install authorization is what it was before activation: none.
+    assert report["auth_before"] is None and report["auth_after"] is None, report
+    assert report["auto_install"] is False, report
+
+
+def test_discovery_keeps_the_interpreter_that_proved_the_agent(tmp_path, webui):
+    """An Agent found through the launching interpreter keeps that interpreter as
+    api.config's proven Python, ahead of WebUI's own .venv (#8529 gate: the
+    public export reset `_DISCOVERY.python_exe` to None)."""
+    agent_dir = _fake_managed_agent(
+        tmp_path / "opt" / "hermes-agent", bootstrap=_FAKE_PLAIN_BOOTSTRAP,
+    )
+    env = _isolated_env(tmp_path, PYTHONPATH=str(agent_dir))
+    # Unset, so discovery proves the Agent with the launching interpreter.
+    env.pop("HERMES_WEBUI_PYTHON")
+    report = _activate_and_report(tmp_path, webui, agent_dir, env, with_config=True)
+    assert report["activated"] == "1", report
+    assert report["runtime_agent"] == str(agent_dir.resolve()), report
+    assert report["proven_python"] == sys.executable, report
+    assert report["python_exe"] == sys.executable, report
+    assert report["handoff_after"] is None and report["agent_dir_after"] is None, report
+
+
+def test_relaunch_handoff_is_private_to_managed_agent_startup():
+    """Only the startup hook may read the handoff: api.config, auto-install, the
+    gateway and every subprocess keep master's view of HERMES_WEBUI_AGENT_DIR."""
+    skip_dirs = {".git", "node_modules", "tests", "__pycache__", ".venv", "venv"}
+    readers = []
+    for dirpath, dirnames, filenames in os.walk(WEBUI_ROOT):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.suffix in {".py", ".sh", ".bash", ".ps1", ".js", ".nix"} and HANDOFF in path.read_text(
+                encoding="utf-8", errors="ignore"
+            ):
+                readers.append(path.relative_to(WEBUI_ROOT).as_posix())
+    assert readers == ["managed_agent_startup.py"], readers
+
+
+def test_explicit_agent_dir_still_wins_over_discovery_and_the_handoff(tmp_path, monkeypatch):
     import managed_agent_startup
 
     _fake_managed_agent(tmp_path / "hermes-home" / "hermes-agent")
@@ -159,12 +271,31 @@ def test_explicit_agent_dir_still_wins_over_discovery(tmp_path, monkeypatch):
     explicit.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     monkeypatch.setenv("HERMES_WEBUI_AGENT_DIR", f" {explicit} ")
+    monkeypatch.setenv(HANDOFF, str(tmp_path / "handed-off"))
     assert managed_agent_startup._resolve_agent_dir(WEBUI_ROOT) == str(explicit)
+    assert HANDOFF not in os.environ
 
 
-def test_startup_activation_and_api_config_resolve_the_same_agent(tmp_path):
+def test_relaunch_handoff_wins_over_discovery_once(tmp_path, monkeypatch):
+    import managed_agent_startup
+    from api import startup
+
+    handed = tmp_path / "handed-off"
+    monkeypatch.delenv("HERMES_WEBUI_AGENT_DIR", raising=False)
+    monkeypatch.setenv(HANDOFF, f" {handed} ")
+    monkeypatch.setattr(
+        startup, "discover_runtime_agent_identity",
+        lambda **_kw: startup._AgentDiscovery(tmp_path / "discovered"),
+    )
+    assert managed_agent_startup._resolve_agent_dir(WEBUI_ROOT) == str(handed)
+    assert HANDOFF not in os.environ
+    # Consumed: the next resolution is discovery again.
+    assert managed_agent_startup._resolve_agent_dir(WEBUI_ROOT) == str(tmp_path / "discovered")
+
+
+def test_startup_activation_and_api_config_resolve_the_same_agent(tmp_path, webui):
     """Both a legacy ~/.hermes/hermes-agent and a different platform-default home
-    (Windows: %LOCALAPPDATA%\\hermes) hold an Agent; HERMES_HOME is unset. The hook
+    (Windows: %LOCALAPPDATA%\\\\hermes) hold an Agent; HERMES_HOME is unset. The hook
     must activate the Agent api.config then runs against (#8355 review)."""
     legacy = _fake_managed_agent(tmp_path / "home" / ".hermes" / "hermes-agent")
     platform_default = tmp_path / "localappdata" / "hermes"
@@ -173,19 +304,17 @@ def test_startup_activation_and_api_config_resolve_the_same_agent(tmp_path):
     env.pop("HERMES_HOME")
     script = (
         "import sys\n"
-        f"sys.path.insert(0, {str(WEBUI_ROOT)!r})\n"
+        f"sys.path.insert(0, {str(webui)!r})\n"
         "from pathlib import Path\n"
         "import api.paths as paths\n"
         f"paths._platform_default_hermes_home = lambda: Path({str(platform_default)!r})\n"
         "import managed_agent_startup as m\n"
-        f"print('ACTIVATE', m._resolve_agent_dir(Path({str(WEBUI_ROOT)!r})))\n"
+        f"print('ACTIVATE', m._resolve_agent_dir(Path({str(webui)!r})))\n"
         "import api.config as config\n"
         "print('RUNTIME', config._AGENT_DIR)\n"
     )
-    result = subprocess.run(
-        [sys.executable, "-c", script], cwd=str(WEBUI_ROOT), env=env,
-        capture_output=True, text=True, timeout=120,
-    )
+    # Nothing here imports a bootstrap; still pre-flight + guard the launch.
+    result, _resolved = run_guarded(script, webui=webui, env=env, cwd=webui, timeout=120)
     assert result.returncode == 0, result.stderr[-3000:]
     lines = dict(
         line.split(" ", 1) for line in result.stdout.splitlines()
@@ -206,6 +335,7 @@ def test_no_discoverable_agent_leaves_startup_untouched(tmp_path, monkeypatch):
     before = list(sys.path)
     managed_agent_startup.activate_managed_agent()
     assert [p for p in sys.path if p not in before and p != str(WEBUI_ROOT)] == []
+    assert HANDOFF not in os.environ
 
 
 # ── Docker (docker_init.bash) ────────────────────────────────────────────────
@@ -237,7 +367,7 @@ def _run_selection(tmp_path: Path, src: str, stage: str, agent_dir_env: str | No
     if agent_dir_env is not None:
         env["HERMES_WEBUI_AGENT_DIR"] = agent_dir_env
     script = (
-        "set -e\n"
+        "set -eu\n"
         + _select_staged_agent_function()
         + 'select_staged_agent_for_git_checkout "$1" "$2"\n'
         + 'bash -c \'printf "RESULT=%s\\n" "${HERMES_WEBUI_AGENT_DIR-<unset>}"\'\n'
@@ -247,7 +377,7 @@ def _run_selection(tmp_path: Path, src: str, stage: str, agent_dir_env: str | No
         env=env, capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    return result.stdout.strip().splitlines()[-1].removeprefix("RESULT=")
+    return result.stdout.rstrip("\n").splitlines()[-1].removeprefix("RESULT=")
 
 
 @pytest.fixture
@@ -255,6 +385,7 @@ def staged_agent(tmp_path):
     src = tmp_path / "mount" / "hermes-agent"
     src.mkdir(parents=True)
     (src / "run_agent.py").write_text("", encoding="utf-8")
+    (src / "hermes_bootstrap.py").write_text("", encoding="utf-8")
     stage = tmp_path / "app" / "hermes-agent-src"
     stage.mkdir(parents=True)
     (stage / "run_agent.py").write_text("", encoding="utf-8")
@@ -265,8 +396,10 @@ def test_docker_single_container_git_checkout_runs_the_staged_agent(tmp_path, st
     src, stage = staged_agent
     (src / ".git").mkdir()
     assert _run_selection(tmp_path, str(src), str(stage), None) == str(stage)
-    # A blank value is unset everywhere else too (api.config, activation).
-    assert _run_selection(tmp_path, str(src), str(stage), "") == str(stage)
+    # A blank or whitespace-only value is unset everywhere else too
+    # (api.config, activation), so it must not count as an operator override.
+    for blank in ("", "  ", "\t", " \n "):
+        assert _run_selection(tmp_path, str(src), str(stage), blank) == str(stage), repr(blank)
 
 
 def test_docker_selection_leaves_every_other_topology_alone(tmp_path, staged_agent):
@@ -278,6 +411,12 @@ def test_docker_selection_leaves_every_other_topology_alone(tmp_path, staged_age
     (src / ".git").mkdir()
     # The operator's own choice always wins.
     assert _run_selection(tmp_path, str(src), str(stage), "/srv/agent") == "/srv/agent"
+    assert _run_selection(tmp_path, str(src), str(stage), " /srv/agent ") == " /srv/agent "
+    # A git checkout without hermes_bootstrap.py (pre-PM Agent) never relaunches:
+    # keep master's behaviour (the mounted checkout, in-app git update intact).
+    (src / "hermes_bootstrap.py").unlink()
+    assert _run_selection(tmp_path, str(src), str(stage), None) == "<unset>"
+    (src / "hermes_bootstrap.py").write_text("", encoding="utf-8")
     # No usable stage (staging failed): keep today's behaviour.
     (stage / "run_agent.py").unlink()
     assert _run_selection(tmp_path, str(src), str(stage), None) == "<unset>"

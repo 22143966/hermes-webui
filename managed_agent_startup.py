@@ -8,6 +8,17 @@ from pathlib import Path
 import sys
 
 
+# Private, one-shot handoff to the process a PM-managed Agent's bootstrap
+# re-execs this one into. Set only around the bootstrap import, only for an
+# Agent found by discovery, and consumed (popped) by the next
+# ``_resolve_agent_dir`` call: it never reaches api.config, auto-install, the
+# gateway, cron or terminal subprocesses. Deliberately NOT
+# HERMES_WEBUI_AGENT_DIR: that is the operator's override, which api.config
+# turns into a different interpreter selection and api.startup into
+# auto-install authorization (#8529 gate).
+_RELAUNCH_AGENT_DIR_ENV = "_HERMES_WEBUI_RELAUNCH_AGENT_DIR"
+
+
 def _resolve_agent_dir(webui_root: Path) -> str | None:
     """The Agent root to activate: the exported one, else the one api.config uses.
 
@@ -22,7 +33,13 @@ def _resolve_agent_dir(webui_root: Path) -> str | None:
     * A non-blank ``HERMES_WEBUI_AGENT_DIR`` always wins, even when it names a
       directory without ``run_agent.py``: that is the browser-only signal and
       keeps this hook a no-op.
-    * Unset, empty or whitespace-only falls back to
+    * Otherwise (unset, empty or whitespace-only) a relaunch handoff from the
+      parent process comes next: the store Python the bootstrap re-execs into
+      cannot see an Agent the launching interpreter found through its own
+      site-packages (``pip install -e``, a ``.pth``). It is popped here on
+      every call, so it is consumed exactly once and never reaches a
+      subprocess.
+    * Otherwise this falls back to
       ``api.startup.discover_runtime_agent_identity``, the exact discovery
       ``api.config`` runs, so startup cannot activate one Agent's dependency
       layer while the runtime imports another Agent's code. ``api.config``
@@ -32,9 +49,12 @@ def _resolve_agent_dir(webui_root: Path) -> str | None:
 
     Discovery is best-effort: any failure leaves startup exactly as before.
     """
+    handoff = os.environ.pop(_RELAUNCH_AGENT_DIR_ENV, "").strip()
     explicit = os.environ.get("HERMES_WEBUI_AGENT_DIR", "").strip()
     if explicit:
         return str(Path(explicit).expanduser())
+    if handoff:
+        return handoff
     try:
         # Stdlib-only (api.startup -> api.paths), so safe before activation.
         from api import startup as _startup
@@ -66,9 +86,9 @@ def activate_managed_agent() -> None:
         # The bootstrap may re-exec this process into the Agent's store Python,
         # which cannot re-discover an Agent this interpreter found through its
         # own site-packages (`pip install -e`, a .pth). Hand the child the same
-        # root, as start.sh/bootstrap.py do, so it activates the same Agent.
+        # root privately; an explicit HERMES_WEBUI_AGENT_DIR reaches it anyway.
         if not os.environ.get("HERMES_WEBUI_AGENT_DIR", "").strip():
-            os.environ["HERMES_WEBUI_AGENT_DIR"] = agent_dir
+            os.environ[_RELAUNCH_AGENT_DIR_ENV] = agent_dir
         # Bootstrap's probe adds the checkout to its own PYTHONPATH, not ours.
         if agent_dir not in sys.path:
             sys.path.insert(1, agent_dir)
@@ -85,3 +105,6 @@ def activate_managed_agent() -> None:
                 file=sys.stderr,
                 flush=True,
             )
+        finally:
+            # No re-exec happened (or it failed): the handoff has no reader left.
+            os.environ.pop(_RELAUNCH_AGENT_DIR_ENV, None)
