@@ -6815,7 +6815,7 @@ async function _settlePreviewForWorkspaceSwitch(targetWs){
   }
   if(typeof _previewBelongsToWorkspace==='function'&&!_previewBelongsToWorkspace(target)){
     if(typeof cancelEditMode==='function')cancelEditMode();
-    if(typeof clearPreview==='function')clearPreview();
+    if(typeof clearPreview==='function')clearPreview({keepPanelOpen:true});
   }
   return true;
 }

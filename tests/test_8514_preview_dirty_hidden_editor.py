@@ -183,6 +183,13 @@ def test_closed_panel_is_never_dirty(tmp_path):
     assert _run_sync("edited", "original", "", "closed", tmp_path)["dirty"] is False
 
 
+def test_no_baseline_is_never_dirty(tmp_path):
+    """After clearPreview() the baseline is null while the textarea keeps the old
+    text. Reopening the panel must not turn that leftover into a discard prompt
+    (#8515 review: edit, Discard via the breadcrumb, then Refresh prompted again)."""
+    assert _run_sync("leftover", None, "", "preview", tmp_path)["dirty"] is False
+
+
 def test_dirty_state_is_recomputed_even_when_it_stays_false(tmp_path):
     """The badge must be refreshed on every sync, not only when the state flips."""
     assert _run_sync("edited", "original", "", "closed", tmp_path)["updates"] == 1

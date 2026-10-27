@@ -1245,7 +1245,9 @@ function _previewEditorOnScreen(){
 }
 function _syncPreviewDirty(){
   const ta=$('previewEditArea');
-  _previewDirty = !!ta && _previewEditorOnScreen()
+  // No baseline (after clearPreview) means nothing was loaded to edit: a
+  // leftover textarea value is not an edit (#8515 review).
+  _previewDirty = _previewSavedText!==null && !!ta && _previewEditorOnScreen()
     && String(ta.value||'')!==String(_previewSavedText||'');
   updateEditBtn();
 }

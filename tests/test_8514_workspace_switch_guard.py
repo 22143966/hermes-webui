@@ -344,3 +344,12 @@ def test_same_workspace_selection_keeps_hidden_edits_without_prompting(tmp_path)
     assert all(s["ws"] == "A" for s in out["saves"])
     assert out["fs"]["B"]["note.txt"] == "original-B"
     assert out["fs"]["A"]["note.txt"] == "edited"
+
+
+def test_dropping_a_clean_foreign_editor_keeps_the_files_panel_open():
+    """A clean editor from another workspace is dropped on switch. In preview
+    mode clearPreview() closes the whole panel unless told otherwise, so the
+    switch must pass keepPanelOpen (#8515 review: panel ended `closed`)."""
+    block = _function_block(PANELS_JS, "_settlePreviewForWorkspaceSwitch")
+    assert "clearPreview({keepPanelOpen:true})" in block
+    assert "clearPreview()" not in block
