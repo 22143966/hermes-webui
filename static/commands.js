@@ -2421,6 +2421,12 @@ async function forkFromMessage(msgIdx, btn){
   // since loading full history (e.g. the outline) re-bases indices without a
   // re-render (#2184).
   const forkRow=btn&&btn.closest?btn.closest('[data-msg-idx]'):null;
+  if(forkRow&&forkRow.dataset&&forkRow.dataset.displayOnly==='1'){
+    // Recovered display-only prompts have no canonical index, so any
+    // keep_count derived from the row would fork the wrong point.
+    showToast('This prompt is not in the saved transcript yet; fork becomes available once it is saved.',3000);
+    return;
+  }
   if(forkRow&&typeof _rowCurrentRawIdx==='function') msgIdx=_rowCurrentRawIdx(forkRow,msgIdx-1)+1;
   // During streaming, only block fork if the clicked message is the
   // currently-streaming (live) message itself.  Past messages that are
