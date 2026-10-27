@@ -4,8 +4,6 @@ tool-result pruning gate must read the active engine object, not a config string
 
 import types
 
-import pytest
-
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
