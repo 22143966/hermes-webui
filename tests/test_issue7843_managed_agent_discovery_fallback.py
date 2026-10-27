@@ -9,8 +9,9 @@ exports nothing, so activate_managed_agent() returned before its first action
 and the WebUI died on `import yaml` in api/profiles.py -- the managed runtime's
 dependency set is only ever attached by the Agent's own bootstrap.
 
-api.config already resolves the same Agent with _discover_agent_identity(); the
-hook must fall back to that instead of going blind when the variable is unset.
+api.config already resolves the same Agent; the hook must fall back to that same
+discovery (api.startup.discover_runtime_agent_identity) instead of going blind
+when the variable is unset.
 """
 
 import os
@@ -62,7 +63,17 @@ def _launch(agent_dir, extra_env):
     env.pop("HERMES_WEBUI_AGENT_DIR", None)
     env.pop("PM_DEPS_ACTIVATED", None)
     env["HERMES_HOME"] = str(agent_dir.parent)
-    env["HERMES_WEBUI_PYTHON"] = ""
+    # Hermetic: discovery also probes ~/.hermes, ~/hermes-agent, XDG data, a
+    # `hermes` launcher on PATH and the selected interpreter's site-packages
+    # (the test interpreter may be a real Agent's venv). Without this a real
+    # host Agent would be found and its bootstrap run against the temp home.
+    user_home = agent_dir.parent / "user-home"
+    user_home.mkdir(parents=True, exist_ok=True)
+    env["HERMES_WEBUI_PYTHON"] = str(user_home / "no-python")
+    env["HOME"] = str(user_home)
+    env["USERPROFILE"] = str(user_home)
+    env["XDG_DATA_HOME"] = str(user_home / ".local" / "share")
+    env["PATH"] = os.pathsep.join([os.path.dirname(sys.executable), "/usr/bin", "/bin"])
     env.update(extra_env)
     return subprocess.run(
         [sys.executable, "-c", _SEAM_SCRIPT],
@@ -106,12 +117,16 @@ def test_explicit_env_var_still_wins_over_discovery(tmp_path):
 
 def test_browser_only_empty_agent_dir_still_no_ops(tmp_path):
     """An exported empty Agent directory is a deliberate browser-only signal."""
-    empty = tmp_path / "home" / "hermes-agent"
+    empty = tmp_path / "browser-only" / "hermes-agent"
     empty.mkdir(parents=True)
-    # A real Agent exists at the discoverable default and must NOT be picked up.
-    _managed_agent(tmp_path / "home")
+    # A real Agent exists where discovery WOULD find it ($HERMES_HOME/hermes-agent)
+    # and must NOT be picked up.
+    discoverable = _managed_agent(tmp_path / "home")
 
-    result = _launch(empty, {"HERMES_WEBUI_AGENT_DIR": str(empty)})
+    result = _launch(
+        empty,
+        {"HERMES_WEBUI_AGENT_DIR": str(empty), "HERMES_HOME": str(discoverable.parent)},
+    )
 
     # No activation: the browser-only export wins over the discoverable Agent.
     assert result.returncode == 3, (
@@ -128,9 +143,10 @@ def test_no_agent_anywhere_still_reaches_the_webui_import_seam(tmp_path):
     result = _launch(hermes_home, {})
 
     # 3 = seam reached, deps absent (correct: there is no Agent to activate).
-    # 9 = the hook raised before WebUI could import anything.
-    assert result.returncode != 9, (
-        f"activate_managed_agent() raised with no Agent present.\n{result.stderr}"
+    # Anything else (9, or a bootstrap's SystemExit) means the hook did not
+    # return cleanly before WebUI's first import.
+    assert result.returncode == 3, (
+        f"activate_managed_agent() did not return cleanly with no Agent present.\n{result.stderr}"
     )
 
 
