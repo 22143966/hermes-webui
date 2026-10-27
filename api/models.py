@@ -8471,7 +8471,16 @@ def _apply_sidebar_state_db_override_rows(
                 session['updated_at'] = max(
                     float(session.get('updated_at') or 0), float(state_last)
                 )
-            if state_count > current_count:
+            # The timestamp guard is load-bearing: it is what keeps a
+            # TRUNCATED session truncated. Without it, the state.db rows for
+            # the removed suffix still carry an older ``last_message_at`` and
+            # count, so a four-to-zero truncate reports 4 raw / 4 visible and
+            # a four-to-two truncate reports 4 raw / 2 visible, both of which
+            # bring deleted messages back into the sidebar (master hides the
+            # empty row and reports 2). Growth from state.db is only credible
+            # when it is NEWER than the sidecar; a row the user just deleted is
+            # not. Keep master's condition verbatim.
+            if state_count > current_count and (state_last <= 0 or state_last > current_last):
                 try:
                     existing_actual = max(0, int(session.get('actual_message_count') or 0))
                 except (TypeError, ValueError):

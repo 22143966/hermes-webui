@@ -512,8 +512,47 @@ def test_first_append_row_is_public_through_the_writer_and_handler(monkeypatch, 
         )
 
 
+def _public_poll_row_or_none(sid):
+    """Like ``_public_poll`` but tolerates the row being hidden from the sidebar."""
+    import api.routes as routes
+
+    routes._clear_session_list_cache()
+    handler = _GetHandler("/api/sessions?sidebar_source=webui")
+    routes.handle_get(handler, urlparse(handler.path))
+    assert handler.status == 200, f"GET /api/sessions returned {handler.status}"
+    for row in handler.response_json["sessions"]:
+        if row.get("session_id") == sid:
+            return row
+    return None
+
+
+def _sync_state_db_session_count(tmp_path, sid, count):
+    """Keep the state.db sessions row in step with the truncated transcript.
+
+    The real writer decrements this row when the transcript shrinks; the message
+    ROWS stay behind, which is the "raw growth" the overlay reads. Leaving the
+    counter at its pre-truncation value makes the row's current count equal the
+    raw count, so the timestamp guard has nothing to protect and the regression
+    is invisible to the fixture.
+    """
+    conn = sqlite3.connect(str(tmp_path / "state.db"))
+    try:
+        conn.execute(
+            "UPDATE sessions SET message_count = ? WHERE id = ?", (count, sid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_truncate_four_to_two_on_the_public_poll(monkeypatch, tmp_path):
-    """The truncation repair, on the real ingress: state.db must not re-credit the suffix."""
+    """Truncation repair on the real ingress: state.db must not re-credit the suffix.
+
+    Master's contract: the sidecar's truncated count wins while the removed
+    suffix's state.db rows carry an older timestamp. Dropping the timestamp
+    guard made this report 4 raw / 4 visible, resurrecting deleted messages in
+    the sidebar (#8400 re-gate).
+    """
     now = time.time()
     _seed_store(monkeypatch, tmp_path, now=now)
     four = [
@@ -530,21 +569,46 @@ def test_truncate_four_to_two_on_the_public_poll(monkeypatch, tmp_path):
     session.messages = four[:2]
     session.truncation_boundary = float(now - 57.5)
     session.save(touch_updated_at=False)
+    _sync_state_db_session_count(tmp_path, TARGET, 2)
 
     monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", str(CAP))
     first = _public_poll(TARGET)
     second = _public_poll(TARGET)
 
     for row in (first, second):
-        assert row["message_count"] == 4, "state.db raw growth stays authoritative"
-        # Until the next save the merged transcript is the only authority: the
-        # sidecar is empty, its truncation watermark is not persisted and the
-        # cutoff sits below every state.db row, so no row here can be the
-        # removed suffix. A capped-out row therefore reports the raw count and
-        # the sidecar's prefix re-asserts the truncated total on the next save.
-        assert row["visible_message_count"] in (2, 4), (
+        assert row["message_count"] == 2, (
+            "the truncated sidecar owns the count: an older state.db suffix "
+            "must not be re-credited"
+        )
+        assert row["visible_message_count"] == 2, (
             "append-only state.db rows must not re-credit a suffix the sidecar truncated"
         )
+
+
+def test_truncate_four_to_zero_hides_the_row_on_the_public_poll(monkeypatch, tmp_path):
+    """Master's contract for a fully emptied transcript: the row disappears."""
+    now = time.time()
+    _seed_store(monkeypatch, tmp_path, now=now)
+    four = [
+        {"role": "user", "content": "q1", "timestamp": now - 60},
+        {"role": "assistant", "content": "a1", "timestamp": now - 59},
+        {"role": "user", "content": "q2", "timestamp": now - 58},
+        {"role": "assistant", "content": "a2", "timestamp": now - 57},
+    ]
+    session = _new_session(TARGET, messages=four, created_at=now - 60, updated_at=now - 57)
+    session.save(touch_updated_at=False)
+    _state_db(tmp_path, {TARGET: list(four)})
+
+    session.messages = []
+    session.truncation_boundary = float(now - 56.5)
+    session.save(touch_updated_at=False)
+    _sync_state_db_session_count(tmp_path, TARGET, 0)
+
+    monkeypatch.setenv("HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N", str(CAP))
+    assert _public_poll_row_or_none(TARGET) is None, (
+        "an emptied transcript must not be resurrected by the removed suffix "
+        "still sitting in state.db"
+    )
 
 
 # --- the fact itself must live where a real row can read it -----------------------
