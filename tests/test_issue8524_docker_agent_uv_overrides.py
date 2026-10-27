@@ -87,6 +87,29 @@ def test_malformed_entries_are_dropped_and_never_span_lines():
     assert dvp.uv_override_dependencies(text) == ["pillow==13.0.0"]
 
 
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "-r http://127.0.0.1:9/injected.txt",
+        "  -r /etc/passwd",
+        "-c constraints.txt",
+        "-e /etc",
+        "--index-url http://127.0.0.1:9/simple",
+        "--extra-index-url=http://127.0.0.1:9/simple",
+        "pillow==13.0.0 \\",
+    ],
+)
+def test_requirements_file_directives_are_never_passed_to_uv(entry):
+    # uv parses the overrides file as requirements.txt: a "-" line is a directive it
+    # acts on (a -r URL is fetched) and a trailing backslash joins the next line.
+    text = "[tool.uv]\noverride-dependencies = [%s, \"cryptography==50.0.1\"]\n" % _toml_str(entry)
+    assert dvp.uv_override_dependencies(text) == ["cryptography==50.0.1"]
+
+
+def _toml_str(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 # ── the CLI mode docker_init.bash calls ──────────────────────────────────────
 
 def _cli(*args):

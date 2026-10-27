@@ -464,8 +464,20 @@ def uv_override_dependencies(pyproject_text: str) -> list[str]:
     entries = uv.get("override-dependencies") if isinstance(uv, dict) else None
     if not isinstance(entries, list):
         return []
-    # One requirement per line in the file uv reads: never let an entry span lines.
-    return [e.strip() for e in entries if isinstance(e, str) and e.strip() and "\n" not in e and "\r" not in e]
+    # uv reads the overrides file as requirements.txt syntax, so a line starting with
+    # "-" is a directive (-r/-c/-e/--index-url, which uv acts on, fetching -r URLs,
+    # before it judges the entry), and a trailing "\" joins the next line. Neither can
+    # be a PEP 508 requirement, which is all [tool.uv] override-dependencies accepts.
+    # Keep one requirement per line: never let an entry span lines.
+    kept = []
+    for entry in entries:
+        if not isinstance(entry, str) or "\n" in entry or "\r" in entry:
+            continue
+        entry = entry.strip()
+        if not entry or entry.startswith("-") or entry.endswith("\\"):
+            continue
+        kept.append(entry)
+    return kept
 
 
 def _run_uv_overrides(argv: list[str]) -> int:
