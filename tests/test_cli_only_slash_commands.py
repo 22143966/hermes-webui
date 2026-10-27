@@ -1117,6 +1117,33 @@ def test_slash_autocomplete_treats_underscore_like_hyphen():
     assert result["neighbour_hit"] is False
 
 
+def test_slash_plain_prefix_keeps_master_order():
+    """A prefix without `_`/`-` must keep the original row order (#8203 gate).
+
+    Literal-first re-ranking exists for dual spellings only; applied to a plain
+    prefix it moved prefix-matched skills above substring/description matches
+    and changed the first row of the menu versus master.
+    """
+    result = _run_commands_js(
+        """
+        _bundleCommandCacheReady = true;
+        _skillCommandCache.length = 0;
+        _skillCommandCache.push({name: 'incident-review', desc: 'Incident review', source: 'skill', skillName: 'incident-review'});
+        _skillCommandCache.push({name: 'review-pr', desc: 'Review PR', source: 'skill', skillName: 'review-pr'});
+        _skillCommandCache.push({name: 'knowledge-loop', desc: 'Loop', source: 'skill', skillName: 'knowledge-loop'});
+        _skillCommandCache.push({name: 'alpha-notes', desc: 'Loop notes', source: 'skill', skillName: 'alpha-notes'});
+        const mine = new Set(['incident-review', 'review-pr', 'knowledge-loop', 'alpha-notes']);
+        return {
+          review: getMatchingCommands('review').map(c => c.name).filter(n => mine.has(n)),
+          loop: getMatchingCommands('loop').map(c => c.name).filter(n => mine.has(n))
+        };
+        """
+    )
+
+    assert result["review"] == ["incident-review", "review-pr"]
+    assert result["loop"] == ["knowledge-loop", "alpha-notes"]
+
+
 def test_slash_alias_matching_covers_skill_and_agent_rounds():
     """Skill and agent/plugin command rounds both honour the underscore alias."""
     result = _run_commands_js(

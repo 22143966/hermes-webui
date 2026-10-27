@@ -249,6 +249,9 @@ function _slashCommandNameIncludes(name,q){
 function _rankLiteralPrefixMatchesFirst(matches,q){
   const needle=String(q||'').toLowerCase();
   if(!needle||matches.length<2)return matches;
+  // Only a separator spelling (`_` vs `-`) needs literal-first ordering; a plain
+  // prefix keeps master's order (skill rows matched by substring/description).
+  if(_slashCommandSlugVariants(needle).length<2)return matches;
   return matches.slice().sort((a,b)=>{
     const an=String(a&&a.name||'').toLowerCase();
     const bn=String(b&&b.name||'').toLowerCase();
