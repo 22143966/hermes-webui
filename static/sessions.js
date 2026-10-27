@@ -4533,6 +4533,19 @@ function _mergePendingSessionMessage(session,messages){
   if(!pendingMsg) return false;
   if(_hasCurrentTailUserDuplicate(currentTurnMessages,pendingMsg)) return false;
   if(liveAssistantIdx>=0){
+    // Same windowed-transcript case as _mergeInflightTailMessages: the first
+    // page can start INSIDE the running turn, so `messages` holds the turn's
+    // activity rows but not its `user` row. Splicing the prompt in front of
+    // the live tail would leave it below its own progress narration and
+    // renderMessages() would paint those orphaned rows as a standalone
+    // assistant turn above the user bubble. The prompt predates every loaded
+    // row here, so it belongs in front of the window.
+    const windowHasUser=messages.some(m=>m&&String(m.role||'')==='user');
+    const windowedTranscript=typeof _oldestIdx==='number'&&_oldestIdx>0;
+    if(windowedTranscript&&!windowHasUser){
+      messages.unshift(pendingMsg);
+      return true;
+    }
     const misplacedIdx=messages.findIndex((m,idx)=>
       idx>liveAssistantIdx&&m&&m.role==='user'&&_sameTranscriptMessage(m,pendingMsg)
     );
@@ -4840,10 +4853,24 @@ function _mergeInflightTailMessages(baseMessages, inflightMessages){
   for(const msg of tail){
     let candidate=msg;
     if(!candidate) continue;
-    const duplicate=String(candidate.role||'')==='user'
+    const isUser=String(candidate.role||'')==='user';
+    const duplicate=isUser
       ? _hasCurrentTailUserDuplicate(merged,candidate)
       : merged.slice(-Math.max(5,tail.length+2)).some(existing=>_sameTranscriptMessage(existing,candidate));
-    if(!duplicate) merged.push(candidate);
+    if(duplicate) continue;
+    // A windowed first page (msg_limit paging) can start INSIDE the running
+    // turn: `base` then holds the turn's activity rows but not its `user` row,
+    // so the dedupe above cannot hit and appending would park the prompt BELOW
+    // its own progress narration. renderMessages() paints those orphaned
+    // window rows as a standalone assistant turn, which reads as "messages
+    // above my first message". When the window carries no user row at all the
+    // prompt predates every loaded row, so it belongs in front of the window.
+    // With an earlier turn already inside the window the current prompt
+    // genuinely starts after it and the append stays correct.
+    const windowHasUser=merged.some(m=>m&&String(m.role||'')==='user');
+    const windowedTranscript=typeof _oldestIdx==='number'&&_oldestIdx>0;
+    if(isUser&&windowedTranscript&&!windowHasUser) merged.unshift(candidate);
+    else merged.push(candidate);
   }
   return merged;
 }
