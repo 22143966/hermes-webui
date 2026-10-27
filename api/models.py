@@ -7741,9 +7741,11 @@ def _strict_agent_state_db_path(*, profile=None) -> Path | None:
             db_path = _get_profile_home(profile) / 'state.db'
         else:
             db_path = _strict_active_state_db_path()
+        # Inside the try: an inaccessible profile directory makes exists()
+        # raise PermissionError, which must fail closed (retain), never 500.
+        if db_path is None or not db_path.exists():
+            return None
     except Exception:
-        return None
-    if db_path is None or not db_path.exists():
         return None
     return db_path
 

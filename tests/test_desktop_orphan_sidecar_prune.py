@@ -573,3 +573,48 @@ def test_all_profiles_prune_matrix_for_named_profile_db(tmp_path, monkeypatch):
         "corrupt-db",
     }
     assert pruned == ["deleted-row"]
+
+
+def test_inaccessible_owner_profile_retains_row_and_never_fails_the_sidebar(tmp_path, monkeypatch):
+    """Release-gate fold: an owning profile directory that cannot be traversed
+    (chmod 000) made ``db_path.exists()`` raise ``PermissionError`` outside the
+    lookup's exception handler, so the whole sidebar builder failed (HTTP 500).
+    It must fail closed instead: keep the row, prune nothing, with either
+    visibility toggle and either profile scope."""
+    import pytest
+
+    from api import models
+
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+
+    active_home = tmp_path / "active"
+    active_home.mkdir()
+    locked_home = tmp_path / "locked"
+    locked_home.mkdir()
+    _make_state_db(locked_home / "state.db", ["locked-row"])
+
+    try:
+        for all_profiles, profile in ((True, "locked"), (False, "default")):
+            if all_profiles:
+                _make_state_db(active_home / "state.db", [])
+                monkeypatch.setattr(models, "_active_state_db_path", lambda: active_home / "state.db")
+            else:
+                monkeypatch.setattr(models, "_active_state_db_path", lambda: locked_home / "state.db")
+            monkeypatch.setattr(models, "_get_profile_home", lambda _profile: locked_home)
+            locked_home.chmod(0)
+            try:
+                for show_cli_sessions in (False, True):
+                    payload, pruned = _run_actual_builder(
+                        monkeypatch,
+                        [_desktop_row("locked-row", profile=profile)],
+                        show_cli_sessions=show_cli_sessions,
+                        all_profiles=all_profiles,
+                    )
+                    assert [row["session_id"] for row in payload["sessions"]] == ["locked-row"], (
+                        all_profiles, show_cli_sessions)
+                    assert pruned == [], (all_profiles, show_cli_sessions)
+            finally:
+                locked_home.chmod(0o755)
+    finally:
+        locked_home.chmod(0o755)
