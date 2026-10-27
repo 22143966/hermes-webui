@@ -510,6 +510,21 @@ def handle_upload_extract(handler):
         return j(handler, {'error': 'Archive extraction failed'}, status=500)
 
 
+# A command STT provider that exits cleanly but writes no transcript has not
+# failed — it found no speech. transcription_command.py raises this message
+# only after the exit code has been checked (a crash is reported as
+# "exited with code N"), so silence is the only way to reach it.
+_NO_SPEECH_ERROR_MARKERS = (
+    "wrote no output file",
+    "produced no stdout",
+)
+
+
+def _is_no_speech_error(message):
+    lowered = (message or "").lower()
+    return any(marker in lowered for marker in _NO_SPEECH_ERROR_MARKERS)
+
+
 def handle_transcribe(handler):
     import traceback as _tb
     temp_path = None
@@ -535,6 +550,12 @@ def handle_transcribe(handler):
         result = transcribe_audio(temp_path)
         if not result.get('success'):
             msg = str(result.get('error') or 'Transcription failed')
+            if _is_no_speech_error(msg):
+                # The recorder worked; there was just nothing to hear. Answering
+                # 400 here made the client report a failure for a silent clip,
+                # which is a normal outcome when the mic opens before the user
+                # speaks or when auto-stop fires on an empty room.
+                return j(handler, {'ok': True, 'transcript': '', 'no_speech': True})
             status = 503 if 'unavailable' in msg.lower() or 'not configured' in msg.lower() else 400
             return j(handler, {'error': msg}, status=status)
         transcript = str(result.get('transcript') or '').strip()

@@ -1282,7 +1282,17 @@ function _micToastKeyForRecognitionError(error){
         err.status=res.status;
         throw err;
       }
-      _commitTranscript(data.transcript||'', prefixSnapshot);
+      const transcript=(data.transcript||'').trim();
+      if(!transcript){
+        // Silence, not failure: the server answers 200 with an empty transcript
+        // (and no_speech) when the audio carried no speech. Committing an empty
+        // string left the user watching an unchanged composer, unable to tell a
+        // dead mic from a quiet room.
+        window._micPendingSend=false;
+        showToast(t('mic_no_speech'));
+        return;
+      }
+      _commitTranscript(transcript, prefixSnapshot);
     }catch(err){
       if(_isServerSttUnavailable(err)&&_allowBrowserSttFallback()){
         window._micPendingSend=false;
