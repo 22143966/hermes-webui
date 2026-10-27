@@ -27,8 +27,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 SESSIONS_JS_PATH = ROOT / "static" / "sessions.js"
 UI_JS_PATH = ROOT / "static" / "ui.js"

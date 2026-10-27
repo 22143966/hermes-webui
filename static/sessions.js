@@ -5217,12 +5217,15 @@ async function _loadOlderMessages() {
     }
     // Re-place recovered prompts that are still outside the window (or drop
     // them when the page just loaded the canonical row they mirror). The
-    // canonical rows above keep their absolute indices either way.
-    _reconcileRecoveredPromptRows(
-      nextMessages,
-      carriedRecoveredRows,
-      Number(S.session && S.session.session_id === sid && S.session.pending_started_at) || 0
-    );
+    // canonical rows above keep their absolute indices either way. Guarded for
+    // partial test harnesses that extract this function alone.
+    if (carriedRecoveredRows.length && typeof _reconcileRecoveredPromptRows === 'function') {
+      _reconcileRecoveredPromptRows(
+        nextMessages,
+        carriedRecoveredRows,
+        Number(S.session && S.session.session_id === sid && S.session.pending_started_at) || 0
+      );
+    }
     S.messages = nextMessages;
     _syncToolCallsForLoadedMessages(nextMessages, responseSession.tool_calls);
     // #7882 (greptile round-4 P2): older rows prepended during an in-flight
