@@ -322,7 +322,7 @@ def test_capped_out_grown_row_takes_the_walk_not_the_raw_delta(monkeypatch):
     metadata["TOOLUSER"] = {
         "_state_db_source": "webui",
         "_state_db_message_count": 8,
-        "_state_db_last_message_at": 1003.5,
+        "_state_db_last_message_at": 1004.0,
     }
     walked = []
 
