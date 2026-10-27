@@ -510,36 +510,28 @@ def handle_upload_extract(handler):
         return j(handler, {'error': 'Archive extraction failed'}, status=500)
 
 
-# A command STT provider that exits cleanly and writes no transcript produced no
-# audible result. transcription_command.py raises that message only after the
-# exit code has been checked, but a *crash* error embeds the child's stderr, and
-# stderr can itself contain "produced no stdout" / "wrote no output file". Those
-# failures must stay failures, so any crash shape disqualifies a match and only
-# the plain clean-run wording counts.
-_NO_SPEECH_ERROR_MARKERS = (
-    "wrote no output file",
-    "produced no stdout",
-)
-
-# Present in a failed-provider error envelope (nonzero exit, stderr capture) or
-# in any other diagnostic that merely quotes the phrases above.
-_NO_SPEECH_DISQUALIFIERS = (
-    "exited with code",
-    "exit code",
-    "exit status",
-    "stderr",
-    "traceback",
-    "exception",
+# The only outcome that means "the provider ran cleanly and returned nothing to
+# transcribe" is the message transcription_tools raises *after* the exit code has
+# been checked:
+#   Command STT provider wrote no output file at <path> and produced no stdout
+# Match that complete message form and nothing else. A crash-shaped error embeds
+# the child's stderr, which can quote the same words ("produced no stdout"), so a
+# substring match would turn real failures into a successful silent clip. This is
+# also not proof the audio was decoded and found silent: it is only proof the
+# provider exited cleanly without producing a transcript.
+_NO_SPEECH_ERROR_RE = _re.compile(
+    r"^command stt provider wrote no output file at \S(?:.*\S)? and produced no stdout\.?$",
+    _re.IGNORECASE,
 )
 
 
 def _is_no_speech_error(message):
-    lowered = (message or "").strip().lower()
-    if not lowered:
+    # A trailing/leading newline in a wrapped diagnostic would turn the form match
+    # into a miss, so compare the stripped single-line message only.
+    text = (message or "").strip()
+    if not text:
         return False
-    if any(bad in lowered for bad in _NO_SPEECH_DISQUALIFIERS):
-        return False
-    return any(marker in lowered for marker in _NO_SPEECH_ERROR_MARKERS)
+    return _NO_SPEECH_ERROR_RE.match(text) is not None
 
 
 def handle_transcribe(handler):
@@ -568,10 +560,10 @@ def handle_transcribe(handler):
         if not result.get('success'):
             msg = str(result.get('error') or 'Transcription failed')
             if _is_no_speech_error(msg):
-                # The recorder worked; there was just nothing to hear. Answering
-                # 400 here made the client report a failure for a silent clip,
-                # which is a normal outcome when the mic opens before the user
-                # speaks or when auto-stop fires on an empty room.
+                # The provider ran cleanly and produced no transcript — a normal
+                # outcome when the mic opens before the user speaks or auto-stop
+                # fires on an empty room. Answering 400 here made the client report
+                # a failure for a clip that never had anything to transcribe.
                 return j(handler, {'ok': True, 'transcript': '', 'no_speech': True})
             status = 503 if 'unavailable' in msg.lower() or 'not configured' in msg.lower() else 400
             return j(handler, {'error': msg}, status=status)
