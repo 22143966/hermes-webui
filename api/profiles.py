@@ -1967,7 +1967,7 @@ def switch_profile(name: str, *, process_wide: bool = True) -> dict:
 # mtime_ns/org are the change-detection snapshot taken before the compute;
 # validated_at is when the entry was last confirmed (or written).
 _SKILLS_STATS_CACHE: dict[Path, tuple[int, int, int, float, str | None, float]] = {}
-_SKILLS_STATS_CACHE_TTL = 300.0  # seconds — long because .clear() handles programmatic changes
+_SKILLS_STATS_CACHE_TTL = 300.0  # seconds — long because invalidate_profile_skills_stats() handles programmatic changes
 
 # Stale-while-revalidate window (#7940). The stat-only probe still walks the
 # whole skill tree (thousands of stat() calls on a large library), so running
