@@ -326,11 +326,11 @@ assert.strictEqual(merged.filter(m => m.role === 'user').length, 1);
     _run(script)
 
 
-def _fork_harness(index_helpers: str, helper_src: str, fork_src: str, oldest_idx: int = 31) -> str:
+def _fork_harness(index_helpers: str, helper_src: str, fork_src: str, oldest_idx: int = 31, busy: bool = False) -> str:
     """Shared node prelude: real index helpers + real merge helpers + real fork caller."""
     return f"""
 const assert = require('assert');
-var S = {{session:{{session_id:'s1', pending_started_at:100}}, messages:[], busy:false}};
+var S = {{session:{{session_id:'s1', pending_started_at:100}}, messages:[], busy:{'true' if busy else 'false'}}};
 let _oldestIdx = {oldest_idx};
 {index_helpers}
 {helper_src}
@@ -489,3 +489,114 @@ function msgContent(m) {{ return String((m && m.content) || ''); }}
     out = _run(script)
     assert '"before":32' in out, out
     assert '"after":32' in out, out
+
+
+def test_busy_guard_forks_saved_row_after_recovered_prefix():
+    """S.busy=true: a saved canonical row right after a recovered prefix still forks.
+
+    `_rowCurrentRawIdx()` returns the CANONICAL window-relative index
+    (display-only rows excluded). A busy guard that indexes `S.messages` with
+    that canonical count lands on the recovered display-only prompt, which
+    carries `_pending`, so the fork of a committed row is refused even though
+    the correct keep_count is computable. Both recovery sources must fork the
+    window head (canonical 31) with keep_count 32 while S.busy is true.
+    """
+    index_helpers = _index_helpers()
+    helper_src = _helper_src()
+    fork_src = _fork_caller()
+    script = (
+        _fork_harness(index_helpers, helper_src, fork_src, busy=True)
+        + """
+function getPendingSessionMessage(session, messages) {
+  const text = String((session && session.pending_user_message) || '').trim();
+  if (!text) return null;
+  return {role:'user', content:text, _ts:(session.pending_started_at || 10), _pending:true};
+}
+async function forkAttempt(rawIdx) {
+  try { return await forkAt(rawIdx); } catch (e) { return null; }
+}
+
+(async () => {
+  // Source A: local-INFLIGHT live-tail recovery — the recovered prompt leads
+  // the window, the 30 saved canonical rows follow, the live row trails.
+  S.messages = _mergeInflightTailMessages(windowRows, [
+    currentPrompt,
+    {role:'assistant', _live:true, content:'working on it'},
+  ]);
+  assert.strictEqual(S.messages[0]._displayOnlyRow, true);
+  assert.strictEqual(_messageSessionIndexForRawIdx(1), 31);
+  const inflightKeep = await forkAttempt(1);
+  assert.strictEqual(inflightKeep, 32,
+    'INFLIGHT recovery: the saved row after the recovered prompt must fork with 32, not be misread as the pending prompt');
+
+  // Source B: prompt-free server-journal recovery (pending prompt spliced
+  // into the loaded window by _mergePendingSessionMessage).
+  S.messages = windowRows.slice();
+  const changed = _mergePendingSessionMessage({pending_user_message:'current prompt', pending_started_at:100}, S.messages);
+  assert.strictEqual(changed, true);
+  S.messages.push({role:'assistant', _live:true, content:'working on it'});
+  assert.strictEqual(S.messages[0]._displayOnlyRow, true);
+  assert.strictEqual(_messageSessionIndexForRawIdx(1), 31);
+  const pendingKeep = await forkAttempt(1);
+  assert.strictEqual(pendingKeep, 32,
+    'server-journal recovery: the saved row after the recovered prompt must fork with 32');
+
+  console.log(JSON.stringify({inflightKeep, pendingKeep}));
+})().catch(e => { console.error(e); process.exit(1); });
+"""
+    )
+    out = _run(script)
+    assert '"inflightKeep":32' in out, out
+    assert '"pendingKeep":32' in out, out
+
+
+def test_busy_guard_refuses_live_row():
+    """S.busy=true: forking the live row itself must be refused, not branched.
+
+    With a recovered display-only prefix, the live row's canonical index is
+    smaller than its real array position: `S.messages[canonical-1]` is the
+    last SAVED row and the last-row check compares a canonical count against
+    the display array length — both miss the live row, so the branch API is
+    called. The guard must read the real current array position instead.
+    """
+    index_helpers = _index_helpers()
+    helper_src = _helper_src()
+    fork_src = _fork_caller()
+    script = (
+        _fork_harness(index_helpers, helper_src, fork_src, busy=True)
+        + """
+function getPendingSessionMessage(session, messages) {
+  const text = String((session && session.pending_user_message) || '').trim();
+  if (!text) return null;
+  return {role:'user', content:text, _ts:(session.pending_started_at || 10), _pending:true};
+}
+async function forkAttempt(rawIdx) {
+  try { return await forkAt(rawIdx); } catch (e) { return null; }
+}
+
+(async () => {
+  // Source A: local-INFLIGHT live-tail recovery.
+  S.messages = _mergeInflightTailMessages(windowRows, [
+    currentPrompt,
+    {role:'assistant', _live:true, content:'working on it'},
+  ]);
+  const inflightCalls = forkPayloads.length;
+  await forkAttempt(S.messages.length - 1);
+  assert.strictEqual(forkPayloads.length, inflightCalls,
+    'INFLIGHT recovery: the live row must not reach /api/session/branch');
+
+  // Source B: prompt-free server-journal recovery.
+  S.messages = windowRows.slice();
+  _mergePendingSessionMessage({pending_user_message:'current prompt', pending_started_at:100}, S.messages);
+  S.messages.push({role:'assistant', _live:true, content:'working on it'});
+  const pendingCalls = forkPayloads.length;
+  await forkAttempt(S.messages.length - 1);
+  assert.strictEqual(forkPayloads.length, pendingCalls,
+    'server-journal recovery: the live row must not reach /api/session/branch');
+
+  console.log(JSON.stringify({liveRefused: true}));
+})().catch(e => { console.error(e); process.exit(1); });
+"""
+    )
+    out = _run(script)
+    assert '"liveRefused":true' in out, out
