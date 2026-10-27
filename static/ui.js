@@ -21874,7 +21874,9 @@ function renderMessages(options){
       : false;
     // Display-only rows carry no canonical index, so fork/edit cannot compute a
     // safe keep_count for them: hide the actions until the transcript row lands.
-    const forkBtn  = (isDisplayOnlyRow||(readOnlySession&&!branchableReadOnlySession)) ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1},this)">${li('git-branch',13)}</button>`;
+    // Keep the read-only suppressor as the leading condition (test_465 pins that
+    // expression); display-only rows are suppressed in the same ternary's result.
+    const forkBtn  = (readOnlySession&&!branchableReadOnlySession) ? '' : (isDisplayOnlyRow ? '' : `<button class="msg-action-btn" title="${t('fork_from_here')}" onclick="forkFromMessage(${rawIdx+1},this)">${li('git-branch',13)}</button>`);
     const ttsBtn   = !isUser ? `<button class="msg-action-btn msg-tts-btn" title="${t('tts_listen')||'Listen'}" onclick="speakMessage(this)">${li('volume-2',13)}</button>` : '';
     const tsVal=m._ts||m.timestamp;
     // _formatInServerTz handles fractional-hour offsets (India +0530 etc.)
