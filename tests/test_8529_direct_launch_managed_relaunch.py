@@ -82,7 +82,15 @@ def _fake_managed_agent(agent_dir: Path, bootstrap: str = _FAKE_BOOTSTRAP) -> Pa
         "import hermes_bootstrap\nclass AIAgent:\n    pass\n", encoding="utf-8"
     )
     (agent_dir / "pyproject.toml").write_text("[project]\nname = 'hermes-agent'\n", encoding="utf-8")
+    _add_pm_launch_files(agent_dir)
     return agent_dir
+
+
+def _add_pm_launch_files(agent_dir: Path) -> None:
+    """What makes an Agent a PM launcher (v0.21.6+), beside hermes_bootstrap.py."""
+    for rel in ("hermes_cli/venv_sync.py", "pm/environments.py"):
+        (agent_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+        (agent_dir / rel).write_text("", encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
@@ -247,6 +255,72 @@ def test_discovery_keeps_the_interpreter_that_proved_the_agent(tmp_path, webui):
     assert report["handoff_after"] is None and report["agent_dir_after"] is None, report
 
 
+# A pre-PM Agent's bootstrap (the Windows UTF-8 shim, since 2026-05) moves its
+# checkout to the FRONT of sys.path. Imported before WebUI's own dependencies,
+# copies vendored into that checkout would shadow the working installed ones
+# (#8529 gate: a vendored `cryptography` turned OIDC off). Such an Agent never
+# relaunches, so a direct launch must keep master's behaviour: no early import.
+_FAKE_PRE_PM_BOOTSTRAP = textwrap.dedent(
+    """
+    import os, sys
+    _root = os.path.dirname(os.path.abspath(__file__))
+    sys.path[:] = [p for p in sys.path if os.path.abspath(p) != _root]
+    sys.path.insert(0, _root)
+    os.environ["FAKE_PM_ACTIVATED"] = "1"
+    """
+)
+
+_PRE_PM_REPORT = """
+import json, os, sys
+sys.path.insert(0, {webui!r})
+import managed_agent_startup
+managed_agent_startup.activate_managed_agent()
+print("REPORT=" + json.dumps(dict(
+    activated=os.environ.get("FAKE_PM_ACTIVATED"),
+    bootstrap_imported="hermes_bootstrap" in sys.modules,
+    agent_on_path={agent!r} in sys.path,
+)))
+"""
+
+
+def _pre_pm_agent(agent_dir: Path) -> Path:
+    agent_dir = _fake_managed_agent(agent_dir, bootstrap=_FAKE_PRE_PM_BOOTSTRAP)
+    (agent_dir / "hermes_cli" / "venv_sync.py").unlink()
+    (agent_dir / "pm" / "environments.py").unlink()
+    return agent_dir
+
+
+def _pre_pm_report(webui, env, agent_dir) -> dict:
+    script = _PRE_PM_REPORT.format(webui=str(webui), agent=str(agent_dir.resolve()))
+    result, resolved = run_guarded(script, webui=webui, env=env, cwd=webui)
+    assert resolved["ACTIVATES"] == agent_dir.resolve(), resolved
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr[-3000:]}"
+    line = next(x for x in result.stdout.splitlines() if x.startswith("REPORT="))
+    return json.loads(line.removeprefix("REPORT="))
+
+
+def test_discovered_pre_pm_agent_keeps_masters_lazy_bootstrap(tmp_path, webui):
+    agent_dir = _pre_pm_agent(tmp_path / "hermes-home" / "hermes-agent")
+    report = _pre_pm_report(webui, _isolated_env(tmp_path), agent_dir)
+    assert report == dict(activated=None, bootstrap_imported=False, agent_on_path=False), report
+
+
+def test_explicit_pre_pm_agent_is_still_activated_as_on_master(tmp_path, webui):
+    # start.sh / bootstrap.py export the variable; that path is unchanged.
+    agent_dir = _pre_pm_agent(tmp_path / "hermes-home" / "hermes-agent")
+    env = _isolated_env(tmp_path, HERMES_WEBUI_AGENT_DIR=str(agent_dir))
+    report = _pre_pm_report(webui, env, agent_dir)
+    assert report == dict(activated="1", bootstrap_imported=True, agent_on_path=True), report
+
+
+def test_pm_launch_markers_match_the_docker_selection():
+    import managed_agent_startup
+
+    function = _select_staged_agent_function()
+    for marker in managed_agent_startup._PM_LAUNCH_MARKERS:
+        assert f'"$_src/{marker}"' in function, marker
+
+
 def test_relaunch_handoff_is_private_to_managed_agent_startup():
     """Only the startup hook may read the handoff: api.config, auto-install, the
     gateway and every subprocess keep master's view of HERMES_WEBUI_AGENT_DIR."""
@@ -386,6 +460,7 @@ def staged_agent(tmp_path):
     src.mkdir(parents=True)
     (src / "run_agent.py").write_text("", encoding="utf-8")
     (src / "hermes_bootstrap.py").write_text("", encoding="utf-8")
+    _add_pm_launch_files(src)
     stage = tmp_path / "app" / "hermes-agent-src"
     stage.mkdir(parents=True)
     (stage / "run_agent.py").write_text("", encoding="utf-8")
@@ -412,11 +487,15 @@ def test_docker_selection_leaves_every_other_topology_alone(tmp_path, staged_age
     # The operator's own choice always wins.
     assert _run_selection(tmp_path, str(src), str(stage), "/srv/agent") == "/srv/agent"
     assert _run_selection(tmp_path, str(src), str(stage), " /srv/agent ") == " /srv/agent "
-    # A git checkout without hermes_bootstrap.py (pre-PM Agent) never relaunches:
-    # keep master's behaviour (the mounted checkout, in-app git update intact).
-    (src / "hermes_bootstrap.py").unlink()
-    assert _run_selection(tmp_path, str(src), str(stage), None) == "<unset>"
-    (src / "hermes_bootstrap.py").write_text("", encoding="utf-8")
+    # A pre-PM git checkout never relaunches: keep master's behaviour (the
+    # mounted checkout, in-app git update intact). Pre-PM Agents ship a
+    # hermes_bootstrap.py too, so each PM launch file must be required.
+    for marker in ("hermes_bootstrap.py", "hermes_cli/venv_sync.py", "pm/environments.py"):
+        body = (src / marker).read_text(encoding="utf-8")
+        (src / marker).unlink()
+        assert _run_selection(tmp_path, str(src), str(stage), None) == "<unset>", marker
+        (src / marker).write_text(body, encoding="utf-8")
+    assert _run_selection(tmp_path, str(src), str(stage), None) == str(stage)
     # No usable stage (staging failed): keep today's behaviour.
     (stage / "run_agent.py").unlink()
     assert _run_selection(tmp_path, str(src), str(stage), None) == "<unset>"
@@ -436,6 +515,9 @@ def test_docker_init_selects_the_stage_before_launching_server():
     assert re.search(r'^_agent_stage=/app/hermes-agent-src$', source, re.M)
     assert '_stage_src="/app/hermes-agent-src"' in source
     assert "--exclude='.git'" in source
+    # The cp -a fallback (no rsync in the image) must drop .git as well, or its
+    # stage would never be selected.
+    assert 'rm -rf "$_stage_src"/.git' in source
     # The selection must not be skipped by the fast-restart path: it sits after
     # the dependency install / reuse decision, not inside install_venv_dependencies.
     assert call > source.index("ensure_hindsight_client_docker_dependency\n\n")
