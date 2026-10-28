@@ -1,10 +1,14 @@
 """Composed recovered-prompt lifecycle at zero and nonzero paging offsets."""
 
 import json
+import os
+import subprocess
+import tempfile
 
 import pytest
 
 from tests.test_inflight_tail_windowed_user_position import (
+    NODE,
     SESSIONS_JS_PATH,
     _ensure_loaded_scaffold,
     _fork_caller,
@@ -12,8 +16,21 @@ from tests.test_inflight_tail_windowed_user_position import (
     _function,
     _helper_src,
     _index_helpers,
-    _run,
 )
+
+
+def _run_file(script: str) -> str:
+    """Execute via a temp file: the composed script exceeds MAX_ARG_STRLEN."""
+    assert NODE, "node is required for this test"
+    fd, path = tempfile.mkstemp(suffix=".js", dir=os.environ.get("TMPDIR", "/tmp"))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(script)
+        result = subprocess.run([NODE, path], capture_output=True, text=True, check=False)
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, result.stderr or result.stdout
+    return result.stdout
 
 
 @pytest.mark.parametrize("oldest_idx", [0, 31])
@@ -153,5 +170,5 @@ INFLIGHT.s1 = {{streamId:'stream-1', messages:[
   console.log(JSON.stringify({{offset:{oldest_idx}, lifecycle:true}}));
 }})().catch(e=>{{ console.error(e); process.exit(1); }});
 """
-    out = _run(script)
+    out = _run_file(script)
     assert '"lifecycle":true' in out, out
