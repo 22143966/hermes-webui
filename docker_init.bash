@@ -945,7 +945,7 @@ fi
 # always wins. A blank or whitespace-only value is unset, as server.py and
 # api/config.py treat it.
 select_staged_agent_for_git_checkout() {
-  local _src="$1" _stage="$2" _override="${HERMES_WEBUI_AGENT_DIR:-}" _mech
+  local _src="$1" _stage="$2" _override="${HERMES_WEBUI_AGENT_DIR:-}" _mech _out _stamp _timeout
   [ -z "${_override//[[:space:]]/}" ] || return 0
   # Only a PM launcher (Agent v0.21.6+) re-execs WebUI: hermes_bootstrap.py alone
   # is also in pre-PM Agents. managed_agent_startup._PM_LAUNCH_MARKERS lists the same files.
@@ -964,18 +964,37 @@ select_staged_agent_for_git_checkout() {
     1|true|yes) return 0 ;;
   esac
   [ -f "$_src/pyproject.toml" ] || return 0
-  if [ -e "$_src/install-stamp.json" ]; then
-    # No python3 to read it: prefer the stage. Keeping a mount that does
-    # relaunch crash-loops (#8529); a stage it did not need only costs the
-    # in-app Agent update.
-    if command -v python3 >/dev/null 2>&1; then
-      _mech="$(python3 -c 'import json, sys
+  # The Agent reads the stamp of the tree it runs from at $HERMES_INSTALL_ROOT when
+  # that is non-empty (pm/paths.py install_root), else beside the checkout.
+  _stamp="${HERMES_INSTALL_ROOT:-$_src}/install-stamp.json"
+  if [ -e "$_stamp" ] || [ -L "$_stamp" ]; then
+    # Read only a regular file of at most 64 KiB, with python3, within 5 s. The
+    # Agent's reader turns a malformed or non-object stamp into {} (no relaunch:
+    # keep the mount). Anything this cannot read safely (a FIFO or other
+    # non-regular file, an oversized or unreadable file, no python3, a reader that
+    # fails or times out) prefers the stage: keeping a mount that does relaunch
+    # crash-loops (#8529); an unneeded stage only costs the in-app Agent update.
+    _mech="<unread>"
+    if [ -f "$_stamp" ] && command -v python3 >/dev/null 2>&1 \
+        && [ "$(wc -c < "$_stamp" 2>/dev/null | tr -d '[:space:]')" -le 65536 ] 2>/dev/null; then
+      _timeout=""
+      command -v timeout >/dev/null 2>&1 && _timeout="timeout 5"
+      if _out="$($_timeout python3 -c 'import json, sys
 try:
-    d = json.load(open(sys.argv[1], encoding="utf-8-sig"))
-except Exception:
+    with open(sys.argv[1], "rb") as f:
+        raw = f.read(65537)
+except OSError:
+    sys.exit(3)
+try:
+    d = json.loads(raw.decode("utf-8-sig"))
+except ValueError:
     d = {}
-print(d.get("updateMechanism", "") if isinstance(d, dict) else "")' "$_src/install-stamp.json" 2>/dev/null)" || _mech=""
-      [ "$_mech" = "self" ] || return 0
+print(d.get("updateMechanism", "") if isinstance(d, dict) else "")' "$_stamp" 2>/dev/null)"; then
+        _mech="$_out"
+      fi
+    fi
+    if [ "$_mech" != "<unread>" ] && [ "$_mech" != "self" ]; then
+      return 0
     fi
   fi
   [ -f "$_stage/run_agent.py" ] && [ ! -e "$_stage/.git" ] || return 0

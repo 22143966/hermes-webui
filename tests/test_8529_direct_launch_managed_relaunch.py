@@ -639,3 +639,75 @@ def test_the_operator_override_still_wins_over_the_relaunch_checks(tmp_path, sta
     assert _run_selection(tmp_path, str(src), str(stage), "/srv/agent",
                           {"HERMES_DISABLE_LAZY_INSTALLS": "1"}) == "/srv/agent"
 
+
+def _tool_bin(tmp_path: Path, name: str, extra: dict | None = None) -> Path:
+    """A PATH dir with the real shell tools the selector uses plus optional stub scripts."""
+    bindir = tmp_path / name
+    bindir.mkdir()
+    for tool in ("bash", "tr", "printf", "wc", "timeout", "python3"):
+        found = shutil.which(tool)
+        if found and tool not in (extra or {}):
+            (bindir / tool).symlink_to(found)
+    for tool, body in (extra or {}).items():
+        stub = bindir / tool
+        stub.write_text("#!" + shutil.which("bash") + "\n" + body + "\n", encoding="utf-8")
+        stub.chmod(0o755)
+    return bindir
+
+
+def test_the_stamp_is_read_where_the_agent_reads_it(tmp_path, staged_agent):
+    """pm/paths.py install_root(): a non-empty HERMES_INSTALL_ROOT moves the executing tree's stamp."""
+    src, stage = staged_agent
+    (src / ".git").mkdir()
+    (src / "install-stamp.json").write_text('{"updateMechanism": "external"}', encoding="utf-8")
+    root = tmp_path / "install-root"
+    root.mkdir()
+    (root / "install-stamp.json").write_text('{"updateMechanism": "self"}', encoding="utf-8")
+    # The Agent relaunches (it reads root's "self"): the stage, never the external stamp beside the checkout.
+    assert _run_selection(tmp_path, str(src), str(stage), None, {"HERMES_INSTALL_ROOT": str(root)}) == str(stage)
+    (root / "install-stamp.json").write_text('{"updateMechanism": "external"}', encoding="utf-8")
+    (src / "install-stamp.json").write_text('{"updateMechanism": "self"}', encoding="utf-8")
+    assert _run_selection(tmp_path, str(src), str(stage), None, {"HERMES_INSTALL_ROOT": str(root)}) == "<unset>"
+    # An empty value is unset, as in the Agent (`if env`): the stamp beside the checkout decides.
+    assert _run_selection(tmp_path, str(src), str(stage), None, {"HERMES_INSTALL_ROOT": ""}) == str(stage)
+
+
+def test_a_fifo_or_oversized_stamp_prefers_the_stage_without_blocking(tmp_path, staged_agent):
+    src, stage = staged_agent
+    (src / ".git").mkdir()
+    stamp = src / "install-stamp.json"
+    os.mkfifo(stamp)                                      # open() on it would block startup forever
+    assert _run_selection(tmp_path, str(src), str(stage), None) == str(stage)
+    stamp.unlink()
+    stamp.write_text('{"updateMechanism": "external", "pad": "' + "x" * 70000 + '"}', encoding="utf-8")
+    assert _run_selection(tmp_path, str(src), str(stage), None) == str(stage)
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root reads mode-000 files")
+def test_an_unreadable_stamp_prefers_the_stage(tmp_path, staged_agent):
+    """docker_init may not run as the user the Agent runs as, so a stamp it cannot read says nothing
+    about the relaunch: prefer the stage (a kept mount that does relaunch crash-loops, #8529)."""
+    src, stage = staged_agent
+    (src / ".git").mkdir()
+    stamp = src / "install-stamp.json"
+    stamp.write_text('{"updateMechanism": "self"}', encoding="utf-8")
+    stamp.chmod(0)
+    try:
+        assert _run_selection(tmp_path, str(src), str(stage), None) == str(stage)
+    finally:
+        stamp.chmod(0o644)
+
+
+def test_a_failing_or_hanging_stamp_reader_prefers_the_stage(tmp_path, staged_agent):
+    src, stage = staged_agent
+    (src / ".git").mkdir()
+    (src / "install-stamp.json").write_text('{"updateMechanism": "external"}', encoding="utf-8")
+    failing = _tool_bin(tmp_path, "bin-fail", {"python3": "exit 1"})
+    assert _run_selection(tmp_path, str(src), str(stage), None, {"PATH": str(failing)}) == str(stage)
+    if shutil.which("timeout"):
+        import time
+        hanging = _tool_bin(tmp_path, "bin-hang", {"python3": shutil.which("sleep") + " 30; echo external"})
+        t0 = time.monotonic()
+        assert _run_selection(tmp_path, str(src), str(stage), None, {"PATH": str(hanging)}) == str(stage)
+        assert time.monotonic() - t0 < 20
+
