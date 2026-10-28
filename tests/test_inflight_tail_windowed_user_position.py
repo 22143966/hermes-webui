@@ -17,10 +17,12 @@ completed turn while the new prompt is still unpersisted. Placement therefore
 follows turn/start ownership (`pending_started_at` vs persisted `_ts`, plus
 `_live` rows) instead of the shape of the window.
 
-A prompt recovered from a window is display-only: its canonical index is
-outside the loaded window (or not persisted yet), so it must never shift the
-absolute index of the real window rows that fork/edit/regenerate and the
-older-page cursor are computed from.
+A prompt recovered from outside the canonical transcript — a windowed tail or
+a full (zero-offset) load whose prompt is still unpersisted — is display-only:
+it has no canonical index, so it must never shift the absolute index of the
+real rows that fork/edit/regenerate and the older-page cursor are computed
+from. The display-only marker is what keeps saved row 0 at absolute 0
+(keep_count 1) when the recovered prompt leads a zero-offset transcript.
 """
 
 import shutil
@@ -348,7 +350,10 @@ function _isReadOnlySession() {{ return false; }}
 function _isBranchableReadOnlySession() {{ return false; }}
 {fork_src}
 function rowFor(rawIdx) {{
-  return {{dataset:{{msgIdx:String(rawIdx), sessionMsgIdx:String(_messageSessionIndexForRawIdx(rawIdx))}}}};
+  // Mirror the real renderer (ui.js line ~21986): display-only rows carry
+  // data-display-only='1', which forkFromMessage reads before any index math.
+  const m = S.messages[rawIdx] || null;
+  return {{dataset:{{msgIdx:String(rawIdx), sessionMsgIdx:String(_messageSessionIndexForRawIdx(rawIdx)), displayOnly:(m && m._displayOnlyRow) ? '1' : undefined}}}};
 }}
 async function forkAt(rawIdx) {{
   await forkFromMessage(rawIdx + 1, {{closest:() => rowFor(rawIdx)}});
@@ -600,3 +605,277 @@ async function forkAttempt(rawIdx) {
     )
     out = _run(script)
     assert '"liveRefused":true' in out, out
+
+
+# ── Zero-offset (full transcript) recovered-prompt regressions ────────────
+# The non-windowed branch (offset 0) also recovers an unpersisted current-turn
+# prompt ahead of the server's activity rows. Without the display-only marker
+# the prompt counts as a real array member: saved row 0 (array position 1)
+# maps to absolute position 1 and the real fork caller sends keep_count 2
+# instead of 1. These tests compose the real merge, the real index helpers,
+# the real fork caller and the real reload path with a stubbed transport.
+
+_ZERO_OFFSET_FIXTURES = """
+const savedRows = [
+  {role:'assistant', content:'saved answer 0', _ts:10},
+  {role:'tool', content:'{"status":"success"}', _ts:11},
+];
+const inflightTail = [
+  {role:'user', content:'current prompt', _ts:10, _pending:true},
+  {role:'assistant', _live:true, content:'working on it'},
+];
+"""
+
+
+def _ensure_loaded_scaffold() -> str:
+    """Module-state + stubs required to run the real `_ensureMessagesLoaded`."""
+    return """
+let _loadingSessionId = 's1';
+let _loadSessionGeneration = 0;
+let _pendingCarryForwardSnapshot = null;
+let _sameSessionForceReloadHint = null;
+let _messagesTruncated = false;
+let _msgLimitMax = 500;
+const _MSG_LIMIT_MAX = 500;
+function _messageReloadLimitForSession() { return 30; }
+function _clearSameSessionForceReloadHint() {}
+function clearLiveToolCards() {}
+function _syncToolCallsForLoadedMessages() {}
+function _isSessionActivelyViewedForList() { return true; }
+function _setSessionViewedCount() {}
+var INFLIGHT = {};
+var window = {};
+"""
+
+
+def test_zero_offset_recovered_prompt_keeps_canonical_index():
+    """Full-transcript recovery: saved row 0 must stay canonical 0 (keep_count 1)."""
+    index_helpers = _index_helpers()
+    helper_src = _helper_src()
+    fork_src = _fork_caller()
+    script = (
+        _fork_harness(index_helpers, helper_src, fork_src, oldest_idx=0)
+        + _ZERO_OFFSET_FIXTURES
+        + """
+async function forkAttempt(rawIdx) {
+  try { return await forkAt(rawIdx); } catch (e) { return null; }
+}
+
+(async () => {
+  // Real caller chain: prepare the live tail, drop current-turn assistant
+  // rows, then merge.
+  S.messages = savedRows.slice();
+  const prepared = _prepareRunningLiveTail(S.messages, inflightTail);
+  if (prepared) S.messages = _dropCurrentTurnAssistantMessages(S.messages);
+  S.messages = _mergeInflightTailMessages(S.messages, inflightTail);
+  assert.deepStrictEqual(S.messages.map(m => m.role), ['user','assistant','tool','assistant']);
+  assert.strictEqual(S.messages[0].content, 'current prompt');
+  // The recovered prompt is display-only: no canonical index of its own, and
+  // the saved rows keep their absolute positions (0, 1) instead of 1, 2.
+  assert.strictEqual(S.messages[0]._displayOnlyRow, true);
+  assert.strictEqual(_messageSessionIndexForRawIdx(0), null,
+    'display-only rows have no canonical index');
+  assert.strictEqual(_messageSessionIndexForRawIdx(1), 0,
+    'saved row 0 must stay canonical 0, not shift to 1');
+  const idleKeep = await forkAt(1);
+  assert.strictEqual(idleKeep, 1,
+    'idle fork of saved row 0 must send keep_count 1, not 2');
+  // The recovered prompt itself refuses the branch (renderer marks the row
+  // data-display-only; forkFromMessage returns before any index math).
+  const callsBefore = forkPayloads.length;
+  await forkAttempt(0);
+  assert.strictEqual(forkPayloads.length, callsBefore,
+    'the recovered display-only prompt must not reach /api/session/branch');
+  console.log(JSON.stringify({idleKeep}));
+})().catch(e => { console.error(e); process.exit(1); });
+"""
+    )
+    out = _run(script)
+    assert '"idleKeep":1' in out, out
+
+
+def test_zero_offset_busy_guard_forks_saved_row_and_refuses_live():
+    """S.busy=true: saved row 0 still forks keep_count 1; live row refuses."""
+    index_helpers = _index_helpers()
+    helper_src = _helper_src()
+    fork_src = _fork_caller()
+    script = (
+        _fork_harness(index_helpers, helper_src, fork_src, oldest_idx=0, busy=True)
+        + _ZERO_OFFSET_FIXTURES
+        + """
+async function forkAttempt(rawIdx) {
+  try { return await forkAt(rawIdx); } catch (e) { return null; }
+}
+
+(async () => {
+  S.messages = _mergeInflightTailMessages(savedRows.slice(), inflightTail);
+  assert.strictEqual(S.messages[0]._displayOnlyRow, true);
+  assert.strictEqual(_messageSessionIndexForRawIdx(1), 0);
+  const busyKeep = await forkAttempt(1);
+  assert.strictEqual(busyKeep, 1,
+    'busy fork of saved row 0 must send keep_count 1, not 2');
+  const promptCalls = forkPayloads.length;
+  await forkAttempt(0);
+  assert.strictEqual(forkPayloads.length, promptCalls,
+    'recovered display-only prompt must refuse the branch while busy');
+  const liveCalls = forkPayloads.length;
+  await forkAttempt(S.messages.length - 1);
+  assert.strictEqual(forkPayloads.length, liveCalls,
+    'the live row must refuse the branch while busy');
+  console.log(JSON.stringify({busyKeep, refusals:true}));
+})().catch(e => { console.error(e); process.exit(1); });
+"""
+    )
+    out = _run(script)
+    assert '"busyKeep":1' in out, out
+    assert '"refusals":true' in out, out
+
+
+def test_zero_offset_canonical_prompt_stays_unmarked():
+    """Control: an already-canonical prompt is deduped in place and unmarked."""
+    index_helpers = _index_helpers()
+    helper_src = _helper_src()
+    fork_src = _fork_caller()
+    script = (
+        _fork_harness(index_helpers, helper_src, fork_src, oldest_idx=0)
+        + """
+// Full transcript already carries the canonical prompt; the INFLIGHT tail
+// mirrors it. Real callers drop current-turn assistant rows first, so the
+// tail user row is the last row and dedupe keeps the canonical copy in place.
+let base = [
+  {role:'user', content:'saved prompt', _ts:10},
+  {role:'assistant', content:'saved answer', _ts:11},
+];
+const inflight = [
+  {role:'user', content:'saved prompt', _ts:10, _pending:true},
+  {role:'assistant', _live:true, content:'working on it'},
+];
+const dropped = _dropCurrentTurnAssistantMessages(base);
+assert.deepStrictEqual(dropped.map(m => m.role), ['user']);
+S.messages = _mergeInflightTailMessages(dropped, inflight);
+assert.deepStrictEqual(S.messages.map(m => m.role), ['user','assistant']);
+assert.strictEqual(S.messages[0].content, 'saved prompt');
+assert.strictEqual(S.messages[0]._displayOnlyRow, undefined,
+  'the canonical prompt must stay unmarked');
+assert.strictEqual(S.messages.filter(m => m.role === 'user').length, 1);
+assert.strictEqual(_messageSessionIndexForRawIdx(0), 0);
+
+(async () => {
+  const keep = await forkAt(0);
+  assert.strictEqual(keep, 1);
+  console.log(JSON.stringify({keep}));
+})().catch(e => { console.error(e); process.exit(1); });
+"""
+    )
+    out = _run(script)
+    assert '"keep":1' in out, out
+
+
+def test_zero_offset_repeated_recovery_keeps_one_prompt():
+    """A second recovery pass against the carried array must not stack a prompt.
+
+    The real reload can early-return (messages populated + a
+    regeneration_revision), so the second pass merges against the array that
+    already holds the recovered prompt. The real prepare/drop step clears the
+    current-turn assistant rows that would otherwise block the tail-user
+    duplicate scan, so exactly one prompt survives with exact indices.
+    """
+    index_helpers = _index_helpers()
+    helper_src = _helper_src()
+    fork_src = _fork_caller()
+    ensure = _function(SESSIONS_JS_PATH.read_text(encoding="utf-8"), "_ensureMessagesLoaded")
+    script = (
+        _fork_harness(index_helpers, helper_src, fork_src, oldest_idx=0)
+        + _ZERO_OFFSET_FIXTURES
+        + _ensure_loaded_scaffold()
+        + f"""
+{ensure}
+let ensureCalls = 0;
+function api(url, opts) {{
+  if (opts && opts.method === 'POST') {{
+    forkPayloads.push(JSON.parse(opts.body));
+    return Promise.resolve({{session_id:'forked'}});
+  }}
+  ensureCalls++;
+  return Promise.resolve({{session:{{messages:[], _messages_offset:0, _messages_truncated:false, _msg_limit_max:500, tool_calls:[], message_count:0, visible_message_count:0, last_usage:{{}}}}}});
+}}
+function recoverPass() {{
+  return _ensureMessagesLoaded('s1', {{}}).then(() => {{
+    const prepared = _prepareRunningLiveTail(S.messages, inflightTail);
+    if (prepared) S.messages = _dropCurrentTurnAssistantMessages(S.messages);
+    S.messages = _mergeInflightTailMessages(S.messages, inflightTail);
+  }});
+}}
+(async () => {{
+  S.session.regeneration_revision = 'r1';
+  S.messages = _mergeInflightTailMessages(savedRows.slice(), inflightTail);
+  assert.strictEqual(S.messages[0]._displayOnlyRow, true);
+  await recoverPass();
+  assert.strictEqual(ensureCalls, 0,
+    'reload must early-return; the second pass merged against the carried array');
+  assert.strictEqual(S.messages.filter(m => m.role === 'user').length, 1,
+    'repeated recovery must keep exactly one prompt');
+  assert.strictEqual(S.messages[0].content, 'current prompt');
+  assert.strictEqual(_messageSessionIndexForRawIdx(0), null);
+  assert.strictEqual(_messageSessionIndexForRawIdx(1), 0,
+    'saved row 0 must stay canonical 0 after the second pass');
+  const keep = await forkAt(1);
+  assert.strictEqual(keep, 1);
+  console.log(JSON.stringify({{keep}}));
+}})().catch(e => {{ console.error(e); process.exit(1); }});
+"""
+    )
+    out = _run(script)
+    assert '"keep":1' in out, out
+
+
+def test_zero_offset_canonical_reload_drops_display_copy():
+    """Once the turn settles, a full reload replaces the display copy with the
+    canonical prompt and indices are correct again.
+
+    Drives the real `_ensureMessagesLoaded()` against a stubbed transport: the
+    reload response carries the now-persisted prompt, so the wholesale replace
+    drops the display-only row instead of duplicating it.
+    """
+    index_helpers = _index_helpers()
+    helper_src = _helper_src()
+    fork_src = _fork_caller()
+    ensure = _function(SESSIONS_JS_PATH.read_text(encoding="utf-8"), "_ensureMessagesLoaded")
+    script = (
+        _fork_harness(index_helpers, helper_src, fork_src, oldest_idx=0)
+        + _ZERO_OFFSET_FIXTURES
+        + _ensure_loaded_scaffold()
+        + f"""
+{ensure}
+function api(url, opts) {{
+  if (opts && opts.method === 'POST') {{
+    forkPayloads.push(JSON.parse(opts.body));
+    return Promise.resolve({{session_id:'forked'}});
+  }}
+  // The turn settled: the canonical transcript now includes the prompt.
+  return Promise.resolve({{session:{{messages:[
+    {{role:'user', content:'current prompt', _ts:10}},
+    {{role:'assistant', content:'saved answer 0', _ts:11}},
+    {{role:'tool', content:'{{"status":"success"}}', _ts:12}},
+  ], _messages_offset:0, _messages_truncated:false, _msg_limit_max:500,
+     tool_calls:[], message_count:3, visible_message_count:3, last_usage:{{}}}}}});
+}}
+(async () => {{
+  S.messages = _mergeInflightTailMessages(savedRows.slice(), inflightTail);
+  assert.strictEqual(S.messages[0]._displayOnlyRow, true);
+  assert.strictEqual(S.messages.filter(m => m.role === 'user').length, 1);
+  await _ensureMessagesLoaded('s1', {{force:true}});
+  assert.deepStrictEqual(S.messages.map(m => m.role), ['user','assistant','tool']);
+  assert.strictEqual(S.messages.filter(m => m.role === 'user' && m.content === 'current prompt').length, 1);
+  assert.strictEqual(S.messages[0]._displayOnlyRow, undefined,
+    'the canonical reload must replace the display copy, not duplicate it');
+  assert.strictEqual(_oldestIdx, 0);
+  assert.strictEqual(_messageSessionIndexForRawIdx(0), 0);
+  const keep = await forkAt(0);
+  assert.strictEqual(keep, 1);
+  console.log(JSON.stringify({{keep, len: S.messages.length}}));
+}})().catch(e => {{ console.error(e); process.exit(1); }});
+"""
+    )
+    out = _run(script)
+    assert '"keep":1' in out, out

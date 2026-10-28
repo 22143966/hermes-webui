@@ -5058,9 +5058,14 @@ function _mergeInflightTailMessages(baseMessages, inflightMessages){
         if(!hasAnyUser){
           const turnStart=_messageTimestampValue(candidate)
             ||Number(typeof S!=='undefined'&&S&&S.session&&S.session.pending_started_at)||0;
-          // NOT marked display-only: outside a msg_limit window the row is a
-          // real array member, and the marker would offset canonical indices.
-          merged.splice(_recoveredPromptTargetIndex(merged,turnStart),0,candidate);
+          // Marked display-only like the windowed branch: the prompt is NOT in
+          // the server's canonical transcript yet (deferred session saving),
+          // so counting it as a real array member would shift every canonical
+          // index after it — fork/edit/regenerate would send the wrong
+          // keep_count (saved row 0 would look like absolute 1). The marker
+          // keeps `_messageSessionIndexForRawIdx()` excluding the prompt, and
+          // a later canonical reload drops the display copy once it persists.
+          merged.splice(_recoveredPromptTargetIndex(merged,turnStart),0,_markRecoveredPromptRow(candidate));
           continue;
         }
       }
