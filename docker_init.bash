@@ -945,13 +945,39 @@ fi
 # always wins. A blank or whitespace-only value is unset, as server.py and
 # api/config.py treat it.
 select_staged_agent_for_git_checkout() {
-  local _src="$1" _stage="$2" _override="${HERMES_WEBUI_AGENT_DIR:-}"
+  local _src="$1" _stage="$2" _override="${HERMES_WEBUI_AGENT_DIR:-}" _mech
   [ -z "${_override//[[:space:]]/}" ] || return 0
   # Only a PM launcher (Agent v0.21.6+) re-execs WebUI: hermes_bootstrap.py alone
   # is also in pre-PM Agents. managed_agent_startup._PM_LAUNCH_MARKERS lists the same files.
   [ -n "$_src" ] && [ -e "$_src/.git" ] || return 0
   [ -f "$_src/hermes_bootstrap.py" ] && [ -f "$_src/hermes_cli/venv_sync.py" ] \
     && [ -f "$_src/pm/environments.py" ] || return 0
+  # #8581: and only when that Agent's bootstrap would actually relaunch. Mirror
+  # hermes_cli/venv_sync.py prepare_launch(): it never does with
+  # HERMES_DISABLE_LAZY_INSTALLS set to 1/true/yes (lowercased, not trimmed),
+  # without pyproject.toml, or when an install-stamp.json exists whose
+  # updateMechanism is not "self" (a malformed stamp reads as {} and is not
+  # adopted). A missing stamp is adopted as self. In those cases the mounted
+  # checkout runs exactly as on v0.52.544, keeping its .git for the in-app
+  # Agent update and taking mount edits on restart.
+  case "$(printf '%s' "${HERMES_DISABLE_LAZY_INSTALLS:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes) return 0 ;;
+  esac
+  [ -f "$_src/pyproject.toml" ] || return 0
+  if [ -e "$_src/install-stamp.json" ]; then
+    # No python3 to read it: prefer the stage. Keeping a mount that does
+    # relaunch crash-loops (#8529); a stage it did not need only costs the
+    # in-app Agent update.
+    if command -v python3 >/dev/null 2>&1; then
+      _mech="$(python3 -c 'import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+except Exception:
+    d = {}
+print(d.get("updateMechanism", "") if isinstance(d, dict) else "")' "$_src/install-stamp.json" 2>/dev/null)" || _mech=""
+      [ "$_mech" = "self" ] || return 0
+    fi
+  fi
   [ -f "$_stage/run_agent.py" ] && [ ! -e "$_stage/.git" ] || return 0
   export HERMES_WEBUI_AGENT_DIR="$_stage"
   echo "-- $_src is a git checkout; running the staged copy at $_stage"
