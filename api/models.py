@@ -8354,7 +8354,7 @@ def _apply_sidebar_state_db_override_metadata(
     # filter depends on them.
     memo_token = _SIDEBAR_RECONCILE_MEMO.set({})
     try:
-        _apply_sidebar_state_db_override_rows(sessions, metadata, count_session_ids)
+        _apply_sidebar_state_db_override_rows(sessions, metadata)
     finally:
         _SIDEBAR_RECONCILE_MEMO.reset(memo_token)
 
@@ -8362,7 +8362,6 @@ def _apply_sidebar_state_db_override_metadata(
 def _apply_sidebar_state_db_override_rows(
     sessions: list[dict],
     metadata: dict[str, dict],
-    count_session_ids: set[str] | None,
 ) -> None:
     for session in sessions:
         sid = session.get('session_id')
@@ -8407,26 +8406,30 @@ def _apply_sidebar_state_db_override_rows(
             except (TypeError, ValueError):
                 current_count = 0
                 state_count = 0
-            # #7882 re-gate: the reconciled walk's revision check compares its
-            # own row count with the overlay's count, so both sides must count
-            # the SAME row domain. The walk reads through the detailed reader,
-            # which excludes `active = 0` archive rows; `state_count` above is
-            # the raw total and legitimately includes them for the growth guard
-            # and the displayed message_count. Handing the raw total to the
-            # revision check made a static store with two active rows and four
-            # archives look like a concurrent append on every poll, and the
-            # raw-growth fallback reported six instead of two. The SQL read
-            # supplies the active-domain count next to the raw one; when it is
-            # absent (a test double, or a schema without the column) the raw
-            # count remains the expectation, exactly as before.
-            expected_state_count = state_count
+            # The revision check below compares the walk's row count with the
+            # overlay's count, so both sides must count the SAME row domain.
+            # The walk reads through the detailed reader, which excludes
+            # `active = 0` archive rows; the raw total legitimately includes
+            # them for the growth guard and the displayed message_count.
+            #
+            # The expectation therefore exists ONLY in the active domain, and
+            # only when the aggregate that computed it is actually present
+            # (it is produced by the SQL read inside the cap). Falling back to
+            # the raw stored counter is what made archived rows visible
+            # growth: three hundred fillers keep the row outside the cap, the
+            # aggregate is absent, the raw counter (six, two active + four
+            # archived) was handed to the revision check, the walk was
+            # refused and the raw-growth fallback reported six where master
+            # and the full GET report two. Unknown expectations skip the
+            # check (``None``); they never fail it with the wrong domain.
+            expected_state_count = None
             if state_db_active_message_count is not None:
                 try:
                     expected_state_count = max(
                         0, int(state_db_active_message_count)
                     )
                 except (TypeError, ValueError):
-                    expected_state_count = state_count
+                    expected_state_count = None
             try:
                 current_last = max(
                     float(session.get('last_message_at') or 0),
@@ -8456,21 +8459,6 @@ def _apply_sidebar_state_db_override_rows(
             # sidecar+state.db merge per grown row: measured 98 rows x 0.19 s
             # = 18.8 s of a 20 s build, 307k _cached_message_key calls), so
             # only that call is bounded by ``reconcile_ids``.
-            latest_replaceable = (
-                state_last > 0
-                and state_count >= current_count
-                and state_last > current_last
-            )
-            if latest_replaceable and state_count <= current_count:
-                try:
-                    existing_actual = max(0, int(session.get('actual_message_count') or 0))
-                except (TypeError, ValueError):
-                    existing_actual = 0
-                session['actual_message_count'] = max(state_count, existing_actual)
-                session['last_message_at'] = float(state_last)
-                session['updated_at'] = max(
-                    float(session.get('updated_at') or 0), float(state_last)
-                )
             # The timestamp guard is load-bearing: it is what keeps a
             # TRUNCATED session truncated. Without it, the state.db rows for
             # the removed suffix still carry an older ``last_message_at`` and
@@ -8480,6 +8468,12 @@ def _apply_sidebar_state_db_override_rows(
             # empty row and reports 2). Growth from state.db is only credible
             # when it is NEWER than the sidecar; a row the user just deleted is
             # not. Keep master's condition verbatim.
+            #
+            # The guard also settles the equal-count replay: an equal-count
+            # restamp must NOT move ``last_message_at`` forward (that is
+            # #8368's ``latest_replaceable`` branch, removed there and not
+            # reintroduced here), because a replayed transcript would jump to
+            # the top of the sidebar as if it had new activity.
             if state_count > current_count and (state_last <= 0 or state_last > current_last):
                 try:
                     existing_actual = max(0, int(session.get('actual_message_count') or 0))
