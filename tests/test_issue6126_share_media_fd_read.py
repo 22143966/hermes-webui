@@ -60,8 +60,10 @@ def _embed(text: str, roots) -> str:
 class _FsEvents:
     """Intercept the filesystem primitives the embedder can use.
 
-    Records each call; when ``fire_at`` is set, runs ``action`` immediately
-    BEFORE the ``fire_at``-th call executes (a deterministic race window).
+    Records each call made by THIS thread (other threads in a shared pytest
+    process pass straight through, so counts stay deterministic); when
+    ``fire_at`` is set, runs ``action`` immediately BEFORE the
+    ``fire_at``-th call executes (a deterministic race window).
     """
 
     OS_NAMES = ("open", "stat", "lstat", "fstat", "read")
@@ -71,9 +73,12 @@ class _FsEvents:
         self.action = action
         self.fired = False
         self.events: list[str] = []
+        self.owner = threading.get_ident()
 
     def _wrap(self, label, real):
         def wrapper(*args, **kwargs):
+            if threading.get_ident() != self.owner:
+                return real(*args, **kwargs)
             index = len(self.events)
             self.events.append(label)
             if self.fire_at == index and not self.fired:
@@ -377,8 +382,21 @@ def test_inline_data_uri_is_unaffected_by_unsupported_platform(monkeypatch):
 # --- Descriptor hygiene -------------------------------------------------------
 
 
+def _fds_into(base: Path) -> list[str]:
+    """Open descriptors of this process that point into *base* (Linux)."""
+    found = []
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            continue
+        if target == str(base) or target.startswith(str(base) + os.sep):
+            found.append(target)
+    return found
+
+
 @pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs /proc/self/fd")
-def test_no_descriptor_leak_across_success_and_refusal_paths(tree):
+def test_no_descriptor_leak_across_success_and_refusal_paths(tree, tmp_path):
     refs = [
         "slot/image.png",
         "alias/img.png",
@@ -389,9 +407,9 @@ def test_no_descriptor_leak_across_success_and_refusal_paths(tree):
         "slot",
         "real.png",
     ]
-    before = len(os.listdir("/proc/self/fd"))
+    assert _fds_into(tmp_path) == []
     for _ in range(25):
         for ref in refs:
             _embed(f"MEDIA:{ref}", [tree["ws"], tree["outside"]])
-    after = len(os.listdir("/proc/self/fd"))
-    assert after == before
+            _embed(f"MEDIA:{tree['ws']}/{ref}", [tree["ws"], tree["outside"]])
+    assert _fds_into(tmp_path) == []
