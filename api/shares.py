@@ -297,11 +297,18 @@ def _embed_share_data_uri(raw: str) -> str:
 def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> str:
     """Find local MEDIA: references and replace them with inline <img> tags.
 
-    Only relative paths that resolve inside at least one of *allowed_roots*
-    are honoured.  Absolute paths, ``file://`` URIs, paths that traverse
-    outside the allowed directories via ``..`` or symlinks, non-image MIME
-    types, and files larger than ``_SHARE_EMBED_MAX_BYTES`` are all replaced
-    with a static placeholder — no file content leaves the server.
+    Only paths that name a regular file inside at least one of
+    *allowed_roots* are honoured.  Absolute paths outside the roots,
+    ``file://`` URIs, ``..`` components, ANY symlinked component below a
+    root, non-image MIME types, and files larger than
+    ``_SHARE_EMBED_MAX_BYTES`` are all replaced with a static placeholder —
+    no file content leaves the server.
+
+    The file is opened by walking from an opened allowed-root directory
+    descriptor one component at a time with ``O_NOFOLLOW``; its type, size
+    and bytes all come from that SAME descriptor, so a concurrent writer
+    inside a root cannot swap a directory or the file between validation and
+    read (#6126).  Platforms without that primitive fail closed.
 
     This runs BEFORE :func:`_redact_share_paths` so the concrete file path
     is still available for the allowed-roots check.
@@ -310,53 +317,62 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
         return text
 
     allowed = tuple(Path(r).resolve() for r in allowed_roots if r)
+    # Lexical spellings of each root (resolved + as configured) so an absolute
+    # ref written against either spelling maps onto that root's descriptor.
+    # The root itself is trusted configuration; only names BELOW it are
+    # attacker-influenced, and those are never followed.
+    root_spellings: list[tuple[Path, list[str]]] = []
+    for configured, root in zip((r for r in allowed_roots if r), allowed):
+        for spelling in (str(root), os.path.abspath(str(configured))):
+            spelling_parts = _share_path_components(spelling)
+            if spelling_parts is None:
+                continue  # never widen a root to "/" on an odd spelling
+            spelled = (root, spelling_parts)
+            if spelled not in root_spellings:
+                root_spellings.append(spelled)
 
-    def _resolve_against_roots(raw: str) -> Path | None:
-        """Resolve *raw* against each allowed root, returning the first valid
-        absolute Path that lives inside one of them, or ``None``.
+    def _candidates_under_roots(raw: str) -> list[tuple[Path, list[str]]]:
+        """Map *raw* to ``(allowed root, component names)`` pairs, lexically.
+
+        No filesystem access happens here; the walk itself is done on
+        descriptors by :func:`_read_share_media_nofollow`.
 
         - ``file://`` is always rejected (absolute, un-scoped).
-        - Absolute paths (``/…``, ``~…``) are resolved as-is and checked
-          against the allowed-roots allow-list via ``is_relative_to()``.
-        - Relative paths are joined with each allowed root in turn so they
+        - Absolute paths (``/…``, ``~…``) must sit lexically under a root.
+        - Relative paths are anchored at each allowed root in turn so they
           don't silently anchor to the server's process CWD.
+        - ``..`` refuses the whole ref; empty and ``.`` components are dropped.
         """
         if raw.startswith("file://"):
-            return None
+            return []
 
         # Defensive length / newline guard (#7949). A real local attachment
         # path is short; an over-long or newline-bearing token (e.g. a
         # data:...;base64,<blob> URI that slipped past the caller) is never a
-        # valid file and must never be handed to the filesystem — a stat() on
-        # an over-length path raises OSError ENAMETOOLONG (errno 36), and that
-        # stat happens inside .is_file() below, OUTSIDE the resolve()
-        # try/except, so the error would otherwise escape and 500 the caller.
+        # valid file and must never be handed to the filesystem (an
+        # over-length name raises OSError ENAMETOOLONG, errno 36).
         # 4096 comfortably exceeds any real PATH_MAX-bounded attachment path.
         if len(raw) > 4096 or "\n" in raw or "\x00" in raw:
-            return None
+            return []
 
-        # --- Absolute paths: resolve as-is, then allow-list check ------------
+        # --- Absolute paths: lexical allow-list check against root spellings
         if raw.startswith("/") or raw.startswith("~"):
-            try:
-                p = Path(raw).expanduser().resolve(strict=False)
-                if not allowed or not any(p.is_relative_to(r) for r in allowed):
-                    return None
-                return p if p.is_file() else None
-            except (OSError, ValueError, RuntimeError):
-                return None
+            expanded = os.path.expanduser(raw)
+            parts = _share_path_components(expanded) if os.path.isabs(expanded) else None
+            if not parts:
+                return []
+            candidates = []
+            for root, root_parts in root_spellings:
+                depth = len(root_parts)
+                if len(parts) > depth and parts[:depth] == root_parts:
+                    candidates.append((root, parts[depth:]))
+            return candidates
 
         # --- Relative paths: try each allowed root as the anchor -------------
-        for root in allowed:
-            try:
-                candidate = (root / raw).resolve(strict=False)
-                # Path traversal guard: resolved path must still be under root.
-                if not candidate.is_relative_to(root):
-                    continue
-                if candidate.is_file():
-                    return candidate
-            except (OSError, ValueError, RuntimeError):
-                continue
-        return None
+        parts = _share_path_components(raw)
+        if not parts:
+            return []
+        return [(root, parts) for root in allowed]
 
     def _replace_ref(m: re.Match) -> str:
         parts = split_media_token_ref(text, m)
@@ -372,27 +388,24 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
             return _embed_share_data_uri(raw) + suffix
 
         # --- Resolve and validate against allowed roots -----------------------
-        p = _resolve_against_roots(raw)
-        if p is None:
+        candidates = _candidates_under_roots(raw)
+        if not candidates:
             return _PLACEHOLDER + suffix
-
-        # --- Size guard -------------------------------------------------------
-        try:
-            size = p.stat().st_size
-        except OSError:
-            return _PLACEHOLDER + suffix
-
-        if size > _SHARE_EMBED_MAX_BYTES:
-            return _PLACEHOLDER + suffix
+        first_root, first_names = candidates[0]
+        name = first_names[-1]
 
         # --- MIME allow-list (images only) ------------------------------------
-        mime_type, _ = mimetypes.guess_type(str(p))
+        mime_type, _ = mimetypes.guess_type(os.path.join(str(first_root), *first_names))
         if not mime_type or mime_type not in _SHARE_ALLOWED_MIME_TYPES:
+            return _PLACEHOLDER + suffix
+
+        # --- Size guard + bounded read from ONE no-follow descriptor (#6126) --
+        data = _read_share_media_nofollow(candidates, _SHARE_EMBED_MAX_BYTES)
+        if data is None:
             return _PLACEHOLDER + suffix
 
         # --- Embed as base64 <img> -------------------------------------------
         try:
-            data = p.read_bytes()
             # Content-based MIME validation: verify the actual file header
             # matches the claimed MIME type — catches extension-spoofed files
             # (e.g. a script renamed to .png).
@@ -407,7 +420,7 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
             # HTML-escape the filename so a crafted name like
             # '"><script>alert(1)</script>' cannot break out of the
             # attribute and inject script into the share page.
-            safe_name = html.escape(p.name, quote=True)
+            safe_name = html.escape(name, quote=True)
             return (
                 f'<img src="data:{mime_type};base64,{b64}"'
                 f' class="msg-media-img" alt="{safe_name}"'
@@ -417,6 +430,110 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
             return _PLACEHOLDER + suffix
 
     return _SHARE_MEDIA_RE.sub(_replace_ref, text)
+
+
+def _share_path_components(path: str) -> list[str] | None:
+    """Split a POSIX path into plain names for a no-follow descriptor walk.
+
+    Empty and ``.`` components are dropped.  Any ``..`` refuses the whole
+    path (``None``): it is never resolved, lexically or by the kernel (#6126).
+    """
+    parts = [part for part in path.split("/") if part not in ("", ".")]
+    if ".." in parts:
+        return None
+    return parts
+
+
+def _share_nofollow_open_supported() -> bool:
+    """True when a rooted, descriptor-relative, no-follow open is available.
+
+    The public-share embedder refuses every local file when this is False
+    instead of falling back to a racy pathname read (#6126).  Evaluated per
+    call (it is cheap) so it always reflects the live ``os`` module.
+    """
+    return (
+        hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_DIRECTORY")
+        and os.open in getattr(os, "supports_dir_fd", ())
+    )
+
+
+def _open_share_file_nofollow(root: Path, names: list[str], dir_flags: int, file_flags: int) -> int | None:
+    """Open ``root/names...`` without following any symlink below *root*.
+
+    *root* (already resolved, trusted configuration) is opened as a
+    directory; every name is then opened relative to the previous directory
+    descriptor, so no component is ever looked up by pathname again.
+    Returns the final descriptor (caller closes it) or ``None``.
+    """
+    try:
+        dir_fd = os.open(str(root), dir_flags)
+    except (OSError, ValueError):
+        return None
+    try:
+        for name in names[:-1]:
+            next_fd = os.open(name, dir_flags, dir_fd=dir_fd)
+            prev_fd, dir_fd = dir_fd, next_fd
+            os.close(prev_fd)
+        return os.open(names[-1], file_flags, dir_fd=dir_fd)
+    except (OSError, ValueError):
+        return None
+    finally:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+
+
+def _read_share_media_nofollow(candidates, limit: int) -> bytes | None:
+    """Return the bytes of the first regular file among *candidates*.
+
+    Each candidate is ``(allowed root, component names)``.  The file is opened
+    with :func:`_open_share_file_nofollow`; type and size come from ``fstat``
+    on that descriptor and at most ``limit + 1`` bytes are read from it, so a
+    file that grows after ``fstat`` is refused rather than embedded (#6126).
+    Like the old ``is_file()`` probe, an entry that cannot be opened (missing,
+    symlinked component, permission) or is not a regular file falls through
+    to the next root; an unsupported platform, an oversize file or a read
+    error returns ``None`` and the caller emits the placeholder.
+    """
+    if not _share_nofollow_open_supported():
+        return None
+    import stat as _stat
+
+    common = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    dir_flags = common | os.O_DIRECTORY
+    file_flags = common | getattr(os, "O_NOCTTY", 0)  # O_NONBLOCK: never block on a FIFO
+    for root, names in candidates:
+        if not names:
+            continue
+        fd = _open_share_file_nofollow(root, names, dir_flags, file_flags)
+        if fd is None:
+            continue
+        try:
+            st = os.fstat(fd)
+            if not _stat.S_ISREG(st.st_mode):
+                continue
+            if st.st_size > limit:
+                return None
+            chunks = []
+            remaining = limit + 1
+            while remaining > 0:
+                chunk = os.read(fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            return data if len(data) <= limit else None
+        except (OSError, MemoryError):
+            return None
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return None
 
 
 def _sanitize_message(message: dict, *, redact_paths=(), allowed_roots: tuple[Path, ...] = ()) -> dict | None:
