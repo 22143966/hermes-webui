@@ -481,6 +481,7 @@ from api.profiles import (  # noqa: F401, E402  (re-export)
     _is_root_profile,
     _root_profile_names_snapshot,
     _SKILLS_STATS_CACHE,
+    invalidate_profile_skills_stats,
     get_active_profile_name,
     get_active_profile_name as _get_active_profile_name,
     get_active_hermes_home,
@@ -16942,6 +16943,22 @@ def handle_get(handler, parsed) -> bool:
         except KeyError:
             return bad(handler, "Session not found", 404)
 
+    if parsed.path == "/api/session/delegations":
+        # #8019: advisory read-only live-delegation snapshot for one session.
+        # Counts only; an unreadable ledger is reported as unknown, never zero,
+        # so a pre-switch guard cannot mistake "could not check" for "safe".
+        sid = parse_qs(parsed.query).get("session_id", [""])[0]
+        if not sid:
+            return bad(handler, "Missing session_id")
+        from api.delegation_status import session_delegation_status
+        try:
+            profile = get_session_profile_readonly(sid)
+        except Exception:
+            # Unknown ownership falls back to the active profile's ledger; the
+            # result stays advisory either way.
+            profile = None
+        return j(handler, session_delegation_status(sid, profile=profile))
+
     if parsed.path == "/api/session/yolo":
         sid = parse_qs(parsed.query).get("session_id", [""])[0]
         if not sid:
@@ -25219,6 +25236,13 @@ def _handle_approval_inject(handler, parsed):
     sid = qs.get("session_id", [""])[0]
     key = qs.get("pattern_key", ["test_pattern"])[0]
     cmd = qs.get("command", ["rm -rf /tmp/test"])[0]
+    desc = qs.get("description", ["test pattern"])[0]
+    # The core stamps exactly one stable `request_id` per approval entry
+    # (`_ApprovalEntry.__init__`), and the frontend's logical identity requires a
+    # non-empty stable id. Mirror that contract here so seeded approvals carry
+    # the same identity as production ones; tests that need to model two
+    # identical-content approvals pass an explicit distinct `request_id`.
+    request_id = (qs.get("request_id", [""])[0] or "").strip() or uuid.uuid4().hex
     if sid:
         submit_pending(
             sid,
@@ -25226,10 +25250,11 @@ def _handle_approval_inject(handler, parsed):
                 "command": cmd,
                 "pattern_key": key,
                 "pattern_keys": [key],
-                "description": "test pattern",
+                "description": desc,
+                "request_id": request_id,
             },
         )
-        return j(handler, {"ok": True, "session_id": sid})
+        return j(handler, {"ok": True, "session_id": sid, "request_id": request_id})
     return j(handler, {"error": "session_id required"}, status=400)
 
 
@@ -33956,7 +33981,7 @@ def _handle_skill_save(handler, body):
     if skill_file.is_symlink():
         return bad(handler, "Cannot save to a symlinked skill file")
     skill_file.write_text(body["content"], encoding="utf-8")
-    _SKILLS_STATS_CACHE.clear()
+    invalidate_profile_skills_stats()
     return j(handler, {"ok": True, "name": skill_name, "path": str(skill_file)})
 
 
@@ -33976,7 +34001,7 @@ def _handle_skill_delete(handler, body):
         return bad(handler, "Skill not found", 404)
     skill_dir = matches[0].parent
     shutil.rmtree(str(skill_dir))
-    _SKILLS_STATS_CACHE.clear()
+    invalidate_profile_skills_stats()
     return j(handler, {"ok": True, "name": body["name"]})
 
 
@@ -34051,7 +34076,7 @@ def _handle_skill_toggle(handler, body):
         _save_yaml_config_file(config_path, cfg)
 
     reload_config()  # outside with block — reload_config() acquires the lock itself
-    _SKILLS_STATS_CACHE.clear()
+    invalidate_profile_skills_stats()
     return j(handler, {"ok": True, "name": name, "enabled": enabled})
 
 
