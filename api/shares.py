@@ -322,7 +322,7 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
     # The root itself is trusted configuration; only names BELOW it are
     # attacker-influenced, and those are never followed.
     root_spellings: list[tuple[Path, list[str]]] = []
-    for configured, root in zip((r for r in allowed_roots if r), allowed):
+    for configured, root in zip((r for r in allowed_roots if r), allowed, strict=True):
         for spelling in (str(root), os.path.abspath(str(configured))):
             spelling_parts = _share_path_components(spelling)
             if spelling_parts is None:
