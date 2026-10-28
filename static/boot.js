@@ -1288,6 +1288,16 @@ function _micToastKeyForRecognitionError(error){
         // (and no_speech) when the audio carried no speech. Committing an empty
         // string left the user watching an unchanged composer, unable to tell a
         // dead mic from a quiet room.
+        //
+        // A Send click while recording is an unambiguous send intent (same rule
+        // as the raw-audio path): honour it whenever the composer has text to
+        // send, instead of dropping the queued send and leaving the draft
+        // behind. The "no speech" toast is only for the case where there is
+        // nothing to send.
+        if(window._micPendingSend&&ta.value.trim()){
+          _commitTranscript('', prefixSnapshot);
+          return;
+        }
         window._micPendingSend=false;
         showToast(t('mic_no_speech'));
         return;
