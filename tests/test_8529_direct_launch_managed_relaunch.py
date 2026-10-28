@@ -685,8 +685,9 @@ def test_a_fifo_or_oversized_stamp_prefers_the_stage_without_blocking(tmp_path, 
 
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root reads mode-000 files")
 def test_an_unreadable_stamp_prefers_the_stage(tmp_path, staged_agent):
-    """docker_init may not run as the user the Agent runs as, so a stamp it cannot read says nothing
-    about the relaunch: prefer the stage (a kept mount that does relaunch crash-loops, #8529)."""
+    """Fail-closed: the Agent (the same user) would read an unreadable stamp as {} and not relaunch,
+    but the selector cannot prove what the Agent will see, so it prefers the stage. A kept mount that
+    does relaunch crash-loops (#8529); an unneeded stage only costs the in-app Agent update."""
     src, stage = staged_agent
     (src / ".git").mkdir()
     stamp = src / "install-stamp.json"
@@ -710,4 +711,26 @@ def test_a_failing_or_hanging_stamp_reader_prefers_the_stage(tmp_path, staged_ag
         t0 = time.monotonic()
         assert _run_selection(tmp_path, str(src), str(stage), None, {"PATH": str(hanging)}) == str(stage)
         assert time.monotonic() - t0 < 20
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root reads mode-000 files")
+def test_an_unreadable_stamp_is_quiet_and_explained(tmp_path, staged_agent):
+    """No shell redirection error in the boot log; one line says why the stage was chosen."""
+    src, stage = staged_agent
+    (src / ".git").mkdir()
+    stamp = src / "install-stamp.json"
+    stamp.write_text('{"updateMechanism": "external"}', encoding="utf-8")
+    stamp.chmod(0)
+    try:
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("HERMES_WEBUI_AGENT_DIR", "HERMES_DISABLE_LAZY_INSTALLS", "HERMES_INSTALL_ROOT")}
+        script = ("set -eu\n" + _select_staged_agent_function()
+                  + 'select_staged_agent_for_git_checkout "$1" "$2"\n')
+        proc = subprocess.run(["bash", "-c", script, "docker_init", str(src), str(stage)],
+                              env=env, capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0, proc.stderr
+    finally:
+        stamp.chmod(0o644)
+    assert "Permission denied" not in proc.stderr, proc.stderr
+    assert "could not read" in proc.stdout and "running the staged copy" in proc.stdout, proc.stdout
 

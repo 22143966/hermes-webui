@@ -976,14 +976,17 @@ select_staged_agent_for_git_checkout() {
     # Agent's reader turns a malformed or non-object stamp into {} (no relaunch:
     # keep the mount). Anything this cannot read safely (a FIFO or other
     # non-regular file, an oversized or unreadable file, no python3, a reader that
-    # fails or times out) prefers the stage: keeping a mount that does relaunch
-    # crash-loops (#8529); an unneeded stage only costs the in-app Agent update.
+    # fails or times out) prefers the stage. That is fail-closed, not a guess
+    # about the Agent: it runs as this same user and would read an unreadable
+    # stamp as {} and not relaunch, but the selector cannot prove what the Agent
+    # will see. Keeping a mount that does relaunch crash-loops (#8529); an
+    # unneeded stage only costs the in-app Agent update.
     _mech="<unread>"
     if [ -f "$_stamp" ] && command -v python3 >/dev/null 2>&1 \
-        && [ "$(wc -c < "$_stamp" 2>/dev/null | tr -d '[:space:]')" -le 65536 ] 2>/dev/null; then
+        && [ "$({ wc -c < "$_stamp"; } 2>/dev/null | tr -d '[:space:]')" -le 65536 ] 2>/dev/null; then
       _timeout=""
       command -v timeout >/dev/null 2>&1 && _timeout="timeout 5"
-      if _out="$($_timeout python3 -c 'import json, sys
+      if _out="$($_timeout python3 -I -c 'import json, sys
 try:
     with open(sys.argv[1], "rb") as f:
         raw = f.read(65537)
@@ -1003,6 +1006,9 @@ print(d.get("updateMechanism", "") if isinstance(d, dict) else "")' "$_stamp" 2>
   fi
   [ -f "$_stage/run_agent.py" ] && [ ! -e "$_stage/.git" ] || return 0
   export HERMES_WEBUI_AGENT_DIR="$_stage"
+  if [ "${_mech:-}" = "<unread>" ]; then
+    echo "-- could not read $_stamp safely; treating the Agent as self-updating"
+  fi
   echo "-- $_src is a git checkout; running the staged copy at $_stage"
 }
 select_staged_agent_for_git_checkout "$_agent_src" "$_agent_stage"
