@@ -946,6 +946,7 @@ fi
 # api/config.py treat it.
 select_staged_agent_for_git_checkout() {
   local _src="$1" _stage="$2" _override="${HERMES_WEBUI_AGENT_DIR:-}" _mech _out _stamp _timeout
+  local _lazy="${HERMES_DISABLE_LAZY_INSTALLS:-}"
   [ -z "${_override//[[:space:]]/}" ] || return 0
   # Only a PM launcher (Agent v0.21.6+) re-execs WebUI: hermes_bootstrap.py alone
   # is also in pre-PM Agents. managed_agent_startup._PM_LAUNCH_MARKERS lists the same files.
@@ -960,7 +961,10 @@ select_staged_agent_for_git_checkout() {
   # adopted). A missing stamp is adopted as self. In those cases the mounted
   # checkout runs exactly as on v0.52.544, keeping its .git for the in-app
   # Agent update and taking mount edits on restart.
-  case "$(printf '%s' "${HERMES_DISABLE_LAZY_INSTALLS:-}" | tr '[:upper:]' '[:lower:]')" in
+  # ${_lazy,,} lowercases without a command substitution, which would strip a
+  # trailing newline the Agent keeps (a "1\n" from a --from-file ConfigMap is not
+  # "disabled" to the Agent, so it relaunches: keep the stage).
+  case "${_lazy,,}" in
     1|true|yes) return 0 ;;
   esac
   [ -f "$_src/pyproject.toml" ] || return 0

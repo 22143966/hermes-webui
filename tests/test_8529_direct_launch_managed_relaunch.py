@@ -585,7 +585,7 @@ def test_disabled_lazy_installs_keep_the_mounted_checkout(tmp_path, staged_agent
         assert _run_selection(tmp_path, str(src), str(stage), None,
                               {"HERMES_DISABLE_LAZY_INSTALLS": value}) == "<unset>", value
     # Anything prepare_launch() does not read as disabled still relaunches → stage.
-    for value in ("", "0", "false", "no", " 1", "1 ", "on"):
+    for value in ("", "0", "false", "no", " 1", "1 ", "on", "1\n", "true\n"):
         assert _run_selection(tmp_path, str(src), str(stage), None,
                               {"HERMES_DISABLE_LAZY_INSTALLS": value}) == str(stage), repr(value)
 
