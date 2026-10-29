@@ -32,11 +32,16 @@ How the gate works (and why it has no cross-file false positives):
      contract). The un-guarded bare call is exactly what makes #3696 a bug.
 
 Usage:
-  python3 scripts/scope_undef_gate.py [/path/to/webui/checkout]
+  python3 scripts/scope_undef_gate.py [--require-eslint] [/path/to/webui/checkout]
   (defaults to the repo this script lives in)
+
+ESLint is looked up in the checkout's node_modules/.bin first (where CI's
+`npm install --no-save eslint` puts it), then on PATH.
 
 Exit 0 = clean (or eslint unavailable → skip). Non-zero = a new undefined /
 scope-misplaced reference that throws at runtime. DO NOT TAG/RELEASE on non-zero.
+With --require-eslint (CI) a missing eslint is exit 2, not a skip: a gate that
+cannot run must not report success.
 
 Known false-negative classes (the gate is a strong net, not a proof):
   * Name-collision shadowing — if two files both declare a top-level symbol of the
@@ -122,11 +127,29 @@ def _toplevel_symbols(src: str) -> set[str]:
     return syms
 
 
-def main() -> int:
-    root = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent
+def _find_eslint(root: Path) -> "str | None":
+    """Project-local install first (CI runs `npm install --no-save eslint`, which
+    does not touch PATH), then PATH. Mirrors tests/test_static_js_runtime_lint.py."""
+    # npm writes both shims; `eslint` is a #!/bin/sh script native Windows Python cannot run.
+    for name in (("eslint.cmd",) if sys.platform == "win32" else ("eslint",)):
+        local = root / "node_modules" / ".bin" / name
+        if local.is_file():
+            return str(local)
+    return which("eslint")
+
+
+def main(argv: "list[str] | None" = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    require_eslint = "--require-eslint" in args
+    paths = [a for a in args if a != "--require-eslint"]
+    root = Path(paths[0]).resolve() if paths else Path(__file__).resolve().parent.parent
     static_dir = root / "static"
-    eslint = which("eslint")
+    eslint = _find_eslint(root)
     if not eslint:
+        if require_eslint:
+            print("❌ eslint not found (checked node_modules/.bin and PATH) and --require-eslint "
+                  "is set — scope_undef_gate could not run.")
+            return 2
         print("⚠ eslint not found on PATH — scope_undef_gate SKIPPED (install eslint to enable).")
         return 0
     if not static_dir.is_dir():
