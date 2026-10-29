@@ -961,11 +961,13 @@ select_staged_agent_for_git_checkout() {
   # adopted). A missing stamp is adopted as self. In those cases the mounted
   # checkout runs exactly as on v0.52.544, keeping its .git for the in-app
   # Agent update and taking mount edits on restart.
-  # ${_lazy,,} lowercases without a command substitution, which would strip a
-  # trailing newline the Agent keeps (a "1\n" from a --from-file ConfigMap is not
-  # "disabled" to the Agent, so it relaunches: keep the stage).
-  case "${_lazy,,}" in
-    1|true|yes) return 0 ;;
+  # Case-insensitive POSIX patterns rather than ${_lazy,,}: that expansion needs
+  # bash 4 (macOS /bin/bash is 3.2, so the test harness there died with "bad
+  # substitution"), and a command substitution would strip a trailing newline
+  # the Agent keeps (a "1\n" from a --from-file ConfigMap is not "disabled" to
+  # the Agent, so it relaunches: keep the stage).
+  case "$_lazy" in
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) return 0 ;;
   esac
   [ -f "$_src/pyproject.toml" ] || return 0
   # The Agent reads the stamp of the tree it runs from at $HERMES_INSTALL_ROOT when
