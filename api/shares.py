@@ -843,8 +843,10 @@ def _read_share_media_windows(candidates, limit: int) -> bytes | None:
     """Windows reader: open once, verify the OPENED file, read the same fd.
 
     For each ``(resolved root, names)`` candidate the file is opened with
-    ``O_RDONLY|O_BINARY``.  A missing file falls through to the next root;
-    every other outcome is final: the handle's final path must be inside the
+    ``O_RDONLY|O_BINARY``.  A missing file, or an entry an advisory ``stat``
+    shows is not a regular file (a directory: ``_wopen`` reports EACCES for
+    one), falls through to the next root without being opened; every other
+    outcome is final: the handle's final path must be inside the
     root (component boundary, ``normcase`` on both sides), ``fstat`` must
     report a regular file, and then at most ``limit + 1`` bytes are read from
     that descriptor.  Any exception or unverifiable result returns ``None``
@@ -862,6 +864,10 @@ def _read_share_media_windows(candidates, limit: int) -> bytes | None:
             return None
         path = root_text.rstrip("\\/") + "\\" + "\\".join(names)
         try:
+            # Advisory only: containment, type and size are verified on the
+            # OPENED handle below (#6126 r5).
+            if not _stat.S_ISREG(os.stat(path).st_mode):
+                continue  # a directory or device where the image should be: a miss
             fd = os.open(path, flags)
         except (FileNotFoundError, NotADirectoryError):
             continue
