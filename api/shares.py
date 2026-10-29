@@ -470,6 +470,24 @@ class _ShareMediaRefused(Exception):
     try the ref under another allowed root (#6126 round 1)."""
 
 
+def _share_dir_open_flags() -> int:
+    """Open flags for the directory descriptors of the no-follow walk.
+
+    On Linux these are ``O_PATH`` descriptors: they need only SEARCH
+    permission on the parent, exactly like a pathname lookup, so an image
+    beneath an execute-only (``0111``) directory or root still embeds.  They
+    can only serve as ``dir_fd`` anchors; the final file is still opened with
+    read flags.  Elsewhere (no ``O_PATH``) the directory must be readable
+    (#6126 round 1).
+    """
+    import sys
+
+    flags = os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    if sys.platform.startswith("linux") and hasattr(os, "O_PATH"):
+        return flags | os.O_PATH
+    return flags | os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+
+
 def _share_openat_dir(dir_fd: int, name: str, dir_flags: int) -> int:
     """Open directory *name* relative to *dir_fd* and return the new descriptor.
 
@@ -547,7 +565,7 @@ def _read_share_media_nofollow(candidates, limit: int) -> bytes | None:
     import stat as _stat
 
     common = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
-    dir_flags = common | os.O_DIRECTORY
+    dir_flags = _share_dir_open_flags()
     file_flags = common | getattr(os, "O_NOCTTY", 0)  # O_NONBLOCK: never block on a FIFO
     for root, names in candidates:
         if not names:

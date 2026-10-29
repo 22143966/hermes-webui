@@ -600,3 +600,45 @@ def test_permission_denied_in_first_root_never_substitutes_later_root(tmp_path, 
     # Control: a plain miss in root A still falls through to root B.
     (root_a / "sub" / "img.png").unlink()
     assert _payloads(_embed("MEDIA:sub/img.png", [root_a, root_b])) == [OUTSIDE]
+
+
+# R1-4  Directory descriptors only need SEARCH permission: on Linux they are
+#       O_PATH descriptors, so an image under an execute-only (0111) directory
+#       (or root) still embeds, as it did with pathname reads.
+
+_linux_o_path = os.uname().sysname == "Linux" and hasattr(os, "O_PATH")
+
+
+@needs_non_root
+@pytest.mark.skipif(not _linux_o_path, reason="O_PATH directory descriptors are Linux-only")
+@pytest.mark.parametrize("execute_only", ["root", "intermediate-dir"])
+def test_image_under_execute_only_directory_still_embeds(tmp_path, execute_only):
+    ws = tmp_path / "ws"
+    (ws / "sub").mkdir(parents=True)
+    (ws / "sub" / "img.png").write_bytes(INSIDE)
+    os.symlink("img.png", ws / "sub" / "link.png")
+    target = ws if execute_only == "root" else ws / "sub"
+    with _chmod(target, 0o111):
+        for ref in ("MEDIA:sub/img.png", f"MEDIA:{ws}/sub/img.png"):
+            assert _payloads(_embed(ref, [ws])) == [INSIDE], ref
+        # Symlinks stay refused through O_PATH directory descriptors.
+        assert _embed("MEDIA:sub/link.png", [ws]) == shares._PLACEHOLDER
+        assert _embed("MEDIA:sub/missing.png", [ws]) == shares._PLACEHOLDER
+
+
+@pytest.mark.skipif(not _linux_o_path, reason="O_PATH directory descriptors are Linux-only")
+def test_linux_directory_descriptors_are_o_path_nofollow():
+    flags = shares._share_dir_open_flags()
+    for flag in ("O_PATH", "O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC"):
+        assert flags & getattr(os, flag), flag
+
+
+def test_directory_flags_without_o_path_keep_rdonly_and_still_work(tree, monkeypatch):
+    monkeypatch.delattr(os, "O_PATH", raising=False)
+    flags = shares._share_dir_open_flags()
+    assert flags & os.O_DIRECTORY and flags & os.O_NOFOLLOW
+    assert flags & os.O_ACCMODE == os.O_RDONLY
+    assert _payloads(_embed("MEDIA:real/img.png", [tree["ws"]])) == [INSIDE]
+    assert _payloads(_embed(f"MEDIA:{tree['ws']}/real/img.png", [tree["ws"]])) == [INSIDE]
+    for ref in ("alias/img.png", "link.png", "escape/image.png"):
+        assert _embed(f"MEDIA:{ref}", [tree["ws"]]) == shares._PLACEHOLDER, ref
