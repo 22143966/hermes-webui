@@ -521,13 +521,16 @@ def _share_nofollow_open_supported() -> bool:
 
 
 # Open errors that mean "nothing usable is there" and may fall through to the
-# next allowed root: missing, not a directory, or a symlink refused by
-# O_NOFOLLOW (ELOOP; EMLINK on FreeBSD).  Anything else (EMFILE, ENFILE, EIO,
+# next allowed root: missing, not a directory, a symlink refused by O_NOFOLLOW
+# (ELOOP; EMLINK on FreeBSD), or a name this filesystem cannot hold
+# (ENAMETOOLONG, e.g. eCryptfs encrypted names; #6126 round 4).  Anything else (EMFILE, ENFILE, EIO,
 # ESTALE, ...) means something may be there that we failed to read, so it is
 # terminal: falling through would substitute another root's namesake
 # (#6126 round 3).
 _SHARE_MISS_ERRNOS = frozenset(
-    e for e in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP, getattr(errno, "EMLINK", None)) if e is not None
+    e
+    for e in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ENAMETOOLONG, getattr(errno, "EMLINK", None))
+    if e is not None
 )
 
 
@@ -592,7 +595,13 @@ def _open_share_file_nofollow(root: Path, names: list[str], dir_flags: int, file
         return None
     try:
         dir_fd = os.open("/", dir_flags)
-    except (OSError, ValueError):
+    except PermissionError:
+        return None
+    except OSError as exc:
+        if exc.errno in _SHARE_MISS_ERRNOS:
+            return None
+        raise _ShareMediaRefused from None  # EMFILE, EIO, ...: terminal (#6126 r4)
+    except ValueError:
         return None
     try:
         try:
@@ -619,6 +628,15 @@ def _open_share_file_nofollow(root: Path, names: list[str], dir_flags: int, file
         try:
             for name in names[:-1]:
                 dir_fd = _share_openat_dir(dir_fd, name, dir_flags)
+            if os.stat in os.supports_dir_fd and os.stat in os.supports_follow_symlinks:
+                # Skip a socket, FIFO, device or symlink without opening it, as
+                # master's is_file() probe did: opening a socket fails (ENXIO,
+                # EOPNOTSUPP) and opening a device can have side effects.  The
+                # no-follow open + fstat below stay authoritative (#6126 r4).
+                import stat as _stat
+
+                if not _stat.S_ISREG(os.stat(names[-1], dir_fd=dir_fd, follow_symlinks=False).st_mode):
+                    return None
             return os.open(names[-1], file_flags, dir_fd=dir_fd)
         except PermissionError:
             # EACCES/EPERM below the root: something is there but cannot be
