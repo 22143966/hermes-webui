@@ -116,6 +116,22 @@ def test_gate_picks_the_platform_shim_npm_writes(tmp_path, monkeypatch):
     assert gate._find_eslint(tmp_path) == str(bin_dir / "eslint")
 
 
+def test_gate_prefers_a_working_path_eslint_over_a_project_local_one(tmp_path, monkeypatch):
+    """A stale or broken node_modules/.bin/eslint must not displace a working
+    eslint on PATH: the gate would exit 2 and the pytest wrapper treats that as
+    a skip, hiding undefined references (Codex, #8588 re-review)."""
+    gate = _load_gate()
+    bin_dir = tmp_path / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True)
+    for name in ("eslint", "eslint.cmd"):
+        (bin_dir / name).write_text("broken launcher\n", encoding="utf-8")
+    monkeypatch.setattr(gate, "which", lambda _name: "/usr/local/bin/eslint")
+    assert gate._find_eslint(tmp_path) == "/usr/local/bin/eslint"
+    monkeypatch.setattr(gate, "which", lambda _name: None)
+    expected = "eslint.cmd" if gate.sys.platform == "win32" else "eslint"
+    assert gate._find_eslint(tmp_path) == str(bin_dir / expected)
+
+
 def test_gate_fails_closed_when_eslint_required_but_missing(tmp_path, monkeypatch, capsys):
     gate = _load_gate()
     (tmp_path / "static").mkdir()

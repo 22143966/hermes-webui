@@ -35,8 +35,8 @@ Usage:
   python3 scripts/scope_undef_gate.py [--require-eslint] [/path/to/webui/checkout]
   (defaults to the repo this script lives in)
 
-ESLint is looked up in the checkout's node_modules/.bin first (where CI's
-`npm install --no-save eslint` puts it), then on PATH.
+ESLint is looked up on PATH first (as before), then in the checkout's
+node_modules/.bin, where CI's `npm install --no-save eslint` puts it.
 
 Exit 0 = clean (or eslint unavailable → skip). Non-zero = a new undefined /
 scope-misplaced reference that throws at runtime. DO NOT TAG/RELEASE on non-zero.
@@ -128,14 +128,19 @@ def _toplevel_symbols(src: str) -> set[str]:
 
 
 def _find_eslint(root: Path) -> "str | None":
-    """Project-local install first (CI runs `npm install --no-save eslint`, which
-    does not touch PATH), then PATH. Mirrors tests/test_static_js_runtime_lint.py."""
+    """PATH first, then the project-local install (CI runs `npm install --no-save
+    eslint`, which does not touch PATH). PATH wins so a stale or broken
+    node_modules/.bin/eslint cannot displace a working eslint and turn the gate
+    into a silent skip."""
+    on_path = which("eslint")
+    if on_path:
+        return on_path
     # npm writes both shims; `eslint` is a #!/bin/sh script native Windows Python cannot run.
     for name in (("eslint.cmd",) if sys.platform == "win32" else ("eslint",)):
         local = root / "node_modules" / ".bin" / name
         if local.is_file():
             return str(local)
-    return which("eslint")
+    return None
 
 
 def main(argv: "list[str] | None" = None) -> int:
