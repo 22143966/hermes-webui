@@ -4686,8 +4686,16 @@ function _mergePendingSessionMessage(session,messages){
     // Tail-window transcript: the prompt's canonical position is outside the
     // loaded window (or not persisted yet), so it is a display-only row placed
     // by turn ownership. The window rows keep their absolute indices.
-    const turnStart=(typeof _messageTimestampValue==='function'?_messageTimestampValue(pendingMsg):null)
-      ||Number(session&&session.pending_started_at)||0;
+    // `pendingMsg` here is always a FRESH row from getPendingSessionMessage
+    // (the adopt path returns null), and that helper stamps it with
+    // `session.pending_started_at || Date.now()/1000`. Trusting the fallback
+    // makes "now" the turn start, so every loaded row looks older than the
+    // turn and the recovered prompt is pushed past all of them — the reported
+    // "there is content above my first message" order. Only the server-issued
+    // pending_started_at proves turn ownership here; without it pass 0 so
+    // _recoveredPromptTargetIndex falls back to structure (a window carrying
+    // no `user` row means the prompt IS the running turn's first row).
+    const turnStart=Number(session&&session.pending_started_at)||0;
     const existingIdx=typeof _existingRecoveredPromptIndex==='function'
       ?_existingRecoveredPromptIndex(messages,pendingMsg)
       :messages.indexOf(pendingMsg);

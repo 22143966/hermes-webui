@@ -879,3 +879,53 @@ function api(url, opts) {{
     )
     out = _run(script)
     assert '"keep":1' in out, out
+
+
+def test_missing_pending_started_at_still_leads_the_turn():
+    """A Date.now() fallback stamp must not become the turn start.
+
+    `getPendingSessionMessage` stamps a freshly materialized pending row with
+    `session.pending_started_at || Date.now()/1000`. When the session carries no
+    `pending_started_at` (reload / recovery before the server re-stamps the
+    turn), reading that fallback back as the turn start makes "now" the start:
+    every loaded row then looks OLDER than the turn, so the recovered prompt
+    was spliced after all of them — the reported "there is content above my
+    first message" order, with the window's activity above the question.
+
+    Only the server-issued `pending_started_at` proves ownership. Without it
+    placement must fall back to structure: a window carrying no `user` row means
+    the prompt IS the running turn's first row, so it leads the window.
+    """
+    helper_src = _helper_src()
+    script = f"""
+const assert = require('assert');
+let _oldestIdx = 12;
+{helper_src}
+
+function getPendingSessionMessage(session, messages) {{
+  const text = String((session && session.pending_user_message) || '').trim();
+  if (!text) return null;
+  // ui.js: the new row's `_ts` falls back to "now" when the session has no
+  // pending_started_at.
+  return {{role:'user', content:text, _ts:(session && session.pending_started_at) || Date.now()/1000, _pending:true}};
+}}
+
+const T0 = 1793245868;  // the turn really started here
+const messages = Array.from({{length:30}}, (_, i) => ({{
+  role: i % 2 ? 'assistant' : 'tool',
+  content: 'current turn activity ' + i,
+  _ts: T0 + 12 + i,
+}}));
+messages.push({{role:'assistant', _live:true, content:'working on it'}});
+
+const changed = _mergePendingSessionMessage(
+  {{pending_user_message:'brand new prompt'}},  // no pending_started_at
+  messages
+);
+assert.strictEqual(changed, true);
+const userIdx = messages.findIndex(m => m.role === 'user');
+assert.strictEqual(userIdx, 0, 'prompt must lead the window instead of sinking below its own activity');
+assert.strictEqual(messages[messages.length - 1]._live, true);
+assert.strictEqual(messages.filter(m => m.role === 'user').length, 1);
+"""
+    _run(script)
