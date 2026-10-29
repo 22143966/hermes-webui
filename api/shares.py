@@ -539,6 +539,11 @@ def _share_dir_open_flags() -> int:
     flags = os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     if sys.platform.startswith("linux") and hasattr(os, "O_PATH"):
         return flags | os.O_PATH
+    # macOS defines O_SEARCH (search-only directory open); prefer it so an
+    # execute-only directory keeps working without read permission (#6126 r2).
+    o_search = getattr(os, "O_SEARCH", 0)
+    if o_search:
+        return flags | o_search
     return flags | os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
 
 
@@ -581,8 +586,14 @@ def _open_share_file_nofollow(root: Path, names: list[str], dir_flags: int, file
         try:
             for name in root_names:
                 dir_fd = _share_openat_dir(dir_fd, name, dir_flags)
+            # An O_PATH/O_SEARCH descriptor opens even a root we cannot SEARCH
+            # (mode 000).  Probe "." through the pinned root so an unsearchable
+            # root stays a miss that falls through to the next allowed root, as
+            # pathname reads did; denials BELOW a searchable root remain
+            # terminal (#6126 r2).
+            os.close(os.open(".", dir_flags, dir_fd=dir_fd))
         except (OSError, ValueError):
-            return None  # root missing, unreachable or redirected: a miss
+            return None  # root missing, unreachable, unsearchable or redirected: a miss
         try:
             for name in names[:-1]:
                 dir_fd = _share_openat_dir(dir_fd, name, dir_flags)
