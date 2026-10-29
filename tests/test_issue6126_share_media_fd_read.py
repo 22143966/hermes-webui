@@ -26,8 +26,10 @@ import io
 import mimetypes
 import os
 import re
+import sys
 import threading
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
 
 import pytest
 
@@ -546,8 +548,6 @@ def test_malformed_ref_is_placeholder(tmp_path, ref):
 
 
 def test_malformed_tilde_ref_does_not_fail_share_snapshot(tmp_path):
-    from types import SimpleNamespace
-
     ws = tmp_path / "ws"
     ws.mkdir()
     (ws / "ok.png").write_bytes(INSIDE)
@@ -642,3 +642,333 @@ def test_directory_flags_without_o_path_keep_rdonly_and_still_work(tree, monkeyp
     assert _payloads(_embed(f"MEDIA:{tree['ws']}/real/img.png", [tree["ws"]])) == [INSIDE]
     for ref in ("alias/img.png", "link.png", "escape/image.png"):
         assert _embed(f"MEDIA:{ref}", [tree["ws"]]) == shares._PLACEHOLDER, ref
+
+
+# R1-5  Windows: verify-after-open.  Native Windows is NOT available to this
+#       suite, so the Windows branch is exercised on POSIX with the platform
+#       switch, ``msvcrt.get_osfhandle`` and the ``GetFinalPathNameByHandleW``
+#       ctypes call mocked.  The fake ``os.open`` maps Windows paths onto real
+#       temp files, so ``fstat`` and the capped read run for real on a real
+#       descriptor; each opened handle reports a configurable final path (what
+#       a junction/symlink swap would make the kernel report).
+
+
+class _FakeWin32:
+    HANDLE_BASE = 0x1000
+
+    def __init__(self, monkeypatch):
+        self.files: dict[str, tuple[object, str]] = {}
+        self.handles: dict[int, str] = {}
+        self.open_calls: list[str] = []
+        self.opened: list[int] = []
+        self.closed: list[int] = []
+        owner = threading.get_ident()
+        real_open, real_close = os.open, os.close
+
+        def fake_open(path, flags, *args, **kwargs):
+            if threading.get_ident() != owner or not isinstance(path, str) or "\\" not in path:
+                return real_open(path, flags, *args, **kwargs)
+            assert not args and not kwargs, "the Windows reader must not use dir_fd"
+            self.open_calls.append(path)
+            if path not in self.files:
+                raise FileNotFoundError(2, "No such file or directory", path)
+            target, final = self.files[path]
+            if isinstance(target, BaseException):
+                raise target
+            fd = real_open(str(target), os.O_RDONLY | os.O_NONBLOCK)
+            self.opened.append(fd)
+            self.handles[self.HANDLE_BASE + fd] = final
+            return fd
+
+        def fake_close(fd):
+            if threading.get_ident() == owner:
+                self.closed.append(fd)
+            return real_close(fd)
+
+        monkeypatch.setattr(os, "open", fake_open)
+        monkeypatch.setattr(os, "close", fake_close)
+        self.msvcrt = SimpleNamespace(get_osfhandle=lambda fd: self.HANDLE_BASE + fd)
+        monkeypatch.setitem(sys.modules, "msvcrt", self.msvcrt)
+        monkeypatch.setattr(
+            shares, "_share_win_final_path_api", lambda: self.final_path_api, raising=False
+        )
+
+    def final_path_api(self, handle, buf, size, flags):
+        assert flags == 0, "FILE_NAME_NORMALIZED | VOLUME_NAME_DOS"
+        final = self.handles.get(handle)
+        if final is None:
+            return 0
+        if len(final) + 1 > size:
+            return len(final) + 1  # buffer too small: required size incl. NUL
+        buf.value = final
+        return len(final)
+
+    def add(self, path: str, target, final: str) -> None:
+        self.files[path] = (target, final)
+
+    def assert_all_closed(self) -> None:
+        assert set(self.opened) <= set(self.closed), (self.opened, self.closed)
+
+
+@pytest.fixture()
+def win(monkeypatch):
+    return _FakeWin32(monkeypatch)
+
+
+@pytest.fixture()
+def win_files(tmp_path):
+    a = tmp_path / "a.png"
+    a.write_bytes(INSIDE)
+    b = tmp_path / "b.png"
+    b.write_bytes(OUTSIDE)
+    return {"inside": a, "other": b}
+
+
+def _read_win(candidates):
+    return shares._read_share_media_windows(candidates, shares._SHARE_EMBED_MAX_BYTES)
+
+
+@pytest.mark.parametrize(
+    "root, final",
+    [
+        ("C:\\a\\b", "\\\\?\\C:\\a\\b\\x.png"),
+        ("C:\\a\\b", "C:\\a\\b\\x.png"),
+        ("C:\\a\\b", "\\\\?\\c:\\A\\B\\X.PNG"),  # normcase on both sides
+        ("C:\\a\\b", "\\\\?\\C:\\a\\b\\deeper\\x.png"),  # in-root junction target
+        ("\\\\?\\C:\\a\\b", "\\\\?\\C:\\a\\b\\x.png"),  # \\?\ long-path root
+        ("C:\\", "\\\\?\\C:\\x.png"),  # drive root
+        ("\\\\server\\share\\ws", "\\\\?\\UNC\\server\\share\\ws\\x.png"),
+        ("\\\\server\\share\\ws", "\\\\server\\share\\ws\\x.png"),
+    ],
+)
+def test_windows_reader_embeds_file_verified_inside_root(win, win_files, root, final):
+    path = root.rstrip("\\") + "\\x.png"
+    win.add(path, win_files["inside"], final)
+    assert _read_win([(root, ["x.png"])]) == INSIDE
+    assert win.open_calls == [path]
+    win.assert_all_closed()
+
+
+_UNVERIFIED_FINALS = {
+    "outside": "\\\\?\\C:\\outside\\x.png",
+    "prefix-sibling": "\\\\?\\C:\\a\\bc\\x.png",
+    "parent": "\\\\?\\C:\\a\\x.png",
+    "the-root-itself": "\\\\?\\C:\\a\\b",
+    "other-drive": "\\\\?\\D:\\a\\b\\x.png",
+    "unc-outside": "\\\\?\\UNC\\server\\share\\a\\b\\x.png",
+    "device": "\\\\.\\PhysicalDrive0",
+    "device-in-root-shape": "\\\\.\\C:\\a\\b\\x.png",
+    "globalroot": "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume3\\a\\b\\x.png",
+    "volume-guid": "\\\\?\\Volume{0b0e8c3a-0000-0000-0000-100000000000}\\a\\b\\x.png",
+    "nt-namespace": "\\??\\C:\\a\\b\\x.png",
+    "dotdot": "\\\\?\\C:\\a\\b\\..\\x.png",
+    "relative": "a\\b\\x.png",
+    "rooted-no-drive": "\\a\\b\\x.png",
+    "empty": "",
+}
+
+
+@pytest.mark.parametrize("case", sorted(_UNVERIFIED_FINALS))
+def test_windows_reader_refuses_unverified_final_path_and_stops(win, win_files, case):
+    win.add("C:\\a\\b\\x.png", win_files["other"], _UNVERIFIED_FINALS[case])
+    # A verifiable namesake in a later root must NOT be substituted.
+    win.add("C:\\z\\x.png", win_files["inside"], "\\\\?\\C:\\z\\x.png")
+    assert _read_win([("C:\\a\\b", ["x.png"]), ("C:\\z", ["x.png"])]) is None
+    assert win.open_calls == ["C:\\a\\b\\x.png"]
+    win.assert_all_closed()
+
+
+@pytest.mark.parametrize(
+    "final",
+    [
+        "\\\\?\\UNC\\server\\share\\wsx\\x.png",  # prefix sibling
+        "\\\\?\\UNC\\other\\share\\ws\\x.png",
+        "\\\\?\\UNC\\server\\share2\\ws\\x.png",
+        "\\\\?\\UNC\\server\\share",
+    ],
+)
+def test_windows_reader_unc_root_component_boundary(win, win_files, final):
+    root = "\\\\server\\share\\ws"
+    win.add(root + "\\x.png", win_files["other"], final)
+    assert _read_win([(root, ["x.png"])]) is None
+    win.assert_all_closed()
+
+
+def test_windows_reader_long_final_path_uses_resized_buffer(win, win_files):
+    root = "C:\\" + "\\".join(["d" * 60] * 12)  # final path > the first buffer
+    win.add(root + "\\x.png", win_files["inside"], "\\\\?\\" + root + "\\x.png")
+    assert len(root) > 512
+    assert _read_win([(root, ["x.png"])]) == INSIDE
+    win.assert_all_closed()
+
+
+def test_windows_reader_api_failure_is_placeholder(win, win_files, monkeypatch):
+    win.add("C:\\a\\b\\x.png", win_files["inside"], "\\\\?\\C:\\a\\b\\x.png")
+    # GetFinalPathNameByHandleW returns 0 on failure.
+    monkeypatch.setattr(shares, "_share_win_final_path_api", lambda: lambda *_a: 0)
+    assert _read_win([("C:\\a\\b", ["x.png"])]) is None
+    assert win.open_calls == ["C:\\a\\b\\x.png"]
+    win.assert_all_closed()
+
+
+@pytest.mark.parametrize("failure", ["get_osfhandle", "api-lookup", "api-call", "no-msvcrt"])
+def test_windows_reader_any_exception_is_placeholder(win, win_files, monkeypatch, failure):
+    win.add("C:\\a\\b\\x.png", win_files["inside"], "\\\\?\\C:\\a\\b\\x.png")
+
+    def boom(*_args, **_kwargs):
+        raise OSError(22, "simulated Win32 failure")
+
+    if failure == "get_osfhandle":
+        monkeypatch.setattr(win.msvcrt, "get_osfhandle", boom)
+    elif failure == "api-lookup":
+        monkeypatch.setattr(shares, "_share_win_final_path_api", boom)
+    elif failure == "api-call":
+        monkeypatch.setattr(shares, "_share_win_final_path_api", lambda: boom)
+    else:
+        monkeypatch.setitem(sys.modules, "msvcrt", None)  # import -> ImportError
+    assert _read_win([("C:\\a\\b", ["x.png"])]) is None
+    assert win.open_calls == ["C:\\a\\b\\x.png"]
+    win.assert_all_closed()
+
+
+@pytest.mark.parametrize("kind", ["char-device", "directory"])
+def test_windows_reader_requires_regular_file(win, tmp_path, kind):
+    target = Path(os.devnull) if kind == "char-device" else tmp_path
+    win.add("C:\\a\\b\\x.png", target, "\\\\?\\C:\\a\\b\\x.png")
+    assert _read_win([("C:\\a\\b", ["x.png"])]) is None
+    win.assert_all_closed()
+
+
+def test_windows_reader_size_cap_on_same_descriptor(win, tmp_path):
+    limit = shares._SHARE_EMBED_MAX_BYTES
+    exact = tmp_path / "exact.png"
+    exact.write_bytes(PNG + b"\x00" * (limit - len(PNG)))
+    over = tmp_path / "over.png"
+    over.write_bytes(PNG + b"\x00" * (limit + 1 - len(PNG)))
+    win.add("C:\\a\\b\\exact.png", exact, "\\\\?\\C:\\a\\b\\exact.png")
+    win.add("C:\\a\\b\\over.png", over, "\\\\?\\C:\\a\\b\\over.png")
+    data = _read_win([("C:\\a\\b", ["exact.png"])])
+    assert data is not None and len(data) == limit
+    assert _read_win([("C:\\a\\b", ["over.png"])]) is None
+    win.assert_all_closed()
+
+
+def test_windows_reader_missing_falls_through_but_denied_is_terminal(win, win_files):
+    win.add("C:\\z\\x.png", win_files["other"], "\\\\?\\C:\\z\\x.png")
+    candidates = [("C:\\a\\b", ["x.png"]), ("C:\\z", ["x.png"])]
+    assert _read_win(candidates) == OUTSIDE  # missing in root A: root B is used
+    win.add("C:\\a\\b\\x.png", PermissionError(13, "Access is denied"), "")
+    assert _read_win(candidates) is None  # denied in root A: never root B
+    win.assert_all_closed()
+
+
+@pytest.mark.parametrize(
+    "names",
+    [["nul.png"], ["CON"], ["com1.png"], ["LPT\u00b9.png"], ["x.png:secret"], ["sub", "D:"], ["a\\b.png"]],
+)
+def test_windows_reader_refuses_device_and_stream_names_without_opening(win, names):
+    assert _read_win([("C:\\a\\b", names)]) is None
+    assert win.open_calls == []
+
+
+def test_windows_unverifiable_root_fails_closed_without_opening(win):
+    for root in ("\\\\?\\Volume{0b0e8c3a}\\ws", "\\\\.\\C:\\ws", "relative\\ws", "/tmp/posix-root"):
+        assert _read_win([(root, ["x.png"])]) is None, root
+    assert win.open_calls == []
+
+
+def test_windows_canonical_and_containment_helpers():
+    canon = shares._share_win_canonical
+    assert canon("\\\\?\\C:\\A\\B\\") == "c:\\a\\b"
+    assert canon("C:/A/B") == "c:\\a\\b"
+    assert canon("\\\\?\\UNC\\Srv\\Share\\X") == "\\\\srv\\share\\x"
+    for bad in ("\\\\.\\C:\\x", "\\\\?\\Volume{1}\\x", "\\??\\C:\\x", "C:x", "\\x", "\\\\srv", "C:\\a\\..\\b"):
+        assert canon(bad) is None, bad
+    within = shares._share_win_is_within
+    assert within("\\\\?\\C:\\a\\b\\x.png", "c:\\a\\b")
+    assert not within("\\\\?\\C:\\a\\bc\\x.png", "c:\\a\\b")
+    assert not within("\\\\?\\C:\\a\\b", "c:\\a\\b")
+
+
+# -- Windows end-to-end through _embed_share_media (lexical mapping included) --
+
+
+class _ResolvedWinPath(PureWindowsPath):
+    """A PureWindowsPath whose resolve() is the identity (already canonical)."""
+
+    def resolve(self, strict=False):  # noqa: ARG002 - pathlib signature
+        return self
+
+
+@pytest.fixture()
+def win_e2e(win_files, win, monkeypatch):
+    # The platform switch plus Windows' platform facts: os.open has no dir_fd
+    # support and there is no O_NOFOLLOW / O_DIRECTORY.  (raising=False keeps
+    # the test runnable against the pre-round-1 code, where it must go RED.)
+    monkeypatch.setattr(shares, "_share_platform_is_windows", lambda: True, raising=False)
+    monkeypatch.setattr(shares, "Path", _ResolvedWinPath)
+    monkeypatch.setattr(os, "supports_dir_fd", frozenset())
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    monkeypatch.delattr(os, "O_DIRECTORY", raising=False)
+    return win
+
+
+WS = "C:\\Users\\Me\\ws"
+ATT = WS + "\\inbox\\attachments"
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "sub\\img.png",
+        "sub/img.png",
+        WS + "\\sub\\img.png",
+        "C:/Users/Me/ws/sub/img.png",
+        "c:\\users\\me\\WS\\sub\\img.png",  # case-insensitive root match
+        "\\\\?\\C:\\Users\\Me\\ws\\sub\\img.png",
+    ],
+)
+def test_windows_embeds_in_root_image_end_to_end(win_e2e, win_files, ref):
+    win_e2e.add(WS + "\\sub\\img.png", win_files["inside"], "\\\\?\\" + WS + "\\sub\\img.png")
+    out = _embed(f"MEDIA:{ref}", [WS])
+    assert _payloads(out) == [INSIDE], (ref, out[:200])
+    assert 'alt="img.png"' in out
+    win_e2e.assert_all_closed()
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "C:\\Users\\Me\\wsx\\sub\\img.png",  # sibling sharing the root's prefix
+        "C:\\Users\\Me\\ws\\..\\secret\\img.png",
+        "C:sub\\img.png",  # drive-relative
+        "\\Users\\Me\\ws\\sub\\img.png",  # rooted without a drive
+        "D:\\Users\\Me\\ws\\sub\\img.png",
+        "file://C:/Users/Me/ws/sub/img.png",
+        "\\\\.\\C:\\Users\\Me\\ws\\sub\\img.png",  # device namespace
+        "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume3\\Users\\Me\\ws\\sub\\img.png",
+    ],
+)
+def test_windows_refuses_lexically_outside_refs_without_opening(win_e2e, win_files, ref):
+    win_e2e.add(WS + "\\sub\\img.png", win_files["inside"], "\\\\?\\" + WS + "\\sub\\img.png")
+    assert _embed(f"MEDIA:{ref}", [WS]) == shares._PLACEHOLDER
+    assert win_e2e.open_calls == []
+
+
+@pytest.mark.parametrize("ref", ["img.png", ATT + "\\img.png"])
+def test_windows_nested_root_redirect_is_placeholder_end_to_end(win_e2e, win_files, ref):
+    # inbox swapped for a junction to C:\outside after root resolution: the
+    # opened handle's final path is outside every root -> placeholder.
+    win_e2e.add(ATT + "\\img.png", win_files["other"], "\\\\?\\C:\\outside\\attachments\\img.png")
+    out = _embed(f"MEDIA:{ref}", [WS, ATT])
+    assert OUTSIDE_MARK not in b"".join(_payloads(out))
+    assert out == shares._PLACEHOLDER
+    win_e2e.assert_all_closed()
+
+
+def test_windows_switch_with_posix_roots_fails_closed(tree, monkeypatch):
+    # On the real POSIX tree the Windows reader cannot verify anything (the
+    # roots are not drive/UNC paths and there is no msvcrt): placeholder, and
+    # nothing is opened.
+    monkeypatch.setattr(shares, "_share_platform_is_windows", lambda: True, raising=False)
+    _assert_refuses_without_opening(tree, monkeypatch)
