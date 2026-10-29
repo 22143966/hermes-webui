@@ -223,6 +223,43 @@ load_env() {
   fi
 }
 
+# Inline helper for `find ... -exec sh -c "$_chown_tolerating_vanished" ...
+# OWNER {} +`. Two-container compose shares ~/.hermes with a running agent
+# that replaces files atomically (write temp + rename), so an entry listed by
+# find can be gone before chown reaches it (#8106). Only chown's ENOENT for
+# that vanished entry is tolerated: any other chown failure (EACCES, EROFS
+# outside a pruned path, EIO) still fails the walk.
+_chown_tolerating_vanished='
+  owner=$1; shift
+  chown -h "$owner" "$@" 2>/dev/null && exit 0
+  for f in "$@"; do
+    err=$(LC_ALL=C chown -h "$owner" "$f" 2>&1) && continue
+    case "$err" in *": No such file or directory") continue ;; esac
+    printf "%s\n" "$err" >&2
+    exit 1
+  done
+'
+
+# Run find, tolerating only entries that vanish mid-walk.
+# -ignore_readdir_race covers entries that vanish before find stats them, but
+# find still reports a directory it can no longer open and exits non-zero
+# (#8106). So find's own "No such file or directory" diagnostics for entries
+# below the root are accepted; any other diagnostic, including the chown
+# helper's or one for the root itself, fails the walk.
+find_tolerating_vanished() {
+  local root="$1" err rc=0 line
+  shift
+  err=$(LC_ALL=C find "$root" -ignore_readdir_race "$@" 2>&1 >/dev/null) || rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ -n "$err" ] || { echo "find exited with status $rc" >&2; return 1; }
+  while IFS= read -r line; do
+    case "$line" in
+      "find: '$root/"*"': No such file or directory") ;;
+      *) printf "%s\n" "$err" >&2; return 1 ;;
+    esac
+  done <<< "$err"
+}
+
 chown_home_hermeswebui() {
   # macOS Docker bind mounts can expose hermes-agent git object packs as
   # read-only host files. The runtime only needs to read those existing objects;
@@ -236,10 +273,26 @@ chown_home_hermeswebui() {
   # source — prune the entire hermes-agent path from the chown walk so a
   # read-only or partially-read-only mount doesn't break the rest of the home
   # ownership alignment.
-  find /home/hermeswebui \
+  find_tolerating_vanished /home/hermeswebui \
     -path "/home/hermeswebui/.hermes/hermes-agent" -prune \
     -o -name ".git" -prune \
-    -o -exec chown -h "${WANTED_UID}:${WANTED_GID}" {} +
+    -o -exec sh -c "$_chown_tolerating_vanished" chown_home_hermeswebui "${WANTED_UID}:${WANTED_GID}" {} +
+}
+
+# usermod -u used to move the old UID's files to the new UID anywhere under
+# the home. Its walk is skipped (#8106), so this gives the subtrees that
+# chown_home_hermeswebui prunes the same old-UID-only migration: every .git
+# directory (git refuses repositories owned by another user), and the
+# hermes-agent checkout when it is writable (a local development checkout the
+# runtime user keeps working in). Like usermod, only the UID changes. A
+# read-only agent source mount is left untouched.
+migrate_home_old_uid() {
+  local old_uid="$1"
+  local agent="/home/hermeswebui/.hermes/hermes-agent"
+  local skip_agent=()
+  [ -w "$agent" ] || skip_agent=(-path "$agent" -prune -o)
+  find_tolerating_vanished /home/hermeswebui "${skip_agent[@]}" \
+    -uid "$old_uid" -exec sh -c "$_chown_tolerating_vanished" migrate_home_old_uid "${WANTED_UID}" {} +
 }
 
 # The production image does not ship sudo. The entrypoint starts as root only
@@ -267,10 +320,24 @@ if [ "A${whoami}" == "Aroot" ]; then
     fi
   else
     groupmod -o -g "${WANTED_GID}" hermeswebui || error_exit "Failed to set GID of hermeswebui user"
-    usermod -o -u "${WANTED_UID}" hermeswebui || error_exit "Failed to set UID of hermeswebui user"
+    # usermod -u also walks the home directory to chown the old UID's files,
+    # and aborts on the first entry that vanishes mid-walk — which happens
+    # when a running agent replaces files in the shared ~/.hermes (#8106).
+    # Pointing the home at a path that does not exist for that one call skips
+    # usermod's walk; the real home is restored right after, and
+    # chown_home_hermeswebui and migrate_home_old_uid below perform the
+    # ownership walks with race-tolerant error handling.
+    _usermod_nohome="/nonexistent-hermeswebui-home.$$"
+    [ ! -e "$_usermod_nohome" ] || error_exit "Unexpected path $_usermod_nohome exists"
+    _old_hermeswebui_uid=$(id -u hermeswebui)
+    usermod -o -u "${WANTED_UID}" -d "$_usermod_nohome" hermeswebui || error_exit "Failed to set UID of hermeswebui user"
+    usermod -d /home/hermeswebui hermeswebui || error_exit "Failed to restore home directory of hermeswebui user"
   fi
 
   chown_home_hermeswebui || error_exit "Failed to set owner of /home/hermeswebui"
+  if [ -n "${_old_hermeswebui_uid:-}" ] && [ "A${_old_hermeswebui_uid}" != "A${WANTED_UID}" ]; then
+    migrate_home_old_uid "$_old_hermeswebui_uid" || error_exit "Failed to move files of UID ${_old_hermeswebui_uid} under /home/hermeswebui to UID ${WANTED_UID}"
+  fi
 
   echo ""; echo "-- Preparing /app for the hermeswebui runtime user"
   mkdir -p /app || error_exit "Failed to create /app directory"
@@ -473,6 +540,45 @@ _agent_stage_prev=/app/hermes-agent-src.previous
 _agent_venv_journal=/app/.agent-venv-rebuild
 _venv_helper=/app/scripts/docker_venv_python.py
 
+# Install the staged hermes-agent (editable, every extra) into $VIRTUAL_ENV with
+# the agent's own `[tool.uv] override-dependencies` (#8524). `uv pip install`
+# never reads a project's [tool.uv] table, and since Agent v0.22.5 the agent's
+# requirements only resolve with those overrides (they lift a dependency's old
+# Pillow pin to take Pillow 13's security fixes), so a plain install exits with
+# "requirements are unsatisfiable". Anything that keeps the overrides file from
+# being produced falls back to that plain install, exactly as before.
+install_staged_agent() {
+  _isa_src="$1"
+  _isa_overrides=""
+  if [ -f "$_venv_helper" ] && [ -f "$_isa_src/pyproject.toml" ]; then
+    # TMPDIR first; then the stage's parent (/app, already written to here), for
+    # runtimes whose /tmp is not writable (#1470 read_only, #2010 userns).
+    _isa_overrides="$(mktemp "${TMPDIR:-/tmp}/hermes-agent-uv-overrides.XXXXXX" 2>/dev/null)" \
+      || _isa_overrides="$(mktemp "$(dirname "$_isa_src")/.hermes-agent-uv-overrides.XXXXXX" 2>/dev/null)" \
+      || _isa_overrides=""
+    if [ -z "$_isa_overrides" ]; then
+      echo "!! Could not create a temporary file for hermes-agent's uv overrides; installing without them"
+    elif ! python3 "$_venv_helper" --uv-overrides "$_isa_src/pyproject.toml" "$_isa_overrides"; then
+      echo "!! Could not read hermes-agent's [tool.uv] override-dependencies; installing without them"
+      rm -f "$_isa_overrides"
+      _isa_overrides=""
+    fi
+    if [ -n "$_isa_overrides" ] && [ ! -s "$_isa_overrides" ]; then
+      rm -f "$_isa_overrides"
+      _isa_overrides=""
+    fi
+  fi
+  if [ -n "$_isa_overrides" ]; then
+    echo "-- Applying hermes-agent's [tool.uv] override-dependencies ($(grep -c . "$_isa_overrides") entries)"
+    _isa_rc=0
+    uv pip install -e "$_isa_src[all]" --overrides "$_isa_overrides" \
+      --trusted-host pypi.org --trusted-host files.pythonhosted.org || _isa_rc=$?
+    rm -f "$_isa_overrides"
+    return "$_isa_rc"
+  fi
+  uv pip install -e "$_isa_src[all]" --trusted-host pypi.org --trusted-host files.pythonhosted.org
+}
+
 # Install WebUI's requirements and the staged agent into $VIRTUAL_ENV. Returns
 # non-zero on any failure instead of exiting, so a rebuild can roll back (a
 # normal install below still treats a failure as fatal). set -e does not apply
@@ -545,11 +651,16 @@ install_venv_dependencies() {
     fi
     chmod -R u+w "$_stage_src" \
       || { echo "!! Failed to make staged hermes-agent source writable (rsync/cp preserved :ro mount perms)"; return 1; }
+    # rsync excluded .git; the cp -a fallback copied it, and only now (after the
+    # chmod: cp -a keeps a :ro mount's 0555 directories) can it be removed. A
+    # stage with .git is never run by select_staged_agent_for_git_checkout.
+    rm -rf "$_stage_src/.git" \
+      || echo "!! WARNING: could not drop .git from the staged hermes-agent copy; the mounted Agent will be run instead"
     # Never fatal: without the manifest the recovery path simply ignores the
     # stage and falls back to the authorized Agent directory.
     write_agent_stage_manifest "$_agent_src" "$_stage_src" \
       || echo "!! WARNING: could not record which hermes-agent source was staged; the startup recovery installer will not use the staged copy"
-    uv pip install -e "$_stage_src[all]" --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+    install_staged_agent "$_stage_src" \
       || { echo "!! Failed to install hermes-agent's requirements"; return 1; }
   else
     echo ""
@@ -819,6 +930,33 @@ if [ -n "$_agent_src" ] && [ -f /app/scripts/docker_venv_python.py ] && command 
     echo ""
   fi
 fi
+
+# #8529: server.py activates the Agent it discovers before importing anything
+# else. In the single-container stack that is the host's own checkout, mounted
+# at ~/.hermes/hermes-agent. A git checkout there is what a PM-managed Agent
+# (v0.21.6+) treats as a self-managed install: its bootstrap would sync
+# dependencies into the host's ~/.hermes/installs and re-exec WebUI into the
+# host's store Python, a binary built for the host OS. Run the staged copy
+# instead: it is the tree /app/venv's dependencies were installed from, and it
+# has no .git, so the Agent's bootstrap leaves the process alone. Agent images
+# ship without .git, so the two- and three-container stacks keep the mounted
+# Agent; a pre-PM Agent (no hermes_cli/venv_sync.py + pm/environments.py beside
+# its hermes_bootstrap.py) never relaunches, so it keeps the mounted checkout too; and an operator-set HERMES_WEBUI_AGENT_DIR
+# always wins. A blank or whitespace-only value is unset, as server.py and
+# api/config.py treat it.
+select_staged_agent_for_git_checkout() {
+  local _src="$1" _stage="$2" _override="${HERMES_WEBUI_AGENT_DIR:-}"
+  [ -z "${_override//[[:space:]]/}" ] || return 0
+  # Only a PM launcher (Agent v0.21.6+) re-execs WebUI: hermes_bootstrap.py alone
+  # is also in pre-PM Agents. managed_agent_startup._PM_LAUNCH_MARKERS lists the same files.
+  [ -n "$_src" ] && [ -e "$_src/.git" ] || return 0
+  [ -f "$_src/hermes_bootstrap.py" ] && [ -f "$_src/hermes_cli/venv_sync.py" ] \
+    && [ -f "$_src/pm/environments.py" ] || return 0
+  [ -f "$_stage/run_agent.py" ] && [ ! -e "$_stage/.git" ] || return 0
+  export HERMES_WEBUI_AGENT_DIR="$_stage"
+  echo "-- $_src is a git checkout; running the staged copy at $_stage"
+}
+select_staged_agent_for_git_checkout "$_agent_src" "$_agent_stage"
 
 echo ""; echo "== Running hermes-webui"
 cd /app; python server.py || error_exit "hermes-webui failed or exited with an error"
