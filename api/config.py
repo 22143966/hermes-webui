@@ -10858,8 +10858,12 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 # entry, so a successful probe does not retire it (#8080).
                 _cp_model_ids: list[str] = []
                 _cp_sticky_default = str(_cp.get("model", "") or "").strip()
+                # ``_live_models`` stays ``None`` for entries that never reach
+                # the probe branch (unnamed entries, named entries without a
+                # resolvable endpoint); tolerate that state here so the
+                # configured fallback below still runs for them.
                 _live_id_set = {
-                    str(_lm.get("id") or "").strip() for _lm in _live_models
+                    str(_lm.get("id") or "").strip() for _lm in (_live_models or [])
                 }
                 if _cp_sticky_default and _cp_sticky_default not in _live_id_set:
                     if _cp_sticky_default not in _cp_model_ids:
