@@ -57,6 +57,8 @@
 
 ### Fixed
 
+- **The sidebar session list builds in about 1.5 s instead of 9-13 s on large stores.** Reconciling visible message counts against state.db merged the sidecar and the transcript for every sidebar row; the count tier is now bounded to the top `HERMES_WEBUI_STATE_DB_OVERRIDE_TOP_N` rows (default 300, `0` disables the cap), the transcript walk runs only for rows whose state.db count and time actually advanced, and its answer is memoised per payload. On a 637-sidecar store `/api/sessions` p95 went from 31.5 s to 1.9 s. The eager-checkpoint fact that discounts a hidden pending turn is now validated by the same function on write and read, so a truncation, a reload or a stale fact can no longer vouch for a row it doesn't belong to. Thanks @fedebyes. (#8368, #8400)
+
 - **The workspace git panel no longer rewrites `.git/index` when it reads a diff.** On a stale index (files touched, line endings changed, or edited outside WebUI), the panel's `git diff --numstat` / `--name-only` and the file diff view refreshed the index as a side effect, taking `.git/index.lock` while you might be committing in a terminal. Diff reads now pass `diff.autoRefreshIndex=false` per call, so they never write; the numbers shown are unchanged. Completes #8520 after #8532. Thanks @balabommablock-cpu. (#8570)
 
 - **The approval card answers on the first click.** The card now checks the server's pending approval before it responds, so a stale id no longer swallows the first click (or the X), and a click is never moved onto a different queued approval, even one with identical text: that approval is shown for a fresh click instead. (#7144 by @BBaFSE, fixes #7091)
