@@ -644,6 +644,53 @@ def test_directory_flags_without_o_path_keep_rdonly_and_still_work(tree, monkeyp
         assert _embed(f"MEDIA:{ref}", [tree["ws"]]) == shares._PLACEHOLDER, ref
 
 
+# R2-1  Without O_PATH (macOS), prefer O_SEARCH when the platform exposes it:
+#       a search-only directory descriptor needs only search permission, like
+#       a pathname lookup, so execute-only (0111) directories keep working.
+#       Simulated on Linux by hiding O_PATH and exposing its value as O_SEARCH.
+
+
+@needs_non_root
+@pytest.mark.skipif(not _linux_o_path, reason="simulation reuses the Linux O_PATH bit")
+@pytest.mark.parametrize("execute_only", ["root", "intermediate-dir"])
+def test_directory_flags_prefer_o_search_without_o_path(tmp_path, monkeypatch, execute_only):
+    search_bit = os.O_PATH
+    monkeypatch.delattr(os, "O_PATH")
+    monkeypatch.setattr(os, "O_SEARCH", search_bit, raising=False)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    flags = shares._share_dir_open_flags()
+    assert flags & search_bit and flags & os.O_DIRECTORY and flags & os.O_NOFOLLOW
+    ws = tmp_path / "ws"
+    (ws / "sub").mkdir(parents=True)
+    (ws / "sub" / "img.png").write_bytes(INSIDE)
+    target = ws if execute_only == "root" else ws / "sub"
+    with _chmod(target, 0o111):
+        assert _payloads(_embed("MEDIA:sub/img.png", [ws])) == [INSIDE]
+        # A plain miss under a searchable directory is still a miss, not a refusal.
+        assert _embed("MEDIA:sub/missing.png", [ws]) == shares._PLACEHOLDER
+
+
+# R2-2  A root that can be opened but not SEARCHED (mode 000) is a miss, so
+#       the lookup falls through to the next allowed root exactly as pathname
+#       reads did; a permission error BELOW a searchable root stays terminal
+#       (R1-3).
+
+
+@needs_non_root
+def test_unsearchable_root_is_a_miss_and_falls_through_to_next_root(tmp_path):
+    root_a = tmp_path / "ws-a"
+    root_b = tmp_path / "attachments-b"
+    for root in (root_a, root_b):
+        (root / "sub").mkdir(parents=True)
+    (root_a / "sub" / "img.png").write_bytes(INSIDE)
+    (root_b / "sub" / "img.png").write_bytes(OUTSIDE)
+    with _chmod(root_a, 0):
+        assert _payloads(_embed("MEDIA:sub/img.png", [root_a, root_b])) == [OUTSIDE]
+    # Control: an unreadable directory BELOW a searchable root stays terminal.
+    with _chmod(root_a / "sub", 0):
+        assert _embed("MEDIA:sub/img.png", [root_a, root_b]) == shares._PLACEHOLDER
+
+
 # R1-5  Windows: verify-after-open.  Native Windows is NOT available to this
 #       suite, so the Windows branch is exercised on POSIX with the platform
 #       switch, ``msvcrt.get_osfhandle`` and the ``GetFinalPathNameByHandleW``
