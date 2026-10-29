@@ -130,7 +130,8 @@ def _toplevel_symbols(src: str) -> set[str]:
 def _find_eslint(root: Path) -> "str | None":
     """Project-local install first (CI runs `npm install --no-save eslint`, which
     does not touch PATH), then PATH. Mirrors tests/test_static_js_runtime_lint.py."""
-    for name in ("eslint", "eslint.cmd"):
+    # npm writes both shims; `eslint` is a #!/bin/sh script native Windows Python cannot run.
+    for name in (("eslint.cmd",) if sys.platform == "win32" else ("eslint",)):
         local = root / "node_modules" / ".bin" / name
         if local.is_file():
             return str(local)

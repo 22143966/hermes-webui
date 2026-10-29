@@ -101,6 +101,21 @@ def test_gate_reports_findings_from_project_local_eslint(tmp_path, monkeypatch, 
     assert "a.js:1: missingName is not defined." in capsys.readouterr().out
 
 
+def test_gate_picks_the_platform_shim_npm_writes(tmp_path, monkeypatch):
+    """npm writes both `eslint` (a #!/bin/sh script) and `eslint.cmd` into node_modules/.bin.
+    Native Windows Python can only run the .cmd shim; POSIX runs the shell one."""
+    gate = _load_gate()
+    bin_dir = tmp_path / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "eslint").write_text("#!/bin/sh\n", encoding="utf-8")
+    (bin_dir / "eslint.cmd").write_text("@echo off\n", encoding="utf-8")
+    monkeypatch.setattr(gate, "which", lambda _name: None)
+    monkeypatch.setattr(gate.sys, "platform", "win32")
+    assert gate._find_eslint(tmp_path) == str(bin_dir / "eslint.cmd")
+    monkeypatch.setattr(gate.sys, "platform", "linux")
+    assert gate._find_eslint(tmp_path) == str(bin_dir / "eslint")
+
+
 def test_gate_fails_closed_when_eslint_required_but_missing(tmp_path, monkeypatch, capsys):
     gate = _load_gate()
     (tmp_path / "static").mkdir()
