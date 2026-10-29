@@ -1331,11 +1331,11 @@ function _micToastKeyForRecognitionError(error){
         // dead mic from a quiet room.
         //
         // A Send click while recording is an unambiguous send intent (same rule
-        // as the raw-audio path): honour it whenever the composer has text to
-        // send, instead of dropping the queued send and leaving the draft
-        // behind. The "no speech" toast is only for the case where there is
-        // nothing to send.
-        if(window._micPendingSend&&ta.value.trim()){
+        // as the raw-audio path): honour it whenever the composer has anything
+        // send() would accept (text, staged files or selected context), instead
+        // of dropping the queued send and leaving the draft behind. The
+        // "no speech" toast is only for the case where there is nothing to send.
+        if(window._micPendingSend&&_composerHasContent()){
           _commitTranscript('', prefixSnapshot);
           return;
         }

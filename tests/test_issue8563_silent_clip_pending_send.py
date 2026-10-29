@@ -71,6 +71,10 @@ function showToast(m) { toasts.push(m); }
 function t(k) { return k; }
 function setComposerStatus(s) { statuses.push(s); }
 function _ensureSpeechRecognition() { return null; }
+// Mirrors static/ui.js _composerHasContent(): text, staged files or selected context.
+function _composerHasContent() {
+  return !!(ta.value.trim().length > 0 || (input.pendingFiles || 0) > 0 || !!input.hasSelection);
+}
 
 // The real transcription endpoint answer: 200 + empty transcript.
 global.FormData = class { append() {} };
@@ -110,11 +114,14 @@ def driver_path(tmp_path_factory):
     return str(p)
 
 
-def _run(driver_path, *, composer_text="", pending_send=False, prefix_snapshot=""):
+def _run(driver_path, *, composer_text="", pending_send=False, prefix_snapshot="",
+         pending_files=0, has_selection=False):
     payload = {
         "composerText": composer_text,
         "pendingSend": pending_send,
         "prefixSnapshot": prefix_snapshot,
+        "pendingFiles": pending_files,
+        "hasSelection": has_selection,
     }
     result = subprocess.run(
         [NODE, driver_path, str(BOOT_JS_PATH), json.dumps(payload)],
@@ -153,3 +160,24 @@ class TestSilentClipWithoutAnythingToSend:
         assert out["sendCalls"] == 0
         assert out["toasts"] == ["mic_no_speech"]
         assert out["pendingSendAfter"] is False
+
+
+class TestSilentClipWithQueuedSendAndNoText:
+    """A staged file or selected context is a turn even with an empty textarea."""
+
+    def test_attachment_only_queued_send_is_sent(self, driver_path):
+        out = _run(driver_path, composer_text="", pending_send=True, pending_files=1)
+        assert out["sendCalls"] == 1, "a queued Send with a staged file must still send"
+        assert "mic_no_speech" not in out["toasts"]
+        assert out["pendingSendAfter"] is False
+
+    def test_selection_only_queued_send_is_sent(self, driver_path):
+        out = _run(driver_path, composer_text="", pending_send=True, has_selection=True)
+        assert out["sendCalls"] == 1, "a queued Send with selected context must still send"
+        assert "mic_no_speech" not in out["toasts"]
+        assert out["pendingSendAfter"] is False
+
+    def test_staged_file_without_queued_send_only_toasts(self, driver_path):
+        out = _run(driver_path, composer_text="", pending_send=False, pending_files=1)
+        assert out["sendCalls"] == 0
+        assert out["toasts"] == ["mic_no_speech"]
