@@ -57,6 +57,10 @@
 
 ### Fixed
 
+- **Single-container Docker no longer warns at startup that the staged Agent copy is "not a current copy" of itself.** When the staged Agent directory resolves to the directory already chosen for installation, startup uses it without comparing it against itself; a different stage still goes through the ownership, ancestry, identity and freshness checks. Thanks @GeorgiaPreda. (#8568, fixes #8555)
+
+- **A silent voice clip says "No speech detected" instead of failing, and a Send clicked while recording still sends.** When server speech-to-text answers with an empty transcript, the composer now shows the existing no-speech toast rather than a transcription error, and a queued Send goes through with whatever the composer holds (text, staged files or selected context) instead of being dropped. Real transcription failures, including a provider command that crashes with an error marker, still report an error. Thanks @fedebyes. (#8563)
+
 - **The workspace git panel no longer rewrites `.git/index` when it reads a diff.** On a stale index (files touched, line endings changed, or edited outside WebUI), the panel's `git diff --numstat` / `--name-only` and the file diff view refreshed the index as a side effect, taking `.git/index.lock` while you might be committing in a terminal. Diff reads now pass `diff.autoRefreshIndex=false` per call, so they never write; the numbers shown are unchanged. Completes #8520 after #8532. Thanks @balabommablock-cpu. (#8570)
 
 - **The approval card answers on the first click.** The card now checks the server's pending approval before it responds, so a stale id no longer swallows the first click (or the X), and a click is never moved onto a different queued approval, even one with identical text: that approval is shown for a fresh click instead. (#7144 by @BBaFSE, fixes #7091)
