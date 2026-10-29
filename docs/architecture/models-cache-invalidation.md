@@ -295,7 +295,6 @@ snapshot survives it and is served without a live rebuild, each source-axis
 change or a delete/recreate forces a fresh rebuild, and a same-path config
 edit still deletes the snapshot.
 
-<<<<<<< HEAD
 `tests/test_issue8302_models_cache_memo_identity.py` covers the parse memo's
 runtime invariants: two concurrent consumers never receive the same catalog
 object (the read-validate-clear path is mutually exclusive, and exactly one wins
