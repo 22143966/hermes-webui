@@ -25,6 +25,7 @@ import contextlib
 import io
 import mimetypes
 import os
+import socket as socket_mod
 import re
 import sys
 import threading
@@ -708,7 +709,7 @@ def _two_roots(tmp_path):
 
 
 @pytest.mark.parametrize("err", ["EMFILE", "EIO", "ESTALE", "ENFILE"])
-@pytest.mark.parametrize("where", ["root-walk", "root-probe", "below-root-dir", "final-file"])
+@pytest.mark.parametrize("where", ["slash-open", "root-walk", "root-probe", "below-root-dir", "final-file"])
 def test_unexpected_open_error_never_substitutes_a_later_root(tmp_path, monkeypatch, where, err):
     import errno as _errno
 
@@ -719,7 +720,8 @@ def test_unexpected_open_error_never_substitutes_a_later_root(tmp_path, monkeypa
     def fake_open(path, flags, mode=0o777, *, dir_fd=None):
         name = os.fspath(path)
         hit = (
-            (where == "root-walk" and name == root_a.name and dir_fd is not None)
+            (where == "slash-open" and name == "/" and dir_fd is None)
+            or (where == "root-walk" and name == root_a.name and dir_fd is not None)
             or (where == "root-probe" and name == "." and dir_fd is not None)
             or (where == "below-root-dir" and name == "sub" and dir_fd is not None)
             or (where == "final-file" and name == "img.png" and dir_fd is not None)
@@ -742,7 +744,7 @@ def test_unexpected_open_error_never_substitutes_a_later_root(tmp_path, monkeypa
     assert out == shares._PLACEHOLDER, out[:200]
 
 
-@pytest.mark.parametrize("err", ["ENOENT", "ENOTDIR", "ELOOP"])
+@pytest.mark.parametrize("err", ["ENOENT", "ENOTDIR", "ELOOP", "ENAMETOOLONG"])
 def test_nothing_there_errors_at_the_root_still_fall_through(tmp_path, monkeypatch, err):
     import errno as _errno
 
@@ -764,6 +766,47 @@ def test_nothing_there_errors_at_the_root_still_fall_through(tmp_path, monkeypat
     assert shares._share_nofollow_open_supported()
     assert _payloads(_embed("MEDIA:sub/img.png", [root_a, root_b])) == [OUTSIDE]
     assert fired, "the injected error never fired"
+
+
+# R4-2  A non-regular entry (socket, FIFO, device) where the image should be is
+#       a miss, as master's ``is_file()`` probe treated it, and is never
+#       opened: opening a socket fails (ENXIO on Linux, EOPNOTSUPP on macOS)
+#       and opening a device node can have side effects.
+
+
+@pytest.mark.skipif(not hasattr(socket_mod, "AF_UNIX"), reason="needs Unix sockets")
+def test_socket_in_first_root_is_a_miss_and_never_opened(tmp_path, monkeypatch):
+    root_a, root_b = _two_roots(tmp_path)
+    (root_a / "sub" / "img.png").unlink()
+    monkeypatch.chdir(root_a / "sub")  # bind by a short relative name (AF_UNIX path limit)
+    sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    try:
+        sock.bind("img.png")
+        monkeypatch.chdir(tmp_path)
+        real_open = os.open
+        opened = []
+
+        def spy_open(path, flags, mode=0o777, *, dir_fd=None):
+            opened.append(os.fspath(path))
+            if dir_fd is None:
+                return real_open(path, flags, mode)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "open", spy_open)
+        monkeypatch.setattr(os, "supports_dir_fd", set(os.supports_dir_fd) | {spy_open})
+        assert _payloads(_embed("MEDIA:sub/img.png", [root_a, root_b])) == [OUTSIDE]
+        # root A's socket was never opened; only root B's regular file was
+        assert opened.count("img.png") == 1, opened
+    finally:
+        sock.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+def test_fifo_in_first_root_is_a_miss(tmp_path):
+    root_a, root_b = _two_roots(tmp_path)
+    (root_a / "sub" / "img.png").unlink()
+    os.mkfifo(root_a / "sub" / "img.png")
+    assert _payloads(_embed("MEDIA:sub/img.png", [root_a, root_b])) == [OUTSIDE]
 
 
 # R1-5  Windows: verify-after-open.  Native Windows is NOT available to this
