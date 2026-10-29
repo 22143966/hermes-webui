@@ -465,6 +465,11 @@ def _share_nofollow_open_supported() -> bool:
     )
 
 
+class _ShareMediaRefused(Exception):
+    """Terminal refusal of a share media ref: emit the placeholder and do NOT
+    try the ref under another allowed root (#6126 round 1)."""
+
+
 def _share_openat_dir(dir_fd: int, name: str, dir_flags: int) -> int:
     """Open directory *name* relative to *dir_fd* and return the new descriptor.
 
@@ -501,11 +506,22 @@ def _open_share_file_nofollow(root: Path, names: list[str], dir_flags: int, file
     except (OSError, ValueError):
         return None
     try:
-        for name in root_names + names[:-1]:
-            dir_fd = _share_openat_dir(dir_fd, name, dir_flags)
-        return os.open(names[-1], file_flags, dir_fd=dir_fd)
-    except (OSError, ValueError):
-        return None
+        try:
+            for name in root_names:
+                dir_fd = _share_openat_dir(dir_fd, name, dir_flags)
+        except (OSError, ValueError):
+            return None  # root missing, unreachable or redirected: a miss
+        try:
+            for name in names[:-1]:
+                dir_fd = _share_openat_dir(dir_fd, name, dir_flags)
+            return os.open(names[-1], file_flags, dir_fd=dir_fd)
+        except PermissionError:
+            # EACCES/EPERM below the root: something is there but cannot be
+            # read.  Terminal, so a namesake in a later root is never
+            # substituted for it (#6126 round 1).
+            raise _ShareMediaRefused from None
+        except (OSError, ValueError):
+            return None
     finally:
         try:
             os.close(dir_fd)
@@ -521,9 +537,10 @@ def _read_share_media_nofollow(candidates, limit: int) -> bytes | None:
     on that descriptor and at most ``limit + 1`` bytes are read from it, so a
     file that grows after ``fstat`` is refused rather than embedded (#6126).
     Like the old ``is_file()`` probe, an entry that cannot be opened (missing,
-    symlinked component, permission) or is not a regular file falls through
-    to the next root; an unsupported platform, an oversize file or a read
-    error returns ``None`` and the caller emits the placeholder.
+    symlinked component) or is not a regular file falls through to the next
+    root.  Permission denied below a root is terminal (never substitute a
+    later root's namesake); an unsupported platform, an oversize file or a
+    read error also return ``None`` and the caller emits the placeholder.
     """
     if not _share_nofollow_open_supported():
         return None
@@ -535,7 +552,10 @@ def _read_share_media_nofollow(candidates, limit: int) -> bytes | None:
     for root, names in candidates:
         if not names:
             continue
-        fd = _open_share_file_nofollow(root, names, dir_flags, file_flags)
+        try:
+            fd = _open_share_file_nofollow(root, names, dir_flags, file_flags)
+        except _ShareMediaRefused:
+            return None
         if fd is None:
             continue
         try:

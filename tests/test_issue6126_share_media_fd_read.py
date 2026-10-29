@@ -563,3 +563,40 @@ def test_malformed_tilde_ref_does_not_fail_share_snapshot(tmp_path):
     content = snapshot["messages"][-1]["content"]
     assert content.startswith("bad " + shares._PLACEHOLDER + " good <img "), content[:200]
     assert _payloads(content) == [INSIDE]
+
+
+# R1-3  Permission denied below a root is TERMINAL: the ref becomes the
+#       placeholder and a namesake in a later root is never substituted.
+
+_as_root = hasattr(os, "geteuid") and os.geteuid() == 0
+needs_non_root = pytest.mark.skipif(_as_root, reason="root bypasses DAC permission bits")
+
+
+@contextlib.contextmanager
+def _chmod(path: Path, mode: int):
+    old = path.stat().st_mode & 0o7777
+    path.chmod(mode)
+    try:
+        yield
+    finally:
+        path.chmod(old)
+
+
+@needs_non_root
+@pytest.mark.parametrize(
+    "denied", ["final-file", "intermediate-dir"]
+)
+def test_permission_denied_in_first_root_never_substitutes_later_root(tmp_path, denied):
+    root_a = tmp_path / "root-a"
+    root_b = tmp_path / "root-b"
+    for root, payload in ((root_a, INSIDE), (root_b, OUTSIDE)):
+        (root / "sub").mkdir(parents=True)
+        (root / "sub" / "img.png").write_bytes(payload)
+    target = root_a / "sub" / "img.png" if denied == "final-file" else root_a / "sub"
+    with _chmod(target, 0):
+        out = _embed("MEDIA:sub/img.png", [root_a, root_b])
+    assert OUTSIDE_MARK not in b"".join(_payloads(out)), "root B namesake substituted"
+    assert out == shares._PLACEHOLDER, out[:200]
+    # Control: a plain miss in root A still falls through to root B.
+    (root_a / "sub" / "img.png").unlink()
+    assert _payloads(_embed("MEDIA:sub/img.png", [root_a, root_b])) == [OUTSIDE]
