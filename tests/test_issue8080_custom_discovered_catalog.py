@@ -167,3 +167,48 @@ def test_refresh_clears_warm_provider_card(catalog_scene, monkeypatch):
     assert payload["ok"] is True
     assert card(providers)["models_total"] == 1
     assert picker_ids(config) == ["model-a"]
+
+
+def test_configured_fallback_without_probe_precondition(monkeypatch, tmp_path):
+    """A named entry without a resolvable endpoint (and an unnamed entry)
+    never probes, so ``_live_models`` stays ``None``; the configured
+    fallback and the singular sticky default must still be emitted.
+
+    Regression: building the sticky-default dedupe set iterated ``_live_models``
+    unconditionally, raising ``TypeError: 'NoneType' object is not iterable``
+    before the configured fallback could run for these entries.
+    """
+    from api import config
+
+    cfg = {
+        "model": {"provider": "other"},
+        "custom_providers": [
+            # named entry, model + models, but NO base_url -> never probes
+            {"name": "ModelOnly", "model": "sticky-def", "models": {"cfg-a": {}, "cfg-b": {}}},
+        ],
+    }
+    monkeypatch.setattr(config, "cfg", cfg)
+    monkeypatch.setattr(config, "get_config", lambda: cfg)
+    monkeypatch.setattr(config, "reload_config_if_stale", lambda: None)
+    monkeypatch.setattr(config, "_get_config_path", lambda: tmp_path / "config.yaml")
+    monkeypatch.setattr(config, "_get_auth_store_path", lambda: tmp_path / "auth.json")
+    monkeypatch.setattr(config, "_models_cache_source_fingerprint", lambda: {"test": "8080-noendpoint"})
+    config.invalidate_models_cache()
+    try:
+        result = config.get_available_models()
+    finally:
+        config.invalidate_models_cache()
+    groups = {g.get("provider_id"): g for g in result.get("groups", [])}
+
+    def bare(mid):
+        return mid.removeprefix("@custom:modelonly:")
+
+    modelonly = groups.get("custom:modelonly")
+    assert modelonly is not None, "named model-only entry must still produce a group"
+    modelonly_ids = {bare(m["id"]) for m in modelonly["models"]}
+    assert "sticky-def" in modelonly_ids, f"sticky default missing: {modelonly_ids}"
+    assert {"cfg-a", "cfg-b"} <= modelonly_ids, f"configured fallback missing: {modelonly_ids}"
+
+    # An unnamed entry without any endpoint is skipped by the named
+    # provider scan (no slug to key a group on); that behaviour is pinned by
+    # test_issue1106's own fixtures and is out of scope for this regression.
