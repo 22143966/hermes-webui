@@ -522,3 +522,44 @@ def test_root_with_symlinked_ancestor_is_still_served(tmp_path):
         f"MEDIA:{real}/ws/sub/img.png",
     ):
         assert _payloads(_embed(ref, [root])) == [INSIDE], ref
+
+
+# R1-2  A malformed reference (lone surrogate in a ``~user`` name or in a
+#       path) is a placeholder, never an exception that fails the whole share
+#       snapshot (the route would turn it into HTTP 400).
+
+_MALFORMED_REFS = [
+    "~\ud800/img.png",  # expanduser -> pwd.getpwnam -> UnicodeEncodeError
+    "~\ud800",
+    "\ud800.png",  # relative: os.open(name) -> UnicodeEncodeError
+    "sub\ud800/img.png",
+]
+
+
+@pytest.mark.parametrize("ref", _MALFORMED_REFS)
+def test_malformed_ref_is_placeholder(tmp_path, ref):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    assert _embed(f"see MEDIA:{ref}", [ws]) == "see " + shares._PLACEHOLDER
+    absolute = f"MEDIA:{ws}/{ref.lstrip('~')}"
+    assert _embed(absolute, [ws]) == shares._PLACEHOLDER
+
+
+def test_malformed_tilde_ref_does_not_fail_share_snapshot(tmp_path):
+    from types import SimpleNamespace
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "ok.png").write_bytes(INSIDE)
+    session = SimpleNamespace(
+        workspace=str(ws),
+        title="malformed media ref",
+        messages=[
+            {"role": "user", "content": "share it"},
+            {"role": "assistant", "content": "bad MEDIA:~\ud800/img.png good MEDIA:ok.png"},
+        ],
+    )
+    snapshot = shares.build_share_snapshot(session)
+    content = snapshot["messages"][-1]["content"]
+    assert content.startswith("bad " + shares._PLACEHOLDER + " good <img "), content[:200]
+    assert _payloads(content) == [INSIDE]

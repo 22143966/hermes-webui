@@ -357,7 +357,14 @@ def _embed_share_media(text: str, *, allowed_roots: tuple[Path, ...] = ()) -> st
 
         # --- Absolute paths: lexical allow-list check against root spellings
         if raw.startswith("/") or raw.startswith("~"):
-            expanded = os.path.expanduser(raw)
+            try:
+                # ``~user`` expansion looks the name up in the password
+                # database; a malformed name (e.g. a lone surrogate) raises
+                # UnicodeEncodeError, which must become the placeholder, not
+                # fail the whole share snapshot (#6126 round 1).
+                expanded = os.path.expanduser(raw)
+            except (OSError, ValueError, RuntimeError):
+                return []
             parts = _share_path_components(expanded) if os.path.isabs(expanded) else None
             if not parts:
                 return []
