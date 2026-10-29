@@ -57,6 +57,8 @@
 
 ### Fixed
 
+- **CI's scope/undefined-reference check now actually runs, and fails closed when it can't.** The gate looked for eslint only on PATH, but CI installs it under `node_modules/.bin`, so every CI run skipped it with a warning. It now finds the checkout's eslint first (`eslint.cmd` on Windows), and CI passes `--require-eslint` so a missing eslint is a failure instead of a silent skip. Local runs without node still skip as before. (#8588)
+
 - **Single-container Docker no longer warns at startup that the staged Agent copy is "not a current copy" of itself.** When the staged Agent directory resolves to the directory already chosen for installation, startup uses it without comparing it against itself; a different stage still goes through the ownership, ancestry, identity and freshness checks. Thanks @GeorgiaPreda. (#8568, fixes #8555)
 
 - **A silent voice clip says "No speech detected" instead of failing, and a Send clicked while recording still sends.** When server speech-to-text answers with an empty transcript, the composer now shows the existing no-speech toast rather than a transcription error, and a queued Send goes through with whatever the composer holds (text, staged files or selected context) instead of being dropped. Real transcription failures, including a provider command that crashes with an error marker, still report an error. Thanks @fedebyes. (#8563)
