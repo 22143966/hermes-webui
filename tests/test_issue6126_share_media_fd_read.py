@@ -825,10 +825,11 @@ class _FakeWin32:
         self.files: dict[str, tuple[object, str]] = {}
         self.handles: dict[int, str] = {}
         self.open_calls: list[str] = []
+        self.stat_calls: list[str] = []
         self.opened: list[int] = []
         self.closed: list[int] = []
         owner = threading.get_ident()
-        real_open, real_close = os.open, os.close
+        real_open, real_close, real_stat = os.open, os.close, os.stat
 
         def fake_open(path, flags, *args, **kwargs):
             if threading.get_ident() != owner or not isinstance(path, str) or "\\" not in path:
@@ -840,6 +841,9 @@ class _FakeWin32:
             target, final = self.files[path]
             if isinstance(target, BaseException):
                 raise target
+            if os.path.isdir(str(target)):
+                # CPython opens with _wopen, which reports EACCES for a directory (Codex r5)
+                raise PermissionError(13, "Permission denied", path)
             fd = real_open(str(target), os.O_RDONLY | os.O_NONBLOCK)
             self.opened.append(fd)
             self.handles[self.HANDLE_BASE + fd] = final
@@ -850,8 +854,20 @@ class _FakeWin32:
                 self.closed.append(fd)
             return real_close(fd)
 
+        def fake_stat(path, *args, **kwargs):
+            if threading.get_ident() != owner or not isinstance(path, str) or "\\" not in path:
+                return real_stat(path, *args, **kwargs)
+            self.stat_calls.append(path)
+            if path not in self.files:
+                raise FileNotFoundError(2, "No such file or directory", path)
+            target, _final = self.files[path]
+            if isinstance(target, BaseException):
+                raise target
+            return real_stat(str(target))
+
         monkeypatch.setattr(os, "open", fake_open)
         monkeypatch.setattr(os, "close", fake_close)
+        monkeypatch.setattr(os, "stat", fake_stat)
         self.msvcrt = SimpleNamespace(get_osfhandle=lambda fd: self.HANDLE_BASE + fd)
         monkeypatch.setitem(sys.modules, "msvcrt", self.msvcrt)
         monkeypatch.setattr(
@@ -1024,6 +1040,27 @@ def test_windows_reader_missing_falls_through_but_denied_is_terminal(win, win_fi
     assert _read_win(candidates) == OUTSIDE  # missing in root A: root B is used
     win.add("C:\\a\\b\\x.png", PermissionError(13, "Access is denied"), "")
     assert _read_win(candidates) is None  # denied in root A: never root B
+    win.assert_all_closed()
+
+
+def test_windows_reader_directory_in_first_root_is_a_miss_and_never_opened(win, win_files, tmp_path):
+    # Codex r5: _wopen reports EACCES for a directory, so opening it first would end the lookup with the
+    # placeholder where master's is_file() fell through to root B.  An advisory stat skips it unopened.
+    (tmp_path / "adir").mkdir()
+    win.add("C:\\ws\\sub\\x.png", tmp_path / "adir", "\\\\?\\C:\\ws\\sub\\x.png")
+    win.add("C:\\att\\sub\\x.png", win_files["other"], "\\\\?\\C:\\att\\sub\\x.png")
+    candidates = [("C:\\ws", ["sub", "x.png"]), ("C:\\att", ["sub", "x.png"])]
+    assert _read_win(candidates) == OUTSIDE
+    assert win.open_calls == ["C:\\att\\sub\\x.png"], win.open_calls
+    win.assert_all_closed()
+
+
+@pytest.mark.parametrize("err", [PermissionError(13, "denied"), OSError(5, "EIO"), OSError(24, "EMFILE")])
+def test_windows_reader_stat_errors_other_than_missing_are_terminal(win, win_files, err):
+    win.add("C:\\ws\\x.png", err, "")
+    win.add("C:\\att\\x.png", win_files["other"], "\\\\?\\C:\\att\\x.png")
+    assert _read_win([("C:\\ws", ["x.png"]), ("C:\\att", ["x.png"])]) is None
+    assert win.open_calls == []
     win.assert_all_closed()
 
 
