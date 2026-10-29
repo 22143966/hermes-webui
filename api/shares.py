@@ -458,23 +458,44 @@ def _share_nofollow_open_supported() -> bool:
     )
 
 
-def _open_share_file_nofollow(root: Path, names: list[str], dir_flags: int, file_flags: int) -> int | None:
-    """Open ``root/names...`` without following any symlink below *root*.
+def _share_openat_dir(dir_fd: int, name: str, dir_flags: int) -> int:
+    """Open directory *name* relative to *dir_fd* and return the new descriptor.
 
-    *root* (already resolved, trusted configuration) is opened as a
-    directory; every name is then opened relative to the previous directory
-    descriptor, so no component is ever looked up by pathname again.
-    Returns the final descriptor (caller closes it) or ``None``.
+    *dir_fd* is closed only once the new descriptor exists, so on an exception
+    the caller still owns (and closes) exactly one descriptor.
     """
+    next_fd = os.open(name, dir_flags, dir_fd=dir_fd)
     try:
-        dir_fd = os.open(str(root), dir_flags)
+        os.close(dir_fd)
+    except OSError:
+        pass
+    return next_fd
+
+
+def _open_share_file_nofollow(root: Path, names: list[str], dir_flags: int, file_flags: int) -> int | None:
+    """Open ``root/names...`` without following any symlink at or below *root*.
+
+    *root* is the already-resolved (realpath) allowed root.  It is NOT opened
+    by pathname: the walk starts at ``/`` and opens every component of the
+    resolved root relative to the previous directory descriptor with
+    ``O_NOFOLLOW``, so an ancestor of a nested root (an attachments root inside
+    a writable workspace) swapped for a symlink after resolution fails the
+    walk instead of redirecting the root descriptor (#6126 round 1).  A root
+    configured through a symlink still works because its realpath has none.
+    The names below the root are then walked the same way.  Returns the final
+    descriptor (caller closes it) or ``None``.
+    """
+    root_text = str(root)
+    root_names = _share_path_components(root_text)
+    if root_names is None or not root_text.startswith("/"):
+        return None
+    try:
+        dir_fd = os.open("/", dir_flags)
     except (OSError, ValueError):
         return None
     try:
-        for name in names[:-1]:
-            next_fd = os.open(name, dir_flags, dir_fd=dir_fd)
-            prev_fd, dir_fd = dir_fd, next_fd
-            os.close(prev_fd)
+        for name in root_names + names[:-1]:
+            dir_fd = _share_openat_dir(dir_fd, name, dir_flags)
         return os.open(names[-1], file_flags, dir_fd=dir_fd)
     except (OSError, ValueError):
         return None

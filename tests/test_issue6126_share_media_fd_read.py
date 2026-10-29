@@ -413,3 +413,112 @@ def test_no_descriptor_leak_across_success_and_refusal_paths(tree, tmp_path):
             _embed(f"MEDIA:{ref}", [tree["ws"], tree["outside"]])
             _embed(f"MEDIA:{tree['ws']}/{ref}", [tree["ws"], tree["outside"]])
     assert _fds_into(tmp_path) == []
+
+
+# --- Codex round 1 (#6126) ----------------------------------------------------
+#
+# R1-1  The allowed root is now opened from "/" one component at a time with
+#       O_NOFOLLOW, so an ANCESTOR of a nested root (an attachments root inside
+#       a writable workspace) swapped for a symlink after root resolution can no
+#       longer redirect the root descriptor outside.
+
+
+def _nested_root_tree(base: Path) -> dict:
+    ws = base / "workspace"
+    inbox = ws / "inbox"
+    att = inbox / "attachments"
+    att.mkdir(parents=True)
+    (att / "img.png").write_bytes(INSIDE)
+    outside = base / "outside"
+    (outside / "attachments").mkdir(parents=True)
+    (outside / "attachments" / "img.png").write_bytes(OUTSIDE)
+    return {"ws": ws, "inbox": inbox, "att": att, "outside": outside}
+
+
+def _swap_inbox(tree):
+    def action():
+        os.rename(tree["inbox"], tree["ws"] / "inbox.saved")
+        os.symlink(tree["outside"], tree["inbox"])
+
+    return action
+
+
+def _nested_roots(kind: str, tree) -> list[Path]:
+    return [tree["att"]] if kind == "attachments-only" else [tree["ws"], tree["att"]]
+
+
+def _nested_ref(kind: str, tree) -> str:
+    return "MEDIA:img.png" if kind == "relative" else f"MEDIA:{tree['att']}/img.png"
+
+
+@pytest.mark.parametrize("ref_kind", ["relative", "absolute"])
+@pytest.mark.parametrize("roots_kind", ["attachments-only", "workspace+attachments"])
+def test_nested_root_ancestor_swap_after_resolution_never_embeds_outside_bytes(
+    tmp_path, monkeypatch, ref_kind, roots_kind
+):
+    # Dry run: unswapped, the nested-root image embeds (non-vacuous) and we
+    # learn every filesystem step.  Root resolution (realpath's lstat calls)
+    # happens before the first os.open; a swap BEFORE resolution redirects
+    # the trusted configuration itself (pre-existing policy, out of scope), so
+    # the swap is applied at every step from the first open onwards.
+    dry_tree = _nested_root_tree(tmp_path / "dry")
+    dry = _FsEvents()
+    with dry.installed(monkeypatch):
+        out = _embed(_nested_ref(ref_kind, dry_tree), _nested_roots(roots_kind, dry_tree))
+    assert _payloads(out) == [INSIDE], out[:200]
+    first_open = dry.events.index("os.open")
+
+    leaks = []
+    for n in range(first_open, len(dry.events)):
+        tree = _nested_root_tree(tmp_path / f"run{n}")
+        hook = _FsEvents(fire_at=n, action=_swap_inbox(tree))
+        with hook.installed(monkeypatch):
+            out = _embed(_nested_ref(ref_kind, tree), _nested_roots(roots_kind, tree))
+        assert hook.fired, f"swap point {n} ({dry.events[n]}) never reached"
+        payloads = _payloads(out)
+        if any(OUTSIDE_MARK in p for p in payloads):
+            leaks.append((n, dry.events[n]))
+            continue
+        assert out == shares._PLACEHOLDER or payloads == [INSIDE], (n, out[:200])
+    assert not leaks, f"outside bytes embedded when swapped before: {leaks}"
+
+
+@pytest.mark.parametrize("ref_kind", ["relative", "absolute"])
+def test_nested_root_ancestor_already_swapped_is_placeholder(tmp_path, monkeypatch, ref_kind):
+    # Deterministic single-shot shape of the Codex probe: resolve the roots,
+    # then swap workspace/inbox for a symlink before the reader's first open.
+    tree = _nested_root_tree(tmp_path)
+    swap = _swap_inbox(tree)
+    real_open = os.open
+    fired = []
+    owner = threading.get_ident()
+
+    def open_after_swap(*args, **kwargs):
+        if threading.get_ident() == owner and not fired:
+            fired.append(True)
+            swap()
+        return real_open(*args, **kwargs)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "open", open_after_swap)
+        mp.setattr(os, "supports_dir_fd", set(os.supports_dir_fd) | {open_after_swap})
+        out = _embed(_nested_ref(ref_kind, tree), [tree["ws"], tree["att"]])
+    assert fired, "the reader never opened anything"
+    assert OUTSIDE_MARK not in b"".join(_payloads(out))
+    assert out == shares._PLACEHOLDER, out[:200]
+
+
+def test_root_with_symlinked_ancestor_is_still_served(tmp_path):
+    # Configured roots are resolved first, then walked no-follow: a symlink
+    # ANYWHERE in the configured spelling of the root keeps working.
+    real = tmp_path / "real-parent"
+    (real / "ws" / "sub").mkdir(parents=True)
+    (real / "ws" / "sub" / "img.png").write_bytes(INSIDE)
+    os.symlink(real, tmp_path / "parent-link")
+    root = tmp_path / "parent-link" / "ws"
+    for ref in (
+        "MEDIA:sub/img.png",
+        f"MEDIA:{root}/sub/img.png",
+        f"MEDIA:{real}/ws/sub/img.png",
+    ):
+        assert _payloads(_embed(ref, [root])) == [INSIDE], ref
