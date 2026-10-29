@@ -691,6 +691,81 @@ def test_unsearchable_root_is_a_miss_and_falls_through_to_next_root(tmp_path):
         assert _embed("MEDIA:sub/img.png", [root_a, root_b]) == shares._PLACEHOLDER
 
 
+# R3-1  Only "nothing is there" errors (ENOENT, ENOTDIR, a refused symlink, and
+#       a permission error AT the root) may fall through to the next allowed
+#       root.  Any other error (EMFILE, EIO, ESTALE, ...) at the root walk, the
+#       root search probe or below the root is TERMINAL: falling through would
+#       substitute another root's namesake for an image that exists.
+
+
+def _two_roots(tmp_path):
+    root_a = tmp_path / "ws-a"
+    root_b = tmp_path / "attachments-b"
+    for root, payload in ((root_a, INSIDE), (root_b, OUTSIDE)):
+        (root / "sub").mkdir(parents=True)
+        (root / "sub" / "img.png").write_bytes(payload)
+    return root_a, root_b
+
+
+@pytest.mark.parametrize("err", ["EMFILE", "EIO", "ESTALE", "ENFILE"])
+@pytest.mark.parametrize("where", ["root-walk", "root-probe", "below-root-dir", "final-file"])
+def test_unexpected_open_error_never_substitutes_a_later_root(tmp_path, monkeypatch, where, err):
+    import errno as _errno
+
+    root_a, root_b = _two_roots(tmp_path)
+    real_open = os.open
+    fired = []
+
+    def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+        name = os.fspath(path)
+        hit = (
+            (where == "root-walk" and name == root_a.name and dir_fd is not None)
+            or (where == "root-probe" and name == "." and dir_fd is not None)
+            or (where == "below-root-dir" and name == "sub" and dir_fd is not None)
+            or (where == "final-file" and name == "img.png" and dir_fd is not None)
+        )
+        if hit and not fired:
+            fired.append(name)
+            raise OSError(getattr(_errno, err), os.strerror(getattr(_errno, err)))
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", fake_open)
+    # Register the wrapper as dir_fd-capable, as the real os.open is; otherwise
+    # the capability gate refuses everything and the test proves nothing.
+    monkeypatch.setattr(os, "supports_dir_fd", set(os.supports_dir_fd) | {fake_open})
+    assert shares._share_nofollow_open_supported()
+    out = _embed("MEDIA:sub/img.png", [root_a, root_b])
+    assert fired, "the injected error never fired"
+    assert OUTSIDE_MARK not in b"".join(_payloads(out)), f"{err} at {where} substituted root B"
+    assert out == shares._PLACEHOLDER, out[:200]
+
+
+@pytest.mark.parametrize("err", ["ENOENT", "ENOTDIR", "ELOOP"])
+def test_nothing_there_errors_at_the_root_still_fall_through(tmp_path, monkeypatch, err):
+    import errno as _errno
+
+    root_a, root_b = _two_roots(tmp_path)
+    real_open = os.open
+
+    fired = []
+
+    def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+        if os.fspath(path) == root_a.name and dir_fd is not None:
+            fired.append(err)
+            raise OSError(getattr(_errno, err), os.strerror(getattr(_errno, err)))
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(os, "supports_dir_fd", set(os.supports_dir_fd) | {fake_open})
+    assert shares._share_nofollow_open_supported()
+    assert _payloads(_embed("MEDIA:sub/img.png", [root_a, root_b])) == [OUTSIDE]
+    assert fired, "the injected error never fired"
+
+
 # R1-5  Windows: verify-after-open.  Native Windows is NOT available to this
 #       suite, so the Windows branch is exercised on POSIX with the platform
 #       switch, ``msvcrt.get_osfhandle`` and the ``GetFinalPathNameByHandleW``
