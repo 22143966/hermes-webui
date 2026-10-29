@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import html
 import io
 import json
@@ -519,6 +520,17 @@ def _share_nofollow_open_supported() -> bool:
     )
 
 
+# Open errors that mean "nothing usable is there" and may fall through to the
+# next allowed root: missing, not a directory, or a symlink refused by
+# O_NOFOLLOW (ELOOP; EMLINK on FreeBSD).  Anything else (EMFILE, ENFILE, EIO,
+# ESTALE, ...) means something may be there that we failed to read, so it is
+# terminal: falling through would substitute another root's namesake
+# (#6126 round 3).
+_SHARE_MISS_ERRNOS = frozenset(
+    e for e in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP, getattr(errno, "EMLINK", None)) if e is not None
+)
+
+
 class _ShareMediaRefused(Exception):
     """Terminal refusal of a share media ref: emit the placeholder and do NOT
     try the ref under another allowed root (#6126 round 1)."""
@@ -591,9 +603,19 @@ def _open_share_file_nofollow(root: Path, names: list[str], dir_flags: int, file
             # root stays a miss that falls through to the next allowed root, as
             # pathname reads did; denials BELOW a searchable root remain
             # terminal (#6126 r2).
-            os.close(os.open(".", dir_flags, dir_fd=dir_fd))
-        except (OSError, ValueError):
-            return None  # root missing, unreachable, unsearchable or redirected: a miss
+            probe_fd = os.open(".", dir_flags, dir_fd=dir_fd)
+        except PermissionError:
+            return None  # root unreachable or unsearchable: a miss
+        except OSError as exc:
+            if exc.errno in _SHARE_MISS_ERRNOS:
+                return None  # root missing or redirected: a miss
+            raise _ShareMediaRefused from None  # EMFILE, EIO, ...: terminal (#6126 r3)
+        except ValueError:
+            return None
+        try:
+            os.close(probe_fd)
+        except OSError:
+            pass  # a close failure is not a lookup result
         try:
             for name in names[:-1]:
                 dir_fd = _share_openat_dir(dir_fd, name, dir_flags)
@@ -603,7 +625,11 @@ def _open_share_file_nofollow(root: Path, names: list[str], dir_flags: int, file
             # read.  Terminal, so a namesake in a later root is never
             # substituted for it (#6126 round 1).
             raise _ShareMediaRefused from None
-        except (OSError, ValueError):
+        except OSError as exc:
+            if exc.errno in _SHARE_MISS_ERRNOS:
+                return None  # missing, or a symlinked component: a miss
+            raise _ShareMediaRefused from None  # EMFILE, EIO, ...: terminal (#6126 r3)
+        except ValueError:
             return None
     finally:
         try:
